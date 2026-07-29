@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 import time
 
 import pytest
 
-from Zou_lab_control.api import PulseFacade, connect
+from Zou_lab_control.api import PulseFacade, WorkspacePaths, connect
 from Zou_lab_control.api.facade import _service_guard
 from zlc_neutral_atom.devices.sequencer.application import (
     PulseApplicationOwner,
@@ -25,6 +26,9 @@ from zlc_pulse import (
     RepeatRegion,
     ScanParameter,
 )
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _authored_scan_document(experiment) -> tuple[PulseDocument, PulseFieldRef]:
@@ -96,7 +100,11 @@ def _wait_for_scan_progress(pulse: PulseFacade, timeout: float = 5.0):
 @pytest.fixture(scope="module")
 def experiment(tmp_path_factory):
     with connect(
-        repository=tmp_path_factory.mktemp("pulse-application-state")
+        "virtual",
+        workspace=WorkspacePaths.for_workspace(
+            ROOT,
+            repository_root=tmp_path_factory.mktemp("pulse-application-state"),
+        ),
     ) as value:
         yield value
 

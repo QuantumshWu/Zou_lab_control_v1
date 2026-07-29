@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType
 
 from zlc_neutral_atom.catalog import DefinitionKey
@@ -21,6 +22,8 @@ class TaskConsoleApplicationPorts:
     """
 
     attachments: tuple[ConsoleCapabilityAttachment, ...]
+    tasks_root: Path
+    output_root: Path
     _by_key: Mapping[DefinitionKey, ConsoleCapabilityAttachment] = field(
         init=False,
         repr=False,
@@ -46,6 +49,11 @@ class TaskConsoleApplicationPorts:
                 )
             by_key[attachment.key] = attachment
         object.__setattr__(self, "attachments", attachments)
+        for name in ("tasks_root", "output_root"):
+            value = Path(getattr(self, name)).expanduser()
+            if not value.is_absolute():
+                raise ValueError(f"TaskConsole {name} must be absolute")
+            object.__setattr__(self, name, value.resolve())
         object.__setattr__(self, "_by_key", MappingProxyType(by_key))
 
     def attachment_for(

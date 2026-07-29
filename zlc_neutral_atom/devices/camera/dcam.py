@@ -746,7 +746,7 @@ class DcamCameraAdapter:
 
     def capture_state(self) -> tuple[bool, int]:
         with self._state_lock:
-            return self._armed, len(self._pending)
+            return self._armed, self._copied_count
 
     def observed_produced_count(self) -> int:
         """Read the DCAM transfer counter without consuming a frame."""

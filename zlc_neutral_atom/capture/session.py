@@ -648,6 +648,19 @@ class CaptureSession:
                     )
                 )
                 self._validate_ack(ack, CaptureStartedAck)
+                if (
+                    ack.settings_fingerprint
+                    != self._port.capability.settings_fingerprint
+                    or ack.capability_fingerprint
+                    != self._port.capability.capability_fingerprint
+                    or ack.capture_spec_fingerprint != self._capture_spec_digest
+                    or ack.expected_total_events != self._contract.total_events
+                    or ack.buffer_frame_count != self._contract.total_events
+                    or ack.source_ordinal_baseline != 0
+                ):
+                    raise RuntimeError(
+                        "camera arm acknowledgement differs from the frozen capture"
+                    )
             except BaseException as error:
                 self._poison(
                     SourceFailed(f"capture start failed: {safe_error_summary(error)}")

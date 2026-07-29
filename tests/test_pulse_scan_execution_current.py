@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from fpga.pulse_streamer.host.image import CtrlWords, STATUS_DONE
+from conftest import private_pulse_backend_snapshot
+
+from fpga.pulse_streamer.host.image import CtrlWords, STATUS_DONE, StreamerParams
 from zlc_pulse.artifact import (
     PulseExecutionForm,
     compiled_pulse_artifact_from_tree,
@@ -195,6 +197,7 @@ def test_continuous_scan_rejects_terminal_evidence_and_service_completion():
         pulse_target_manifest_from_lanes(document.target),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
         connection_generation="focused-generation",
     )
     reference = service.prepare(artifact)
@@ -208,12 +211,17 @@ def test_continuous_scan_rejects_terminal_evidence_and_service_completion():
 class _RecordingBackend:
     def __init__(self) -> None:
         self.actions: list[str] = []
+        self.artifact = None
+        self.state = "IDLE"
 
     def prepare(self, _artifact) -> None:
         self.actions.append("prepare")
+        self.artifact = _artifact
+        self.state = "PREPARED"
 
     def fire(self, _artifact) -> None:
         self.actions.append("fire")
+        self.state = "RUNNING"
 
     def await_completion(self, _artifact, _timeout):
         self.actions.append("await_completion")
@@ -221,9 +229,15 @@ class _RecordingBackend:
 
     def safe_state(self) -> None:
         self.actions.append("safe_state")
+        self.artifact = None
+        self.state = "SAFE"
 
     def request_interrupt(self) -> None:
         self.actions.append("request_interrupt")
 
     def snapshot(self) -> dict[str, object]:
-        return {"actions": tuple(self.actions)}
+        return private_pulse_backend_snapshot(
+            state=self.state,
+            raw_lane_count=len(_execution_document().target.raw_lanes),
+            artifact=self.artifact,
+        )

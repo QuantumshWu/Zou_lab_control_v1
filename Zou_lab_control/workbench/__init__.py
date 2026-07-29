@@ -7,6 +7,7 @@ def open_figure_workbench(
     figure_factory,
     source,
     *,
+    output_root,
     intent=None,
     point_ordinals=None,
     preferences=None,
@@ -44,7 +45,7 @@ def open_figure_workbench(
         options["open_fit"] = True
     if fit_timeout_seconds is not None:
         options["fit_timeout_seconds"] = fit_timeout_seconds
-    return _open(figure_factory, source, **options)
+    return _open(figure_factory, source, output_root=output_root, **options)
 
 
 def open_pulse_editor(
@@ -53,34 +54,36 @@ def open_pulse_editor(
     document=None,
     path=None,
     remote_endpoint=None,
-    repository=None,
+    workspace=None,
 ):
     """Open PulseGUI from explicit bound or standalone composition inputs."""
 
     from zlc_workbench.pulse_editor.app import open_pulse_editor as _open
 
     if experiment is None:
-        from ._composition import (
-            standalone_pulse_connection_factory,
-            standalone_pulse_workspace,
-        )
+        from Zou_lab_control.api import WorkspacePaths
+        from ._composition import standalone_pulse_connection_factory
 
-        workspace = standalone_pulse_workspace(repository)
+        if not isinstance(workspace, WorkspacePaths):
+            raise TypeError("standalone Pulse editor requires WorkspacePaths")
         return _open(
             connection_factory=standalone_pulse_connection_factory(workspace),
+            pulses_root=workspace.pulses_root,
+            output_root=workspace.output_root,
             initial_connection_mode="offline",
             document=document,
             path=path,
             remote_endpoint=remote_endpoint,
         )
 
-    if remote_endpoint is not None or repository is not None:
+    if remote_endpoint is not None or workspace is not None:
         raise ValueError(
             "a bound Experiment already owns its Pulse endpoint and workspace"
         )
     from ._composition import bound_pulse_mode, _require_experiment
 
     experiment = _require_experiment(experiment)
+    roots = experiment._workspace_paths()
 
     def compose():
         pulse = experiment.pulse
@@ -88,6 +91,8 @@ def open_pulse_editor(
             pulse=pulse,
             descriptor=pulse.target,
             initial_connection_mode=bound_pulse_mode(experiment),
+            pulses_root=roots.pulses_root,
+            output_root=roots.output_root,
             document=document,
             path=path,
         )
@@ -110,7 +115,7 @@ def open_device_manager(
     *,
     document=None,
     config_path=None,
-    repository=None,
+    workspace=None,
     name="neutral_atom",
     on_initialized=None,
 ):
@@ -126,7 +131,7 @@ def open_device_manager(
         experiment = _require_experiment(experiment)
         if any(
             value is not None
-            for value in (document, config_path, repository, on_initialized)
+            for value in (document, config_path, workspace, on_initialized)
         ):
             raise ValueError(
                 "a bound DeviceManager takes its config from the Experiment"
@@ -138,7 +143,7 @@ def open_device_manager(
         return experiment._open_workbench_handle("device-manager", compose)
 
     admin = ExperimentDeviceAdmin.standalone(
-        repository=repository,
+        workspace=workspace,
         name=name,
     )
 

@@ -8,6 +8,7 @@ __all__ = ["open_figure_viewer"]
 def open_figure_viewer(
     path=None,
     *,
+    output_root,
     scale=None,
     window_ratio=None,
     hide_on_close=False,
@@ -25,6 +26,7 @@ def open_figure_viewer(
     ensure_qt_app()
     viewer = FigureViewer(
         path,
+        output_root=output_root,
         scale=scale,
         window_ratio=(
             WINDOW_SCREEN_FRACTION

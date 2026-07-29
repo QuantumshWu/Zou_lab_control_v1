@@ -24,9 +24,12 @@ def _until(application, predicate, *, timeout: float = 5.0) -> None:
 
 
 @pytest.fixture
-def editor():
+def editor(tmp_path):
     application = ensure_qt_app()
-    body = open_pulse_editor()
+    body = open_pulse_editor(
+        pulses_root=tmp_path / "pulses",
+        output_root=tmp_path / "output",
+    )
     body.window().show()
     _until(application, lambda: bool(body.schedule_view.period_cards()))
     yield application, body

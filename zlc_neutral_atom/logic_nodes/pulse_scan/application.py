@@ -655,7 +655,7 @@ def _compile_pulse_requests(
         raise TypeError(
             "association_requirement must be SignalAssociationScheduleRequirement"
         )
-    trigger_channels = association_requirement.trigger_channels
+    trigger_channels = (association_requirement.trigger_channel,)
     if isinstance(program, AutonomousScanSlotProgram):
         logical = program.execution_document
         document = expand_autonomous_scan_repeats(logical)
@@ -816,11 +816,22 @@ def _association_request(
     group: str,
     expected_event_count: int,
 ) -> SignalAssociationRequest:
+    schedules = artifact.trigger_schedules
+    if len(schedules) != 1:
+        raise RuntimeError(
+            "the current formal signal association requires exactly one "
+            "compiled physical trigger schedule"
+        )
     return SignalAssociationRequest(
         f"{context.run_id.value}:{group}",
         session.session_id,
         artifact.fingerprint,
         expected_event_count,
+        schedules[0].fingerprint,
+        schedules[0].channel,
+        schedules[0].total,
+        schedules[0].minimum_interval_ticks,
+        artifact.target_ir.clock_hz,
     )
 
 

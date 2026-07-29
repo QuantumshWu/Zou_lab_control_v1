@@ -19,6 +19,13 @@ from zlc_pulse import PulseExecutionForm, load_pulse_document
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _workspace(repository_root: Path) -> zlc.WorkspacePaths:
+    return zlc.WorkspacePaths.for_workspace(
+        ROOT,
+        repository_root=repository_root,
+    )
+
+
 class _LiveView:
     def __init__(self, spec: CameraMonitorViewSpec) -> None:
         self.spec = spec
@@ -79,7 +86,10 @@ def _start_one_live_frame(exp, *, exposure):
 
 
 def test_live_camera_applies_and_restores_requested_exposure(tmp_path) -> None:
-    with zlc.connect("virtual", repository=tmp_path / "workspace") as exp:
+    with zlc.connect(
+        "virtual",
+        workspace=_workspace(tmp_path / "workspace"),
+    ) as exp:
         _start_one_live_frame(exp, exposure=0.013)
         # A second baseline run executes the endpoint's unchanged-working-point
         # check.  It can succeed only if cleanup restored the installed exposure.
@@ -108,7 +118,10 @@ def _run_finite_camera(exp, *, exposure, pulse_request):
 
 
 def test_finite_camera_applies_and_restores_requested_exposure(tmp_path) -> None:
-    with zlc.connect("virtual", repository=tmp_path / "workspace") as exp:
+    with zlc.connect(
+        "virtual",
+        workspace=_workspace(tmp_path / "workspace"),
+    ) as exp:
         document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
         pulse_request = exp.pulse.request(
             document,

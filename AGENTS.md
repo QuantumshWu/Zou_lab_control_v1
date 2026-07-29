@@ -43,6 +43,7 @@
 
 20. 迁移期间只运行能证明当前边界的最窄 current test、public API 流或真实 product flow。历史测试失败先判断其物理/public contract 是否仍有效；不得改实现去迎合已删除架构。
 21. **测试源码与 owner 同 cut 收口**：生产 owner、public contract 或 codec 被替换时，所有直接相关测试必须在该 cut 改写为当前物理/public contract，或与被删行为一起删除；禁止把仍导入旧类型、私有 lane、旧字符串 vocabulary 或兼容入口的测试留给 M7。留到 M7 的只有 broad-suite 执行、跨 cut E2E 补强和最终总清点。反复运行同一历史测试、为了绿灯恢复私有方法/调用次数或在每个微改后跑全仓，均不构成验证。
+    - 本规则追溯适用于已经实施的 M1、M2 及所有后续 cut：只要当前检查发现测试仍引用该 cut 已删除的类型、模块、私有结构或旧行为，就必须在继续下一 cut 前按现行物理/public contract 改写，或随退役行为删除；不得标记为“已知历史合同”、延期处理，或据此恢复生产兼容。
 22. 性能问题先阅读调用链并 profiling，交叉验证 copy、algorithm、compose、lock、I/O 与线程边界。修正复杂度和 owner 后再选择 executor/process；不得用假缩放、旧 raster stretch、任意 debounce 或预算拒绝掩盖。
 23. 每个 dependency cut 对照旧树同等物理/产品能力报告生产行数、frozen dataclass/class/enum 数量和主要复杂度来源。超过约三倍必须压缩或逐项说明不可替代的 consumer/invariant；行数不是单独删除依据。
 24. 每个文件审查都必须进入 change-impact 清单：它拥有何种事实、由谁调用、又调用谁、是否重述别处合同、增加同类能力要修改哪些文件、能否删除。仅“逐文件读过”不算架构审查完成。

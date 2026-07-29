@@ -10,7 +10,11 @@ from zlc_neutral_atom.devices.sequencer.port import (
     PulseTerminalReceipt,
     SequencerCapabilitySnapshot,
 )
-from zlc_pulse import PreparedPulseRef, RemotePulseExecutionClient
+from zlc_pulse import (
+    PreparedPulseRef,
+    PulseServerSnapshot,
+    RemotePulseExecutionClient,
+)
 from zlc_storage import (
     canonical_digest,
     canonical_text as _text,
@@ -129,40 +133,29 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
         point_count = len(session.request.artifact.target_ir.scan_points)
 
         def unavailable(reason: str) -> PulseScanProgress:
-            backend_state = snapshot.backend.get("state")
             return PulseScanProgress.unavailable(
                 run_id=session.run_id,
                 artifact_digest=session.artifact_digest,
                 point_count=point_count,
-                backend_state=(
-                    backend_state if isinstance(backend_state, str) else snapshot.state
-                ),
+                backend_state=snapshot.physical_state,
                 reason=reason,
             )
 
         reference = session.prepared_ref
         if reference is None or snapshot.prepared_ref != reference:
             return unavailable("remote server no longer owns the prepared artifact")
-        backend = snapshot.backend
-        if snapshot.state != "RUNNING" or backend.get("state") != "RUNNING":
+        if snapshot.state != "RUNNING" or snapshot.physical_state != "RUNNING":
             return unavailable("remote sequencer is not reporting an active scan")
-        if backend.get("prepared_artifact_digest") != session.artifact_digest:
+        if snapshot.physical_prepared_artifact_digest != session.artifact_digest:
             return unavailable("remote backend artifact identity differs")
-        if backend.get("scan_points") != point_count:
+        if snapshot.physical_scan_point_count != point_count:
             return unavailable("remote backend scan table cardinality differs")
-        sample_count = backend.get("cursor_sample_count")
-        if (
-            isinstance(sample_count, bool)
-            or not isinstance(sample_count, int)
-            or sample_count < 1
-        ):
+        if snapshot.physical_underflow_observed:
+            return unavailable("remote backend observed a scan underflow")
+        if snapshot.physical_cursor_sample_count < 1:
             return unavailable("remote backend has not sampled a scan cursor yet")
-        point_index = backend.get("last_confirmed_cursor")
-        if (
-            isinstance(point_index, bool)
-            or not isinstance(point_index, int)
-            or not 0 <= point_index < point_count
-        ):
+        point_index = snapshot.physical_scan_cursor
+        if point_index is None or not 0 <= point_index < point_count:
             return unavailable("remote backend cursor is outside the scan table")
         return PulseScanProgress(
             session.run_id,
@@ -200,22 +193,31 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
     def _backend_close_evidence(
         self,
         session_id: str,
-        snapshot: object,
+        snapshot: PulseServerSnapshot,
     ) -> tuple[bool, str]:
-        state = getattr(snapshot, "state", None)
-        prepared_ref = getattr(snapshot, "prepared_ref", None)
-        safe = state == "SAFE" and prepared_ref is None
+        safe = (
+            snapshot.state == "SAFE"
+            and snapshot.prepared_ref is None
+            and snapshot.safe_readback_confirmed
+        )
         return safe, canonical_digest(
             {
                 "session_id": session_id,
                 "server_connection_generation": self._server_connection_generation,
-                "state": state,
-                "prepared_ref": None if prepared_ref is None else "present",
-                "backend": getattr(snapshot, "backend", None),
+                "state": snapshot.state,
+                "prepared_ref": (
+                    None if snapshot.prepared_ref is None else "present"
+                ),
+                "physical_state": snapshot.physical_state,
+                "physical_prepared_artifact_digest": (
+                    snapshot.physical_prepared_artifact_digest
+                ),
+                "safe_status_word": snapshot.safe_status_word,
+                "safe_clock_enable_words": snapshot.safe_clock_enable_words,
             }
         )
 
-    def _backend_interrupt_digest(self, snapshot: object) -> str:
+    def _backend_interrupt_digest(self, snapshot: PulseServerSnapshot) -> str:
         return canonical_digest(
             {
                 "operation": "SAFE_STATE",

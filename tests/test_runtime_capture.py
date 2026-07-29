@@ -8,7 +8,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from fpga.pulse_streamer.host.image import DEFAULT_CONFIG_PATH, default_clock_hz
 from zlc_data import (
     AxisId,
     AxisSpec,
@@ -47,6 +46,7 @@ from zlc_neutral_atom.capture.triggered import (
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
 from zlc_pulse import (
     PulseExecutionForm,
+    load_deployed_geometry_facts,
     load_deployed_pulse_target,
     load_pulse_document,
     pulse_target_manifest_from_lanes,
@@ -205,14 +205,16 @@ class _RuntimeFixture:
             self.broker.verify_capability(binding)
         )
         pulse_target = load_deployed_pulse_target()
+        geometry = load_deployed_geometry_facts()
         self.sequencer = VirtualSequencer(
             pulse_target,
-            clock_hz=default_clock_hz(DEFAULT_CONFIG_PATH),
+            clock_hz=geometry.clock_hz,
             sleep_scale=0,
         )
         pulse_endpoint = VirtualSequencerExecutionEndpoint(
             self.sequencer,
             pulse_target_manifest_from_lanes(pulse_target),
+            geometry_fingerprint=geometry.geometry_fingerprint,
         )
         pulse_identity = PhysicalDeviceIdentity(
             "fixture-sequencer",

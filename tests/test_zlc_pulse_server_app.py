@@ -5,16 +5,25 @@ import json
 from pathlib import Path
 
 import pytest
-from conftest import pulse_backend_completion_for
+from conftest import private_pulse_backend_snapshot, pulse_backend_completion_for
 
 from fpga.pulse_streamer.host.image import StreamerParams
+import zlc_pulse.deployment as pulse_deployment
 from zlc_pulse import (
     PORT_DIGITAL,
+    PulseDocument,
+    PulseExecutionForm,
+    PulsePeriod,
     PulsePortSpec,
     PulseTarget,
+    compile_pulse_artifact,
+    load_deployed_geometry_facts,
     load_deployed_pulse_target,
     load_pulse_target,
+    pack_target_ir,
     pulse_target_manifest_from_xdc,
+    require_deployed_geometry_facts,
+    validate_target_ir_for_geometry,
 )
 from zlc_pulse.server_app import (
     bring_up_frozen_session,
@@ -35,6 +44,9 @@ class AppSession:
         self.events: list[str] = []
         self.fail_self_test = False
         self.fail_layout = False
+        self.state = "IDLE"
+        self.prepared = None
+        self.scan_points = 0
 
     def start(self):
         self.events.append("start")
@@ -42,6 +54,8 @@ class AppSession:
 
     def clear_host_config(self):
         self.events.append("clear")
+        self.prepared = None
+        self.state = "SAFE"
 
     def check_register_layout(self):
         self.events.append("layout")
@@ -55,25 +69,38 @@ class AppSession:
 
     def safe_state(self):
         self.events.append("safe")
+        self.prepared = None
+        self.state = "SAFE"
 
     def request_interrupt(self):
         pass
 
     def close(self):
         self.events.append("close")
+        self.state = "CLOSED"
 
     def prepare(self, artifact):
         self.events.append("prepare")
+        self.prepared = artifact
+        self.scan_points = len(artifact.target_ir.scan_points)
+        self.state = "PREPARED"
 
     def fire(self, artifact):
         self.events.append("fire")
+        self.state = "RUNNING"
 
     def await_completion(self, artifact, timeout=None):
         self.events.append("wait")
+        self.state = "DONE"
         return pulse_backend_completion_for(artifact)
 
     def snapshot(self):
-        return {"transport": "test"}
+        return private_pulse_backend_snapshot(
+            state=self.state,
+            raw_lane_count=len(_target().raw_lanes),
+            artifact=self.prepared,
+            scan_point_count=self.scan_points,
+        )
 
 
 def _target():
@@ -96,6 +123,88 @@ def test_target_file_loader_accepts_only_the_current_canonical_schema(tmp_path):
     path.write_text(json.dumps({"schema": "old-target", "channels": []}), encoding="utf-8")
     with pytest.raises(ValueError):
         load_pulse_target(path)
+
+
+def test_deployment_is_the_single_strict_owner_of_geometry_facts(
+    tmp_path,
+    monkeypatch,
+):
+    canonical_source = ROOT / "fpga" / "board_config" / "streamer_config.json"
+    alternate_source = tmp_path / "alternate-streamer-config.json"
+    alternate_source.write_text(
+        canonical_source.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    cwd_source = tmp_path / "fpga" / "board_config" / "streamer_config.json"
+    cwd_source.parent.mkdir(parents=True)
+    cwd_source.write_text(
+        canonical_source.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ZLC_PS_CONFIG", str(alternate_source))
+    monkeypatch.chdir(tmp_path)
+
+    facts = load_deployed_geometry_facts()
+
+    assert facts.clock_hz == 50e6
+    assert facts.source == canonical_source.resolve()
+    assert load_deployed_geometry_facts(alternate_source).source == (
+        alternate_source.resolve()
+    )
+    assert require_deployed_geometry_facts(
+        facts.geometry_fingerprint,
+        facts.clock_hz,
+    ) == facts.source
+    with pytest.raises(ValueError, match="geometry differs"):
+        require_deployed_geometry_facts(
+            facts.geometry_fingerprint ^ 1,
+            facts.clock_hz,
+        )
+    with pytest.raises(ValueError, match="clock differs"):
+        require_deployed_geometry_facts(
+            facts.geometry_fingerprint,
+            facts.clock_hz / 2,
+        )
+
+
+def test_default_compile_pack_and_validation_use_the_checked_deployment(
+    tmp_path,
+    monkeypatch,
+):
+    target = _target()
+    low = tuple(0 for _ in target.raw_lanes)
+    document = PulseDocument(
+        name="strict deployed geometry witness",
+        target=target,
+        time_step_ns=20.0,
+        periods=(PulsePeriod("safe", 20.0, "ns", "safe", low),),
+    )
+    canonical = compile_pulse_artifact(
+        document,
+        clock_hz=50e6,
+        execution_form=PulseExecutionForm.STATIC_ONCE,
+        params=StreamerParams(),
+    )
+    config = json.loads(
+        (ROOT / "fpga" / "board_config" / "streamer_config.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    config["params"]["channel_count"] -= 1
+    alternate = tmp_path / "narrower-streamer-config.json"
+    alternate.write_text(json.dumps(config), encoding="utf-8")
+    monkeypatch.setattr(pulse_deployment, "DEFAULT_CONFIG_PATH", alternate)
+
+    with pytest.raises(ValueError, match="more raw lanes"):
+        compile_pulse_artifact(
+            document,
+            clock_hz=50e6,
+            execution_form=PulseExecutionForm.STATIC_ONCE,
+        )
+    with pytest.raises(ValueError, match="channels"):
+        validate_target_ir_for_geometry(canonical.target_ir)
+    with pytest.raises(ValueError, match="channels"):
+        pack_target_ir(canonical.target_ir)
 
 
 def test_frozen_bringup_is_safe_and_never_programs_hardware():
@@ -211,7 +320,8 @@ def test_server_runtime_composes_only_the_current_service(monkeypatch, tmp_path)
     assert calls[0][0] == "serve"
     assert calls[0][1][1:] == ("127.0.0.1", 18862, False)
     assert target_validation_count == 1
-    assert runtime.service.snapshot()["backend"]["transport"] == "test"
+    assert runtime.service.snapshot().physical_state == "SAFE"
+    assert runtime.service.snapshot().safe_readback_confirmed
     runtime.close()
     assert calls[-1] == ("close", None)
     assert session.events[-2:] == ["safe", "close"]
@@ -283,9 +393,13 @@ def test_runtime_close_failure_is_not_latched_as_success():
 
     runtime = PulseServerRuntime(Service(), rpc_server, session)
 
+    with pytest.raises(RuntimeError, match="safe verification failed"):
+        runtime.close()
+    assert not runtime._closed
     with pytest.raises(RuntimeError, match="transport revocation failed"):
         runtime.close()
     assert not runtime._closed
     runtime.close()
     assert runtime._closed
     assert rpc_server.close_count == 1
+    assert session.events == ["safe", "safe", "close", "safe", "close"]

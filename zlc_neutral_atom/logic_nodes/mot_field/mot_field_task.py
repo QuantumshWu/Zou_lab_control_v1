@@ -74,10 +74,10 @@ from zlc_storage import (
     normalized_text,
     positive_real,
 )
-from zlc_storage.paths import resolve_under_project
+from zlc_storage.paths import resolve_under
 
 
-DEFAULT_MOT_FIELD_REPORT_FOLDER = "_output/mot_field"
+DEFAULT_MOT_FIELD_REPORT_FOLDER = "mot_field"
 DEFAULT_MOT_FIELD_PULSE_PATH = MOT_FIELD_PULSE_PATH
 
 
@@ -343,7 +343,7 @@ MOT_FIELD_LOGIC_NODE = LogicNodeDeclaration(
         PathPresentationHint(
             "folder",
             mode="dir",
-            base_dir=DEFAULT_MOT_FIELD_REPORT_FOLDER,
+            base_dir="output",
         ),
     ),
     resolve_dynamic_choices=_mot_camera_choices,
@@ -363,7 +363,10 @@ def write_mot_field_report(
 
     if not isinstance(result, MotFieldResult):
         raise TypeError("result must be MotFieldResult")
-    directory = resolve_under_project(folder)
+    directory = Path(folder).expanduser()
+    if not directory.is_absolute():
+        raise ValueError("MOT report folder must be resolved by composition")
+    directory = directory.resolve()
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / "mot_field_scan.npz"
     axes = tuple(
@@ -544,7 +547,10 @@ def _compile_mot_field_task_plan(
         raise TypeError("capture_plan must be RunPlan")
     if not isinstance(result_owner, _MotFieldTaskResultOwner):
         raise TypeError("result_owner must be _MotFieldTaskResultOwner")
-    report_folder = resolve_under_project(report_folder)
+    report_folder = Path(report_folder).expanduser()
+    if not report_folder.is_absolute():
+        raise ValueError("MOT report folder must be resolved by composition")
+    report_folder = report_folder.resolve()
 
     base_preflight = capture_plan.preflight
     base_execute = capture_plan.execute
@@ -720,6 +726,7 @@ def prepare_mot_field_task(
     dependencies: MotFieldTaskDependencies,
     *,
     capture_repository: CaptureRepository,
+    output_root: Path,
     start_run: Callable[[RunPlan], RunHandle],
 ) -> PreparedMotFieldTask:
     """Bind one complete MOT task without starting hardware execution."""
@@ -761,7 +768,7 @@ def prepare_mot_field_task(
         plan = _compile_mot_field_task_plan(
             request,
             capture_plan,
-            intent.folder,
+            resolve_under(output_root, intent.folder),
             result_owner,
         )
         return PreparedMotFieldTask(

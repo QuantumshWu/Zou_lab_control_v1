@@ -18,8 +18,50 @@ from zlc_neutral_atom.capture.artifact import CaptureRepository
 from zlc_neutral_atom.devices.sequencer.application import PulseApplicationOwner
 from zlc_neutral_atom.installation import DeviceCatalogView
 from zlc_neutral_atom.installation_config import InstallationConfigDocument
-from zlc_pulse import PulseDocument, load_pulse_document
-from zlc_storage.paths import resolve_under_project
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspacePaths:
+    """Application-owned roots for user-authored and generated files."""
+
+    pulses_root: Path
+    tasks_root: Path
+    output_root: Path
+    repository_root: Path
+
+    def __post_init__(self) -> None:
+        for name in (
+            "pulses_root",
+            "tasks_root",
+            "output_root",
+            "repository_root",
+        ):
+            value = Path(getattr(self, name)).expanduser()
+            if not value.is_absolute():
+                raise ValueError(f"WorkspacePaths.{name} must be absolute")
+            object.__setattr__(self, name, value.resolve())
+
+    @classmethod
+    def for_workspace(
+        cls,
+        authored_root: str | Path,
+        *,
+        repository_root: str | Path,
+    ) -> "WorkspacePaths":
+        """Build the conventional four roots from two explicit authorities."""
+
+        authored = Path(authored_root).expanduser()
+        repository = Path(repository_root).expanduser()
+        if not authored.is_absolute() or not repository.is_absolute():
+            raise ValueError("workspace and repository roots must be absolute")
+        authored = authored.resolve()
+        repository = repository.resolve()
+        return cls(
+            authored / "pulses",
+            authored / "tasks",
+            repository / "output",
+            repository,
+        )
 
 @runtime_checkable
 class WorkbenchHandle(Protocol):
@@ -81,7 +123,7 @@ def wait_for_close_attempt(
 
 @dataclass
 class ExperimentServices:
-    repository_root: Path
+    workspace_paths: WorkspacePaths
     installation: object
     runtime: object
     capture_repository: CaptureRepository
@@ -179,20 +221,12 @@ def resolve_role(
     return candidates[0]
 
 
-def load_project_pulse(value: PulseDocument | str | Path) -> PulseDocument:
-    """Resolve one operator-authored pulse against the project catalog."""
-
-    if isinstance(value, PulseDocument):
-        return value
-    return load_pulse_document(resolve_under_project(value))
-
-
 __all__ = [
     "ExperimentCloseAttempt",
     "ExperimentServices",
+    "WorkspacePaths",
     "WorkbenchHandle",
     "fit_service_guard",
-    "load_project_pulse",
     "resolve_role",
     "service_guard",
     "wait_for_close_attempt",

@@ -21,19 +21,32 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="runtime workspace (default: ~/.zlc/device-manager)",
     )
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path(__file__).resolve().parent,
+        help="Authored workspace containing pulses/ and tasks/.",
+    )
     parser.add_argument("--name", default="device-manager")
     args = parser.parse_args(argv)
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
 
     from PyQt5 import QtCore
 
-    from Zou_lab_control.api import device_manager
+    from Zou_lab_control.api import WorkspacePaths, device_manager
     from zlc_frontend.qt_widgets import ensure_qt_app
 
     application = ensure_qt_app()
     body = device_manager(
         args.config,
-        repository=args.repository,
+        workspace=WorkspacePaths.for_workspace(
+            args.workspace.expanduser().resolve(),
+            repository_root=(
+                (Path.home() / ".zlc" / "device-manager").resolve()
+                if args.repository is None
+                else args.repository.expanduser().resolve()
+            ),
+        ),
         name=args.name,
     )
     auto_close_ms = os.environ.get("ZLC_DEVICE_MANAGER_AUTO_CLOSE_MS")

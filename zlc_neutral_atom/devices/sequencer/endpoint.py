@@ -375,18 +375,11 @@ class _SequencerSessionOwner:
             self._operation_epoch += 1
             if session is not None:
                 session.closed = True
-            was_in_flight = bool(
-                session is not None and session.physical_operation_in_flight
-            )
         snapshot = self._set_safe_state(deadline)
         if time.monotonic() >= deadline:
             raise TimeoutError("sequencer close exceeded its bounded deadline")
         if session is not None and not self._wait_until_joined(session, deadline):
             raise TimeoutError("sequencer physical operation did not join before close")
-        if was_in_flight:
-            snapshot = self._set_safe_state(deadline)
-            if time.monotonic() >= deadline:
-                raise TimeoutError("sequencer close exceeded its bounded deadline")
         safe, digest = self._backend._backend_close_evidence(
             command.session_id,
             snapshot,

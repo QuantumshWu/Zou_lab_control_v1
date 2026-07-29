@@ -7,7 +7,6 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from fpga.pulse_streamer.host.image import StreamerParams, build_fingerprint
 from zlc_neutral_atom.installation_assets import (
     InstallationAsset,
     InstallationAssetMap,
@@ -25,7 +24,14 @@ from zlc_neutral_atom.runtime.ports import BoundDevice, DeviceBroker, SafetyOper
 from zlc_neutral_atom.runtime.resources import DeviceIdentityEvidenceKind, ResourceArbiter, ResourceKey
 from zlc_neutral_atom.runtime.run import RunController
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
-from zlc_pulse import PulseDocument, PulseServerSnapshot, RemotePulseExecutionClient, bind_pulse_document_target, validate_pulse_document_clock_grid
+from zlc_pulse import (
+    PulseDocument,
+    PulseServerSnapshot,
+    RemotePulseExecutionClient,
+    bind_pulse_document_target,
+    require_deployed_geometry_facts,
+    validate_pulse_document_clock_grid,
+)
 from zlc_storage import canonical_digest, normalized_text
 
 @dataclass(frozen=True, slots=True)
@@ -158,13 +164,10 @@ def connect_remote_pulse_client(
         raise TypeError("remote pulse client factory returned the wrong type")
     try:
         snapshot = client.snapshot()
-        host_geometry = build_fingerprint(StreamerParams())
-        if snapshot.geometry_fingerprint != host_geometry:
-            raise ValueError(
-                "remote pulse geometry differs from the current host compiler "
-                f"geometry: remote=0x{snapshot.geometry_fingerprint:08x}, "
-                f"host=0x{host_geometry:08x}"
-            )
+        require_deployed_geometry_facts(
+            snapshot.geometry_fingerprint,
+            snapshot.clock_hz,
+        )
         if required_pulse_document is not None:
             bind_pulse_document_target(required_pulse_document, snapshot.target)
             validate_pulse_document_clock_grid(required_pulse_document, snapshot.clock_hz)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Mapping
 
 from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema
@@ -16,7 +17,6 @@ from zlc_pulse import (
     load_pulse_document,
 )
 from zlc_pulse.scan_template import SWEEP_API_SLOT, SWEEP_SCAN_SLOT
-from zlc_storage.paths import resolve_under_project
 from zlc_neutral_atom.timing.pulse_parameter_scan import (
     ApiSegmentTable,
     ApiSlotSegmentedProgram,
@@ -78,7 +78,10 @@ def build_pulse_scan_program(
     authored = pulse_scan_authoring_schema().freeze(
         {"pulse": values["pulse"]} if "pulse" in values else {}
     )
-    document = load_pulse_document(resolve_under_project(authored["pulse"]))
+    source = Path(authored["pulse"]).expanduser()
+    if not source.is_absolute():
+        raise ValueError("PulseScan pulse path must be resolved by composition")
+    document = load_pulse_document(source.resolve())
     slots = dict(values.get("pulse_slots") or {})
     sweep_kind = str(slots.get("sweep_kind") or "")
     source = str(slots.get("program") or "")

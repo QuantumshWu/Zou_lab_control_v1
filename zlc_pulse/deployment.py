@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+import math
+from dataclasses import dataclass, replace
+from pathlib import Path
 
-from fpga.pulse_streamer.host.image import StreamerParams
+from fpga.pulse_streamer.host.image import (
+    DEFAULT_CONFIG_PATH,
+    StreamerParams,
+    build_fingerprint,
+    load_streamer_config,
+)
 
 from .artifact import CompiledPulseArtifact
 from .document import FrozenScanTable, PulseDocument
@@ -25,6 +32,111 @@ from .validation import validate_target_ir_for_target
 APPROVED_DEPLOYED_TARGET_ABI = (
     "d9ce9aea5da7380f0670ee89c5f936f5f32edfc00c98939b4dd06af32a8563c9"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class DeployedGeometryFacts:
+    """Narrow checked geometry facts exposed across the pulse boundary."""
+
+    geometry_fingerprint: int
+    clock_hz: float
+    source: Path
+
+    def __post_init__(self) -> None:
+        fingerprint = self.geometry_fingerprint
+        if (
+            isinstance(fingerprint, bool)
+            or not isinstance(fingerprint, int)
+            or not 0 <= fingerprint <= 0xFFFFFFFF
+        ):
+            raise TypeError(
+                "geometry_fingerprint must be an unsigned 32-bit integer"
+            )
+        if isinstance(self.clock_hz, bool) or not isinstance(
+            self.clock_hz,
+            (int, float),
+        ):
+            raise TypeError("clock_hz must be numeric")
+        clock = float(self.clock_hz)
+        if not math.isfinite(clock) or clock <= 0.0:
+            raise ValueError("clock_hz must be finite and positive")
+        object.__setattr__(self, "clock_hz", clock)
+        object.__setattr__(self, "source", Path(self.source).resolve())
+
+
+def _load_deployed_streamer_config(
+    path: str | Path | None = None,
+) -> tuple[StreamerParams, float, Path]:
+    """Load the checked deployment geometry from one explicit source."""
+
+    source_path = DEFAULT_CONFIG_PATH if path is None else Path(path)
+    config = load_streamer_config(source_path)
+    source = config["source"]
+    warnings = tuple(str(item) for item in config["warnings"])
+    if source is None:
+        raise FileNotFoundError(
+            "deployed streamer_config.json was not found; refusing deployment use"
+        )
+    if warnings:
+        raise ValueError(
+            "deployed streamer config is not exact: " + "; ".join(warnings)
+        )
+    params = config["params"]
+    if not isinstance(params, StreamerParams):
+        raise TypeError("streamer config returned another geometry type")
+    clock_hz = float(config["clock_hz"])
+    return params, clock_hz, Path(source).resolve()
+
+
+def _resolve_streamer_params(params: StreamerParams | None) -> StreamerParams:
+    """Use an explicit geometry or the one strict checked deployment source."""
+
+    if params is None:
+        return _load_deployed_streamer_config()[0]
+    if not isinstance(params, StreamerParams):
+        raise TypeError("params must be StreamerParams or None")
+    return params
+
+
+def load_deployed_geometry_facts(
+    path: str | Path | None = None,
+) -> DeployedGeometryFacts:
+    """Return only the public fingerprint/clock facts of checked geometry."""
+
+    params, clock_hz, source = _load_deployed_streamer_config(path)
+    return DeployedGeometryFacts(
+        build_fingerprint(params) & 0xFFFFFFFF,
+        clock_hz,
+        source,
+    )
+
+
+def require_deployed_geometry_facts(
+    geometry_fingerprint: int,
+    clock_hz: int | float,
+    path: str | Path | None = None,
+) -> Path:
+    """Reject a remote deployment that differs from the checked local bundle."""
+
+    if (
+        isinstance(geometry_fingerprint, bool)
+        or not isinstance(geometry_fingerprint, int)
+        or not 0 <= geometry_fingerprint <= 0xFFFFFFFF
+    ):
+        raise TypeError("geometry_fingerprint must be an unsigned 32-bit integer")
+    expected = load_deployed_geometry_facts(path)
+    if geometry_fingerprint != expected.geometry_fingerprint:
+        raise ValueError(
+            "remote pulse geometry differs from the checked deployment: "
+            f"remote=0x{geometry_fingerprint:08x}, "
+            f"checked=0x{expected.geometry_fingerprint:08x}"
+        )
+    if float(clock_hz) != expected.clock_hz:
+        raise ValueError(
+            "remote pulse clock differs from the checked deployment: "
+            f"remote={float(clock_hz):g}, checked={expected.clock_hz:g}"
+        )
+    return expected.source
 
 
 def _autonomous_scan_repeat_domain(
@@ -166,7 +278,10 @@ def _validate_artifact_against_bound_deployment(
 
 __all__ = [
     "APPROVED_DEPLOYED_TARGET_ABI",
+    "DeployedGeometryFacts",
     "expand_autonomous_scan_repeats",
+    "load_deployed_geometry_facts",
+    "require_deployed_geometry_facts",
     "require_approved_target_abi",
     "validate_artifact_for_deployment",
     "validate_deployed_target",

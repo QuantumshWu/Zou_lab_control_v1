@@ -8,8 +8,14 @@ Configuration text alone can never mint this capability.
 from __future__ import annotations
 
 import math
+import time
 
-from zlc_neutral_atom.devices.camera.contract import CameraAdapter, CameraFrameRecord
+from zlc_neutral_atom.devices.camera.contract import (
+    CameraAdapter,
+    CameraAssociationProgress,
+    CameraFrameRecord,
+    camera_external_trigger_quiet_window_seconds,
+)
 from zlc_pulse import (
     PORT_DIGITAL,
     PulseDocument,
@@ -23,7 +29,6 @@ from zlc_storage import canonical_digest, canonical_text
 
 E0_TRIGGER_COUNT = 4
 E0_TRIGGER_HIGH_SECONDS = 10e-6
-E0_INTERVAL_MARGIN = 1.25
 
 
 def _qualification_document(
@@ -49,7 +54,12 @@ def _qualification_document(
     high_ticks = max(1, math.ceil(E0_TRIGGER_HIGH_SECONDS * clock_hz))
     interval_ticks = max(
         high_ticks + 1,
-        math.ceil(required_interval_seconds * E0_INTERVAL_MARGIN * clock_hz),
+        math.ceil(
+            camera_external_trigger_quiet_window_seconds(
+                required_interval_seconds
+            )
+            * clock_hz
+        ),
     )
     low_ticks = interval_ticks - high_ticks
     low = tuple(0 for _ in target.raw_lanes)
@@ -160,7 +170,7 @@ def qualify_external_trigger_path(
     camera: CameraAdapter,
     trigger_lane: str,
 ) -> str:
-    """Run one frozen FPGA program and return its runtime-derived digest."""
+    """Actively qualify ordered one-frame-per-trigger path semantics."""
 
     if not isinstance(client, RemotePulseExecutionClient):
         raise TypeError("client must be RemotePulseExecutionClient")
@@ -238,6 +248,25 @@ def qualify_external_trigger_path(
             reference,
             timeout=client.transport_timeout_seconds * 0.8,
         )
+        if isinstance(camera, CameraAssociationProgress):
+            # The adapter readback supplies a safe inter-trigger interval, not
+            # a maximum delivery-latency claim.  E0 also observes the counter
+            # for the corresponding current-working-point quiet window.
+            quiet_window_seconds = camera_external_trigger_quiet_window_seconds(
+                required_interval
+            )
+            produced_before_quiet = camera.observed_produced_count()
+            if produced_before_quiet != E0_TRIGGER_COUNT:
+                raise RuntimeError(
+                    "E0 camera produced count differs before its quiet window"
+                )
+            if quiet_window_seconds:
+                time.sleep(quiet_window_seconds)
+            produced_after_quiet = camera.observed_produced_count()
+            if produced_after_quiet != E0_TRIGGER_COUNT:
+                raise RuntimeError(
+                    "E0 camera produced a late frame after the pulse terminal"
+                )
         terminal = camera.finish_record_capture()
         armed = False
     except BaseException as primary:
@@ -264,26 +293,45 @@ def qualify_external_trigger_path(
         expected_shape=working_point.frame_shape_yx,
         expected_dtype=working_point.dtype,
     )
-    return canonical_digest(
-        {
-            "contract": "zlc.real-camera-active-e0",
-            "connection_generation": snapshot.connection_generation,
-            "manifest_fingerprint": snapshot.manifest.fingerprint,
-            "artifact_fingerprint": artifact.fingerprint,
-            "trigger_schedule_fingerprint": schedule.fingerprint,
-            "camera_settings_fingerprint": working_point.settings_fingerprint,
-            "camera_records": record_rows,
-            "camera_terminal": {
-                "produced_count": terminal.produced_count,
-                "source_stopped": terminal.source_stopped,
-                "no_more_frames": terminal.no_more_frames,
-                "joined": terminal.joined,
-            },
-            "pulse_terminal_fingerprint": completion.hardware_terminal.fingerprint,
-            "pulse_tail_fingerprint": completion.post_terminal_tail.fingerprint,
-            "expected_trigger_counts": completion.expected_trigger_counts_from_completed_schedule,
-        }
-    )
+    qualification_scope = {
+        "adapter_type": f"{type(camera).__module__}.{type(camera).__qualname__}",
+        "acquisition_mode": working_point.acquisition_mode,
+        "frame_shape_yx": working_point.frame_shape_yx,
+        "sensor_shape_yx": working_point.sensor_shape_yx,
+        "roi_origin_yx": working_point.roi_origin_yx,
+        "roi_shape_yx": working_point.roi_shape_yx,
+        "binning_yx": working_point.binning_yx,
+        "dtype": working_point.dtype.str,
+        "count_unit": working_point.count_unit,
+        "capture_trigger_channels": working_point.capture_trigger_channels,
+        "external_trigger_integration_start_offset_seconds": (
+            working_point.external_trigger_integration_start_offset_seconds
+        ),
+        "gain": working_point.gain,
+        "readout_mode": working_point.readout_mode,
+    }
+    evidence = {
+        "contract": "zlc.real-camera-active-e0",
+        "connection_generation": snapshot.connection_generation,
+        "manifest_fingerprint": snapshot.manifest.fingerprint,
+        "artifact_fingerprint": artifact.fingerprint,
+        "trigger_schedule_fingerprint": schedule.fingerprint,
+        # Exposure and its read-back minimum interval are deliberately not
+        # part of this structural path qualification.  Every exact run freezes
+        # current readback and derives its own spacing and quiet-window facts.
+        "camera_qualification_scope": qualification_scope,
+        "camera_records": record_rows,
+        "camera_terminal": {
+            "produced_count": terminal.produced_count,
+            "source_stopped": terminal.source_stopped,
+            "no_more_frames": terminal.no_more_frames,
+            "joined": terminal.joined,
+        },
+        "pulse_terminal_fingerprint": completion.hardware_terminal.fingerprint,
+        "pulse_tail_fingerprint": completion.post_terminal_tail.fingerprint,
+        "expected_trigger_counts": completion.expected_trigger_counts_from_completed_schedule,
+    }
+    return canonical_digest(evidence)
 
 
 __all__ = ["qualify_external_trigger_path"]

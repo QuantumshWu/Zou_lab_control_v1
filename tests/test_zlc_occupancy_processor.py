@@ -56,11 +56,26 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
         import sys
 
         import numpy as np
-        from Zou_lab_control.api import connect
+        from Zou_lab_control.api import WorkspacePaths, connect
+        from zlc_neutral_atom.capture.artifact import CaptureRepository
+        from zlc_neutral_atom.logic_nodes.readout.calibration.repository import (
+            CalibrationRepository,
+        )
+        from zlc_neutral_atom.logic_nodes.readout.occupancy.repository import (
+            OccupancyRepository,
+        )
         from zlc_pulse import RepeatRegion, load_pulse_document
+        from zlc_storage import content_ref_from_tree, decode
 
         workspace = Path(sys.argv[1])
-        experiment = connect("virtual", repository=workspace, seed=7)
+        experiment = connect(
+            "virtual",
+            workspace=WorkspacePaths.for_workspace(
+                Path.cwd(),
+                repository_root=workspace,
+            ),
+            seed=7,
+        )
         try:
             calibration_ref = experiment.nodes.calibration.sitemap(frames=4)
             document = load_pulse_document(
@@ -131,9 +146,44 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
                     not np.any(artifact.occupied.values[invalid])
                 ),
             }
-            print("RESULT_JSON=" + json.dumps(result, sort_keys=True))
         finally:
             experiment.close()
+
+        captures = CaptureRepository(workspace / "captures")
+        calibrations = CalibrationRepository(workspace / "calibrations")
+        occupancies = OccupancyRepository(workspace / "occupancy")
+        try:
+            reopened = occupancies.admit(
+                occupancy_ref,
+                captures,
+                calibrations,
+            )
+            manifest = decode(
+                occupancies._store_authority.read_manifest(
+                    "occupancy",
+                    occupancy_ref.manifest_digest,
+                )
+            )
+            metadata_ref = content_ref_from_tree(manifest["metadata_blob"])
+            metadata = decode(
+                occupancies._store_authority.read_blob(metadata_ref)
+            )
+            result.update(
+                {
+                    "reopened_capture_ref_matches": (
+                        reopened.artifact.source_capture_ref == capture_ref
+                    ),
+                    "reopened_calibration_ref_matches": (
+                        reopened.artifact.calibration_reference == calibration_ref
+                    ),
+                    "canonical_run_id": metadata["run_id"],
+                }
+            )
+        finally:
+            occupancies.close()
+            calibrations.close()
+            captures.close()
+        print("RESULT_JSON=" + json.dumps(result, sort_keys=True))
         """,
         tmp_path / "occupancy-current",
     )
@@ -149,6 +199,10 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
     assert result["model_kind"] == "box"
     assert result["capture_ref_matches"] is True
     assert result["calibration_ref_matches"] is True
+    assert result["reopened_capture_ref_matches"] is True
+    assert result["reopened_calibration_ref_matches"] is True
+    assert isinstance(result["canonical_run_id"], str)
+    assert result["canonical_run_id"]
     assert result["invalid_count_fillers_are_zero"] is True
     assert result["invalid_occupied_fillers_are_false"] is True
 

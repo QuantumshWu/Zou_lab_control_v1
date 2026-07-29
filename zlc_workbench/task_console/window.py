@@ -81,7 +81,6 @@ from zlc_frontend.figure_outputs import (
     materialize_fit_outputs,
     source_identity_matches_snapshot,
 )
-from zlc_storage.paths import user_output_path
 from .panel_board import (
     GAP,
     PanelBoard,
@@ -215,6 +214,8 @@ class TaskConsole(QtWidgets.QWidget):
             [object, str, SignalPublication], object | None
         ]
         | None = None,
+        tasks_root: Path,
+        output_root: Path,
         scale: float | None = None,
         window_ratio: float = WINDOW_SCREEN_FRACTION,
         window_px: tuple[int, int] | None = None,
@@ -223,6 +224,12 @@ class TaskConsole(QtWidgets.QWidget):
         ensure_qt_app()
         set_fluent_scale(scale)
         super().__init__()
+        self._tasks_root = Path(tasks_root).expanduser()
+        self._output_root = Path(output_root).expanduser()
+        if not self._tasks_root.is_absolute() or not self._output_root.is_absolute():
+            raise ValueError("TaskConsole roots must be absolute")
+        self._tasks_root = self._tasks_root.resolve()
+        self._output_root = self._output_root.resolve()
         # One queued edge owns every worker/data-plane -> QWidget transition.
         # Display cadence is deliberately separate and never drains lifecycle
         # mailboxes.
@@ -3691,7 +3698,7 @@ class TaskConsole(QtWidgets.QWidget):
         Unlike a per-plot save (data png+npz), this is a raster of the board region, so it is a plain
         image.  Reuses ``_last_save_dir`` so it shares the per-panel save's remembered folder."""
         default_dir = self._last_save_dir or str(
-            user_output_path("figures", "task-console")
+            self._output_root / "figures" / "task-console"
         )
         default = str(Path(default_dir) / time.strftime("monitor_%Y_%m_%d_%H_%M_%S.png", time.localtime()))
         path, _sel = QtWidgets.QFileDialog.getSaveFileName(
@@ -3852,7 +3859,9 @@ class TaskConsole(QtWidgets.QWidget):
             return
         try:
             state = self.read_state()
-            start = self._address or str(_task_files_dir() / f"{state.name}.json")
+            start = self._address or str(
+                _task_files_dir(self._tasks_root) / f"{state.name}.json"
+            )
             path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save task layout", start, "Task layout (*.json)")
             if not path:
                 return
@@ -3868,7 +3877,11 @@ class TaskConsole(QtWidgets.QWidget):
         if self._task_locked:
             return
         try:
-            start = str(Path(self._address).parent) if self._address else str(_task_files_dir())
+            start = (
+                str(Path(self._address).parent)
+                if self._address
+                else str(_task_files_dir(self._tasks_root))
+            )
             path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load task layout", start, "Task layout (*.json)")
             if not path:
                 return
@@ -4155,6 +4168,8 @@ class TaskConsole(QtWidgets.QWidget):
 
 def show_task_console(
     *,
+    tasks_root: Path,
+    output_root: Path,
     state: TaskConsoleState | None = None,
     task: str | None = None,
     catalog_view: object | None = None,
@@ -4192,8 +4207,10 @@ def show_task_console(
 
     ensure_qt_app()          # the console is a QWidget: the app must exist BEFORE its ctor
     if state is None and task is not None:
-        state = resolve_task_state(task)
+        state = resolve_task_state(task, tasks_root=tasks_root)
     console = TaskConsole(state=state,
+                          tasks_root=tasks_root,
+                          output_root=output_root,
                           catalog_view=catalog_view, run_factory=run_factory,
                           data_plane=data_plane,
                           project_signal_presentation=project_signal_presentation,

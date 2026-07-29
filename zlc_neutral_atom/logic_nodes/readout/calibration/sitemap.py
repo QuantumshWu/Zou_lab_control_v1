@@ -38,7 +38,7 @@ from zlc_storage import (
     positive_integer,
     positive_real,
 )
-from zlc_storage.paths import project_path
+from zlc_storage.paths import resolve_under
 
 from .calibration import (
     CalibrationAnalysisRequest,
@@ -467,10 +467,10 @@ def build_sitemap_calibration_request(
     return SitemapCalibrationRequest(capture, analysis)
 
 
-def load_sitemap_pulse() -> PulseDocument:
+def load_sitemap_pulse(pulses_root: Path) -> PulseDocument:
     """Load the project-owned calibration pulse from the shared pulse catalog."""
 
-    return load_pulse_document(project_path(*CALIBRATION_PULSE_PATH.split("/")))
+    return load_pulse_document(resolve_under(pulses_root, CALIBRATION_PULSE_PATH))
 
 
 __all__ = [

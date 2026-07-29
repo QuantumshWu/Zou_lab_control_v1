@@ -70,7 +70,9 @@ def pack_target_ir(
 ) -> PulseWireImage:
     if not isinstance(value, TargetIR):
         raise TypeError("pack_target_ir requires TargetIR")
-    geometry = params or StreamerParams()
+    from .deployment import _resolve_streamer_params
+
+    geometry = _resolve_streamer_params(params)
     validate_target_ir_for_geometry(value, geometry)
     carrier = SimpleNamespace(
         ticks=value.ticks,

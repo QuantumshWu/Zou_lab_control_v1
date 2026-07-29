@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import QtCore, QtTest, QtWidgets
 
-from Zou_lab_control.api import device_manager
+from Zou_lab_control.api import WorkspacePaths, device_manager
 from tests.gui_user_flow import (
     capture_offscreen_window,
     configure_offscreen_fast_path,
@@ -28,13 +28,20 @@ def _replace_text(widget, text: str) -> None:
     QtTest.QTest.keyClicks(widget, text)
 
 
+def _workspace(tmp_path) -> WorkspacePaths:
+    return WorkspacePaths.for_workspace(
+        (tmp_path / "authored").resolve(),
+        repository_root=(tmp_path / "workspace").resolve(),
+    )
+
+
 def test_formal_device_manager_edits_locally_then_initializes_and_closes(
     tmp_path,
     monkeypatch,
 ):
     configure_offscreen_fast_path()
     application = ensure_qt_app()
-    body = device_manager(repository=tmp_path / "workspace")
+    body = device_manager(workspace=_workspace(tmp_path))
     wrapper = body.window()
     try:
         assert body.tabs.tabText(0) == "Config"
@@ -183,7 +190,7 @@ def test_saved_config_opens_as_the_exact_editing_baseline(tmp_path):
     document = InstallationConfigDocument.from_parameters("virtual", {"seed": 23})
     save_installation_config(path, document)
 
-    body = device_manager(path, repository=tmp_path / "workspace")
+    body = device_manager(path, workspace=_workspace(tmp_path))
     wrapper = body.window()
     try:
         assert body._controller.editor.path == path.resolve()

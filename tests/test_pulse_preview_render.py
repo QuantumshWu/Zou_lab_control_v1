@@ -23,6 +23,7 @@ import pytest
 
 from gui_user_flow import close_pulse_editor
 from zlc_frontend.qt_widgets import ensure_qt_app
+from zlc_frontend.render import PulsePanelPayload
 from zlc_pulse import load_pulse_document
 from zlc_workbench.pulse_editor.session import project_pulse_preview
 
@@ -48,6 +49,16 @@ def _click_tab(body, page) -> None:
         QtCore.Qt.LeftButton,
         pos=bar.tabRect(index).center(),
     )
+
+
+def _visible_pulse_payload(board) -> PulsePanelPayload | None:
+    """Read the typed payload from the board's current public front."""
+
+    frame = board.front_frame
+    if frame is None or len(frame.panels) != 1:
+        return None
+    payload = frame.panels[0].display_payload
+    return payload if isinstance(payload, PulsePanelPayload) else None
 
 
 def _choose_combo(application, combo, text: str) -> None:
@@ -98,11 +109,15 @@ def _send_mouse_move_with_buttons(application, board, position, buttons) -> None
 
 
 @pytest.fixture
-def preview_body():
+def preview_body(tmp_path):
     application = ensure_qt_app()
     from zlc_workbench.pulse_editor.app import open_pulse_editor
 
-    body = open_pulse_editor(path=PULSE_PATH)
+    body = open_pulse_editor(
+        path=PULSE_PATH,
+        pulses_root=tmp_path / "pulses",
+        output_root=tmp_path / "output",
+    )
     _until(
         application,
         lambda: body.window() is not body and body.window().isVisible(),
@@ -124,7 +139,7 @@ def test_preview_opens_as_the_full_formal_plot_with_display_labels(preview_body)
     frame = body.preview_host.front_frame
     assert frame is not None
     raster = frame.panels[0].raster
-    payload = body.preview_host.board.visible_pulse_payload()
+    payload = _visible_pulse_payload(body.preview_host.board)
     assert payload is not None
 
     assert raster.height > 100
@@ -175,6 +190,7 @@ def test_preview_dpr_change_immediately_retires_the_old_front(preview_body) -> N
 
 def test_preview_keeps_the_placeholder_until_the_first_complete_front(
     monkeypatch,
+    tmp_path,
 ) -> None:
     """The deferred renderer must never expose its empty black Qt board."""
 
@@ -199,7 +215,11 @@ def test_preview_keeps_the_placeholder_until_the_first_complete_front(
         "render_pulse_timeline_panel",
         blocked_render,
     )
-    body = open_pulse_editor(path=PULSE_PATH)
+    body = open_pulse_editor(
+        path=PULSE_PATH,
+        pulses_root=tmp_path / "pulses",
+        output_root=tmp_path / "output",
+    )
     try:
         _until(
             application,
@@ -230,19 +250,19 @@ def test_show_off_rows_is_a_visible_switch_that_rebuilds_the_same_plot(preview_b
     switch = body.preview_view.preview_include_off
     assert not switch.isChecked()
     before_frame = body.preview_host.front_frame
-    before = body.preview_host.board.visible_pulse_payload()
+    before = _visible_pulse_payload(body.preview_host.board)
     assert before_frame is not None and before is not None
 
     QtTest.QTest.mouseClick(switch, QtCore.Qt.LeftButton)
     _until(
         application,
         lambda: body.preview_host.front_frame is not before_frame
-        and body.preview_host.board.visible_pulse_payload() is not None
-        and len(body.preview_host.board.visible_pulse_payload().row_keys)
+        and _visible_pulse_payload(body.preview_host.board) is not None
+        and len(_visible_pulse_payload(body.preview_host.board).row_keys)
         > len(before.row_keys),
     )
     after_frame = body.preview_host.front_frame
-    after = body.preview_host.board.visible_pulse_payload()
+    after = _visible_pulse_payload(body.preview_host.board)
     assert after_frame is not None and after is not None
     timeline = project_pulse_preview(load_pulse_document(PULSE_PATH))
     assert tuple(after.row_labels) == tuple(row.label for row in timeline.rows)
@@ -297,14 +317,14 @@ def test_selectors_switch_alone_arms_the_preview_wheel(preview_body) -> None:
     body = preview_body
     board = body.preview_host.board
     switch = body.preview_view.preview_selectors_switch
-    before = board.visible_pulse_payload()
+    before = _visible_pulse_payload(board)
     assert before is not None
     home = before.viewport.home_x_limits
     assert before.viewport.x_limits == home
     assert not switch.isChecked()
 
     _send_wheel(application, board)
-    parked = board.visible_pulse_payload()
+    parked = _visible_pulse_payload(board)
     assert parked is not None and parked.viewport.x_limits == home
 
     QtTest.QTest.mouseClick(switch, QtCore.Qt.LeftButton)
@@ -312,10 +332,10 @@ def test_selectors_switch_alone_arms_the_preview_wheel(preview_body) -> None:
     _send_wheel(application, board)
     _until(
         application,
-        lambda: board.visible_pulse_payload() is not None
-        and board.visible_pulse_payload().viewport.x_limits != home,
+        lambda: _visible_pulse_payload(board) is not None
+        and _visible_pulse_payload(board).viewport.x_limits != home,
     )
-    after = board.visible_pulse_payload()
+    after = _visible_pulse_payload(board)
     assert after is not None
     assert after.viewport.home_x_limits == home
     assert after.viewport.y_limits == before.viewport.y_limits
@@ -331,7 +351,7 @@ def test_middle_drag_repaints_continuously_before_mouse_release(preview_body) ->
     QtTest.QTest.mouseClick(switch, QtCore.Qt.LeftButton)
     _until(application, switch.isChecked)
 
-    initial = board.visible_pulse_payload()
+    initial = _visible_pulse_payload(board)
     assert initial is not None
     initial_revision = initial.viewport.display_revision
     layout_bounds = initial.viewport.plot_bounds
@@ -369,7 +389,7 @@ def test_middle_drag_repaints_continuously_before_mouse_release(preview_body) ->
                 position,
                 QtCore.Qt.MiddleButton,
             )
-            payload = board.visible_pulse_payload()
+            payload = _visible_pulse_payload(board)
             if (
                 payload is not None
                 and payload.viewport.display_revision > initial_revision
@@ -403,14 +423,14 @@ def test_middle_drag_repaints_continuously_before_mouse_release(preview_body) ->
     assert authoring_after == authoring_before
 
     _until(application, lambda: body.worker_idle)
-    settled = board.visible_pulse_payload()
+    settled = _visible_pulse_payload(board)
     assert settled is not None
     settled_revision = settled.viewport.display_revision
     _send_wheel(application, board)
     _until(
         application,
-        lambda: board.visible_pulse_payload() is not None
-        and board.visible_pulse_payload().viewport.display_revision
+        lambda: _visible_pulse_payload(board) is not None
+        and _visible_pulse_payload(board).viewport.display_revision
         > settled_revision,
     )
 
@@ -429,7 +449,7 @@ def test_failed_latest_drag_frame_releases_its_exact_pending_intent(
     switch = body.preview_view.preview_selectors_switch
     QtTest.QTest.mouseClick(switch, QtCore.Qt.LeftButton)
     _until(application, switch.isChecked)
-    initial = board.visible_pulse_payload()
+    initial = _visible_pulse_payload(board)
     assert initial is not None
     base_revision = initial.viewport.display_revision
     first_revision = base_revision + 1
@@ -475,8 +495,8 @@ def test_failed_latest_drag_frame_releases_its_exact_pending_intent(
         )
         _until(
             application,
-            lambda: board.visible_pulse_payload() is not None
-            and board.visible_pulse_payload().viewport.display_revision
+            lambda: _visible_pulse_payload(board) is not None
+            and _visible_pulse_payload(board).viewport.display_revision
             == first_revision,
         )
         _until(
@@ -502,8 +522,8 @@ def test_failed_latest_drag_frame_releases_its_exact_pending_intent(
     _send_wheel(application, board)
     _until(
         application,
-        lambda: board.visible_pulse_payload() is not None
-        and board.visible_pulse_payload().viewport.display_revision
+        lambda: _visible_pulse_payload(board) is not None
+        and _visible_pulse_payload(board).viewport.display_revision
         > failed_revision,
     )
 
@@ -524,7 +544,7 @@ def test_failed_inflight_present_reissues_the_newer_human_drag_intent(
     switch = body.preview_view.preview_selectors_switch
     QtTest.QTest.mouseClick(switch, QtCore.Qt.LeftButton)
     _until(application, switch.isChecked)
-    initial = board.visible_pulse_payload()
+    initial = _visible_pulse_payload(board)
     assert initial is not None
     first_revision = initial.viewport.display_revision + 1
     latest_revision = first_revision + 1
@@ -596,8 +616,8 @@ def test_failed_inflight_present_reissues_the_newer_human_drag_intent(
         release_latest.set()
         _until(
             application,
-            lambda: board.visible_pulse_payload() is not None
-            and board.visible_pulse_payload().viewport.display_revision
+            lambda: _visible_pulse_payload(board) is not None
+            and _visible_pulse_payload(board).viewport.display_revision
             == latest_revision,
         )
     finally:
@@ -644,6 +664,7 @@ def test_save_figure_button_exports_the_visible_preview(
 @pytest.mark.parametrize("scale", ("1", "1.25", "1.5", "1.75", "2", "3"))
 def test_preview_raster_tracks_the_real_screen_dpr_in_a_fresh_qt_process(
     scale,
+    tmp_path,
 ) -> None:
     """Every supported screen scale gets Qt's exact physical pixel box."""
 
@@ -662,7 +683,12 @@ from zlc_workbench.pulse_editor.app import open_pulse_editor
 
 app = ensure_qt_app()
 path = Path("pulses/imaging_template.json").resolve()
-body = open_pulse_editor(path=path)
+root = Path(os.environ["ZLC_TEST_WORKSPACE"]).resolve()
+body = open_pulse_editor(
+    path=path,
+    pulses_root=root / "pulses",
+    output_root=root / "output",
+)
 index = body.tabs.indexOf(body.preview_view)
 bar = body.tabs.tabBar()
 QtTest.QTest.mouseClick(
@@ -716,6 +742,7 @@ app.processEvents(QtCore.QEventLoop.AllEvents, 20)
     environment["QT_SCALE_FACTOR"] = scale
     environment["EXPECTED_SCALE"] = scale
     environment["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
+    environment["ZLC_TEST_WORKSPACE"] = str(tmp_path)
     result = subprocess.run(
         [sys.executable, "-c", source],
         cwd=ROOT,

@@ -26,27 +26,41 @@ from zlc_workbench.task_console.declaration_projection import (
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
 
-def _ports_and_view() -> tuple[TaskConsoleApplicationPorts, ConsoleCatalogView]:
+def _ports_and_view(
+    root: pathlib.Path,
+) -> tuple[TaskConsoleApplicationPorts, ConsoleCatalogView]:
+    path_roots = {
+        "output": root / "output",
+        "tasks": root / "tasks",
+    }
     attachments = (
         project_run_declaration(
             CAMERA_MEASUREMENT_LOGIC_NODE,
             prepare=lambda intent: intent,
             dynamic_choice_context=("camera", "mot_camera"),
+            path_roots=path_roots,
         ),
         project_processor_declaration(
             OCCUPANCY_LOGIC_NODE,
             prepare=lambda request: request,
             resolve_artifact_reference=lambda binding: binding,
+            path_roots=path_roots,
         ),
     )
-    ports = TaskConsoleApplicationPorts(attachments=attachments)
+    ports = TaskConsoleApplicationPorts(
+        attachments=attachments,
+        tasks_root=root / "tasks",
+        output_root=root / "output",
+    )
     return ports, ConsoleCatalogView(
         tuple(attachment.spec for attachment in ports.attachments)
     )
 
 
-def test_every_supplied_attachment_projects_once_with_definition_owned_kind() -> None:
-    ports, view = _ports_and_view()
+def test_every_supplied_attachment_projects_once_with_definition_owned_kind(
+    tmp_path,
+) -> None:
+    ports, view = _ports_and_view(tmp_path)
     specs = view.specs()
 
     assert specs == tuple(attachment.spec for attachment in ports.attachments)
@@ -61,18 +75,26 @@ def test_every_supplied_attachment_projects_once_with_definition_owned_kind() ->
         assert spec.definition is spec.declaration.definition
 
 
-def test_application_ports_reject_duplicate_definition_keys() -> None:
+def test_application_ports_reject_duplicate_definition_keys(tmp_path) -> None:
     attachment = project_run_declaration(
         CAMERA_MEASUREMENT_LOGIC_NODE,
         prepare=lambda intent: intent,
         dynamic_choice_context=("camera",),
+        path_roots={
+            "output": tmp_path / "output",
+            "tasks": tmp_path / "tasks",
+        },
     )
     with pytest.raises(ValueError, match="duplicate TaskConsole attachment"):
-        TaskConsoleApplicationPorts(attachments=(attachment, attachment))
+        TaskConsoleApplicationPorts(
+            attachments=(attachment, attachment),
+            tasks_root=tmp_path / "tasks",
+            output_root=tmp_path / "output",
+        )
 
 
-def test_camera_is_a_measurement_and_request_owns_frame_vocabulary() -> None:
-    _ports, view = _ports_and_view()
+def test_camera_is_a_measurement_and_request_owns_frame_vocabulary(tmp_path) -> None:
+    _ports, view = _ports_and_view(tmp_path)
     (camera,) = view.specs("measurement")
 
     assert camera.kind == "measurement"

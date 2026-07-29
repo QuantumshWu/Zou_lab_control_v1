@@ -310,7 +310,6 @@ import zlc_data
 forbidden = (
     'zlc_storage.content_store',
     'zlc_storage.durability',
-    'zlc_storage.framed_journal',
     'zlc_storage.repository_lease',
 )
 loaded = tuple(name for name in forbidden if name in sys.modules)

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 import threading
 import time
 
 import pytest
 
-from Zou_lab_control.api import PulseRunResult, connect
+from Zou_lab_control.api import PulseRunResult, WorkspacePaths, connect
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.devices.sequencer.application import PulseRunRequest
 from zlc_neutral_atom.runtime.run import CancelOutcome, RunState
@@ -33,6 +34,9 @@ from zlc_pulse import (
     save_pulse_document,
 )
 from zlc_workbench.pulse_editor.session import PulseEditorSession
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _target() -> PulseTarget:
@@ -353,7 +357,13 @@ def test_edit_during_save_remains_dirty(tmp_path, monkeypatch):
 
 
 def test_notebook_pulse_run_and_cancelled_hold_share_the_runtime_safe_path(tmp_path):
-    with connect(repository=tmp_path / "experiment") as experiment:
+    with connect(
+        "virtual",
+        workspace=WorkspacePaths.for_workspace(
+            ROOT,
+            repository_root=tmp_path / "experiment",
+        ),
+    ) as experiment:
         target = experiment.pulse.target
         document = PulseDocument(
             "runtime pulse",

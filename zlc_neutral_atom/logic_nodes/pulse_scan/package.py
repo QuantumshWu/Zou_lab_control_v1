@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from zlc_neutral_atom.artifact_dispatch import ArtifactCapability
 from zlc_neutral_atom.logic_node_package import LogicNodePackage
+from zlc_storage.paths import resolve_under
 
 from .api import PulseScanApi
 from .application import prepare_exact_scan
@@ -34,7 +35,11 @@ def _bind_api(host: object, _dependencies: tuple[object, ...]) -> PulseScanApi:
             start_run=start_run,
         )
 
-    return PulseScanApi(repository, prepare=prepare)
+    return PulseScanApi(
+        repository,
+        pulses_root=operations.pulses_root,
+        prepare=prepare,
+    )
 
 
 def _close_api(api: PulseScanApi) -> tuple[Exception, ...]:
@@ -44,11 +49,25 @@ def _close_api(api: PulseScanApi) -> tuple[Exception, ...]:
 def _bind_task_console(api: PulseScanApi, _catalog: object, projection):
     from zlc_pulse import describe_pulse_template
 
+    from .authoring import build_pulse_scan_program
     from .ui.task_console import pulse_scan_task_console_adapter
+
+    def resolve_values(values):
+        normalized = dict(values)
+        normalized["pulse"] = str(
+            resolve_under(api._pulses_root, normalized["pulse"])
+        )
+        return normalized
 
     return pulse_scan_task_console_adapter(
         prepare=api.prepare_scan_source,
-        read_pulse_template=describe_pulse_template,
+        read_pulse_template=lambda path: describe_pulse_template(
+            resolve_under(api._pulses_root, path)
+        ),
+        build_request=lambda values: build_pulse_scan_program(
+            resolve_values(values)
+        ),
+        pulses_root=api._pulses_root,
         project_custom=projection.custom,
     )
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
 
 from zlc_frontend.form import project_authoring_form
 from zlc_neutral_atom.input_spec import ArtifactInputSpec
@@ -72,11 +74,30 @@ def _dynamic_choice_projection(
     return {value.field_key: value for value in resolved}
 
 
-def _path_projection(values) -> dict[str, PathPresentationHint]:
+def _path_projection(values, path_roots=None) -> dict[str, PathPresentationHint]:
     hints = tuple(values)
     if any(not isinstance(value, PathPresentationHint) for value in hints):
         raise TypeError("path presentation owner returned another value type")
-    return {value.field_key: value for value in hints}
+    roots = {} if path_roots is None else dict(path_roots)
+    projected = {}
+    for value in hints:
+        base = value.base_dir
+        if base:
+            parts = Path(base).parts
+            if parts and parts[0] in roots:
+                root = Path(roots[parts[0]]).expanduser()
+                if not root.is_absolute():
+                    raise ValueError("TaskConsole path roots must be absolute")
+                value = replace(
+                    value,
+                    base_dir=str(root.joinpath(*parts[1:]).resolve()),
+                )
+            elif not Path(base).is_absolute():
+                raise ValueError(
+                    f"unbound TaskConsole path root {parts[0] if parts else base!r}"
+                )
+        projected[value.field_key] = value
+    return projected
 
 
 def project_declaration_spec(
@@ -85,6 +106,7 @@ def project_declaration_spec(
     dynamic_choice_context: object | None = None,
     form: object | None = None,
     editor_factory: Callable[..., object] | None = None,
+    path_roots=None,
 ) -> ConsoleNodeSpec:
     """Mechanically project one owner declaration into the generic host DTO."""
 
@@ -98,7 +120,8 @@ def project_declaration_spec(
                 dynamic_choice_context,
             ),
             path_presentations=_path_projection(
-                declaration.path_presentations
+                declaration.path_presentations,
+                path_roots,
             ),
         )
         if form is None
@@ -111,7 +134,8 @@ def project_declaration_spec(
         input_fields=project_input_fields(
             declaration.input_specs,
             path_presentations=_path_projection(
-                declaration.input_path_presentations
+                declaration.input_path_presentations,
+                path_roots,
             ),
         ),
         editor_factory=editor_factory,
@@ -128,6 +152,7 @@ def project_run_declaration(
     | None = None,
     start: Callable[[object, object, object], object] | None = None,
     start_with_live_output: Callable[[object, object], object] | None = None,
+    path_roots=None,
     project_signal_presentation: Callable[
         [object, str, SignalPublication], object | None
     ]
@@ -142,6 +167,7 @@ def project_run_declaration(
     spec = project_declaration_spec(
         declaration,
         dynamic_choice_context=dynamic_choice_context,
+        path_roots=path_roots,
     )
     return run_attachment(
         spec,
@@ -170,6 +196,7 @@ def project_processor_declaration(
     dynamic_choice_context: object | None = None,
     resolve_artifact_reference: Callable[[ResolvedArtifactInput], object]
     | None = None,
+    path_roots=None,
 ):
     """Build the common reactive Processor attachment for one declaration."""
 
@@ -182,6 +209,7 @@ def project_processor_declaration(
     spec = project_declaration_spec(
         declaration,
         dynamic_choice_context=dynamic_choice_context,
+        path_roots=path_roots,
     )
     return processor_attachment(
         spec,
@@ -201,6 +229,7 @@ def project_custom_declaration(
     form: object,
     editor_factory: Callable[..., object],
     create_node: Callable[..., object],
+    path_roots=None,
 ) -> ConsoleCapabilityAttachment:
     """Admit one earned structured editor without exposing Workbench types."""
 
@@ -210,6 +239,7 @@ def project_custom_declaration(
         declaration,
         form=form,
         editor_factory=editor_factory,
+        path_roots=path_roots,
     )
     return ConsoleCapabilityAttachment(spec, create_node)
 

@@ -15,12 +15,11 @@ from ._failure import detach_failure, record_secondary_failure, safe_error_summa
 from .cancellation import CancellationRequested, CancellationToken, _CancellationSource
 from .cleanup import CleanupReport
 from .commit import (
-    CommitIntent,
-    FinalCommit,
-    PublishVisibilityUnknown,
-    _CommitAuthoritySnapshot,
-    _consume_commit_authority,
-    _discard_commit_authority,
+    PreparedArtifactCommit,
+    _consume_prepared_artifact_commit,
+    _finish_prepared_artifact_commit,
+    _inspect_prepared_artifact_commit,
+    _publish_prepared_artifact_commit,
 )
 from .ports import (
     BoundDevice,
@@ -44,7 +43,7 @@ ExecutedT = TypeVar("ExecutedT")
 FinalT = TypeVar("FinalT")
 CommitT = TypeVar("CommitT")
 _MISSING = object()
-_NO_COMMITTED_RESULT = object()
+_COMMIT_INSPECTION_INTERVAL_SECONDS = 0.02
 
 
 @dataclass(frozen=True, order=True)
@@ -84,10 +83,9 @@ class RunSnapshot:
     state: RunState
     phase: str
     final_committed: bool
-    commit_recovery_warning: str | None
+    commit_publication_warning: str | None
     primary_error: str | None
     cleanup_errors: tuple[str, ...]
-    recovery_instruction: str | None
     # A synchronous ``RunController.start`` rejects with ``RunStartRejected``.
     # A composite run-like owner may encounter that same admission boundary on
     # its coordinator thread after its own handle has already been returned.
@@ -210,34 +208,6 @@ class RunStillCancelling(RuntimeError):
     def __init__(self, handle: "RunHandle") -> None:
         super().__init__(f"run {handle.run_id} is still cancelling; retain its RunHandle")
         self.handle = handle
-
-
-class _CommitResolutionMode(Enum):
-    FORCE_ABORT = "force-abort"
-    RECOVER_VISIBILITY = "recover-visibility"
-    FORCE_COMMIT = "force-commit"
-
-
-@dataclass
-class _PendingCommit:
-    reconciliation_id: str
-    authority: _CommitAuthoritySnapshot
-    intent: CommitIntent
-    mode: _CommitResolutionMode
-    publish_summary: str
-    last_error_summary: str
-    committed_result: object = _NO_COMMITTED_RESULT
-
-
-class _CommitRetryRequired(RuntimeError):
-    """Opaque control signal; live commit authority remains private to RunHandle."""
-
-    def __init__(self, reconciliation_id: str, summary: str) -> None:
-        self.reconciliation_id = reconciliation_id
-        self.summary = summary
-        super().__init__(
-            f"commit reconciliation {reconciliation_id} requires an explicit retry: {summary}"
-        )
 
 
 class _ExecutionOwnership:
@@ -572,13 +542,17 @@ class PostSafetyContext:
         self._require_active()._validate_commit_preparation(self.deadline)
         return self.run_id.value
 
-    def _track_prepared_commit(
+    def track_prepared_commit(
         self,
-        operation: FinalCommit[object],
+        operation: PreparedArtifactCommit[object],
     ) -> None:
+        """Bind one prepared manifest publication to this Run lifetime."""
+
         self._require_active()
-        if not isinstance(operation, FinalCommit):
-            raise TypeError("prepared commit tracking requires FinalCommit")
+        if not isinstance(operation, PreparedArtifactCommit):
+            raise TypeError(
+                "prepared commit tracking requires PreparedArtifactCommit"
+            )
         if operation.run_id != self.run_id.value:
             raise ValueError("prepared commit belongs to another Run")
         if any(existing is operation for existing in self._prepared_commits):
@@ -610,26 +584,29 @@ class PostSafetyContext:
 
     def _commit_operation(
         self,
-        operation: FinalCommit[CommitT],
+        operation: PreparedArtifactCommit[CommitT],
     ) -> CommitT:
         handle = self._require_active()
-        authority, rejection, discard = handle._admit_commit(
-            operation,
-            self.deadline,
-        )
-        if rejection is not None:
-            if discard and handle._discard_rejected_commit(operation, rejection):
-                self._take_tracked(operation)
-            raise rejection
-        assert authority is not None
-        # _admit_commit consumed the repository capability successfully.  From
-        # this point the RunHandle owns either completion or reconciliation.
-        self._take_tracked(operation)
-        return handle._commit_admitted(authority, self.deadline)
+        try:
+            return handle._commit_prepared_artifact(operation, self.deadline)
+        except BaseException as primary:
+            try:
+                operation.abandon()
+            except BaseException as error:
+                record_secondary_failure(
+                    primary,
+                    "rejected artifact commit abandonment also failed",
+                    error,
+                )
+            raise
+        finally:
+            self._take_tracked(operation)
 
-    def commit_final(self, operation: FinalCommit[CommitT]) -> CommitT:
-        if not isinstance(operation, FinalCommit):
-            raise TypeError("commit_final requires a FinalCommit operation")
+    def commit_final(self, operation: PreparedArtifactCommit[CommitT]) -> CommitT:
+        if not isinstance(operation, PreparedArtifactCommit):
+            raise TypeError(
+                "commit_final requires a PreparedArtifactCommit operation"
+            )
         return self._commit_operation(operation)
 
 
@@ -651,8 +628,7 @@ class RunHandle(Generic[FinalT]):
         self._phase = "starting"
         self._final_committed = False
         self._commit_inflight = False
-        self._commit_recovery_warning: str | None = None
-        self._pending_commit: _PendingCommit | None = None
+        self._commit_publication_warning: str | None = None
         self._primary_error: str | None = None
         self._cleanup_errors: tuple[str, ...] = ()
         self._result: object = _MISSING
@@ -666,10 +642,7 @@ class RunHandle(Generic[FinalT]):
         self._cleanup_started = False
         self._owner_thread: threading.Thread | None = None
         self._owner_reaped = False
-        self._recovery_instruction: str | None = None
-        self._retry_disposition: Callable[[], None] | None = None
-        self._retry_phase = "commit-reconciliation-failed"
-        self._recovery_lock = threading.Lock()
+        self._shutdown_requested = False
 
     def snapshot(self) -> RunSnapshot:
         with self._condition:
@@ -767,93 +740,6 @@ class RunHandle(Generic[FinalT]):
             raise RunCancelled(snapshot)
         raise RunFailed(snapshot)
 
-    def retry_recovery(self) -> bool:
-        """Retry only an explicitly classified journal/commit ambiguity."""
-
-        with self._recovery_lock:
-            with self._condition:
-                previous_owner = self._owner_thread
-            if (
-                previous_owner is not None
-                and previous_owner is not threading.current_thread()
-                and previous_owner.is_alive()
-            ):
-                previous_owner.join(0.25)
-                if previous_owner.is_alive():
-                    return False
-            with self._condition:
-                retry = self._retry_disposition
-                if retry is None or self._state.terminal:
-                    return False
-                instruction = self._recovery_instruction or "retry durable recovery"
-                phase = self._retry_phase
-                prior = self._cleanup_errors
-                self._retry_disposition = None
-                self._recovery_instruction = None
-                self._phase = "retrying-" + phase
-                self._state = self._active_state_locked()
-                self._condition.notify_all()
-
-            launch_lock = threading.Lock()
-            launch_claimed = False
-            launch_cancelled = False
-
-            def retry_owner() -> None:
-                nonlocal launch_claimed
-                with launch_lock:
-                    if launch_cancelled:
-                        return
-                    launch_claimed = True
-                try:
-                    retry()
-                except _CommitRetryRequired as error:
-                    self._install_retry(
-                        retry,
-                        instruction,
-                        _diagnostics((*prior, safe_error_summary(error))),
-                        phase=phase,
-                    )
-                except BaseException as error:
-                    self._block_non_retryable_recovery(
-                        _diagnostics((*prior, safe_error_summary(error)))
-                    )
-                    detach_failure(error, note_prefix="detached recovery traceback")
-
-            thread = threading.Thread(
-                target=retry_owner,
-                name=f"zlc-run-{self.run_id.value[:12]}-recovery",
-                daemon=False,
-            )
-            with self._condition:
-                self._owner_thread = thread
-                self._owner_reaped = False
-            try:
-                thread.start()
-            except BaseException as error:
-                restore_retry = False
-                with launch_lock:
-                    if not launch_claimed:
-                        launch_cancelled = True
-                        restore_retry = True
-                if restore_retry:
-                    with self._condition:
-                        if self._owner_thread is thread:
-                            self._owner_thread = None
-                        self._owner_reaped = False
-                    # The target lost the launch claim and therefore cannot run
-                    # the frozen closure.  Restore that exact closure; if the
-                    # target claimed first, it remains the sole owner and this
-                    # caller must not make a second copy runnable.
-                    self._install_retry(
-                        retry,
-                        instruction,
-                        _diagnostics((*prior, safe_error_summary(error))),
-                        phase=phase,
-                    )
-                detach_failure(error, note_prefix="detached recovery start traceback")
-                raise
-            return True
-
     def _active_state_locked(self) -> RunState:
         return RunState.CANCELLING if self._token.is_cancelled else RunState.RUNNING
 
@@ -863,11 +749,19 @@ class RunHandle(Generic[FinalT]):
             state=self._state,
             phase=self._phase,
             final_committed=self._final_committed,
-            commit_recovery_warning=self._commit_recovery_warning,
+            commit_publication_warning=self._commit_publication_warning,
             primary_error=self._primary_error,
             cleanup_errors=self._cleanup_errors,
-            recovery_instruction=self._recovery_instruction,
         )
+
+    def _request_application_shutdown(self) -> None:
+        """Wake the owner so a pending manifest gets one final inspection."""
+
+        with self._condition:
+            if self._state.terminal:
+                return
+            self._shutdown_requested = True
+            self._condition.notify_all()
 
     def _bind_owner(
         self,
@@ -924,371 +818,131 @@ class RunHandle(Generic[FinalT]):
             self._cancel_sealer = None
             self._condition.notify_all()
 
-    def _install_retry(
-        self,
-        retry: Callable[[], None],
-        instruction: str,
-        errors: tuple[str, ...],
-        *,
-        phase: str = "commit-reconciliation-failed",
-    ) -> None:
-        with self._condition:
-            if self._state.terminal:
-                return
-            self._state = self._active_state_locked()
-            self._phase = phase
-            self._retry_disposition = retry
-            self._retry_phase = phase
-            self._recovery_instruction = instruction
-            self._cleanup_errors = _diagnostics(errors)
-            self._condition.notify_all()
-
-    def _block_non_retryable_recovery(self, errors: tuple[str, ...]) -> None:
-        with self._condition:
-            self._state = self._active_state_locked()
-            self._phase = "recovery-blocked-by-invariant-failure"
-            self._retry_disposition = None
-            self._recovery_instruction = (
-                "runtime recovery failed with a non-retryable invariant error; "
-                "retain this RunHandle and inspect diagnostics"
-            )
-            self._cleanup_errors = _diagnostics(errors)
-            self._condition.notify_all()
-
     def _commit_gate_rejection_locked(
         self,
         deadline: float | None,
-    ) -> tuple[BaseException | None, bool]:
+    ) -> BaseException | None:
         if self._state.terminal:
-            return _PermanentCommitRejection("commit cannot run after terminal state"), True
+            return _PermanentCommitRejection("commit cannot run after terminal state")
         try:
             self._token.checkpoint()
         except BaseException as error:
-            return error, True
+            return error
         if deadline is not None and time.monotonic() >= deadline:
-            return TimeoutError(f"run {self.run_id} exceeded its monotonic deadline"), True
+            return TimeoutError(f"run {self.run_id} exceeded its monotonic deadline")
         if threading.current_thread() is not self._owner_thread:
-            return CapabilityRevoked("commit belongs to the Run owner thread"), False
-        if self._pending_commit is not None:
-            return RuntimeError("durable commit reconciliation is pending"), False
+            return CapabilityRevoked("commit belongs to the Run owner thread")
         if self._final_committed:
-            return RuntimeError("final commit may be attempted only once"), True
+            return RuntimeError("final commit may be attempted only once")
         if self._commit_inflight:
-            return RuntimeError("another commit is already in flight"), False
+            return RuntimeError("another commit is already in flight")
         if self._cancel_gate_closed:
-            return RuntimeError("Run is already publishing terminal state"), True
-        return None, True
+            return RuntimeError("Run is already finalizing")
+        return None
 
     def _validate_commit_preparation(self, deadline: float | None) -> None:
         with self._condition:
-            rejection, _ = self._commit_gate_rejection_locked(deadline)
+            rejection = self._commit_gate_rejection_locked(deadline)
         if rejection is not None:
             raise rejection
 
-    @staticmethod
-    def _discard_rejected_commit(
-        operation: FinalCommit,
-        rejection: BaseException,
-    ) -> bool:
-        try:
-            _discard_commit_authority(operation)
-        except BaseException as error:
-            record_secondary_failure(
-                rejection,
-                "rejected commit authority discard also failed",
-                error,
-            )
-            return False
-        return True
-
-    def _admit_commit(
+    def _commit_prepared_artifact(
         self,
-        operation: FinalCommit[CommitT],
-        deadline: float | None,
-    ) -> tuple[
-        _CommitAuthoritySnapshot[CommitT] | None,
-        BaseException | None,
-        bool,
-    ]:
-        rejection: BaseException | None = None
-        discard = True
-        authority: _CommitAuthoritySnapshot[CommitT] | None = None
-        with self._condition:
-            rejection, discard = self._commit_gate_rejection_locked(deadline)
-            if rejection is None and operation.run_id != self.run_id.value:
-                rejection = _PermanentCommitRejection("commit belongs to another Run")
-            if rejection is None:
-                try:
-                    authority = _consume_commit_authority(operation)
-                except BaseException as error:
-                    rejection = error
-                else:
-                    self._commit_inflight = True
-                    self._phase = "preparing-commit-intent"
-                    self._condition.notify_all()
-        return authority, rejection, discard
-
-    def _pause_commit(
-        self,
-        *,
-        authority: _CommitAuthoritySnapshot,
-        intent: CommitIntent,
-        mode: _CommitResolutionMode,
-        publish_error: BaseException | str,
-        recovery_error: BaseException | str,
-        committed_result: object = _NO_COMMITTED_RESULT,
-    ) -> _CommitRetryRequired:
-        publish_summary = (
-            publish_error if isinstance(publish_error, str) else safe_error_summary(publish_error)
-        )
-        recovery_summary = (
-            recovery_error
-            if isinstance(recovery_error, str)
-            else safe_error_summary(recovery_error)
-        )
-        if isinstance(publish_error, BaseException):
-            detach_failure(publish_error, note_prefix="detached commit traceback")
-        if isinstance(recovery_error, BaseException):
-            detach_failure(recovery_error, note_prefix="detached commit recovery traceback")
-        with self._condition:
-            existing = self._pending_commit
-            reconciliation_id = (
-                existing.reconciliation_id
-                if existing is not None and existing.intent == intent
-                else uuid.uuid4().hex
-            )
-        pending = _PendingCommit(
-            reconciliation_id=reconciliation_id,
-            authority=authority,
-            intent=intent,
-            mode=mode,
-            publish_summary=publish_summary,
-            last_error_summary=recovery_summary,
-            committed_result=committed_result,
-        )
-        with self._condition:
-            self._commit_inflight = False
-            self._pending_commit = pending
-            self._phase = "commit-reconciliation-pending"
-            self._condition.notify_all()
-        return _CommitRetryRequired(pending.reconciliation_id, recovery_summary)
-
-    def _execute_commit(
-        self,
-        authority: _CommitAuthoritySnapshot[CommitT],
-        deadline: float | None,
-    ) -> tuple[CommitT, str | None]:
-        authority.require_lifetime()
-        preparation = authority.preparation
-        intent = CommitIntent(
-            commit_id=preparation.commit_id,
-            run_id=preparation.run_id,
-            target=preparation.target,
-            created_at=time.time(),
-        )
-        try:
-            authority.begin_intent(intent)
-        except BaseException as begin_error:
-            try:
-                if any(value == intent for value in authority.pending_intents()):
-                    authority.mark_aborted(intent.commit_id)
-            except BaseException as recovery_error:
-                raise self._pause_commit(
-                    authority=authority,
-                    intent=intent,
-                    mode=_CommitResolutionMode.FORCE_ABORT,
-                    publish_error=begin_error,
-                    recovery_error=recovery_error,
-                ) from None
-            authority.release_lifetime()
-            raise
-        try:
-            with self._condition:
-                self._token.checkpoint()
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError(f"run {self.run_id} exceeded its deadline")
-                self._cancel_gate_closed = True
-                self._phase = "committing"
-                self._condition.notify_all()
-        except BaseException as gate_error:
-            try:
-                authority.mark_aborted(intent.commit_id)
-            except BaseException as recovery_error:
-                raise self._pause_commit(
-                    authority=authority,
-                    intent=intent,
-                    mode=_CommitResolutionMode.FORCE_ABORT,
-                    publish_error=gate_error,
-                    recovery_error=recovery_error,
-                ) from None
-            authority.release_lifetime()
-            raise
-        publish_summary: str | None = None
-        try:
-            committed = authority.publish_validated(intent)
-        except PublishVisibilityUnknown as visibility_error:
-            publish_summary = safe_error_summary(visibility_error)
-            try:
-                recovery = authority.recover_validated(intent)
-            except BaseException as recovery_error:
-                raise self._pause_commit(
-                    authority=authority,
-                    intent=intent,
-                    mode=_CommitResolutionMode.RECOVER_VISIBILITY,
-                    publish_error=visibility_error,
-                    recovery_error=recovery_error,
-                ) from None
-            if recovery is None:
-                try:
-                    authority.mark_aborted(intent.commit_id)
-                except BaseException as marker_error:
-                    raise self._pause_commit(
-                        authority=authority,
-                        intent=intent,
-                        mode=_CommitResolutionMode.FORCE_ABORT,
-                        publish_error=visibility_error,
-                        recovery_error=marker_error,
-                    ) from None
-                authority.release_lifetime()
-                raise
-            committed = recovery.result
-            detach_failure(visibility_error, note_prefix="detached visibility traceback")
-        except BaseException as publish_error:
-            try:
-                authority.mark_aborted(intent.commit_id)
-            except BaseException as marker_error:
-                raise self._pause_commit(
-                    authority=authority,
-                    intent=intent,
-                    mode=_CommitResolutionMode.FORCE_ABORT,
-                    publish_error=publish_error,
-                    recovery_error=marker_error,
-                ) from None
-            authority.release_lifetime()
-            raise
-        try:
-            authority.mark_committed(intent.commit_id)
-        except BaseException as marker_error:
-            raise self._pause_commit(
-                authority=authority,
-                intent=intent,
-                mode=_CommitResolutionMode.FORCE_COMMIT,
-                publish_error=publish_summary or marker_error,
-                recovery_error=marker_error,
-                committed_result=committed,
-            ) from None
-        authority.release_lifetime()
-        return committed, publish_summary
-
-    def _commit_admitted(
-        self,
-        authority: _CommitAuthoritySnapshot[CommitT],
+        operation: PreparedArtifactCommit[CommitT],
         deadline: float | None,
     ) -> CommitT:
-        try:
-            committed, recovered_warning = self._execute_commit(authority, deadline)
-        except BaseException:
-            with self._condition:
-                self._commit_inflight = False
-                self._condition.notify_all()
-            raise
-        with self._condition:
-            self._commit_inflight = False
-            self._pending_commit = None
-            self._final_committed = True
-            self._result = committed
-            if recovered_warning is not None:
-                self._commit_recovery_warning = recovered_warning
-            self._condition.notify_all()
-        return committed
+        """Publish once, then resolve only that exact manifest target.
 
-    def _reconcile_pending_commit(self) -> tuple[bool, object]:
+        Admission, operation consumption, and closure of the cancellation gate
+        share one lock transition.  After publication begins it is never
+        repeated: a failed acknowledgement is resolved only by exact-target
+        inspection on this owner thread.
+        """
+
+        if not isinstance(operation, PreparedArtifactCommit):
+            raise TypeError("operation must be PreparedArtifactCommit")
         with self._condition:
-            if threading.current_thread() is not self._owner_thread:
-                raise CapabilityRevoked("commit reconciliation belongs to Run owner thread")
-            pending = self._pending_commit
-            if pending is None:
-                raise RuntimeError("Run has no pending commit reconciliation")
-            if self._commit_inflight:
-                raise RuntimeError("commit reconciliation is already in flight")
+            rejection = self._commit_gate_rejection_locked(deadline)
+            if rejection is None and operation.run_id != self.run_id.value:
+                rejection = _PermanentCommitRejection(
+                    "prepared artifact commit belongs to another Run"
+                )
+            if rejection is not None:
+                raise rejection
+            _consume_prepared_artifact_commit(operation)
             self._commit_inflight = True
-            self._phase = "reconciling-commit"
+            self._cancel_gate_closed = True
+            self._phase = "committing"
             self._condition.notify_all()
-        authority = pending.authority
-        mode = pending.mode
-        committed_result = pending.committed_result
-        authority.require_lifetime()
-        if mode is _CommitResolutionMode.RECOVER_VISIBILITY:
-            try:
-                recovery = authority.recover_validated(pending.intent)
-            except BaseException as error:
-                raise self._pause_commit(
-                    authority=authority,
-                    intent=pending.intent,
-                    mode=mode,
-                    publish_error=pending.publish_summary,
-                    recovery_error=error,
-                    committed_result=committed_result,
-                ) from None
-            if recovery is not None:
-                committed_result = recovery.result
-                mode = _CommitResolutionMode.FORCE_COMMIT
-            else:
-                mode = _CommitResolutionMode.FORCE_ABORT
+
+        primary: BaseException | None = None
+        publish_warning: str | None = None
         try:
-            authority.begin_intent(pending.intent)
-            if mode is _CommitResolutionMode.FORCE_COMMIT:
-                if committed_result is _NO_COMMITTED_RESULT:
-                    raise RuntimeError("commit reconciliation lost its validated result")
-                authority.mark_committed(pending.intent.commit_id)
-            else:
-                authority.mark_aborted(pending.intent.commit_id)
-        except BaseException as error:
-            raise self._pause_commit(
-                authority=authority,
-                intent=pending.intent,
-                mode=mode,
-                publish_error=pending.publish_summary,
-                recovery_error=error,
-                committed_result=committed_result,
-            ) from None
-        authority.release_lifetime()
-        committed = mode is _CommitResolutionMode.FORCE_COMMIT
-        with self._condition:
-            self._commit_inflight = False
-            self._pending_commit = None
-            if committed:
-                self._final_committed = True
-                self._result = committed_result
-            self._commit_recovery_warning = pending.publish_summary
-            self._condition.notify_all()
-        return committed, committed_result
+            try:
+                committed = _publish_prepared_artifact_commit(operation)
+            except BaseException as publish_error:
+                publish_warning = safe_error_summary(publish_error)
+                while True:
+                    try:
+                        resolution = _inspect_prepared_artifact_commit(operation)
+                    except BaseException as inspection_error:
+                        record_secondary_failure(
+                            inspection_error,
+                            "manifest publication also failed before exact-target "
+                            "inspection found a fatal error",
+                            publish_error,
+                        )
+                        raise inspection_error from None
+                    if resolution is True:
+                        committed = operation.result
+                        detach_failure(
+                            publish_error,
+                            note_prefix="detached manifest publication traceback",
+                        )
+                        break
+                    if resolution is False:
+                        raise
+                    with self._condition:
+                        if self._shutdown_requested:
+                            detach_failure(
+                                publish_error,
+                                note_prefix="detached manifest publication traceback",
+                            )
+                            raise RuntimeError(
+                                "artifact manifest visibility remained indeterminate "
+                                "after the final shutdown inspection; process-local "
+                                "commit ownership was abandoned without republication; "
+                                f"original publication failure: {publish_warning}"
+                            ) from None
+                        self._phase = "commit-inspection-pending"
+                        self._condition.notify_all()
+                        self._condition.wait(_COMMIT_INSPECTION_INTERVAL_SECONDS)
 
-    def _publish_terminal_and_release(
-        self,
-        lease: ResourceLease,
-        *,
-        state: RunState,
-        result: object,
-        primary_error: str | None,
-        cleanup_errors: tuple[str, ...],
-    ) -> None:
-        if not state.terminal:
-            raise ValueError("terminal publication requires terminal state")
-
-        def publish() -> None:
-            self._publish_terminal(
-                state=state,
-                result=result,
-                primary_error=primary_error,
-                cleanup_errors=cleanup_errors,
-            )
-
-        def after_release() -> None:
             with self._condition:
+                self._final_committed = True
+                self._result = committed
+                self._commit_publication_warning = publish_warning
+                self._phase = "committed"
                 self._condition.notify_all()
-
-        lease.release_terminal(publish, after_release)
+            return committed
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            try:
+                _finish_prepared_artifact_commit(operation)
+            except BaseException as finish_error:
+                if primary is None:
+                    raise
+                record_secondary_failure(
+                    primary,
+                    "prepared artifact commit lifetime release also failed",
+                    finish_error,
+                )
+            finally:
+                with self._condition:
+                    self._commit_inflight = False
+                    self._condition.notify_all()
 
     def _publish_terminal(
         self,
@@ -1301,8 +955,8 @@ class RunHandle(Generic[FinalT]):
         with self._condition:
             if self._state.terminal:
                 raise RuntimeError("Run terminal state may be published only once")
-            if self._commit_inflight or self._pending_commit is not None:
-                raise RuntimeError("cannot publish while commit reconciliation is pending")
+            if self._commit_inflight:
+                raise RuntimeError("cannot publish while an artifact commit is active")
             self._cancel_gate_closed = True
             cleanup_errors = _diagnostics(
                 (*cleanup_errors, *self._interrupt_errors)
@@ -1322,8 +976,6 @@ class RunHandle(Generic[FinalT]):
             self._result = result
             self._primary_error = primary_error
             self._cleanup_errors = cleanup_errors
-            self._retry_disposition = None
-            self._recovery_instruction = None
             self._interrupt = None
             self._cancel_sealer = None
             self._condition.notify_all()
@@ -1390,7 +1042,7 @@ class RunController:
         try:
             thread.start()
         except BaseException as error:
-            acquired._release_unarmed()
+            acquired.release()
             summary = safe_error_summary(error)
             handle._publish_terminal(
                 state=RunState.FAILED,
@@ -1448,6 +1100,7 @@ class RunController:
             self._accepting = False
             handles = tuple(self._handles.values())
         for handle in handles:
+            handle._request_application_shutdown()
             handle.cancel("RunController shutdown")
         for handle in handles:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
@@ -1499,17 +1152,25 @@ class RunController:
         detach_failure(error, note_prefix="detached pre-execution traceback")
         try:
             context._revoke_hardware()
-            seed = context._detach_for_post_safety()
         except BaseException as revoke_error:
             summary = summary + "; " + safe_error_summary(revoke_error)
             detach_failure(revoke_error, note_prefix="detached revoke traceback")
+        try:
+            lease.release()
+        except BaseException as release_error:
+            summary = summary + "; " + safe_error_summary(release_error)
+            detach_failure(release_error, note_prefix="detached resource release traceback")
+        try:
+            seed = context._detach_for_post_safety()
+        except BaseException as detach_error:
+            summary = summary + "; " + safe_error_summary(detach_error)
+            detach_failure(detach_error, note_prefix="detached post-safety transition traceback")
             seed = _PostSafetySeed(handle, handle._token, None)
 
         post = seed.mint()
         post._revoke()
         state = RunState.CANCELLED if cancelled else RunState.FAILED
-        handle._publish_terminal_and_release(
-            lease,
+        handle._publish_terminal(
             state=state,
             result=_MISSING,
             primary_error=summary,
@@ -1534,7 +1195,7 @@ class RunController:
         handle: RunHandle,
         error: BaseException,
     ) -> None:
-        if lease.released or handle.snapshot().state.terminal:
+        if handle.snapshot().state.terminal:
             return
         try:
             plan, context = ownership.take()
@@ -1542,8 +1203,15 @@ class RunController:
             summary = safe_error_summary(error)
             detach_failure(error, note_prefix="detached terminal lifecycle traceback")
             handle._mark_post_safety()
-            handle._publish_terminal_and_release(
-                lease,
+            try:
+                lease.release()
+            except BaseException as release_error:
+                summary = summary + "; " + safe_error_summary(release_error)
+                detach_failure(
+                    release_error,
+                    note_prefix="detached fail-closed resource release traceback",
+                )
+            handle._publish_terminal(
                 state=RunState.FAILED,
                 result=_MISSING,
                 primary_error=summary,
@@ -1554,18 +1222,51 @@ class RunController:
         cleanup_summaries: list[str] = []
         try:
             handle._begin_cleanup_after_interrupt()
-            context._enter_cleanup_hardware()
+        except BaseException as cleanup_transition_error:
+            cleanup_summaries.append(safe_error_summary(cleanup_transition_error))
+            detach_failure(
+                cleanup_transition_error,
+                note_prefix="detached fail-closed cleanup transition traceback",
+            )
+        else:
             try:
-                context._run_interrupts(plan.interrupt_operations)
+                context._enter_cleanup_hardware()
             except BaseException as interrupt_error:
                 cleanup_summaries.append(safe_error_summary(interrupt_error))
+                detach_failure(
+                    interrupt_error,
+                    note_prefix="detached fail-closed cleanup entry traceback",
+                )
+            else:
+                try:
+                    context._run_interrupts(plan.interrupt_operations)
+                except BaseException as interrupt_error:
+                    cleanup_summaries.append(safe_error_summary(interrupt_error))
+                    detach_failure(
+                        interrupt_error,
+                        note_prefix="detached fail-closed interrupt traceback",
+                    )
+        try:
             context._revoke_hardware()
         except BaseException as revoke_error:
             cleanup_summaries.append(safe_error_summary(revoke_error))
             detach_failure(revoke_error, note_prefix="detached fail-closed revoke traceback")
         try:
+            lease.release()
+        except BaseException as release_error:
+            cleanup_summaries.append(safe_error_summary(release_error))
+            detach_failure(
+                release_error,
+                note_prefix="detached fail-closed resource release traceback",
+            )
+        try:
             seed = context._detach_for_post_safety()
-        except BaseException:
+        except BaseException as detach_error:
+            cleanup_summaries.append(safe_error_summary(detach_error))
+            detach_failure(
+                detach_error,
+                note_prefix="detached fail-closed post-safety transition traceback",
+            )
             seed = _PostSafetySeed(handle, handle._token, None)
         ownership.clear()
         plan = None  # type: ignore[assignment]
@@ -1573,8 +1274,7 @@ class RunController:
         detach_failure(error, note_prefix="detached lifecycle traceback")
         post = seed.mint()
         post._revoke()
-        handle._publish_terminal_and_release(
-            lease,
+        handle._publish_terminal(
             state=RunState.FAILED,
             result=_MISSING,
             primary_error=summary,
@@ -1642,13 +1342,31 @@ class RunController:
             report = None  # type: ignore[assignment]
             primary = None
             plan = None  # type: ignore[assignment]
-            context._revoke_hardware()
+            try:
+                context._revoke_hardware()
+            except BaseException as revoke_error:
+                cleanup_errors = _diagnostics(
+                    (*cleanup_errors, safe_error_summary(revoke_error))
+                )
+                detach_failure(
+                    revoke_error,
+                    note_prefix="detached hardware revoke traceback",
+                )
+            try:
+                lease.release()
+            except BaseException as release_error:
+                cleanup_errors = _diagnostics(
+                    (*cleanup_errors, safe_error_summary(release_error))
+                )
+                detach_failure(
+                    release_error,
+                    note_prefix="detached resource release traceback",
+                )
             seed = context._detach_for_post_safety()
             context = None  # type: ignore[assignment]
             ownership.clear()
             handle._set_phase("post-cleanup")
             RunController._finalize_and_publish(
-                lease=lease,
                 handle=handle,
                 seed=seed,
                 finalize=finalize,
@@ -1665,7 +1383,6 @@ class RunController:
     @staticmethod
     def _finalize_and_publish(
         *,
-        lease: ResourceLease,
         handle: RunHandle,
         seed: _PostSafetySeed,
         finalize: Callable[[PostSafetyContext, object], object],
@@ -1677,23 +1394,17 @@ class RunController:
     ) -> None:
         post = seed.mint()
         result = _MISSING
-        pending_control = False
         if primary_error is None and not cleanup_errors:
             try:
                 handle._set_phase("finalize")
                 post.checkpoint()
                 result = finalize(post, finalization_input.take())
-            except _CommitRetryRequired:
-                pending_control = True
             except BaseException as error:
                 primary_error = safe_error_summary(error)
                 cancelled = isinstance(error, CancellationRequested)
                 detach_failure(error, note_prefix="detached finalize traceback")
             abandonment_errors = post._abandon_unconsumed_commits()
             cleanup_errors = _diagnostics((*cleanup_errors, *abandonment_errors))
-            # A broad user callback may catch the private control exception.
-            # Durable ambiguity remains authoritative and cannot be swallowed.
-            pending_control = pending_control or handle._pending_commit is not None
         try:
             finalization_input.dispose()
         except BaseException as error:
@@ -1705,48 +1416,6 @@ class RunController:
         post = None  # type: ignore[assignment]
         finalize = None  # type: ignore[assignment]
 
-        def publish_terminal(
-            state: RunState,
-            terminal_result: object,
-            error_summary: str | None,
-            errors: tuple[str, ...],
-        ) -> None:
-            handle._publish_terminal_and_release(
-                lease,
-                state=state,
-                result=terminal_result,
-                primary_error=error_summary,
-                cleanup_errors=errors,
-            )
-
-        if pending_control:
-            pending = handle._pending_commit
-            if pending is None:
-                publish_terminal(
-                    RunState.FAILED,
-                    _MISSING,
-                    "commit reconciliation control signal lost its private record",
-                    cleanup_errors,
-                )
-                return
-            def retry_commit() -> None:
-                committed, committed_result = handle._reconcile_pending_commit()
-                if committed:
-                    errors = cleanup_errors
-                    if primary_error is not None:
-                        errors = _diagnostics((*errors, primary_error))
-                    publish_terminal(RunState.SUCCEEDED, committed_result, None, errors)
-                    return
-                error = primary_error or "ambiguous commit was durably resolved as aborted"
-                publish_terminal(RunState.FAILED, _MISSING, error, cleanup_errors)
-
-            handle._install_retry(
-                retry_commit,
-                "reconcile the pending commit; finalize will not be re-entered",
-                _diagnostics((*cleanup_errors, pending.last_error_summary)),
-                phase="commit-reconciliation-failed",
-            )
-            return
         if primary_error is None and handle._token.is_cancelled and not handle.snapshot().final_committed:
             primary_error = safe_error_summary(CancellationRequested(handle._token.reason))
             cancelled = True
@@ -1762,7 +1431,12 @@ class RunController:
             state = RunState.CANCELLED
         else:
             state = RunState.FAILED
-        publish_terminal(state, result, primary_error, cleanup_errors)
+        handle._publish_terminal(
+            state=state,
+            result=result,
+            primary_error=primary_error,
+            cleanup_errors=cleanup_errors,
+        )
 
 
 def _dispose_finalization_input(

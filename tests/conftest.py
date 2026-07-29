@@ -88,3 +88,43 @@ def pulse_backend_completion_for(artifact, *, transport_id="test-transport"):
         elapsed_ns,
     )
     return PulseBackendCompletion(terminal, tail)
+
+
+def private_pulse_backend_snapshot(
+    *,
+    state: str,
+    raw_lane_count: int,
+    artifact=None,
+    scan_point_count: int | None = None,
+    cursor: int | None = None,
+    cursor_sample_count: int = 0,
+    underflow_observed: bool = False,
+):
+    """Build the current private backend observation used by pulse test doubles.
+
+    This is only a fixture factory.  Production ``PulseServerSnapshot`` remains
+    the sole validator and public codec owner for these physical facts.
+    """
+
+    point_count = (
+        len(artifact.target_ir.scan_points)
+        if scan_point_count is None and artifact is not None
+        else 0 if scan_point_count is None else int(scan_point_count)
+    )
+    sampled_cursor = cursor if cursor_sample_count else None
+    is_safe = state == "SAFE"
+    return {
+        "schema": "zlc_pulse.DeployedStreamerSessionSnapshot",
+        "state": state,
+        "prepared_artifact_digest": (
+            None if artifact is None else artifact.fingerprint
+        ),
+        "scan_points": point_count,
+        "last_confirmed_cursor": sampled_cursor,
+        "cursor_sample_count": cursor_sample_count,
+        "underflow_observed": underflow_observed,
+        "safe_status_word": 0 if is_safe else None,
+        "safe_clock_enable_words": (
+            (0,) * ((raw_lane_count + 31) // 32) if is_safe else None
+        ),
+    }

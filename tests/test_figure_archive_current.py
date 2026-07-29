@@ -413,7 +413,7 @@ def test_formal_viewer_loads_only_on_committed_human_path_and_keeps_good_pane(
 ):
     path = tmp_path / "curve.npz"
     _saved_curve(path)
-    viewer = open_figure_viewer()
+    viewer = open_figure_viewer(output_root=tmp_path / "output")
     wrapper = viewer._zlc_window
     path_edit = viewer.info_pane.path_edit.edit
     status = viewer.info_pane.status
@@ -492,7 +492,7 @@ def test_formal_viewer_refits_and_reopens_the_same_archive(
     )
     original_ref = original.datasets.entries[0].snapshot.ref
 
-    viewer = open_figure_viewer()
+    viewer = open_figure_viewer(output_root=tmp_path / "output")
     wrapper = viewer._zlc_window
     path_edit = viewer.info_pane.path_edit.edit
     try:
@@ -580,7 +580,7 @@ def test_formal_viewer_keeps_old_generation_when_candidate_first_render_fails(
     second_path = tmp_path / "second.npz"
     _saved_curve(first_path)
     _saved_curve(second_path)
-    viewer = open_figure_viewer()
+    viewer = open_figure_viewer(output_root=tmp_path / "output")
     wrapper = viewer._zlc_window
     path_edit = viewer.info_pane.path_edit.edit
     status = viewer.info_pane.status
@@ -660,7 +660,13 @@ def test_notebook_no_argument_entry_opens_the_same_session_independent_viewer(
 ):
     import Zou_lab_control.api as zlc
 
-    experiment = zlc.connect("virtual", repository=tmp_path / "repository")
+    experiment = zlc.connect(
+        "virtual",
+        workspace=zlc.WorkspacePaths.for_workspace(
+            (tmp_path / "authored").resolve(),
+            repository_root=(tmp_path / "repository").resolve(),
+        ),
+    )
     viewer = None
     try:
         viewer = experiment.figure_gui()

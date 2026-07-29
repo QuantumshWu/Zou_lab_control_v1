@@ -36,6 +36,7 @@ from zlc_pulse import (
     PulseExecutionForm,
     compile_pulse_artifact,
     freeze_scan_table,
+    load_deployed_geometry_facts,
     load_pulse_document,
     pulse_target_manifest_from_lanes,
 )
@@ -54,6 +55,9 @@ def _bound_virtual_sequencer(document):
     endpoint = VirtualSequencerExecutionEndpoint(
         sequencer,
         pulse_target_manifest_from_lanes(document.target),
+        geometry_fingerprint=(
+            load_deployed_geometry_facts().geometry_fingerprint
+        ),
     )
     broker = DeviceBroker()
     identity = broker.verify_identity(

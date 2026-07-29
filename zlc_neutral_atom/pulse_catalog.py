@@ -5,10 +5,10 @@ The editable PulseDocuments themselves live only in the repository-level
 Node never imports another Logic Node merely to reuse a default recipe path.
 """
 
-CALIBRATION_PULSE_PATH = "pulses/imaging_template.json"
-MOT_FIELD_PULSE_PATH = "pulses/mot_field_template.json"
-PROBE_PULSE_PATH = "pulses/probe_template.json"
-RELEASE_RECAPTURE_PULSE_PATH = "pulses/release_recapture.json"
+CALIBRATION_PULSE_PATH = "imaging_template.json"
+MOT_FIELD_PULSE_PATH = "mot_field_template.json"
+PROBE_PULSE_PATH = "probe_template.json"
+RELEASE_RECAPTURE_PULSE_PATH = "release_recapture.json"
 
 
 __all__ = [

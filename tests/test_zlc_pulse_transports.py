@@ -114,6 +114,16 @@ class TraceRegisterTransport:
         pass
 
 
+def _physical_safe_batch_count(transport: TraceRegisterTransport) -> int:
+    return sum(
+        any(
+            address == CtrlWords.COMMAND and value == CMD_SAFE
+            for address, value in batch
+        )
+        for batch in transport.write_batches
+    )
+
+
 def _scan_artifact(params, count=5):
     document = load_pulse_document(ROOT / "pulses" / "mot_field_template.json")
     rows = tuple((float(index), 0.0, 0.0) for index in range(count))
@@ -219,7 +229,7 @@ def test_public_service_accepts_scan_larger_than_the_two_resident_banks():
     reference = service.prepare(artifact)
 
     assert reference.artifact_digest == artifact.fingerprint
-    assert service.snapshot()["state"] == "PREPARED"
+    assert service.snapshot().state == "PREPARED"
     service.safe_state()
 
 
@@ -663,6 +673,71 @@ def test_bringup_enters_acknowledged_safe_before_clearing_live_configuration():
     assert session.state == "SAFE"
 
 
+def test_close_reuses_the_current_safe_receipt_without_a_second_physical_safe():
+    params = StreamerParams()
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    transport = TraceRegisterTransport(params)
+    lease = MemoryDeviceLease()
+    session = DeployedStreamerSession(
+        transport,
+        device_lease=lease,
+        deployed_target=document.target,
+        params=params,
+        clock_hz=50e6,
+    ).start()
+    session.check_register_layout()
+    session.safe_state()
+    snapshot = session.snapshot()
+    assert snapshot["safe_status_word"] == 0
+    assert snapshot["safe_clock_enable_words"] == (0,) * params.clk_enable_words
+    safe_batches = _physical_safe_batch_count(transport)
+
+    session.close()
+
+    assert _physical_safe_batch_count(transport) == safe_batches
+    assert transport.closed
+    assert not lease.acquired
+
+
+def test_session_close_failure_can_retry_without_repeating_physical_safe():
+    class FailCloseOnceTransport(TraceRegisterTransport):
+        def __init__(self, params):
+            super().__init__(params)
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise OSError("transport close failed once")
+            super().close()
+
+    params = StreamerParams()
+    document = load_pulse_document(ROOT / "pulses" / "imaging_template.json")
+    transport = FailCloseOnceTransport(params)
+    lease = MemoryDeviceLease()
+    session = DeployedStreamerSession(
+        transport,
+        device_lease=lease,
+        deployed_target=document.target,
+        params=params,
+        clock_hz=50e6,
+    ).start()
+    session.check_register_layout()
+    session.safe_state()
+    safe_batches = _physical_safe_batch_count(transport)
+
+    with pytest.raises(OSError, match="failed once"):
+        session.close()
+    assert session.state == "SAFE"
+    assert lease.acquired
+
+    session.close()
+    assert _physical_safe_batch_count(transport) == safe_batches
+    assert transport.close_calls == 2
+    assert transport.closed
+    assert not lease.acquired
+
+
 def test_safe_requires_a_bounded_stable_status_acknowledgement():
     class StuckSafeTransport(TraceRegisterTransport):
         def write_words(self, rows, *, stop=None, deadline=None):
@@ -714,6 +789,13 @@ def test_failed_safe_command_never_claims_safe_state():
         session.safe_state()
     assert session.state == "SAFE_FAILED"
     assert session.snapshot()["prepared_artifact_digest"] is None
+
+    transport.fail_safe = False
+    session.safe_state()
+    snapshot = session.snapshot()
+    assert session.state == "SAFE"
+    assert snapshot["safe_status_word"] == 0
+    assert snapshot["safe_clock_enable_words"] == (0,) * params.clk_enable_words
 
 
 def test_closed_axi_transport_cannot_implicitly_restart(tmp_path):

@@ -80,6 +80,8 @@ def open_task_console(
         )
 
     body = show_task_console(
+        tasks_root=ports.tasks_root,
+        output_root=ports.output_root,
         state=state,
         task=task,
         catalog_view=catalog_view,

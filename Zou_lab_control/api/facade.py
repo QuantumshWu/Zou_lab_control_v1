@@ -66,6 +66,7 @@ from ._readout_core import ReadoutFacade
 from ._application_services import (
     ExperimentCloseAttempt as _ExperimentCloseAttempt,
     ExperimentServices as _ExperimentServices,
+    WorkspacePaths,
     WorkbenchHandle as _WorkbenchHandle,
     fit_service_guard as _fit_service_guard,
     resolve_role as _resolve_role,
@@ -329,6 +330,12 @@ class Experiment:
         from Zou_lab_control.workbench import open_device_manager
 
         return open_device_manager(self)
+
+    def _workspace_paths(self) -> WorkspacePaths:
+        """Return the immutable roots only to application composition."""
+
+        with _service_guard(self._services) as services:
+            return services.workspace_paths
 
     def _open_workbench_handle(
         self,
@@ -672,10 +679,13 @@ class Experiment:
                 )
 
         from Zou_lab_control.workbench import open_figure_workbench
+        with _service_guard(self._services) as services:
+            output_root = services.workspace_paths.output_root
 
         return open_figure_workbench(
             figure_factory,
             display_source,
+            output_root=output_root,
             intent=intent,
             point_ordinals=point_ordinals,
             preferences=preferences,
@@ -811,7 +821,12 @@ class Experiment:
                 )
             from zlc_workbench.figure_viewer.app import open_figure_viewer
 
-            return open_figure_viewer(path=source)
+            with _service_guard(self._services) as services:
+                output_root = services.workspace_paths.output_root
+            return open_figure_viewer(
+                path=source,
+                output_root=output_root,
+            )
 
         if isinstance(source, FitResultArtifactRef):
             with _service_guard(self._services) as services:
@@ -860,6 +875,8 @@ class Experiment:
             )
 
         from Zou_lab_control.workbench import open_figure_workbench
+        with _service_guard(self._services) as services:
+            output_root = services.workspace_paths.output_root
 
         def figure_factory(current_source, *, intent, point_ordinals, preferences):
             with _service_guard(self._services) as services:
@@ -876,6 +893,7 @@ class Experiment:
         return open_figure_workbench(
             figure_factory,
             source,
+            output_root=output_root,
             intent=intent,
             point_ordinals=point_ordinals,
             preferences=preferences,
@@ -1094,7 +1112,7 @@ def _resolve_installation_document(
 def connect(
     config: str | Path | InstallationConfigDocument = "virtual",
     *,
-    repository: str | Path,
+    workspace: WorkspacePaths,
     name: str = "neutral_atom",
     seed: int | None | object = _CONNECT_SEED_UNSET,
     required_pulse_document: PulseDocument | None = None,
@@ -1107,10 +1125,10 @@ def connect(
         PulseDocument,
     ):
         raise TypeError("required_pulse_document must be PulseDocument or None")
-    if not isinstance(repository, (str, Path)):
-        raise TypeError("repository must be an explicit experiment workspace root")
+    if not isinstance(workspace, WorkspacePaths):
+        raise TypeError("workspace must be WorkspacePaths")
     canonical_name = _text(name, "experiment name")
-    repository_root = Path(repository).expanduser().resolve()
+    repository_root = workspace.repository_root
     # The composition root owns the workspace hierarchy; each repository owns
     # exactly one child beneath it and never guesses missing ancestors.
     durable_makedirs(repository_root)
@@ -1131,7 +1149,7 @@ def connect(
         fit_operations_drained = threading.Event()
         fit_operations_drained.set()
         services = _ExperimentServices(
-            repository_root=repository_root,
+            workspace_paths=workspace,
             installation=installation,
             runtime=runtime,
             capture_repository=capture_repository,
@@ -1178,7 +1196,7 @@ def connect(
 def device_manager(
     config: str | Path | InstallationConfigDocument = "virtual",
     *,
-    repository: str | Path | None = None,
+    workspace: WorkspacePaths,
     name: str = "neutral_atom",
     seed: int | None | object = _CONNECT_SEED_UNSET,
     on_initialized=None,
@@ -1196,7 +1214,7 @@ def device_manager(
     return open_device_manager(
         document=document,
         config_path=config_path,
-        repository=repository,
+        workspace=workspace,
         name=name,
         on_initialized=on_initialized,
     )
@@ -1222,4 +1240,5 @@ __all__ = [
     "PulseRunResult",
     "PulseTargetDescriptor",
     "ReadoutFacade",
+    "WorkspacePaths",
 ]

@@ -2,7 +2,7 @@
 
 Domain artifact schemas and typed references deliberately do not live here.
 Repository backends are exposed lazily so importing ``zlc_storage.canonical``
-does not initialize filesystem, journal, or lease machinery.
+does not initialize filesystem or lease machinery.
 """
 
 from importlib import import_module
@@ -30,8 +30,6 @@ from .canonical import (
 )
 
 _LAZY_EXPORTS = {
-    "FramedJournal": ("framed_journal", "FramedJournal"),
-    "JournalCorruptionError": ("framed_journal", "JournalCorruptionError"),
     "DirectoryDurabilityError": ("durability", "DirectoryDurabilityError"),
     "durable_makedirs": ("durability", "durable_makedirs"),
     "durable_mkdir": ("durability", "durable_mkdir"),
@@ -77,8 +75,6 @@ __all__ = [
     "content_ref_to_tree",
     "canonical_text",
     "canonical_digest",
-    "FramedJournal",
-    "JournalCorruptionError",
     "RepositoryRootBusy",
     "RepositoryRootLease",
     "RepositoryRootLeaseBorrow",

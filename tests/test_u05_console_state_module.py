@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from zlc_neutral_atom.catalog import DefinitionKey, definition_key_to_tree
+from zlc_frontend.plot_kind import PlotKind
 from zlc_workbench.task_console.console_records import (
     CONSOLE_STATE_SCHEMA,
     LogicNodeConfig,
@@ -15,7 +16,6 @@ from zlc_workbench.task_console.console_records import (
 )
 from zlc_workbench.task_console.console_state import TaskConsoleState, default_console_state
 from zlc_workbench.task_console.layout_repository import (
-    TASK_FILES_ENV,
     load_task_console_state,
     resolve_task_state,
     save_task_console_state,
@@ -24,16 +24,23 @@ from zlc_workbench.task_console.layout_repository import (
 
 
 @pytest.fixture
-def layouts(tmp_path, monkeypatch):
-    monkeypatch.setenv(TASK_FILES_ENV, str(tmp_path / "tasks"))
-    return tmp_path
+def layouts(tmp_path):
+    root = (tmp_path / "tasks").resolve()
+    root.mkdir()
+    return root
 
 
 def _state() -> TaskConsoleState:
     return TaskConsoleState(
         name="rb87",
         interval_ms=200,
-        panels=[PanelConfig(panel_id="panel-main", kind="1d", signal="cam/frame")],
+        panels=[
+            PanelConfig(
+                panel_id="panel-main",
+                kind=PlotKind.CURVE,
+                signal="cam/frame",
+            )
+        ],
         logic=[
             LogicNodeConfig(
                 node_id="logic-analysis-1",
@@ -69,17 +76,23 @@ def test_layout_publication_is_readable_and_round_trips(layouts) -> None:
 
 
 def test_a_name_resolves_under_the_explicit_layout_directory(layouts) -> None:
-    save_task_console_state(_state(), task_files_dir() / "my_layout.json")
+    save_task_console_state(
+        _state(),
+        task_files_dir(layouts) / "my_layout.json",
+    )
     elsewhere = layouts / "elsewhere.json"
     save_task_console_state(_state(), elsewhere)
-    assert resolve_task_state("  my_layout  ").name == "rb87"
-    assert resolve_task_state(str(elsewhere)).name == "rb87"
+    assert resolve_task_state("  my_layout  ", tasks_root=layouts).name == "rb87"
+    assert resolve_task_state(str(elsewhere), tasks_root=layouts).name == "rb87"
 
 
 @pytest.mark.parametrize("task", ["nope", "missing.json"])
 def test_an_unknown_layout_fails_closed(task, layouts) -> None:
     with pytest.raises(ValueError):
-        resolve_task_state(task if task == "nope" else str(layouts / task))
+        resolve_task_state(
+            task if task == "nope" else str(layouts / task),
+            tasks_root=layouts,
+        )
 
 
 @pytest.mark.parametrize(

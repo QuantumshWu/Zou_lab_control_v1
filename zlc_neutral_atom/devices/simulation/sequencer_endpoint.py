@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 
-from fpga.pulse_streamer.host.image import StreamerParams, build_fingerprint
 from zlc_neutral_atom.devices.sequencer.endpoint import (
     _EndpointSession,
     _OwnedSequencerEndpoint,
@@ -36,8 +35,8 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
         sequencer: VirtualSequencer,
         manifest: PulseTargetManifest,
         *,
+        geometry_fingerprint: int,
         max_blocking_call_seconds: float = 10.0,
-        params: StreamerParams | None = None,
     ) -> None:
         if type(sequencer) is not VirtualSequencer:
             raise TypeError("this endpoint is specific to VirtualSequencer")
@@ -50,10 +49,17 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
             max_blocking_call_seconds,
             "max_blocking_call_seconds",
         )
-        self._params = params or StreamerParams()
+        if (
+            isinstance(geometry_fingerprint, bool)
+            or not isinstance(geometry_fingerprint, int)
+            or not 0 <= geometry_fingerprint <= 0xFFFFFFFF
+        ):
+            raise TypeError(
+                "geometry_fingerprint must be an unsigned 32-bit integer"
+            )
         self._manifest = manifest
         self._target = manifest.target
-        self._geometry = build_fingerprint(self._params) & 0xFFFFFFFF
+        self._geometry = geometry_fingerprint
         self._owner = _SequencerSessionOwner(
             self,
             max_blocking_call_seconds=self._timeout,

@@ -1,4 +1,4 @@
-"""Current lazy raw-frame CaptureArtifact and crash-safe repository."""
+"""Current lazy raw-frame CaptureArtifact and manifest-only repository."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 from zlc_storage import (
     CanonicalArrayEvent,
     ContentAddressedStore,
+    ContentCorruptionError,
     ContentRef,
     ContentStoreAuthority,
     RepositoryRootLease,
@@ -37,15 +38,7 @@ from .reference import (
     CAPTURE_ARTIFACT_NAMESPACE,
     CaptureArtifactRef,
 )
-from zlc_neutral_atom.runtime.commit import (
-    CommitIntent,
-    CommitTarget,
-    FinalCommit,
-    PersistentCommitJournal,
-    PublishedManifest,
-    RepositoryCommitCoordinator,
-    publish_manifest_with_visibility_reconciliation,
-)
+from zlc_neutral_atom.runtime.commit import PreparedArtifactCommit
 from .session import (
     CameraCaptureProvenance,
     camera_capture_provenance_from_tree,
@@ -103,7 +96,6 @@ from zlc_pulse import (
 )
 
 CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.CaptureArtifact"
-_CAPTURE_ARTIFACT_KIND = "capture"
 _ADMITTED_CAPTURE_TOKEN = object()
 _CAPTURE_MANIFEST_FIELDS = {
     "schema",
@@ -148,7 +140,6 @@ class AdmittedCapture:
         "_repository_token",
         "_reference",
         "_artifact",
-        "_commit_id",
     )
 
     def __init_subclass__(cls, **_kwargs) -> None:
@@ -161,7 +152,6 @@ class AdmittedCapture:
         repository_token: object,
         reference: CaptureArtifactRef,
         artifact: "CaptureArtifact",
-        commit_id: str,
     ) -> None:
         if token is not _ADMITTED_CAPTURE_TOKEN:
             raise PermissionError(
@@ -173,12 +163,10 @@ class AdmittedCapture:
             raise TypeError("reference must be CaptureArtifactRef")
         if not isinstance(artifact, CaptureArtifact):
             raise TypeError("artifact must be CaptureArtifact")
-        _canonical_text(commit_id, "commit_id")
         object.__setattr__(self, "_token", token)
         object.__setattr__(self, "_repository_token", repository_token)
         object.__setattr__(self, "_reference", reference)
         object.__setattr__(self, "_artifact", artifact)
-        object.__setattr__(self, "_commit_id", commit_id)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("AdmittedCapture is immutable")
@@ -207,13 +195,8 @@ class AdmittedCapture:
         self._require_authority()
         return self._artifact
 
-    @property
-    def commit_id(self) -> str:
-        self._require_authority()
-        return self._commit_id
-
     def _matches_admission(self, other: object) -> bool:
-        """Compare exact process-local repository and journal authority."""
+        """Compare exact process-local repository and manifest authority."""
 
         self._require_authority()
         if type(other) is not AdmittedCapture:
@@ -222,7 +205,6 @@ class AdmittedCapture:
         return (
             self._repository_token is other._repository_token
             and self._reference == other._reference
-            and self._commit_id == other._commit_id
         )
 
     def materialize_snapshot(
@@ -431,7 +413,7 @@ class CaptureArtifact:
 
 
 class CaptureRepository:
-    """Current-only raw-capture CAS with durable commit/admission authority."""
+    """Current-only raw-capture CAS whose manifest is the visibility authority."""
 
     __slots__ = (
         "root",
@@ -439,7 +421,6 @@ class CaptureRepository:
         "_root_lease",
         "_store",
         "_store_authority",
-        "_coordinator",
         "_sealed",
     )
 
@@ -461,30 +442,13 @@ class CaptureRepository:
         )
         root_lease = RepositoryRootLease(self.root)
         object.__setattr__(self, "_root_lease", root_lease)
-        journal = None
         try:
-            # The root lease is deliberately acquired before any content-store,
-            # journal, or startup-reconciliation I/O.  A losing second writer
-            # therefore cannot inspect or resolve another live owner's intents.
+            # Acquire the root lease before any content-store I/O so a losing
+            # second writer cannot inspect another live owner's repository.
             store = ContentAddressedStore(self.root / "content")
             object.__setattr__(self, "_store", store)
             object.__setattr__(self, "_store_authority", store.authority())
-            journal = PersistentCommitJournal(
-                self.root / "capture-commit.journal",
-                self.repository_id,
-            )
-            # RepositoryCommitCoordinator performs synchronous startup recovery.
-            coordinator: RepositoryCommitCoordinator[CaptureArtifactRef] = (
-                RepositoryCommitCoordinator(
-                    journal,
-                    self._recover,
-                    root_lease=root_lease,
-                )
-            )
-            object.__setattr__(self, "_coordinator", coordinator)
         except BaseException:
-            if journal is not None:
-                journal.close()
             root_lease.close()
             raise
         object.__setattr__(self, "_sealed", True)
@@ -498,12 +462,8 @@ class CaptureRepository:
         self._root_lease.require_active()
 
     def close(self) -> None:
-        """Close only after every prepared/in-flight commit authority is resolved."""
+        """Close after every prepared/in-flight manifest operation is resolved."""
 
-        coordinator = getattr(self, "_coordinator", None)
-        if coordinator is not None:
-            coordinator.close()
-            return
         root_lease = getattr(self, "_root_lease", None)
         if root_lease is not None:
             root_lease.close()
@@ -547,32 +507,6 @@ class CaptureRepository:
                 repository_id=self.repository_id,
                 abort_check=abort_check,
             )
-
-    def _committed_intents(
-        self,
-        reference: CaptureArtifactRef,
-    ) -> tuple[CommitIntent, ...]:
-        self._validate_ref(reference)
-        target = CommitTarget(
-            self.repository_id,
-            _CAPTURE_ARTIFACT_KIND,
-            CAPTURE_ARTIFACT_SCHEMA,
-            reference.target_ref,
-            reference.manifest_digest,
-        )
-        matching = self._coordinator.committed_for(target)
-        if not matching:
-            raise PermissionError(
-                "CaptureArtifact is visible but has no committed journal authority"
-            )
-        for intent in matching:
-            if intent.commit_id != (
-                f"capture-final-{intent.run_id}-{reference.manifest_digest}"
-            ):
-                raise ValueError(
-                    "committed capture identity differs from its FINAL target"
-                )
-        return matching
 
     def _load_manifest(
         self,
@@ -651,6 +585,7 @@ class CaptureRepository:
             or rebuilt_payload != manifest_payload
         ):
             raise ValueError("CaptureArtifact manifest is not canonical")
+        artifact.frame_source._verify_all_frame_chunks()
         return artifact
 
     def admit(
@@ -659,38 +594,19 @@ class CaptureRepository:
         *,
         abort_check: Callable[[], None] | None = None,
     ) -> AdmittedCapture:
-        """Mint authority only for an exact journal-committed capture target."""
+        """Mint process-local authority for one canonical visible manifest."""
 
         if abort_check is not None and not callable(abort_check):
             raise TypeError("abort_check must be callable or None")
-        with self._root_lease.borrow() as admission_borrow:
-            admission_borrow.require_active()
-            matching = self._committed_intents(reference)
-            if abort_check is not None:
-                abort_check()
-            artifact = self.load(reference, abort_check=abort_check)
-            if abort_check is not None:
-                abort_check()
-            for intent in matching:
-                expected_commit_id = (
-                    f"capture-final-{artifact.run_id}-"
-                    f"{reference.manifest_digest}"
-                )
-                if (
-                    intent.run_id != artifact.run_id
-                    or intent.commit_id != expected_commit_id
-                ):
-                    raise ValueError(
-                        "committed capture intent differs from persisted artifact evidence"
-                    )
-            selected = min(matching, key=lambda intent: intent.commit_id)
-            return AdmittedCapture(
-                _ADMITTED_CAPTURE_TOKEN,
-                repository_token=self._root_lease,
-                reference=reference,
-                artifact=artifact,
-                commit_id=selected.commit_id,
-            )
+        artifact = self.load(reference, abort_check=abort_check)
+        if abort_check is not None:
+            abort_check()
+        return AdmittedCapture(
+            _ADMITTED_CAPTURE_TOKEN,
+            repository_token=self._root_lease,
+            reference=reference,
+            artifact=artifact,
+        )
 
     def materialize_final(
         self,
@@ -743,7 +659,7 @@ class CaptureRepository:
         result: PipelineResult | TriggeredPipelineResult,
         *,
         compiled_pulse_ref: ContentRef | None,
-    ) -> FinalCommit[CaptureArtifactRef]:
+    ) -> PreparedArtifactCommit[CaptureArtifactRef]:
         operation = self._commit_operation(
             context,
             result,
@@ -757,7 +673,7 @@ class CaptureRepository:
         result: PipelineResult | TriggeredPipelineResult,
         *,
         compiled_pulse_ref: ContentRef | None,
-    ) -> FinalCommit[CaptureArtifactRef]:
+    ) -> PreparedArtifactCommit[CaptureArtifactRef]:
         self._require_active()
         if not isinstance(context, PostSafetyContext):
             raise TypeError("capture commit requires PostSafetyContext")
@@ -776,104 +692,70 @@ class CaptureRepository:
             confirmed_subject = context.authorize_commit_preparation()
             if confirmed_subject != run_id:
                 raise RuntimeError("capture commit subject changed while staging")
-            target = CommitTarget(
-                self.repository_id,
-                _CAPTURE_ARTIFACT_KIND,
-                CAPTURE_ARTIFACT_SCHEMA,
-                reference.target_ref,
-                reference.manifest_digest,
-            )
 
-            def publish() -> PublishedManifest[CaptureArtifactRef]:
+            def publish(payload: bytes) -> None:
                 self._require_active()
-                stored = publish_manifest_with_visibility_reconciliation(
-                    self._store_authority,
+                stored = self._store_authority.publish_manifest(
                     CAPTURE_ARTIFACT_NAMESPACE,
-                    manifest_payload,
+                    payload,
                     expected_digest=reference.manifest_digest,
                 )
                 if stored.content.digest != reference.manifest_digest:
                     raise RuntimeError("published capture manifest digest changed")
-                return PublishedManifest(
-                    reference.target_ref,
-                    reference.manifest_digest,
-                    reference,
-                )
 
-            commit_id = (
-                f"capture-final-{run_id}-"
-                f"{reference.manifest_digest}"
-            )
-            operation = self._coordinator.prepare(
-                commit_id,
-                run_id,
-                target,
-                publish,
-            )
+            def inspect(payload: bytes) -> bool | None:
+                self._require_active()
+                try:
+                    durable_payload = self._store_authority.confirm_manifest_durable(
+                        CAPTURE_ARTIFACT_NAMESPACE,
+                        reference.manifest_digest,
+                    )
+                except FileNotFoundError:
+                    return False
+                except OSError:
+                    return None
+                if durable_payload != payload:
+                    raise ContentCorruptionError(
+                        "visible capture manifest differs from prepared payload"
+                    )
+                try:
+                    artifact = self._load_manifest(
+                        reference,
+                        durable_payload,
+                        store_authority=self._store_authority,
+                        repository_id=self.repository_id,
+                    )
+                except FileNotFoundError as error:
+                    raise ContentCorruptionError(
+                        "visible capture manifest references missing content"
+                    ) from error
+                except OSError:
+                    return None
+                if artifact.run_id != run_id:
+                    raise ValueError(
+                        "visible capture provenance belongs to another Run"
+                    )
+                return True
+
+            commit_borrow = self._root_lease.borrow()
+            try:
+                operation = PreparedArtifactCommit(
+                    run_id=run_id,
+                    result=reference,
+                    manifest_payload=manifest_payload,
+                    publish=publish,
+                    inspect=inspect,
+                    repository_borrow=commit_borrow,
+                )
+            except BaseException:
+                commit_borrow.close()
+                raise
         try:
-            context._track_prepared_commit(operation)
+            context.track_prepared_commit(operation)
         except BaseException:
             operation.abandon()
             raise
         return operation
-
-    def _recover(
-        self,
-        intent: CommitIntent,
-    ) -> PublishedManifest[CaptureArtifactRef] | None:
-        self._require_active()
-        store_authority = self._store_authority
-        repository_id = self.repository_id
-        target = intent.target
-        if (
-            target.repository_id != repository_id
-            or target.artifact_kind != _CAPTURE_ARTIFACT_KIND
-            or target.artifact_format != CAPTURE_ARTIFACT_SCHEMA
-        ):
-            raise ValueError("commit intent is not a CaptureArtifact target")
-        reference = CaptureArtifactRef(
-            repository_id,
-            target.expected_manifest_digest,
-        )
-        if target.target_ref != reference.target_ref:
-            raise ValueError("capture commit target ref and digest differ")
-        digest = reference.manifest_digest
-        expected_commit_id = f"capture-final-{intent.run_id}-{digest}"
-        if intent.commit_id != expected_commit_id:
-            raise ValueError("capture commit id differs from kind/run/target")
-        try:
-            manifest_payload = store_authority.read_manifest(
-                CAPTURE_ARTIFACT_NAMESPACE,
-                digest,
-            )
-        except FileNotFoundError:
-            return None
-        # The manifest was observed first.  Any missing/corrupt referenced blob
-        # is now a visible corrupt artifact and must fail startup closed rather
-        # than be misreported as an absent/uncommitted manifest.
-        artifact = self._load_manifest(
-            reference,
-            manifest_payload,
-            store_authority=store_authority,
-            repository_id=repository_id,
-        )
-        # Event chunks were already read and validated while loading the source.
-        artifact.frame_source._verify_all_frame_chunks()
-        if artifact.run_id != intent.run_id:
-            raise ValueError("capture manifest run_id differs from commit intent")
-        # A readable target may be the visible residue of a replace whose
-        # parent-directory flush acknowledgement failed.  This storage-owned
-        # barrier verifies/fsyncs only an existing immutable target and never
-        # creates one.  Recovery cannot resolve COMMITTED until it succeeds.
-        confirmed_payload = store_authority.confirm_manifest_durable(
-            CAPTURE_ARTIFACT_NAMESPACE,
-            digest,
-        )
-        if confirmed_payload != manifest_payload:
-            raise RuntimeError(
-                "capture recovery durability confirmation changed payload"
-            )
-        return PublishedManifest(reference.target_ref, digest, reference)
 
     def _stage_pipeline_result(
         self,

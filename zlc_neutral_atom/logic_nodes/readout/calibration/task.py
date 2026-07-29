@@ -86,7 +86,6 @@ from zlc_storage import (
     normalized_text,
     positive_real,
 )
-from zlc_storage.paths import resolve_under_project
 from zlc_pulse import PulseExecutionForm
 
 if TYPE_CHECKING:
@@ -104,7 +103,7 @@ CALIBRATION_LIVE_OUTPUT_DECLARATIONS = (
     ),
 )
 DEFAULT_CALIBRATION_SOURCE_MODE = "live"
-DEFAULT_CALIBRATION_FOLDER = "_output/calibrations"
+DEFAULT_CALIBRATION_FOLDER = "calibrations"
 DEFAULT_CALIBRATION_SAVE_FRAMES = True
 DEFAULT_CALIBRATION_PULSE_PATH = CALIBRATION_PULSE_PATH
 DEFAULT_CALIBRATION_THRESHOLD_METHOD = "otsu"
@@ -134,7 +133,10 @@ def admit_calibration_capture_export(
     camera_role = normalized_text(expected_camera_role, "expected_camera_role")
     if not isinstance(capture_repository, CaptureRepository):
         raise TypeError("capture_repository must be CaptureRepository")
-    folder = resolve_under_project(source_path)
+    folder = Path(source_path).expanduser()
+    if not folder.is_absolute():
+        raise ValueError("saved calibration source must be resolved by composition")
+    folder = folder.resolve()
     metadata_path = folder / "capture.json"
     if not metadata_path.is_file():
         raise FileNotFoundError(
@@ -277,7 +279,10 @@ def write_calibration_task_outputs(
             f"{admitted.artifact.camera_provenance.binding.value!r}, not "
             f"{camera_role!r}"
         )
-    root = resolve_under_project(folder)
+    root = Path(folder).expanduser()
+    if not root.is_absolute():
+        raise ValueError("calibration output folder must be resolved by composition")
+    root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     nonce = uuid.uuid4().hex
     pointer_path = root / "calibration_ref.json"
@@ -416,9 +421,7 @@ class CalibrationTaskIntent:
             raise ValueError(
                 f"source_mode must be one of {CALIBRATION_SOURCE_MODES}"
             )
-        folder = str(
-            resolve_under_project(normalized_text(self.folder, "folder"))
-        )
+        folder = normalized_text(self.folder, "folder")
         if type(self.save_frames) is not bool:
             raise TypeError("save_frames must be bool")
         pulse = normalized_text(self.pulse, "pulse")
@@ -1150,14 +1153,13 @@ class CalibrationTaskHandle:
                 state,
                 phase,
                 self._result is not None,
-                None if child is None else child.commit_recovery_warning,
+                None if child is None else child.commit_publication_warning,
                 (
                     error
                     if error is not None
                     else None if child is None else child.primary_error
                 ),
                 () if child is None else child.cleanup_errors,
-                None if child is None else child.recovery_instruction,
                 (
                     admission_rejection
                     if admission_rejection is not None
@@ -1272,10 +1274,9 @@ class CalibrationTaskHandle:
                     and child.final_committed
                 )
             ),
-            None if child is None else child.commit_recovery_warning,
+            None if child is None else child.commit_publication_warning,
             None if child is None else child.primary_error,
             () if child is None else child.cleanup_errors,
-            None if child is None else child.recovery_instruction,
             None if child is None else child.admission_rejection,
         )
 

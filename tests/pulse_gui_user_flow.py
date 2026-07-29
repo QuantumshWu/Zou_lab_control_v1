@@ -151,8 +151,9 @@ def capture_offscreen_pulse_gui_user_flow(
 ) -> tuple[Path, ...]:
     """Run the offscreen fast flow and return its whole-window PNG files."""
 
+    from Zou_lab_control.api import WorkspacePaths
+    from Zou_lab_control.workbench import open_pulse_editor
     from zlc_frontend.qt_widgets import ensure_qt_app
-    from zlc_workbench.pulse_editor.app import open_pulse_editor
 
     configure_offscreen_fast_path()
     application = ensure_qt_app()
@@ -167,7 +168,12 @@ def capture_offscreen_pulse_gui_user_flow(
     else:
         repository_path = Path(repository).expanduser().resolve()
 
-    body = open_pulse_editor(repository=repository_path)
+    body = open_pulse_editor(
+        workspace=WorkspacePaths.for_workspace(
+            (repository_path / "authored").resolve(),
+            repository_root=repository_path.resolve(),
+        )
+    )
     captures: list[dict[str, object]] = []
     try:
         captures.append(

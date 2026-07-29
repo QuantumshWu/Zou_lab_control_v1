@@ -45,6 +45,7 @@ def _bind_api(host: object, _dependencies: tuple[object, ...]) -> MotFieldApi:
             intent,
             api,
             capture_repository=capture_repository,
+            output_root=operations.output_root,
             start_run=start_run,
         )
 

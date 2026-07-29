@@ -29,15 +29,7 @@ from zlc_data.codec import (
     validity_from_tree,
     validity_to_tree,
 )
-from zlc_neutral_atom.runtime.commit import (
-    CommitIntent,
-    CommitTarget,
-    FinalCommit,
-    PersistentCommitJournal,
-    PublishedManifest,
-    RepositoryCommitCoordinator,
-    publish_manifest_with_visibility_reconciliation,
-)
+from zlc_neutral_atom.runtime.commit import PreparedArtifactCommit
 from zlc_neutral_atom.runtime.dataset import (
     DatasetSealProvenance,
     dataset_seal_provenance_from_tree,
@@ -54,6 +46,7 @@ from zlc_pulse import (
 from zlc_storage import (
     CanonicalArrayEvent,
     ContentAddressedStore,
+    ContentCorruptionError,
     ContentRef,
     ContentStoreAuthority,
     RepositoryRootLease,
@@ -96,7 +89,6 @@ from .reference import SCAN_ARTIFACT_NAMESPACE, ScanArtifactRef
 
 SCAN_ARTIFACT_SCHEMA = "zlc_neutral_atom.logic_nodes.pulse_scan.storage"
 SCAN_MANIFEST_SCHEMA = "zlc_neutral_atom.logic_nodes.pulse_scan.manifest"
-_SCAN_ARTIFACT_KIND = "scan"
 _MANIFEST_FIELDS = frozenset({"schema", "repository_id", "metadata_blob"})
 _ARTIFACT_FIELDS = frozenset(
     {
@@ -659,20 +651,6 @@ def _values_payload(snapshot: OwnedSnapshot) -> memoryview:
     return memoryview(values).cast("B")
 
 
-def _target(repository_id: str, reference: ScanArtifactRef) -> CommitTarget:
-    return CommitTarget(
-        repository_id,
-        _SCAN_ARTIFACT_KIND,
-        SCAN_MANIFEST_SCHEMA,
-        reference.target_ref,
-        reference.manifest_digest,
-    )
-
-
-def _commit_id(run_id: str, manifest_digest: str) -> str:
-    return f"scan-final-{canonical_text(run_id, 'run_id')}-{manifest_digest}"
-
-
 class ScanRepository:
     """Current-only CAS authority for canonical FINAL scan datasets."""
 
@@ -687,24 +665,10 @@ class ScanRepository:
         self._lock = threading.RLock()
         self._closed = False
         self._root_lease = RepositoryRootLease(self.root)
-        journal = None
         try:
             self._store = ContentAddressedStore(self.root / "content")
             self._store_authority = self._store.authority()
-            journal = PersistentCommitJournal(
-                self.root / "scan-commit.journal",
-                self.repository_id,
-            )
-            self._coordinator: RepositoryCommitCoordinator[
-                ScanArtifactRef
-            ] = RepositoryCommitCoordinator(
-                journal,
-                self._recover,
-                root_lease=self._root_lease,
-            )
         except BaseException:
-            if journal is not None:
-                journal.close()
             self._root_lease.close()
             raise
 
@@ -728,7 +692,7 @@ class ScanRepository:
         with self._lock:
             if self._closed:
                 return
-            self._coordinator.close()
+            self._root_lease.close()
             self._closed = True
 
     def __enter__(self) -> "ScanRepository":
@@ -771,25 +735,6 @@ class ScanRepository:
         ) != tuple(item.fingerprint for item in pulses):
             raise RuntimeError("scan lineage CAS identity differs from its owner")
         return _StagedScanLineage(program_ref, compiled_refs)
-
-    def _require_final_commit(self, reference: ScanArtifactRef) -> CommitIntent:
-        with self._lock:
-            self._require_open()
-            self._validate_reference(reference)
-            matching = self._coordinator.committed_for(
-                _target(self.repository_id, reference)
-            )
-            if not matching:
-                raise PermissionError("scan lacks FINAL commit authority")
-            if len(matching) != 1:
-                raise ValueError("scan has multiple FINAL authorities")
-            intent = matching[0]
-            if intent.commit_id != _commit_id(
-                intent.run_id,
-                reference.manifest_digest,
-            ):
-                raise ValueError("scan commit identity is inconsistent")
-            return intent
 
     def _load_index(
         self,
@@ -867,27 +812,25 @@ class ScanRepository:
             output_ref=stored.output_dataset_ref,
             provenance=stored.provenance,
         )
+        for blob in (stored.values_blob, stored.validity_blob):
+            authority.verify_blob(blob)
         return stored
 
     def admit(self, reference: ScanArtifactRef) -> ScanArtifact:
         with self._root_lease.borrow() as borrow:
             borrow.require_active()
-            intent = self._require_final_commit(reference)
+            self._validate_reference(reference)
             stored = self._load_stored(reference)
             return self._artifact_from_stored(
                 reference,
                 stored,
-                intent,
             )
 
     @staticmethod
     def _artifact_from_stored(
         reference: ScanArtifactRef,
         stored: _StoredScan,
-        intent: CommitIntent,
     ) -> ScanArtifact:
-        if stored.provenance.trace_binding.run_id != intent.run_id:
-            raise ValueError("scan artifact differs from its FINAL commit intent")
         return ScanArtifact(
             reference,
             stored.execution,
@@ -910,12 +853,10 @@ class ScanRepository:
             abort_check()
         with self._root_lease.borrow() as borrow:
             borrow.require_active()
-            intent = self._require_final_commit(reference)
+            self._validate_reference(reference)
             index = self._load_index(reference)
             if abort_check is not None:
                 abort_check()
-            if index.provenance.trace_binding.run_id != intent.run_id:
-                raise ValueError("scan index differs from its FINAL commit intent")
             authority = self._content_authority()
             if abort_check is not None:
                 abort_check()
@@ -985,14 +926,17 @@ class ScanRepository:
     def has(self, reference: ScanArtifactRef) -> bool:
         with self._root_lease.borrow() as borrow:
             borrow.require_active()
+            self._validate_reference(reference)
+            authority = self._content_authority()
             try:
-                self._require_final_commit(reference)
-            except PermissionError:
+                payload = authority.read_manifest(
+                    SCAN_ARTIFACT_NAMESPACE,
+                    reference.manifest_digest,
+                )
+            except FileNotFoundError:
                 return False
-            return self._content_authority().has_manifest(
-                SCAN_ARTIFACT_NAMESPACE,
-                reference.manifest_digest,
-            )
+            self._load_stored(reference, manifest_payload=payload)
+            return True
 
     def _stage_result(
         self,
@@ -1036,7 +980,7 @@ class ScanRepository:
         self,
         context: PostSafetyContext,
         prepared: _PreparedScanDataset,
-    ) -> FinalCommit[ScanArtifactRef]:
+    ) -> PreparedArtifactCommit[ScanArtifactRef]:
         if not isinstance(context, PostSafetyContext):
             raise TypeError("scan commit requires PostSafetyContext")
         if type(prepared) is not _PreparedScanDataset:
@@ -1049,87 +993,65 @@ class ScanRepository:
             reference, payload = self._stage_result(prepared)
             if context.authorize_commit_preparation() != run_id:
                 raise RuntimeError("scan commit subject changed while staging")
-            target = _target(self.repository_id, reference)
 
-            def publish() -> PublishedManifest[ScanArtifactRef]:
-                publish_manifest_with_visibility_reconciliation(
-                    self._content_authority(),
+            def publish(manifest_payload: bytes) -> None:
+                stored = self._content_authority().publish_manifest(
                     SCAN_ARTIFACT_NAMESPACE,
-                    payload,
+                    manifest_payload,
                     expected_digest=reference.manifest_digest,
                 )
-                return PublishedManifest(
-                    reference.target_ref,
-                    reference.manifest_digest,
-                    reference,
-                )
+                if stored.content.digest != reference.manifest_digest:
+                    raise RuntimeError("published scan manifest digest changed")
 
-            with self._lock:
-                self._require_open()
-                operation = self._coordinator.prepare(
-                    _commit_id(run_id, reference.manifest_digest),
-                    run_id,
-                    target,
-                    publish,
+            def inspect(manifest_payload: bytes) -> bool | None:
+                authority = self._content_authority()
+                try:
+                    durable_payload = authority.confirm_manifest_durable(
+                        SCAN_ARTIFACT_NAMESPACE,
+                        reference.manifest_digest,
+                    )
+                except FileNotFoundError:
+                    return False
+                except OSError:
+                    return None
+                if durable_payload != manifest_payload:
+                    raise ContentCorruptionError(
+                        "visible scan manifest differs from prepared payload"
+                    )
+                try:
+                    stored_scan = self._load_stored(
+                        reference,
+                        manifest_payload=durable_payload,
+                    )
+                except FileNotFoundError as error:
+                    raise ContentCorruptionError(
+                        "visible scan manifest references missing content"
+                    ) from error
+                except OSError:
+                    return None
+                if stored_scan.provenance.trace_binding.run_id != run_id:
+                    raise ValueError("visible scan provenance belongs to another Run")
+                return True
+
+            commit_borrow = self._root_lease.borrow()
+            try:
+                operation = PreparedArtifactCommit(
+                    run_id=run_id,
+                    result=reference,
+                    manifest_payload=payload,
+                    publish=publish,
+                    inspect=inspect,
+                    repository_borrow=commit_borrow,
                 )
+            except BaseException:
+                commit_borrow.close()
+                raise
         try:
-            context._track_prepared_commit(operation)
+            context.track_prepared_commit(operation)
         except BaseException:
             operation.abandon()
             raise
         return operation
-
-    def _recover(
-        self,
-        intent: CommitIntent,
-    ) -> PublishedManifest[ScanArtifactRef] | None:
-        target = intent.target
-        if (
-            target.repository_id != self.repository_id
-            or target.artifact_kind != _SCAN_ARTIFACT_KIND
-            or target.artifact_format != SCAN_MANIFEST_SCHEMA
-        ):
-            raise ValueError("commit intent is not a scan target")
-        reference = ScanArtifactRef(
-            self.repository_id,
-            target.expected_manifest_digest,
-        )
-        if target.target_ref != reference.target_ref or intent.commit_id != _commit_id(
-            intent.run_id,
-            reference.manifest_digest,
-        ):
-            raise ValueError("scan commit identity differs from its target")
-        authority = self._content_authority()
-        try:
-            payload = authority.read_manifest(
-                SCAN_ARTIFACT_NAMESPACE,
-                reference.manifest_digest,
-            )
-        except FileNotFoundError:
-            return None
-        stored = self._load_stored(
-            reference,
-            manifest_payload=payload,
-        )
-        if stored.provenance.trace_binding.run_id != intent.run_id:
-            raise ValueError("visible scan differs from pending commit intent")
-        for blob in (
-            stored.pulse_program_blob,
-            *stored.compiled_pulse_blobs,
-            stored.values_blob,
-            stored.validity_blob,
-        ):
-            authority.verify_blob(blob)
-        if authority.confirm_manifest_durable(
-            SCAN_ARTIFACT_NAMESPACE,
-            reference.manifest_digest,
-        ) != payload:
-            raise RuntimeError("recovery durability check changed scan manifest")
-        return PublishedManifest(
-            reference.target_ref,
-            reference.manifest_digest,
-            reference,
-        )
 
 
 __all__ = [

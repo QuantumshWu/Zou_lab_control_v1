@@ -329,14 +329,21 @@ def test_public_current_capture_is_one_autonomous_fire_with_exact_reconciliation
         from pathlib import Path
         import sys
 
-        from Zou_lab_control.api import connect
+        from Zou_lab_control.api import WorkspacePaths, connect
         from zlc_pulse import load_pulse_document
 
         workspace = Path(sys.argv[1])
         document = load_pulse_document(
             Path("pulses/imaging_template.json")
         )
-        experiment = connect("virtual", repository=workspace, seed=7)
+        experiment = connect(
+            "virtual",
+            workspace=WorkspacePaths.for_workspace(
+                Path.cwd(),
+                repository_root=workspace,
+            ),
+            seed=7,
+        )
         try:
             request = experiment.readout.capture_request(
                 document,
@@ -392,7 +399,7 @@ def test_public_current_capture_is_one_autonomous_fire_with_exact_reconciliation
 def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest(
     tmp_path,
 ):
-    from Zou_lab_control.api import connect
+    from Zou_lab_control.api import WorkspacePaths, connect
 
     class RecordingPreview:
         def __init__(self, spec) -> None:
@@ -431,7 +438,10 @@ def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest
 
     experiment = connect(
         "virtual",
-        repository=tmp_path / "preview-selection",
+        workspace=WorkspacePaths.for_workspace(
+            ROOT,
+            repository_root=tmp_path / "preview-selection",
+        ),
         seed=7,
     )
     ports = []

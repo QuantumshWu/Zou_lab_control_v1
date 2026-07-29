@@ -3,9 +3,8 @@
 The repository has one job: make an already computed
 ``CalibrationAnalysisResult`` atomically visible.  Scientific validation lives
 in the calibration/analysis values; canonical encoding lives in the
-capability-local ``codec``; durability lives in ``zlc_storage`` and the
-generic commit coordinator.  This module deliberately adds no second proof
-graph.
+capability-local ``codec``; durability lives in ``zlc_storage``.  The canonical
+CAS manifest is the sole durable visibility authority.
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from zlc_storage import (
     ContentAddressedStore,
+    ContentCorruptionError,
     ContentRef,
     ContentStoreAuthority,
     RepositoryRootLease,
@@ -36,13 +36,7 @@ from zlc_neutral_atom.capture.reference import (
     CaptureArtifactRef,
 )
 from zlc_neutral_atom.runtime.commit import (
-    CommitIntent,
-    CommitTarget,
-    FinalCommit,
-    PersistentCommitJournal,
-    PublishedManifest,
-    RepositoryCommitCoordinator,
-    publish_manifest_with_visibility_reconciliation,
+    PreparedArtifactCommit,
 )
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime._failure import record_secondary_failure
@@ -93,11 +87,11 @@ if TYPE_CHECKING:
 
 
 CALIBRATION_MANIFEST_FORMAT = "zlc_neutral_atom.logic_nodes.readout.calibration.manifest"
-_CALIBRATION_ARTIFACT_KIND = "calibration"
 _MANIFEST_FIELDS = frozenset(
     {
         "format",
         "repository_id",
+        "run_id",
         "artifact_blob",
         "report_blob",
     }
@@ -111,19 +105,22 @@ _PreparedCalibrationAnalysis = tuple[
 
 def _manifest_payload(
     repository_id: str,
+    run_id: str,
     artifact_blob: ContentRef,
     report_blob: ContentRef,
 ) -> bytes:
     """Encode the sole current manifest shape.
 
-    The one plain format name makes the persistent root self-identifying; the
-    remaining fields are only repository ownership and two content references.
+    The format and repository identify the durable owner; ``run_id`` carries
+    the artifact's execution provenance, and the two content references bind
+    the scientific result and its report.
     """
 
     return encode(
         {
             "format": CALIBRATION_MANIFEST_FORMAT,
             "repository_id": repository_id,
+            "run_id": canonical_text(run_id, "run_id"),
             "artifact_blob": content_ref_to_tree(artifact_blob),
             "report_blob": content_ref_to_tree(report_blob),
         },
@@ -132,7 +129,7 @@ def _manifest_payload(
 
 def _decode_manifest(
     payload: bytes,
-) -> tuple[str, ContentRef, ContentRef]:
+) -> tuple[str, str, ContentRef, ContentRef]:
     if not isinstance(payload, bytes):
         raise TypeError("calibration manifest payload must be bytes")
     tree = exact_mapping(
@@ -142,39 +139,24 @@ def _decode_manifest(
         discriminator="format",
     )
     repository_id = canonical_text(tree["repository_id"], "repository_id")
+    run_id = canonical_text(tree["run_id"], "run_id")
     artifact_blob = content_ref_from_tree(tree["artifact_blob"])
     report_blob = content_ref_from_tree(tree["report_blob"])
     if (
         _manifest_payload(
             repository_id,
+            run_id,
             artifact_blob,
             report_blob,
         )
         != payload
     ):
         raise ValueError("calibration manifest is not canonical current format")
-    return repository_id, artifact_blob, report_blob
-
-
-def _target(
-    repository_id: str,
-    reference: CalibrationArtifactRef,
-) -> CommitTarget:
-    return CommitTarget(
-        repository_id,
-        _CALIBRATION_ARTIFACT_KIND,
-        CALIBRATION_MANIFEST_FORMAT,
-        reference.target_ref,
-        reference.manifest_digest,
-    )
-
-
-def _commit_id(run_id: str, manifest_digest: str) -> str:
-    return f"calibration-final-{run_id}-{manifest_digest}"
+    return repository_id, run_id, artifact_blob, report_blob
 
 
 class CalibrationRepository:
-    """Content-addressed calibration store with final-commit visibility."""
+    """Content-addressed calibration store with manifest-only visibility."""
 
     def __init__(
         self,
@@ -187,26 +169,10 @@ class CalibrationRepository:
         self._lock = threading.RLock()
         self._closed = False
         self._root_lease = RepositoryRootLease(self.root)
-        journal = None
         try:
             self._store = ContentAddressedStore(self.root / "content")
             self._store_authority = self._store.authority()
-            journal = PersistentCommitJournal(
-                self.root / "calibration-commit.journal",
-                self.repository_id,
-            )
-            # Construction performs synchronous recovery.  _recover therefore
-            # relies only on fields initialized above, never on _coordinator.
-            self._coordinator: RepositoryCommitCoordinator[
-                CalibrationArtifactRef
-            ] = RepositoryCommitCoordinator(
-                journal,
-                self._recover,
-                root_lease=self._root_lease,
-            )
         except BaseException:
-            if journal is not None:
-                journal.close()
             self._root_lease.close()
             raise
 
@@ -219,7 +185,7 @@ class CalibrationRepository:
         with self._lock:
             if self._closed:
                 return
-            self._coordinator.close()
+            self._root_lease.close()
             self._closed = True
 
     def __enter__(self) -> "CalibrationRepository":
@@ -256,51 +222,34 @@ class CalibrationRepository:
             self._require_open()
             return self._store_authority
 
-    def _require_final_commit(
-        self,
-        reference: CalibrationArtifactRef,
-    ) -> None:
-        """Require the journal linearization point for one public reference."""
-
-        with self._lock:
-            self._require_open()
-            self._validate_reference(reference)
-            target = _target(self.repository_id, reference)
-            matching = self._coordinator.committed_for(target)
-            if not matching:
-                raise PermissionError(
-                    "calibration lacks FINAL commit authority"
-                )
-            for intent in matching:
-                if intent.commit_id != _commit_id(
-                    intent.run_id,
-                    reference.manifest_digest,
-                ):
-                    raise ValueError("calibration commit identity is inconsistent")
-
     def _storage_refs(
         self,
         reference: CalibrationArtifactRef,
         *,
         manifest_payload: bytes | None = None,
-    ) -> tuple[ContentRef, ContentRef]:
+    ) -> tuple[str, ContentRef, ContentRef]:
+        self._validate_reference(reference)
         payload = (
             self._read_manifest(reference)
             if manifest_payload is None
             else manifest_payload
         )
-        repository_id, artifact_ref, report_ref = _decode_manifest(payload)
+        repository_id, run_id, artifact_ref, report_ref = _decode_manifest(payload)
         if repository_id != self.repository_id:
             raise ValueError("calibration manifest belongs to another repository")
-        return artifact_ref, report_ref
+        return run_id, artifact_ref, report_ref
 
     def _materialize_artifact(
         self,
         artifact_ref: ContentRef,
     ) -> CalibrationArtifact:
-        return decode_calibration_artifact(
-            self._content_authority().read_blob(artifact_ref)
-        )
+        try:
+            payload = self._content_authority().read_blob(artifact_ref)
+        except FileNotFoundError as error:
+            raise ContentCorruptionError(
+                "visible calibration manifest references a missing artifact blob"
+            ) from error
+        return decode_calibration_artifact(payload)
 
     def _report_storage_refs(
         self,
@@ -308,7 +257,12 @@ class CalibrationRepository:
         reference: ContentRef,
     ) -> tuple[bytes, ContentRef, ContentRef]:
         authority = self._content_authority()
-        payload = authority.read_blob(reference)
+        try:
+            payload = authority.read_blob(reference)
+        except FileNotFoundError as error:
+            raise ContentCorruptionError(
+                "visible calibration manifest references a missing report blob"
+            ) from error
         average_ref, validity_ref = calibration_report_blob_refs(payload)
         pixels = math.prod(artifact.frame_contract.frame_schema.data_shape)
         expected = (pixels * 8, pixels)
@@ -330,9 +284,16 @@ class CalibrationRepository:
             artifact,
             reference,
         )
+        try:
+            average_payload = authority.read_blob(average_ref)
+            validity_payload = authority.read_blob(validity_ref)
+        except FileNotFoundError as error:
+            raise ContentCorruptionError(
+                "calibration report references missing array content"
+            ) from error
         average, validity = decode_calibration_report_arrays(
-            authority.read_blob(average_ref),
-            authority.read_blob(validity_ref),
+            average_payload,
+            validity_payload,
             image_shape=artifact.frame_contract.frame_schema.data_shape,
         )
         report = decode_calibration_report(
@@ -347,24 +308,22 @@ class CalibrationRepository:
         self,
         reference: CalibrationArtifactRef,
     ) -> CalibrationArtifact:
-        """Load a FINAL calibration artifact."""
+        """Load a calibration named by an exact visible manifest."""
 
         with self._root_lease.borrow() as read_borrow:
             read_borrow.require_active()
-            self._require_final_commit(reference)
-            artifact_ref, _report_ref = self._storage_refs(reference)
+            _run_id, artifact_ref, _report_ref = self._storage_refs(reference)
             return self._materialize_artifact(artifact_ref)
 
     def load_computation(
         self,
         reference: CalibrationArtifactRef,
     ) -> CalibrationComputation:
-        """Load one validated FINAL artifact/report pair."""
+        """Load one validated artifact/report pair."""
 
         with self._root_lease.borrow() as read_borrow:
             read_borrow.require_active()
-            self._require_final_commit(reference)
-            artifact_ref, report_ref = self._storage_refs(reference)
+            _run_id, artifact_ref, report_ref = self._storage_refs(reference)
             artifact = self._materialize_artifact(artifact_ref)
             return self._load_computation_ref(artifact, report_ref)
 
@@ -372,21 +331,36 @@ class CalibrationRepository:
         self,
         reference: CalibrationArtifactRef,
     ) -> CalibrationReport:
-        """Load FINAL diagnostics."""
+        """Load diagnostics for one visible calibration manifest."""
 
         return self.load_computation(reference).report
 
     def has(self, reference: CalibrationArtifactRef) -> bool:
         with self._root_lease.borrow() as read_borrow:
             read_borrow.require_active()
+            self._validate_reference(reference)
             try:
-                self._require_final_commit(reference)
-            except PermissionError:
+                payload = self._read_manifest(reference)
+            except FileNotFoundError:
                 return False
-            return self._content_authority().has_manifest(
-                CALIBRATION_ARTIFACT_NAMESPACE,
-                reference.manifest_digest,
-            )
+            try:
+                _run_id, artifact_ref, report_ref = self._storage_refs(
+                    reference,
+                    manifest_payload=payload,
+                )
+                artifact = self._materialize_artifact(artifact_ref)
+                _report_payload, average_ref, validity_ref = self._report_storage_refs(
+                    artifact,
+                    report_ref,
+                )
+                authority = self._content_authority()
+                authority.verify_blob(average_ref)
+                authority.verify_blob(validity_ref)
+            except FileNotFoundError as error:
+                raise ContentCorruptionError(
+                    "visible calibration manifest references missing content"
+                ) from error
+            return True
 
     @staticmethod
     def _validate_source_admission(
@@ -412,7 +386,7 @@ class CalibrationRepository:
         *,
         checkpoint: Callable[[], None] | None = None,
     ) -> ResolvedCalibration:
-        """Admit a FINAL target and validate its persisted source."""
+        """Admit a visible target and validate its persisted source."""
 
         from zlc_neutral_atom.capture.artifact import CaptureRepository
 
@@ -422,8 +396,7 @@ class CalibrationRepository:
             admission_borrow.require_active()
             with capture_repository._root_lease.borrow() as source_borrow:
                 source_borrow.require_active()
-                self._require_final_commit(reference)
-                artifact_ref, _report_ref = self._storage_refs(reference)
+                _run_id, artifact_ref, _report_ref = self._storage_refs(reference)
                 artifact = self._materialize_artifact(artifact_ref)
                 source_capture_ref = artifact.source_binding.source_capture_ref
                 source = capture_repository.admit(source_capture_ref)
@@ -442,6 +415,8 @@ class CalibrationRepository:
     def _stage_result(
         self,
         result: CalibrationAnalysisResult,
+        *,
+        run_id: str,
     ) -> tuple[CalibrationArtifactRef, bytes]:
         authority = self._content_authority()
         report = result.report
@@ -480,6 +455,7 @@ class CalibrationRepository:
         report_blob = authority.put_blob(report_payload)
         payload = _manifest_payload(
             self.repository_id,
+            run_id,
             artifact_blob,
             report_blob,
         )
@@ -493,7 +469,7 @@ class CalibrationRepository:
         self,
         context: PostSafetyContext,
         result: CalibrationAnalysisResult,
-    ) -> FinalCommit[CalibrationArtifactRef]:
+    ) -> PreparedArtifactCommit[CalibrationArtifactRef]:
         """Prepare publication from the exact admission retained by analysis."""
 
         from .analysis import CalibrationAnalysisResult
@@ -513,97 +489,78 @@ class CalibrationRepository:
         # first write and overlaps prepare() minting the commit-lifetime hold.
         with self._root_lease.borrow() as staging_borrow:
             staging_borrow.require_active()
-            reference, payload = self._stage_result(result)
+            reference, payload = self._stage_result(result, run_id=run_id)
             confirmed = context.authorize_commit_preparation()
             if confirmed != run_id:
                 raise RuntimeError("calibration commit subject changed while staging")
-            target = _target(self.repository_id, reference)
-
-            def publish() -> PublishedManifest[CalibrationArtifactRef]:
-                authority = self._content_authority()
-                publish_manifest_with_visibility_reconciliation(
-                    authority,
+            commit_borrow = self._root_lease.borrow()
+        try:
+            def publish(manifest_payload: bytes) -> None:
+                if manifest_payload != payload:
+                    raise ValueError("calibration commit payload changed after staging")
+                self._content_authority().publish_manifest(
                     CALIBRATION_ARTIFACT_NAMESPACE,
-                    payload,
+                    manifest_payload,
                     expected_digest=reference.manifest_digest,
                 )
-                return PublishedManifest(
-                    reference.target_ref,
-                    reference.manifest_digest,
-                    reference,
-                )
 
-            with self._lock:
-                self._require_open()
-                operation = self._coordinator.prepare(
-                    _commit_id(run_id, reference.manifest_digest),
-                    run_id,
-                    target,
-                    publish,
-                )
+            def inspect(manifest_payload: bytes) -> bool | None:
+                if manifest_payload != payload:
+                    raise ValueError("calibration inspection payload changed")
+                authority = self._content_authority()
+                try:
+                    confirmed_payload = authority.confirm_manifest_durable(
+                        CALIBRATION_ARTIFACT_NAMESPACE,
+                        reference.manifest_digest,
+                    )
+                except FileNotFoundError:
+                    return False
+                except OSError:
+                    return None
+                if confirmed_payload != manifest_payload:
+                    raise ContentCorruptionError(
+                        "calibration manifest differs from its immutable reference"
+                    )
+                try:
+                    stored_run_id, artifact_ref, report_ref = self._storage_refs(
+                        reference,
+                        manifest_payload=confirmed_payload,
+                    )
+                    if stored_run_id != run_id:
+                        raise ValueError(
+                            "visible calibration provenance belongs to another Run"
+                        )
+                    artifact = self._materialize_artifact(artifact_ref)
+                    _report_payload, average_ref, validity_ref = (
+                        self._report_storage_refs(artifact, report_ref)
+                    )
+                    authority.verify_blob(average_ref)
+                    authority.verify_blob(validity_ref)
+                except FileNotFoundError as error:
+                    raise ContentCorruptionError(
+                        "visible calibration manifest references missing content"
+                    ) from error
+                except OSError:
+                    return None
+                return True
+
+            operation = PreparedArtifactCommit(
+                run_id=run_id,
+                result=reference,
+                manifest_payload=payload,
+                publish=publish,
+                inspect=inspect,
+                repository_borrow=commit_borrow,
+            )
+        except BaseException:
+            commit_borrow.close()
+            raise
         try:
-            context._track_prepared_commit(operation)
+            context.track_prepared_commit(operation)
         except BaseException:
             operation.abandon()
             raise
         return operation
-
-    def _recover(
-        self,
-        intent: CommitIntent,
-    ) -> PublishedManifest[CalibrationArtifactRef] | None:
-        """Resolve one pending intent by inspecting, never publishing, storage."""
-
-        authority = self._content_authority()
-        target = intent.target
-        if (
-            target.repository_id != self.repository_id
-            or target.artifact_kind != _CALIBRATION_ARTIFACT_KIND
-            or target.artifact_format != CALIBRATION_MANIFEST_FORMAT
-        ):
-            raise ValueError("commit intent is not a calibration target")
-        reference = CalibrationArtifactRef(
-            self.repository_id,
-            target.expected_manifest_digest,
-        )
-        if target.target_ref != reference.target_ref:
-            raise ValueError("calibration target ref and digest differ")
-        if intent.commit_id != _commit_id(
-            intent.run_id,
-            reference.manifest_digest,
-        ):
-            raise ValueError("calibration commit id differs from its target")
-        try:
-            payload = authority.read_manifest(
-                CALIBRATION_ARTIFACT_NAMESPACE,
-                reference.manifest_digest,
-            )
-        except FileNotFoundError:
-            return None
-        # Once the visibility point exists, missing/corrupt blobs are a
-        # repository fault and startup remains fail-closed.
-        artifact_ref, report_ref = self._storage_refs(
-            reference,
-            manifest_payload=payload,
-        )
-        artifact = self._materialize_artifact(artifact_ref)
-        _report_payload, average_ref, validity_ref = self._report_storage_refs(
-            artifact,
-            report_ref,
-        )
-        authority.verify_blob(average_ref)
-        authority.verify_blob(validity_ref)
-        confirmed = authority.confirm_manifest_durable(
-            CALIBRATION_ARTIFACT_NAMESPACE,
-            reference.manifest_digest,
-        )
-        if confirmed != payload:
-            raise RuntimeError("recovery durability check changed manifest")
-        return PublishedManifest(
-            reference.target_ref,
-            reference.manifest_digest,
-            reference,
-        )
 
 
 def compile_calibration_artifact_plan(

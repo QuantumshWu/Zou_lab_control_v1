@@ -29,17 +29,12 @@ from zlc_neutral_atom.capture.reference import (
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime._failure import record_secondary_failure
 from zlc_neutral_atom.runtime.commit import (
-    CommitIntent,
-    CommitTarget,
-    FinalCommit,
-    PersistentCommitJournal,
-    PublishedManifest,
-    RepositoryCommitCoordinator,
-    publish_manifest_with_visibility_reconciliation,
+    PreparedArtifactCommit,
 )
 from zlc_neutral_atom.runtime.run import PostSafetyContext, RunContext, RunPlan
 from zlc_storage import (
     ContentAddressedStore,
+    ContentCorruptionError,
     ContentRef,
     ContentStoreAuthority,
     RepositoryRootLease,
@@ -91,7 +86,6 @@ from zlc_neutral_atom.runtime.resources import (
 
 OCCUPANCY_ARTIFACT_FORMAT = "zlc_neutral_atom.logic_nodes.readout.occupancy.storage"
 OCCUPANCY_MANIFEST_FORMAT = "zlc_neutral_atom.logic_nodes.readout.occupancy.manifest"
-_OCCUPANCY_ARTIFACT_KIND = "occupancy"
 _ARTIFACT_FIELDS = frozenset(
     {
         "format",
@@ -99,6 +93,7 @@ _ARTIFACT_FIELDS = frozenset(
         "calibration_ref",
         "readout_event_axis_id",
         "model_kind",
+        "run_id",
         "generation",
         "counts_schema",
         "occupied_schema",
@@ -118,6 +113,7 @@ class _StoredOccupancy:
     calibration_reference: CalibrationArtifactRef
     readout_event_axis_id: AxisId
     model_kind: ReadoutModelKind
+    run_id: str
     generation: StreamGenerationId
     counts_schema: DatasetSchema
     occupied_schema: DatasetSchema
@@ -134,8 +130,11 @@ class _StoredOccupancy:
             raise TypeError("readout_event_axis_id must be AxisId")
         if not isinstance(self.model_kind, ReadoutModelKind):
             raise TypeError("model_kind must be ReadoutModelKind")
+        run_id = canonical_text(self.run_id, "run_id")
         if not isinstance(self.generation, StreamGenerationId):
             raise TypeError("generation must be StreamGenerationId")
+        if self.generation != _occupancy_generation_for_run(run_id):
+            raise ValueError("occupancy generation differs from its canonical Run")
         _require_occupancy_output_schemas(
             self.counts_schema,
             self.occupied_schema,
@@ -165,6 +164,7 @@ def _artifact_to_tree(value: _StoredOccupancy) -> dict[str, object]:
         ),
         "readout_event_axis_id": value.readout_event_axis_id.value,
         "model_kind": value.model_kind.value,
+        "run_id": value.run_id,
         "generation": value.generation.value,
         "counts_schema": dataset_schema_to_tree(value.counts_schema),
         "occupied_schema": dataset_schema_to_tree(value.occupied_schema),
@@ -190,6 +190,7 @@ def _artifact_from_tree(tree: object) -> _StoredOccupancy:
         ReadoutModelKind(
             canonical_text(data["model_kind"], "model_kind")
         ),
+        canonical_text(data["run_id"], "run_id"),
         StreamGenerationId(canonical_text(data["generation"], "generation")),
         dataset_schema_from_tree(data["counts_schema"]),
         dataset_schema_from_tree(data["occupied_schema"]),
@@ -284,22 +285,8 @@ def _decode_manifest(payload: bytes) -> tuple[str, ContentRef]:
     return repository_id, metadata_blob
 
 
-def _target(repository_id: str, reference: OccupancyArtifactRef) -> CommitTarget:
-    return CommitTarget(
-        repository_id,
-        _OCCUPANCY_ARTIFACT_KIND,
-        OCCUPANCY_MANIFEST_FORMAT,
-        reference.target_ref,
-        reference.manifest_digest,
-    )
-
-
-def _commit_id(run_id: str, manifest_digest: str) -> str:
-    return f"occupancy-final-{run_id}-{manifest_digest}"
-
-
 class OccupancyRepository:
-    """Content-addressed occupancy store with FINAL visibility authority."""
+    """Content-addressed occupancy store with manifest-only visibility."""
 
     def __init__(
         self,
@@ -312,24 +299,10 @@ class OccupancyRepository:
         self._lock = threading.RLock()
         self._closed = False
         self._root_lease = RepositoryRootLease(self.root)
-        journal = None
         try:
             self._store = ContentAddressedStore(self.root / "content")
             self._store_authority = self._store.authority()
-            journal = PersistentCommitJournal(
-                self.root / "occupancy-commit.journal",
-                self.repository_id,
-            )
-            self._coordinator: RepositoryCommitCoordinator[
-                OccupancyArtifactRef
-            ] = RepositoryCommitCoordinator(
-                journal,
-                self._recover,
-                root_lease=self._root_lease,
-            )
         except BaseException:
-            if journal is not None:
-                journal.close()
             self._root_lease.close()
             raise
 
@@ -342,7 +315,7 @@ class OccupancyRepository:
         with self._lock:
             if self._closed:
                 return
-            self._coordinator.close()
+            self._root_lease.close()
             self._closed = True
 
     def __enter__(self) -> "OccupancyRepository":
@@ -370,41 +343,13 @@ class OccupancyRepository:
         if reference.repository_id != self.repository_id:
             raise ValueError("OccupancyArtifactRef belongs to another repository")
 
-    def _require_final_commit(
-        self,
-        reference: OccupancyArtifactRef,
-    ) -> CommitIntent:
-        with self._lock:
-            self._require_open()
-            self._validate_reference(reference)
-            target = _target(self.repository_id, reference)
-            matching = self._coordinator.committed_for(target)
-            if not matching:
-                raise PermissionError("occupancy lacks FINAL commit authority")
-            if len(matching) != 1:
-                raise ValueError("occupancy has multiple FINAL authorities")
-            intent = matching[0]
-            if intent.commit_id != _commit_id(
-                intent.run_id,
-                reference.manifest_digest,
-            ):
-                raise ValueError("occupancy commit identity is inconsistent")
-            return intent
-
-    @staticmethod
-    def _require_run_generation(
-        artifact: OccupancyArtifact | _StoredOccupancy,
-        intent: CommitIntent,
-    ) -> None:
-        if artifact.generation != _occupancy_generation_for_run(intent.run_id):
-            raise ValueError("occupancy generation differs from its FINAL Run")
-
     def _stored(
         self,
         reference: OccupancyArtifactRef,
         *,
         manifest_payload: bytes | None = None,
     ) -> _StoredOccupancy:
+        self._validate_reference(reference)
         authority = self._content_authority()
         if manifest_payload is None:
             payload = authority.read_manifest(
@@ -416,7 +361,13 @@ class OccupancyRepository:
         repository_id, metadata_ref = _decode_manifest(payload)
         if repository_id != self.repository_id:
             raise ValueError("occupancy manifest belongs to another repository")
-        return _decode_artifact(authority.read_blob(metadata_ref))
+        try:
+            metadata = authority.read_blob(metadata_ref)
+        except FileNotFoundError as error:
+            raise ContentCorruptionError(
+                "visible occupancy manifest references missing metadata"
+            ) from error
+        return _decode_artifact(metadata)
 
     @staticmethod
     def _expected_blob_sizes(
@@ -467,7 +418,14 @@ class OccupancyRepository:
         resolved = binding.resolved_schema
         authority = self._content_authority()
         shape = resolved.counts_schema.physical_shape
-        validity_payload = authority.read_blob(stored.validity_blob)
+        try:
+            validity_payload = authority.read_blob(stored.validity_blob)
+            counts_payload = authority.read_blob(stored.counts_blob)
+            occupied_payload = authority.read_blob(stored.occupied_blob)
+        except FileNotFoundError as error:
+            raise ContentCorruptionError(
+                "visible occupancy manifest references missing array content"
+            ) from error
         validity = DatasetComponentValidity(
             (resolved.selected_model.feature.site_axis.axis_id,),
             _decode_array_payload(
@@ -478,7 +436,6 @@ class OccupancyRepository:
             ),
         )
         del validity_payload
-        counts_payload = authority.read_blob(stored.counts_blob)
         counts = DataBlock(
             OCCUPANCY_COUNTS_BLOCK_ID,
             source.artifact.frame_source.revision,
@@ -492,7 +449,6 @@ class OccupancyRepository:
             resolved.counts_schema,
         )
         del counts_payload
-        occupied_payload = authority.read_blob(stored.occupied_blob)
         occupied = DataBlock(
             OCCUPANCY_OCCUPIED_BLOCK_ID,
             source.artifact.frame_source.revision,
@@ -531,9 +487,7 @@ class OccupancyRepository:
                 with calibration_repository._root_lease.borrow() as calibration_borrow:
                     source_borrow.require_active()
                     calibration_borrow.require_active()
-                    intent = self._require_final_commit(reference)
                     stored = self._stored(reference)
-                    self._require_run_generation(stored, intent)
                     calibration = calibration_repository.admit(
                         stored.calibration_reference,
                         capture_repository,
@@ -572,18 +526,34 @@ class OccupancyRepository:
     def has(self, reference: OccupancyArtifactRef) -> bool:
         with self._root_lease.borrow() as read_borrow:
             read_borrow.require_active()
+            self._validate_reference(reference)
+            authority = self._content_authority()
             try:
-                self._require_final_commit(reference)
-            except PermissionError:
+                payload = authority.read_manifest(
+                    OCCUPANCY_ARTIFACT_NAMESPACE,
+                    reference.manifest_digest,
+                )
+            except FileNotFoundError:
                 return False
-            return self._content_authority().has_manifest(
-                OCCUPANCY_ARTIFACT_NAMESPACE,
-                reference.manifest_digest,
-            )
+            stored = self._stored(reference, manifest_payload=payload)
+            try:
+                for blob in (
+                    stored.counts_blob,
+                    stored.occupied_blob,
+                    stored.validity_blob,
+                ):
+                    authority.verify_blob(blob)
+            except FileNotFoundError as error:
+                raise ContentCorruptionError(
+                    "visible occupancy manifest references missing array content"
+                ) from error
+            return True
 
     def _stage_result(
         self,
         artifact: OccupancyArtifact,
+        *,
+        run_id: str,
     ) -> tuple[OccupancyArtifactRef, bytes]:
         if not isinstance(artifact, OccupancyArtifact):
             raise TypeError("artifact must be OccupancyArtifact")
@@ -615,6 +585,7 @@ class OccupancyRepository:
             artifact.calibration_reference,
             artifact.readout_event_axis_id,
             artifact.model_kind,
+            canonical_text(run_id, "run_id"),
             artifact.generation,
             artifact.counts.schema,
             artifact.occupied.schema,
@@ -644,7 +615,7 @@ class OccupancyRepository:
         context: PostSafetyContext,
         artifact: OccupancyArtifact,
         resolved: _ResolvedCommittedOccupancy,
-    ) -> FinalCommit[OccupancyArtifactRef]:
+    ) -> PreparedArtifactCommit[OccupancyArtifactRef]:
         if not isinstance(context, PostSafetyContext):
             raise TypeError("occupancy commit requires PostSafetyContext")
         if not isinstance(artifact, OccupancyArtifact):
@@ -672,88 +643,77 @@ class OccupancyRepository:
             raise ValueError("occupancy revision differs from the admitted source")
         with self._root_lease.borrow() as staging_borrow:
             staging_borrow.require_active()
-            reference, payload = self._stage_result(artifact)
+            reference, payload = self._stage_result(artifact, run_id=run_id)
             if context.authorize_commit_preparation() != run_id:
                 raise RuntimeError("occupancy commit subject changed while staging")
-            target = _target(self.repository_id, reference)
-
-            def publish() -> PublishedManifest[OccupancyArtifactRef]:
-                publish_manifest_with_visibility_reconciliation(
-                    self._content_authority(),
+            commit_borrow = self._root_lease.borrow()
+        try:
+            def publish(manifest_payload: bytes) -> None:
+                if manifest_payload != payload:
+                    raise ValueError("occupancy commit payload changed after staging")
+                self._content_authority().publish_manifest(
                     OCCUPANCY_ARTIFACT_NAMESPACE,
-                    payload,
+                    manifest_payload,
                     expected_digest=reference.manifest_digest,
                 )
-                return PublishedManifest(
-                    reference.target_ref,
-                    reference.manifest_digest,
-                    reference,
-                )
 
-            with self._lock:
-                self._require_open()
-                operation = self._coordinator.prepare(
-                    _commit_id(run_id, reference.manifest_digest),
-                    run_id,
-                    target,
-                    publish,
-                )
+            def inspect(manifest_payload: bytes) -> bool | None:
+                if manifest_payload != payload:
+                    raise ValueError("occupancy inspection payload changed")
+                authority = self._content_authority()
+                try:
+                    confirmed_payload = authority.confirm_manifest_durable(
+                        OCCUPANCY_ARTIFACT_NAMESPACE,
+                        reference.manifest_digest,
+                    )
+                except FileNotFoundError:
+                    return False
+                except OSError:
+                    return None
+                if confirmed_payload != manifest_payload:
+                    raise ContentCorruptionError(
+                        "occupancy manifest differs from its immutable reference"
+                    )
+                try:
+                    stored = self._stored(
+                        reference,
+                        manifest_payload=confirmed_payload,
+                    )
+                    if stored.run_id != run_id:
+                        raise ValueError(
+                            "visible occupancy provenance belongs to another Run"
+                        )
+                    for blob in (
+                        stored.counts_blob,
+                        stored.occupied_blob,
+                        stored.validity_blob,
+                    ):
+                        authority.verify_blob(blob)
+                except FileNotFoundError as error:
+                    raise ContentCorruptionError(
+                        "visible occupancy manifest references missing content"
+                    ) from error
+                except OSError:
+                    return None
+                return True
+
+            operation = PreparedArtifactCommit(
+                run_id=run_id,
+                result=reference,
+                manifest_payload=payload,
+                publish=publish,
+                inspect=inspect,
+                repository_borrow=commit_borrow,
+            )
+        except BaseException:
+            commit_borrow.close()
+            raise
         try:
-            context._track_prepared_commit(operation)
+            context.track_prepared_commit(operation)
         except BaseException:
             operation.abandon()
             raise
         return operation
-
-    def _recover(
-        self,
-        intent: CommitIntent,
-    ) -> PublishedManifest[OccupancyArtifactRef] | None:
-        target = intent.target
-        if (
-            target.repository_id != self.repository_id
-            or target.artifact_kind != _OCCUPANCY_ARTIFACT_KIND
-            or target.artifact_format != OCCUPANCY_MANIFEST_FORMAT
-        ):
-            raise ValueError("commit intent is not an occupancy target")
-        reference = OccupancyArtifactRef(
-            self.repository_id,
-            target.expected_manifest_digest,
-        )
-        if target.target_ref != reference.target_ref or (
-            intent.commit_id
-            != _commit_id(intent.run_id, reference.manifest_digest)
-        ):
-            raise ValueError("occupancy commit identity differs from its target")
-        authority = self._content_authority()
-        try:
-            payload = authority.read_manifest(
-                OCCUPANCY_ARTIFACT_NAMESPACE,
-                reference.manifest_digest,
-            )
-        except FileNotFoundError:
-            return None
-        stored = self._stored(
-            reference,
-            manifest_payload=payload,
-        )
-        self._require_run_generation(stored, intent)
-        for blob in (
-            stored.counts_blob,
-            stored.occupied_blob,
-            stored.validity_blob,
-        ):
-            authority.verify_blob(blob)
-        if authority.confirm_manifest_durable(
-            OCCUPANCY_ARTIFACT_NAMESPACE,
-            reference.manifest_digest,
-        ) != payload:
-            raise RuntimeError("recovery durability check changed occupancy manifest")
-        return PublishedManifest(
-            reference.target_ref,
-            reference.manifest_digest,
-            reference,
-        )
 
 
 _PreparedOccupancyAnalysis = tuple[

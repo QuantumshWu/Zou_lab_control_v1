@@ -18,7 +18,6 @@ from typing import Any
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from zlc_storage.paths import display_path
 from zlc_frontend.form import (
     FormChoice,
     FormFieldProps,
@@ -640,11 +639,11 @@ class _PathHandler(_StaticHandler):
     def build(self, field, value, on_change, context=None):
         del context
         picker = FluentPathEdit(
-            display_path(self.normalize(field, value)),
+            self.normalize(field, value),
             mode=field.path_mode,
             caption=f"Choose {field.label}",
             file_filter=field.file_filter,
-            base_dir=display_path(field.base_dir),
+            base_dir=field.base_dir,
         )
         picker.setToolTip(field.description)
         _connect_change(picker.changed, on_change)
@@ -654,7 +653,7 @@ class _PathHandler(_StaticHandler):
         return self.normalize(field, widget.text())
 
     def write(self, field, widget, value):
-        widget.setText(display_path(self.normalize(field, value)))
+        widget.setText(self.normalize(field, value))
 
     def is_empty(self, field, widget):
         del field

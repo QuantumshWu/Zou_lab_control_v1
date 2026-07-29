@@ -7,7 +7,7 @@ import time
 
 import pytest
 import zlc_pulse.server as server_module
-from conftest import pulse_backend_completion_for
+from conftest import private_pulse_backend_snapshot, pulse_backend_completion_for
 
 from fpga.pulse_streamer.host.image import StreamerParams
 from zlc_pulse import (
@@ -23,6 +23,7 @@ from zlc_pulse import (
     encode_completion_message,
     encode_prepared_ref_message,
     load_pulse_document,
+    pulse_server_snapshot_to_tree,
     pulse_target_manifest_from_lanes,
 )
 
@@ -43,31 +44,45 @@ class RecordingBackend:
         self.prepared = None
         self.done = True
         self.fail_safe = False
+        self.state = "IDLE"
+        self.scan_points = 0
 
     def prepare(self, artifact):
         self.actions.append(("prepare", artifact.fingerprint))
         self.prepared = artifact
+        self.state = "PREPARED"
+        self.scan_points = len(artifact.target_ir.scan_points)
 
     def fire(self, artifact):
         assert artifact is self.prepared
         self.actions.append(("fire", artifact.fingerprint))
+        self.state = "RUNNING"
 
     def await_completion(self, artifact, timeout):
         assert artifact is self.prepared
         self.actions.append(("await_completion", artifact.fingerprint, timeout))
-        return pulse_backend_completion_for(artifact) if self.done else None
+        if not self.done:
+            return None
+        self.state = "DONE"
+        return pulse_backend_completion_for(artifact)
 
     def safe_state(self):
         self.actions.append(("safe",))
         if self.fail_safe:
             raise RuntimeError("safe readback failed")
         self.prepared = None
+        self.state = "SAFE"
 
     def request_interrupt(self):
         pass
 
     def snapshot(self):
-        return {"prepared": self.prepared is not None}
+        return private_pulse_backend_snapshot(
+            state=self.state,
+            raw_lane_count=len(_service_manifest().target.raw_lanes),
+            artifact=self.prepared,
+            scan_point_count=self.scan_points,
+        )
 
 
 def _artifact(params=None, execution_form=PulseExecutionForm.STATIC_ONCE):
@@ -88,6 +103,7 @@ def test_server_executes_one_exact_current_artifact_and_returns_schedule_receipt
         _service_manifest(),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
         connection_generation="server-generation-1",
     )
 
@@ -104,7 +120,8 @@ def test_server_executes_one_exact_current_artifact_and_returns_schedule_receipt
         "await_completion",
     ]
     snapshot = service.snapshot()
-    assert set(snapshot) == {
+    tree = pulse_server_snapshot_to_tree(snapshot)
+    assert set(tree) == {
         "schema",
         "connection_generation",
         "manifest",
@@ -112,9 +129,17 @@ def test_server_executes_one_exact_current_artifact_and_returns_schedule_receipt
         "geometry_fingerprint",
         "state",
         "prepared_ref",
-        "backend",
+        "physical_state",
+        "physical_prepared_artifact_digest",
+        "physical_scan_point_count",
+        "physical_scan_cursor",
+        "physical_cursor_sample_count",
+        "physical_underflow_observed",
+        "safe_status_word",
+        "safe_clock_enable_words",
     }
-    assert snapshot["state"] == "DONE"
+    assert snapshot.state == "DONE"
+    assert snapshot.physical_state == "DONE"
 
 
 def test_server_messages_are_current_canonical_owner_codecs():
@@ -124,6 +149,7 @@ def test_server_messages_are_current_canonical_owner_codecs():
         _service_manifest(),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
         connection_generation="server-generation-1",
     )
     decoded = decode_artifact_message(encode_artifact_message(artifact))
@@ -167,6 +193,7 @@ def test_completed_receipt_is_replayed_without_reentering_the_backend():
         _service_manifest(),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
         connection_generation="server-generation-1",
     )
     reference = service.prepare(artifact)
@@ -191,6 +218,7 @@ def test_stale_generation_and_geometry_fail_before_backend_prepare():
         _service_manifest(),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
         connection_generation="server-generation-1",
     )
     reference = service.prepare(artifact)
@@ -226,6 +254,7 @@ def test_wire_image_must_equal_the_deterministic_current_ir_packing():
         _service_manifest(),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
     )
 
     with pytest.raises(ValueError, match="deterministic TargetIR packing"):
@@ -241,13 +270,14 @@ def test_timeout_is_not_reported_as_a_completed_schedule():
         _service_manifest(),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
     )
     reference = service.prepare(artifact)
     service.fire(reference)
 
     with pytest.raises(TimeoutError, match="validated terminal"):
         service.complete(reference, timeout=0.1)
-    assert service.snapshot()["state"] == "TIMEOUT"
+    assert service.snapshot().state == "TIMEOUT"
 
     with pytest.raises(RuntimeError, match="requires completion or verified safe_state"):
         service.prepare(artifact)
@@ -278,6 +308,7 @@ def test_independent_safe_interrupts_a_blocked_completion_without_waiting_for_it
         _service_manifest(),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
     )
     reference = service.prepare(artifact)
     service.fire(reference)
@@ -300,7 +331,8 @@ def test_independent_safe_interrupts_a_blocked_completion_without_waiting_for_it
     assert elapsed < 0.5
     assert not worker.is_alive()
     assert errors and "completion interrupted" in str(errors[0])
-    assert service.snapshot()["state"] == "SAFE"
+    assert service.snapshot().state == "SAFE"
+    assert service.snapshot().safe_readback_confirmed
 
 
 def test_safe_during_artifact_validation_is_a_terminal_admission_fence(monkeypatch):
@@ -310,6 +342,7 @@ def test_safe_during_artifact_validation_is_a_terminal_admission_fence(monkeypat
         _service_manifest(),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
     )
     entered = threading.Event()
     release = threading.Event()
@@ -339,7 +372,7 @@ def test_safe_during_artifact_validation_is_a_terminal_admission_fence(monkeypat
     assert not worker.is_alive()
     assert errors and "superseded" in str(errors[0])
     assert [action[0] for action in backend.actions] == ["safe"]
-    assert service.snapshot()["state"] == "SAFE"
+    assert service.snapshot().state == "SAFE"
 
 
 def test_continuous_execution_has_no_false_logical_completion():
@@ -349,6 +382,7 @@ def test_continuous_execution_has_no_false_logical_completion():
         _service_manifest(),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
     )
     reference = service.prepare(artifact)
     service.fire(reference)
@@ -356,7 +390,7 @@ def test_continuous_execution_has_no_false_logical_completion():
     with pytest.raises(RuntimeError, match="no logical completion"):
         service.complete(reference, timeout=1.0)
     assert [action[0] for action in backend.actions] == ["prepare", "fire"]
-    assert service.snapshot()["state"] == "RUNNING"
+    assert service.snapshot().state == "RUNNING"
 
 
 def test_failed_safe_is_never_published_as_safe():
@@ -367,13 +401,23 @@ def test_failed_safe_is_never_published_as_safe():
         _service_manifest(),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
     )
     service.prepare(artifact)
 
     with pytest.raises(RuntimeError, match="safe readback failed"):
         service.safe_state()
 
-    assert service.snapshot()["state"] == "SAFE_FAILED"
+    assert service.snapshot().state == "SAFE_FAILED"
+    assert not service.snapshot().safe_readback_confirmed
+
+    failed_generation = service.connection_generation
+    backend.fail_safe = False
+    service.safe_state()
+    recovered = service.snapshot()
+    assert recovered.state == "SAFE"
+    assert recovered.safe_readback_confirmed
+    assert service.renew_connection_generation() != failed_generation
 
 
 def test_new_connection_generation_permanently_invalidates_old_prepared_refs():
@@ -383,6 +427,7 @@ def test_new_connection_generation_permanently_invalidates_old_prepared_refs():
         _service_manifest(),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
         connection_generation="server-generation-1",
     )
     old_reference = service.prepare(artifact)
@@ -406,6 +451,7 @@ def test_interrupt_receipt_never_leaks_a_new_connection_generation(monkeypatch):
         _service_manifest(),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
         connection_generation="old-generation",
     )
     service.prepare(artifact)
@@ -419,6 +465,7 @@ def test_interrupt_receipt_never_leaks_a_new_connection_generation(monkeypatch):
     monkeypatch.setattr(service, "_safe_state", disconnect_and_replace_owner)
 
     receipt = service.safe_state_for_generation("old-generation")
-    assert receipt["connection_generation"] == "old-generation"
-    assert receipt["state"] == "SAFE"
+    assert receipt.connection_generation == "old-generation"
+    assert receipt.state == "SAFE"
+    assert receipt.safe_readback_confirmed
     assert service.connection_generation != "old-generation"

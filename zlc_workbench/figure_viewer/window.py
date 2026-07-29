@@ -21,8 +21,6 @@ from pathlib import Path
 
 from PyQt5 import QtCore, QtWidgets
 
-from zlc_storage.paths import display_path
-
 from zlc_frontend.qt_widgets import (
     FigureInfoPane,
     FluentFrame,
@@ -72,6 +70,7 @@ class FigureViewer(QtWidgets.QWidget):
         self,
         path: str | Path | None = None,
         *,
+        output_root: Path,
         scale: float | None = None,
         window_ratio: float = WINDOW_SCREEN_FRACTION,
         parent=None,
@@ -79,6 +78,10 @@ class FigureViewer(QtWidgets.QWidget):
         ensure_qt_app()
         set_fluent_scale(scale)
         super().__init__(parent)
+        self._output_root = Path(output_root).expanduser()
+        if not self._output_root.is_absolute():
+            raise ValueError("FigureViewer output_root must be absolute")
+        self._output_root = self._output_root.resolve()
         self.window_ratio = float(window_ratio)
         self._current_path: Path | None = None
         self.archive = None
@@ -198,7 +201,7 @@ class FigureViewer(QtWidgets.QWidget):
         self._load_revision += 1
         self._pending_load = (self._load_revision, path)
         self.info_pane.status.show_message(
-            f"Loading {display_path(str(path))}", severity="task"
+            f"Loading {path}", severity="task"
         )
         self._start_pending_load()
 
@@ -232,7 +235,7 @@ class FigureViewer(QtWidgets.QWidget):
                     self._accept_archive(revision, archive, info)
                 except CancelledError:
                     self.info_pane.status.show_message(
-                        f"Load cancelled: {display_path(str(path))}",
+                        f"Load cancelled: {path}",
                         severity="warning",
                     )
                 except BaseException as error:
@@ -281,6 +284,7 @@ class FigureViewer(QtWidgets.QWidget):
         candidate = create_data_figure_pane(
             value.figure,
             figure_intent,
+            output_root=self._output_root,
             initial_fit_result_identity=(
                 value.payload_digest
                 if value.figure.has_fit_overlays
@@ -321,7 +325,7 @@ class FigureViewer(QtWidgets.QWidget):
             QtCore.Qt.QueuedConnection,
         )
         self.info_pane.status.show_message(
-            f"Rendering {display_path(str(archive.path))}",
+            f"Rendering {archive.path}",
             severity="task",
         )
 
@@ -367,7 +371,7 @@ class FigureViewer(QtWidgets.QWidget):
             raw_text=raw_text,
         )
         self.info_pane.status.show_message(
-            f"Loaded {display_path(str(self._current_path))}"
+            f"Loaded {self._current_path}"
         )
 
     def _accept_fit_save(self, pane: QtWidgets.QWidget, handle: object) -> None:
@@ -410,7 +414,7 @@ class FigureViewer(QtWidgets.QWidget):
             raw_text=raw_text,
         )
         self.info_pane.status.show_message(
-            f"Saved fitted figure {display_path(str(archive.path))}"
+            f"Saved fitted figure {archive.path}"
         )
 
     def _reject_candidate(

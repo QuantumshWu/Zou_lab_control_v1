@@ -9,6 +9,7 @@ cursor used by PulseScan.
 
 from __future__ import annotations
 
+import math
 import time
 import threading
 from dataclasses import dataclass
@@ -62,9 +63,7 @@ class CameraSignalAssociationAuthority(Protocol):
 
     def arm_signal_event_association(
         self,
-        association_id: str,
-        cause_digest: str,
-        expected_trigger_count: int,
+        request: SignalAssociationRequest,
         trigger_group_size: int,
         expected_group_count: int,
     ) -> tuple[object, int]: ...
@@ -111,7 +110,9 @@ class _CameraAssociatedSignalEventCursor:
         "_cursor",
         "_frames_per_cycle",
         "_output_name",
+        "_operation_deadline_seconds",
         "_phase",
+        "_stream",
         "_token",
         "_trigger_channel",
     )
@@ -121,15 +122,18 @@ class _CameraAssociatedSignalEventCursor:
         cursor: SignalEventCursor[CameraSample],
         *,
         authority: CameraSignalAssociationAuthority,
+        stream: AcquisitionStream[CameraSample],
         output_name: str,
         phase: int,
         frames_per_cycle: int,
         trigger_channel: str,
         capability_fingerprint: str,
         binding_instance_id: str,
+        operation_deadline_seconds: float,
     ) -> None:
         self._cursor = cursor
         self._authority = authority
+        self._stream = stream
         self._output_name = canonical_text(output_name, "camera output name")
         self._phase = phase
         self._frames_per_cycle = frames_per_cycle
@@ -145,6 +149,12 @@ class _CameraAssociatedSignalEventCursor:
             binding_instance_id,
             "camera binding instance id",
         )
+        deadline = float(operation_deadline_seconds)
+        if not math.isfinite(deadline) or deadline <= 0.0:
+            raise ValueError(
+                "operation_deadline_seconds must be finite and positive"
+            )
+        self._operation_deadline_seconds = deadline
         self._token: _CameraAssociationToken | None = None
         self._closed = False
 
@@ -171,11 +181,13 @@ class _CameraAssociatedSignalEventCursor:
         if self._token is not None:
             raise RuntimeError("camera association cursor already owns a token")
         physical_count = request.expected_event_count * self._frames_per_cycle
+        if request.trigger_count != physical_count:
+            raise ValueError(
+                "compiled trigger count does not match the camera event cardinality"
+            )
         authority_token, physical_start = (
             self._authority.arm_signal_event_association(
-                request.association_id,
-                request.cause_digest,
-                physical_count,
+                request,
                 self._frames_per_cycle,
                 request.expected_event_count,
             )
@@ -193,6 +205,11 @@ class _CameraAssociatedSignalEventCursor:
             self._authority.cancel_signal_event_association(authority_token)
             raise RuntimeError(
                 "camera association starts inside a declared readout cycle"
+            )
+        if self._cursor.next_sequence != physical_start:
+            self._authority.cancel_signal_event_association(authority_token)
+            raise RuntimeError(
+                "camera physical and published pre-FIRE frontiers differ"
             )
         token = _CameraAssociationToken(
             request,
@@ -286,6 +303,17 @@ class _CameraAssociatedSignalEventCursor:
             raise RuntimeError(
                 "camera association cannot finish before every selected event"
             )
+        expected_end = current.physical_end_ordinal
+        if expected_end is None:
+            raise RuntimeError("camera association lost its physical end ordinal")
+        published_end = self._stream.wait_until_sequence(
+            expected_end,
+            self._operation_deadline_seconds,
+        )
+        if published_end != expected_end:
+            raise RuntimeError(
+                "camera published frames outside the associated hardware FIRE"
+            )
         channel, start, end, terminal_digest = (
             self._authority.finish_signal_event_association(
                 current.authority_token
@@ -311,13 +339,21 @@ class _CameraAssociatedSignalEventCursor:
                 "cause_id": request.cause_id,
                 "cause_digest": request.cause_digest,
                 "expected_event_count": request.expected_event_count,
+                "trigger_schedule_fingerprint": (
+                    request.trigger_schedule_fingerprint
+                ),
+                "trigger_channel": request.trigger_channel,
+                "trigger_count": request.trigger_count,
+                "minimum_trigger_interval_ticks": (
+                    request.minimum_trigger_interval_ticks
+                ),
+                "clock_hz": request.clock_hz,
                 "terminal_evidence_digest": terminal_digest,
                 "camera_capability_fingerprint": self._capability_fingerprint,
                 "camera_binding_instance_id": self._binding_instance_id,
                 "stream_id": self.stream_id.value,
                 "stream_generation": self.stream_generation.value,
                 "output_name": self._output_name,
-                "trigger_channel": channel,
                 "physical_start_ordinal": start,
                 "physical_end_ordinal": end,
                 "physical_trigger_count": end - start,
@@ -372,8 +408,10 @@ class CameraAssociatedSignalEventSource:
         "_binding_instance_id",
         "_capability_fingerprint",
         "_frames_per_cycle",
+        "_operation_deadline_seconds",
         "_phases",
         "_source",
+        "_stream",
         "_trigger_channel",
     )
 
@@ -382,15 +420,18 @@ class CameraAssociatedSignalEventSource:
         source: StreamSignalEventSource[CameraSample],
         *,
         authority: CameraSignalAssociationAuthority,
+        stream: AcquisitionStream[CameraSample],
         phases: dict[str, int],
         frames_per_cycle: int,
         trigger_channel: str,
         capability_fingerprint: str,
         binding_instance_id: str,
+        operation_deadline_seconds: float,
     ) -> None:
         if not isinstance(authority, CameraSignalAssociationAuthority):
             raise TypeError("camera association authority has an incomplete contract")
         self._source = source
+        self._stream = stream
         self._authority = authority
         self._binding_lock = threading.Lock()
         self._association_cursor_opened = False
@@ -409,6 +450,12 @@ class CameraAssociatedSignalEventSource:
             binding_instance_id,
             "camera binding instance id",
         )
+        deadline = float(operation_deadline_seconds)
+        if not math.isfinite(deadline) or deadline <= 0.0:
+            raise ValueError(
+                "operation_deadline_seconds must be finite and positive"
+            )
+        self._operation_deadline_seconds = deadline
 
     @property
     def output_names(self) -> tuple[str, ...]:
@@ -462,7 +509,7 @@ class CameraAssociatedSignalEventSource:
         name = canonical_text(output_name, "camera output name")
         if name not in self._phases:
             raise KeyError(f"camera has no signal output {name!r}")
-        return SignalAssociationScheduleRequirement((self._trigger_channel,))
+        return SignalAssociationScheduleRequirement(self._trigger_channel)
 
     def open_associated_signal_cursor(self, output_name: str):
         self._require_association_running()
@@ -479,12 +526,14 @@ class CameraAssociatedSignalEventSource:
             return _CameraAssociatedSignalEventCursor(
                 cursor,
                 authority=self._authority,
+                stream=self._stream,
                 output_name=name,
                 phase=phase,
                 frames_per_cycle=self._frames_per_cycle,
                 trigger_channel=self._trigger_channel,
                 capability_fingerprint=capability_fingerprint,
                 binding_instance_id=self._binding_instance_id,
+                operation_deadline_seconds=self._operation_deadline_seconds,
             )
         except BaseException:
             cursor.close()
@@ -500,6 +549,7 @@ def camera_signal_event_source(
     trigger_channel: str | None = None,
     capability_fingerprint: str | None = None,
     binding_instance_id: str | None = None,
+    operation_deadline_seconds: float | None = None,
 ) -> StreamSignalEventSource[CameraSample] | CameraAssociatedSignalEventSource:
     """Expose each declared READOUT_EVENT phase as one named live output."""
 
@@ -538,6 +588,7 @@ def camera_signal_event_source(
                 trigger_channel,
                 capability_fingerprint,
                 binding_instance_id,
+                operation_deadline_seconds,
             )
         ):
             raise ValueError(
@@ -548,16 +599,19 @@ def camera_signal_event_source(
         trigger_channel is None
         or capability_fingerprint is None
         or binding_instance_id is None
+        or operation_deadline_seconds is None
     ):
         raise ValueError("camera association authority requires complete binding facts")
     return CameraAssociatedSignalEventSource(
         source,
         authority=association_authority,
+        stream=stream,
         phases=phases,
         frames_per_cycle=phase_count,
         trigger_channel=trigger_channel,
         capability_fingerprint=capability_fingerprint,
         binding_instance_id=binding_instance_id,
+        operation_deadline_seconds=operation_deadline_seconds,
     )
 
 

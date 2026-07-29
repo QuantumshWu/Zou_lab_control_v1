@@ -115,7 +115,7 @@ CALIBRATION_LOGIC_NODE = LogicNodeDeclaration(
         DefaultOutputView(_FINAL[0].name, "sites"),
     ),
     path_presentations=(
-        PathPresentationHint("folder", mode="dir", base_dir=DEFAULT_CALIBRATION_FOLDER),
+        PathPresentationHint("folder", mode="dir", base_dir="output"),
         PathPresentationHint(
             "pulse",
             file_filter="Pulse program (*.json);;All files (*)",

@@ -23,6 +23,7 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraFrameRecord,
     CameraWorkingPoint,
     camera_roi_local_spatial_identity,
+    validate_camera_external_trigger_spacing,
 )
 from zlc_neutral_atom.devices.camera.contract import (
     CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
@@ -65,6 +66,7 @@ from zlc_neutral_atom.runtime.ports import (
     SessionCloseCommand,
     require_current_endpoint_binding as _require_binding,
 )
+from zlc_neutral_atom.runtime.signal_source import SignalAssociationRequest
 from zlc_neutral_atom.devices.camera.contract import (
     CameraCapabilityEvidence,
     CameraPhysicalFacts,
@@ -74,8 +76,6 @@ from zlc_storage import (
     canonical_text as _canonical_text,
     sha256_text as _sha256,
 )
-
-
 def _physical_facts(
     working_point: CameraWorkingPoint,
     binding: BoundDevice,
@@ -187,12 +187,15 @@ class _MonitorSignalAssociation:
 
     association_id: str
     cause_digest: str
+    trigger_schedule_fingerprint: str
     expected_trigger_count: int
     trigger_group_size: int
     expected_group_count: int
     physical_start_ordinal: int
     session: _EndpointSession
     qualification_digest: str
+    reconciliation_deadline_seconds: float
+    quiet_window_seconds: float
     observed_count: int = 0
     previous_produced_count: int | None = None
     previous_frame_stamp: int | None = None
@@ -294,24 +297,11 @@ class CameraCaptureEndpoint:
             if self._capability is not None:
                 self._validate_binding(binding)
             working_point = self._read_working_point(binding)
-            settings = working_point.settings_fingerprint
             payload_contract = working_point.payload_contract
             physical_facts = working_point.physical_facts
-            capability_evidence = CameraCapabilityEvidence(
-                adapter_type=(
-                    f"{type(self._camera).__module__}."
-                    f"{type(self._camera).__qualname__}"
-                ),
-                source_id=self._source_id,
-                payload_contract_fingerprint=payload_contract.fingerprint,
-                capture_spec_owner_fingerprint=(
-                    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT
-                ),
-                max_blocking_call_seconds=self._max_blocking_call_seconds,
-                physical_facts=physical_facts,
-                exact_external_trigger_qualification_digest=(
-                    self._exact_external_trigger_qualification_digest
-                ),
+            capability_evidence = self._capability_evidence(
+                payload_contract,
+                physical_facts,
             )
             stamp = binding.binding_stamp
             snapshot = self._make_capability_snapshot(
@@ -333,6 +323,27 @@ class CameraCaptureEndpoint:
             binding_stamp=binding_stamp,
             payload_contract=payload_contract,
             camera_capability_evidence=capability_evidence,
+        )
+
+    def _capability_evidence(
+        self,
+        payload_contract: CameraSampleContract,
+        physical_facts: CameraPhysicalFacts,
+    ) -> CameraCapabilityEvidence:
+        qualification = self._exact_external_trigger_qualification_digest
+        return CameraCapabilityEvidence(
+            adapter_type=(
+                f"{type(self._camera).__module__}."
+                f"{type(self._camera).__qualname__}"
+            ),
+            source_id=self._source_id,
+            payload_contract_fingerprint=payload_contract.fingerprint,
+            capture_spec_owner_fingerprint=(
+                CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT
+            ),
+            max_blocking_call_seconds=self._max_blocking_call_seconds,
+            physical_facts=physical_facts,
+            exact_external_trigger_qualification_digest=qualification,
         )
 
     def execute_command(self, binding: BoundDevice, command: object) -> object:
@@ -415,9 +426,9 @@ class CameraCaptureEndpoint:
                 raise RuntimeError(
                     "camera exposure command altered another physical working-point fact"
                 )
-            evidence = replace(
-                self._capability_snapshot().camera_capability_evidence,
-                physical_facts=observed.physical_facts,
+            evidence = self._capability_evidence(
+                observed.payload_contract,
+                observed.physical_facts,
             )
             capability = self._make_capability_snapshot(
                 binding.binding_stamp,
@@ -530,6 +541,23 @@ class CameraCaptureEndpoint:
                     timeout=command.timeout_seconds,
                 )
                 arm_returned = True
+                active, source_ordinal_baseline = self._camera.capture_state()
+                if type(active) is not bool:
+                    raise TypeError("camera arm state must report a bool active flag")
+                if not active:
+                    raise RuntimeError("camera arm returned without an active source")
+                if (
+                    isinstance(source_ordinal_baseline, bool)
+                    or not isinstance(source_ordinal_baseline, int)
+                    or source_ordinal_baseline < 0
+                ):
+                    raise TypeError(
+                        "camera arm state must report a non-negative source ordinal"
+                    )
+                if source_ordinal_baseline != 0:
+                    raise RuntimeError(
+                        "finite camera arm retained frames from an earlier acquisition"
+                    )
                 with self._lock:
                     self._require_current_operation(
                         binding,
@@ -537,10 +565,17 @@ class CameraCaptureEndpoint:
                         operation_epoch,
                     )
                     self._require_working_point_unchanged(binding)
+                    capability = self._capability_snapshot()
                     session.started = True
                     return CaptureStartedAck(
                         command.session_id,
                         binding.binding_instance_id,
+                        capability.settings_fingerprint,
+                        capability.capability_fingerprint,
+                        session.spec_fingerprint,
+                        expected,
+                        expected,
+                        source_ordinal_baseline,
                     )
             except BaseException as primary:
                 terminal: CameraCaptureTerminalRecord | None = None
@@ -806,9 +841,9 @@ class CameraCaptureEndpoint:
             raise RuntimeError(
                 "camera did not restore the leased physical working point"
             )
-        evidence = replace(
-            self._capability_snapshot().camera_capability_evidence,
-            physical_facts=baseline.physical_facts,
+        evidence = self._capability_evidence(
+            baseline.payload_contract,
+            baseline.physical_facts,
         )
         capability = self._make_capability_snapshot(
             binding.binding_stamp,
@@ -1148,16 +1183,19 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
 
     def arm_signal_event_association(
         self,
-        association_id: str,
-        cause_digest: str,
-        expected_trigger_count: int,
+        request: SignalAssociationRequest,
         trigger_group_size: int,
         expected_group_count: int,
     ) -> tuple[object, int]:
         """Freeze the next live-camera ordinal interval before hardware FIRE."""
 
-        identity = _canonical_text(association_id, "association_id")
-        digest = _sha256(cause_digest, "cause_digest")
+        if not isinstance(request, SignalAssociationRequest):
+            raise TypeError("request must be SignalAssociationRequest")
+        identity = request.association_id
+        digest = request.cause_digest
+        schedule_fingerprint = request.trigger_schedule_fingerprint
+        channel = request.trigger_channel
+        expected_trigger_count = request.trigger_count
         for value, name in (
             (expected_trigger_count, "expected_trigger_count"),
             (trigger_group_size, "trigger_group_size"),
@@ -1179,6 +1217,27 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 raise RuntimeError(
                     "real camera signal association requires active E0 qualification"
                 )
+            capability = self._capability_snapshot()
+            evidence = capability.camera_capability_evidence
+            quiet_window = evidence.exact_external_trigger_quiet_window_seconds
+            if quiet_window is None:
+                raise RuntimeError(
+                    "real camera signal association lacks a qualified quiet window"
+                )
+            facts = evidence.physical_facts
+            facts.require_single_capture_trigger_channel(channel)
+            required_interval = facts.required_external_trigger_interval_seconds
+            if required_interval is None:
+                raise RuntimeError(
+                    "camera signal association lacks a qualified trigger interval"
+                )
+            validate_camera_external_trigger_spacing(
+                minimum_trigger_interval_ticks=(
+                    request.minimum_trigger_interval_ticks
+                ),
+                clock_hz=request.clock_hz,
+                required_interval_seconds=required_interval,
+            )
             if self._signal_association is not None:
                 raise RuntimeError("camera monitor already owns a signal association")
             session = self._session
@@ -1231,12 +1290,15 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             association = _MonitorSignalAssociation(
                 identity,
                 digest,
+                schedule_fingerprint,
                 expected_trigger_count,
                 trigger_group_size,
                 expected_group_count,
                 start,
                 session,
                 qualification,
+                self._max_blocking_call_seconds,
+                quiet_window,
                 previous_produced_count=session.last_produced_count,
                 previous_frame_stamp=session.last_frame_stamp,
                 previous_camera_stamp=session.last_camera_stamp,
@@ -1283,8 +1345,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 )
             channel = channels[0]
             counts = tuple(trigger_counts)
-            matching = tuple(count for name, count in counts if name == channel)
-            if matching != (association.expected_trigger_count,):
+            if counts != ((channel, association.expected_trigger_count),):
                 raise RuntimeError(
                     "hardware pulse-terminal trigger count differs from camera association"
                 )
@@ -1315,14 +1376,6 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 association.physical_start_ordinal
                 + association.expected_trigger_count
             )
-            if association.observed_count != association.expected_trigger_count:
-                raise RuntimeError(
-                    "camera did not deliver the complete hardware-trigger interval"
-                )
-            if session.drained_count != end:
-                raise RuntimeError(
-                    "camera delivered frames outside the associated hardware FIRE"
-                )
             if self._exact_external_trigger_qualification_digest != association.qualification_digest:
                 raise RuntimeError(
                     "camera E0 qualification changed during signal association"
@@ -1331,6 +1384,65 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             terminal_digest = association.terminal_evidence_digest
             if channel is None or terminal_digest is None:
                 raise RuntimeError("camera association lost its terminal binding")
+            progress = self._camera
+            if not isinstance(progress, CameraAssociationProgress):
+                raise RuntimeError(
+                    "camera signal association lost its produced-frame counter"
+                )
+            quiet_window = association.quiet_window_seconds
+        deadline = time.monotonic() + association.reconciliation_deadline_seconds
+        while True:
+            produced_before_quiet = progress.observed_produced_count()
+            with self._lock:
+                association = self._require_signal_association(token)
+                if association.error is not None:
+                    raise association.error
+                observed = association.observed_count
+                drained = session.drained_count
+            if produced_before_quiet > end or observed > association.expected_trigger_count or drained > end:
+                raise RuntimeError(
+                    "camera produced frames outside the associated hardware FIRE"
+                )
+            if (
+                produced_before_quiet == end
+                and observed == association.expected_trigger_count
+                and drained == end
+            ):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise TimeoutError(
+                    "camera did not deliver and drain the complete hardware-trigger interval"
+                )
+            time.sleep(min(0.005, remaining))
+        if quiet_window:
+            time.sleep(quiet_window)
+        produced_after_quiet = progress.observed_produced_count()
+        if produced_after_quiet != end:
+            raise RuntimeError(
+                "camera produced a late frame after the hardware terminal"
+            )
+        with self._lock:
+            association = self._require_signal_association(token)
+            if association.error is not None:
+                raise association.error
+            if association.session is not session or session.drained_count != end:
+                raise RuntimeError(
+                    "camera association changed during quiet-window reconciliation"
+                )
+            if (
+                self._capability_snapshot()
+                .camera_capability_evidence
+                .exact_external_trigger_qualification_digest
+                != association.qualification_digest
+                or self._capability_snapshot()
+                .camera_capability_evidence
+                .exact_external_trigger_quiet_window_seconds
+                != quiet_window
+            ):
+                raise RuntimeError(
+                    "camera E0 qualification changed during quiet-window reconciliation"
+                )
             self._signal_association = None
             return (
                 channel,
@@ -1357,6 +1469,8 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
         association = self._signal_association
         if association is None or association is not token:
             raise RuntimeError("camera association token is not current")
+        if association.error is not None:
+            return association
         session = association.session
         if (
             self._session is not session
@@ -1416,16 +1530,9 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                     )
                     raise association.error
                 setattr(association, previous_field, current)
-        if all(
-            value is None
-            for value in (
-                metadata.produced_count,
-                metadata.frame_stamp,
-                metadata.camera_stamp,
-            )
-        ):
+        if metadata.frame_stamp is None and metadata.camera_stamp is None:
             association.error = RuntimeError(
-                "camera frame lacks E0-qualified hardware ordinal evidence"
+                "camera frame lacks its E0-qualified hardware stamp"
             )
             raise association.error
         association.observed_count += 1

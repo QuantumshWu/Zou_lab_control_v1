@@ -9,10 +9,6 @@ import tempfile
 
 from .console_state import TaskConsoleState
 from zlc_storage import durable_makedirs, flush_directory
-from zlc_storage.paths import project_path
-
-
-TASK_FILES_ENV = "ZLC_TASK_DIR"
 
 
 def _require_current_state(state: TaskConsoleState) -> TaskConsoleState:
@@ -21,16 +17,13 @@ def _require_current_state(state: TaskConsoleState) -> TaskConsoleState:
     return state
 
 
-def task_files_dir() -> Path:
+def task_files_dir(tasks_root: Path) -> Path:
     """Return the explicit TaskConsole layout/export directory."""
 
-    configured = os.environ.get(TASK_FILES_ENV, "").strip()
-    path = (
-        Path(configured).expanduser().resolve()
-        if configured
-        else project_path("tasks")
-    )
-    return durable_makedirs(path)
+    root = Path(tasks_root).expanduser()
+    if not root.is_absolute():
+        raise ValueError("TaskConsole tasks_root must be absolute")
+    return durable_makedirs(root.resolve())
 
 
 def save_task_console_state(
@@ -77,7 +70,7 @@ def load_task_console_state(path: str | Path) -> TaskConsoleState:
     return _require_current_state(TaskConsoleState.from_dict(payload))
 
 
-def resolve_task_state(task: str) -> TaskConsoleState:
+def resolve_task_state(task: str, *, tasks_root: Path) -> TaskConsoleState:
     """Resolve an existing JSON path or one simple name under the task directory."""
 
     text = str(task).strip()
@@ -89,7 +82,7 @@ def resolve_task_state(task: str) -> TaskConsoleState:
     if supplied.parent != Path("."):
         raise ValueError(f"task layout path does not exist: {supplied}")
     filename = supplied.name if supplied.suffix.lower() == ".json" else f"{text}.json"
-    saved = task_files_dir() / filename
+    saved = task_files_dir(tasks_root) / filename
     if saved.is_file():
         return load_task_console_state(saved)
     raise ValueError(
@@ -98,7 +91,6 @@ def resolve_task_state(task: str) -> TaskConsoleState:
 
 
 __all__ = [
-    "TASK_FILES_ENV",
     "load_task_console_state",
     "resolve_task_state",
     "save_task_console_state",

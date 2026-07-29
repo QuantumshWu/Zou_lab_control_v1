@@ -17,6 +17,7 @@ from .facade import (
     PulseRunRequest,
     PulseRunResult,
     PulseTargetDescriptor,
+    WorkspacePaths,
 )
 from ._readout_core import ReadoutFacade
 from ._logic_node_api import LogicNodeApis
@@ -38,6 +39,7 @@ __all__ = [
     "PulseRunRequest",
     "PulseRunResult",
     "PulseTargetDescriptor",
+    "WorkspacePaths",
     "ReadoutFacade",
     "LogicNodeApis",
 ]

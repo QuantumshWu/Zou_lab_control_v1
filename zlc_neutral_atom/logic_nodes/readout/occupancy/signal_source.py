@@ -412,6 +412,15 @@ class _OccupancyAssociatedCursor:
                     "cause_id": request.cause_id,
                     "cause_digest": request.cause_digest,
                     "expected_event_count": request.expected_event_count,
+                    "trigger_schedule_fingerprint": (
+                        request.trigger_schedule_fingerprint
+                    ),
+                    "trigger_channel": request.trigger_channel,
+                    "trigger_count": request.trigger_count,
+                    "minimum_trigger_interval_ticks": (
+                        request.minimum_trigger_interval_ticks
+                    ),
+                    "clock_hz": request.clock_hz,
                     "terminal_evidence_digest": upstream.terminal_evidence_digest,
                     "upstream_evidence": upstream_tree,
                     "upstream_evidence_digest": canonical_digest(upstream_tree),

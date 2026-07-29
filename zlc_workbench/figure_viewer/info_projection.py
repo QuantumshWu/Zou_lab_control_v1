@@ -12,7 +12,6 @@ from pprint import pformat
 from typing import TypeAlias
 
 from zlc_frontend.flow_graph import FlowGraph, flow_graph_from_tree
-from zlc_storage.paths import display_path
 
 
 InfoRows: TypeAlias = tuple[tuple[str, object], ...]
@@ -208,7 +207,7 @@ def project_figure_info(archive) -> FigureInfoProjection:
     )
 
     measurement_rows = list(_dataset_projection(figure))
-    measurement_rows.append(("path", display_path(str(archive.path))))
+    measurement_rows.append(("path", str(archive.path)))
 
     device_rows: list[tuple[str, object]] = []
     for key, item in value.metadata.items():

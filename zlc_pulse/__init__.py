@@ -84,7 +84,6 @@ from .authoring import (
     set_digital_output,
     set_output_delay,
 )
-from .client import PulseServerSnapshot, RemotePulseExecutionClient, pulse_server_snapshot_from_tree
 from .ir import (
     TARGET_IR_SCHEMA,
     TargetBusDelay,
@@ -108,7 +107,10 @@ from .validation import (
 )
 from .deployment import (
     APPROVED_DEPLOYED_TARGET_ABI,
+    DeployedGeometryFacts,
     expand_autonomous_scan_repeats,
+    load_deployed_geometry_facts,
+    require_deployed_geometry_facts,
     require_approved_target_abi,
     validate_artifact_for_deployment,
     validate_deployed_target,
@@ -141,10 +143,11 @@ from .physical import (
 from .server import (
     PREPARED_PULSE_REF_SCHEMA,
     PULSE_COMPLETION_SCHEMA,
+    PULSE_SERVER_SNAPSHOT_SCHEMA,
     PreparedPulseRef,
     PulseCompletion,
-    PulseExecutionBackend,
     PulseExecutionService,
+    PulseServerSnapshot,
     decode_artifact_message,
     decode_completion_message,
     decode_prepared_ref_message,
@@ -155,8 +158,11 @@ from .server import (
     prepared_pulse_ref_to_tree,
     pulse_completion_from_tree,
     pulse_completion_to_tree,
+    pulse_server_snapshot_from_tree,
+    pulse_server_snapshot_to_tree,
     serve_pulse_execution_service,
 )
+from .client import RemotePulseExecutionClient
 from .artifact import (
     COMPILED_PULSE_ARTIFACT_SCHEMA,
     CompiledPulseArtifact,
@@ -240,6 +246,7 @@ from .timeline import (
 __all__ = [
     "COMPILED_PULSE_ARTIFACT_SCHEMA",
     "APPROVED_DEPLOYED_TARGET_ABI",
+    "DeployedGeometryFacts",
     "AUTONOMOUS_TABLE_READ_RECIPE",
     "COMPILER_ID",
     "CompiledPulseArtifact",
@@ -262,6 +269,7 @@ __all__ = [
     "PULSE_DOCUMENT_SCHEMA",
     "PREPARED_PULSE_REF_SCHEMA",
     "PULSE_COMPLETION_SCHEMA",
+    "PULSE_SERVER_SNAPSHOT_SCHEMA",
     "POST_TERMINAL_TAIL_WAIT_RECIPE",
     "PORT_CLOCK",
     "PORT_DAC",
@@ -275,7 +283,6 @@ __all__ = [
     "PulseFieldRef",
     "PulsePeriod",
     "PulseExecutionForm",
-    "PulseExecutionBackend",
     "PulseExecutionService",
     "PulseServerSnapshot",
     "RemotePulseExecutionClient",
@@ -383,6 +390,7 @@ __all__ = [
     "load_pulse_document",
     "pulse_document_path",
     "load_deployed_pulse_target",
+    "load_deployed_geometry_facts",
     "load_pulse_target",
     "pulse_document_from_tree",
     "pulse_document_to_tree",
@@ -409,6 +417,7 @@ __all__ = [
     "pulse_completion_from_tree",
     "pulse_completion_to_tree",
     "pulse_server_snapshot_from_tree",
+    "pulse_server_snapshot_to_tree",
     "remove_period",
     "replace_field_binding",
     "replace_pulse_field",
@@ -421,6 +430,7 @@ __all__ = [
     "set_digital_output",
     "set_output_delay",
     "require_approved_target_abi",
+    "require_deployed_geometry_facts",
     "expand_autonomous_scan_repeats",
     "serve_pulse_execution_service",
     "target_ir_from_tree",

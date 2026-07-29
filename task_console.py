@@ -39,6 +39,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Experiment workspace used after DeviceManager initializes devices.",
     )
     parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path(__file__).resolve().parent,
+        help="Authored workspace containing pulses/ and tasks/.",
+    )
+    parser.add_argument(
         "--name",
         default="task_console",
         help="Experiment name.",
@@ -89,10 +95,13 @@ class _StandaloneTaskConsoleFlow:
         self.failure: BaseException | None = None
 
     def open(self):
-        from Zou_lab_control.api import device_manager
+        from Zou_lab_control.api import WorkspacePaths, device_manager
 
         kwargs = {
-            "repository": self.args.repository,
+            "workspace": WorkspacePaths.for_workspace(
+                self.args.workspace.expanduser().resolve(),
+                repository_root=self.args.repository.expanduser().resolve(),
+            ),
             "name": self.args.name,
         }
         if self.args.config == "virtual":

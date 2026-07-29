@@ -97,7 +97,6 @@ from zlc_frontend.selector import (
 )
 from zlc_neutral_atom.artifacts import FitResultArtifactRef
 from zlc_storage import nonnegative_integer
-from zlc_storage.paths import user_output_path
 from zlc_workbench.window_runtime import (
     cancel_export_commits,
     submit_compute,
@@ -134,6 +133,7 @@ class DataFigureWindow(FrozenRasterWindow):
         initial_display: DataFigureDisplayState | None = None,
         embedded: bool = False,
         surface_size_name: str,
+        output_root: Path,
     ) -> None:
         if not callable(initial_loader) or not callable(typed_renderer):
             raise TypeError("figure worker callables must be callable")
@@ -152,6 +152,10 @@ class DataFigureWindow(FrozenRasterWindow):
         self._initial_display = initial_display
         self._embedded = embedded
         self._surface_size_name = initial_surface.size_name
+        self._output_root = Path(output_root).expanduser()
+        if not self._output_root.is_absolute():
+            raise ValueError("DataFigure output_root must be absolute")
+        self._output_root = self._output_root.resolve()
         self._surface_geometry = initial_surface
         self._surface_revision = 0
         self._surface_job: tuple[str, object, tuple[object, ...], int] | None = None
@@ -1161,7 +1165,7 @@ class DataFigureWindow(FrozenRasterWindow):
         if bindings.save_requires_path:
             destination = self._fit_save_path
             if destination is None:
-                output_dir = user_output_path("figures", "data-figure")
+                output_dir = self._output_root / "figures" / "data-figure"
                 output_dir.mkdir(parents=True, exist_ok=True)
                 selected, _filter = QtWidgets.QFileDialog.getSaveFileName(
                     self,
@@ -2239,7 +2243,7 @@ class DataFigureWindow(FrozenRasterWindow):
         ):
             return
         family = self._view_family
-        output_dir = user_output_path("figures", "data-figure")
+        output_dir = self._output_root / "figures" / "data-figure"
         output_dir.mkdir(parents=True, exist_ok=True)
         path, _selected = QtWidgets.QFileDialog.getSaveFileName(
             self,

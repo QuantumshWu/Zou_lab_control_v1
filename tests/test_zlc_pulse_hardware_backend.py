@@ -200,9 +200,13 @@ def test_current_artifact_bytes_drive_the_existing_axi_transport_exactly(tmp_pat
     completion = service.complete(reference, timeout=1.0)
 
     assert completion.expected_trigger_counts_from_completed_schedule == (("ch11", 3),)
-    assert service.snapshot()["backend"]["prepared_artifact_digest"] == artifact.fingerprint
+    assert (
+        service.snapshot().physical_prepared_artifact_digest
+        == artifact.fingerprint
+    )
     service.safe_state()
-    assert service.snapshot()["backend"]["prepared_artifact_digest"] is None
+    assert service.snapshot().physical_prepared_artifact_digest is None
+    assert service.snapshot().safe_readback_confirmed
 
 
 def test_current_session_rejects_clock_mismatch_before_hardware_access(tmp_path):
@@ -259,8 +263,10 @@ def test_current_artifact_uses_the_same_contract_over_uart(tmp_path):
         assert transport.writes[address] == value
     service.fire(reference)
     transport.model.regfile[CtrlWords.STATUS] |= STATUS_DONE
-    assert service.complete(reference, timeout=1.0).prepared_ref == reference
-    assert service.snapshot()["backend"]["transport"] == "uart"
+    completion = service.complete(reference, timeout=1.0)
+    assert completion.prepared_ref == reference
+    assert completion.hardware_terminal.transport_id == "uart"
+    assert service.snapshot().physical_state == "DONE"
 
 
 def _self_attested_wrong_topology_artifact(params):

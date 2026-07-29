@@ -343,9 +343,9 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
             raise RuntimeError("calibration terminal completion has no RunHandle")
         snapshot = handle.snapshot()
         warnings = []
-        if snapshot.commit_recovery_warning is not None:
+        if snapshot.commit_publication_warning is not None:
             warnings.append(
-                f"commit recovery warning: {snapshot.commit_recovery_warning}"
+                f"commit publication warning: {snapshot.commit_publication_warning}"
             )
         warnings.extend(f"cleanup warning: {item}" for item in snapshot.cleanup_errors)
         self._run_warnings = tuple(warnings)

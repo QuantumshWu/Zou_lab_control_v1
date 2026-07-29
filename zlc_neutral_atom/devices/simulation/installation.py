@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import uuid
 
-from fpga.pulse_streamer.host.image import DEFAULT_CONFIG_PATH, default_clock_hz
 from zlc_neutral_atom.devices.camera.contract import CameraAcquisitionMode
 from zlc_neutral_atom.installation_assets import (
     InstallationAsset,
@@ -30,7 +29,15 @@ from zlc_neutral_atom.runtime.ports import BoundDevice, DeviceBroker, SafetyOper
 from zlc_neutral_atom.runtime.resources import ResourceArbiter
 from zlc_neutral_atom.runtime.run import RunController
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
-from zlc_pulse import PORT_DAC, PORT_DIGITAL, PulseTarget, PulseTargetManifest, load_deployed_pulse_target, pulse_target_manifest
+from zlc_pulse import (
+    PORT_DAC,
+    PORT_DIGITAL,
+    PulseTarget,
+    PulseTargetManifest,
+    load_deployed_geometry_facts,
+    load_deployed_pulse_target,
+    pulse_target_manifest,
+)
 from zlc_storage import canonical_digest
 
 # Installation wiring, not a friendly simulator alias.  These are the physical
@@ -173,8 +180,13 @@ def _bind_sequencer(
     asset_map_revision: str,
     sequencer: VirtualSequencer,
     manifest: PulseTargetManifest,
+    geometry_fingerprint: int,
 ) -> BoundPulsePort:
-    endpoint = VirtualSequencerExecutionEndpoint(sequencer, manifest)
+    endpoint = VirtualSequencerExecutionEndpoint(
+        sequencer,
+        manifest,
+        geometry_fingerprint=geometry_fingerprint,
+    )
     binding: BoundDevice | None = None
 
     def current_binding() -> BoundDevice:
@@ -277,6 +289,7 @@ def create_virtual_installation(
     resources: ResourceArbiter | None = None
     broker: DeviceBroker | None = None
     try:
+        geometry = load_deployed_geometry_facts()
         target = _deployed_target()
         target_manifest = _virtual_target_manifest(target)
         frame_shape_yx, grid_shape_yx, site_centers_xy = (
@@ -284,10 +297,7 @@ def create_virtual_installation(
         )
         sequencer = VirtualSequencer(
             target,
-            # Standard deployed virtual composition is one frozen config bundle.
-            # Do not combine an env/cwd clock override with the compiler's shipped
-            # StreamerParams geometry.
-            clock_hz=default_clock_hz(DEFAULT_CONFIG_PATH),
+            clock_hz=geometry.clock_hz,
         )
         devices["sequencer"] = sequencer
         rf = VirtualRfSource(sequencer)
@@ -356,6 +366,7 @@ def create_virtual_installation(
             assets.revision,
             sequencer,
             target_manifest,
+            geometry.geometry_fingerprint,
         )
         rf_port = _bind_rf(
             broker,

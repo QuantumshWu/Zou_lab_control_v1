@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import MappingProxyType
 
 from zlc_neutral_atom.logic_node_package import LogicNodePackage
+from zlc_storage.paths import resolve_under
 
 from .api import CalibrationApi
 from .application import prepare_calibration_artifact_plan
@@ -19,6 +20,7 @@ from .task import (
 
 def _bind_api(host: object, _dependencies: tuple[object, ...]) -> CalibrationApi:
     operations = host._logic_node_operations()
+    output_root = operations.output_root
     capture_repository = operations.capture_repository
     start_run = operations.start_run
     profiles = {}
@@ -31,6 +33,7 @@ def _bind_api(host: object, _dependencies: tuple[object, ...]) -> CalibrationApi
             pulse_port=operations.pulse_port(
                 operations.device_ref(apparatus.sequencer_role)
             ),
+            pulses_root=operations.pulses_root,
         )
         binding = profile.readout_binding.value
         if binding in profiles:
@@ -39,7 +42,7 @@ def _bind_api(host: object, _dependencies: tuple[object, ...]) -> CalibrationApi
 
     def admit_saved_capture(path, expected_camera_role):
         return admit_calibration_capture_export(
-            path,
+            resolve_under(output_root, path),
             expected_camera_role=expected_camera_role,
             capture_repository=capture_repository,
         )
@@ -52,13 +55,15 @@ def _bind_api(host: object, _dependencies: tuple[object, ...]) -> CalibrationApi
     ):
         from .ui.report_projection import render_calibration_plot_report
 
+        options = dict(kwargs)
+        options["folder"] = str(resolve_under(output_root, options["folder"]))
         return write_calibration_task_outputs(
             source,
             calibration,
             capture_repository=capture_repository,
             calibration_repository=calibration_repository,
             render_report=render_calibration_plot_report,
-            **kwargs,
+            **options,
         )
 
     def start_calibration(request, calibration_repository):

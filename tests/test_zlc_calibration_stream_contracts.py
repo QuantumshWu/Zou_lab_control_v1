@@ -83,10 +83,17 @@ def test_current_sitemap_preserves_repeat_event_image_and_site_axes(tmp_path):
         from pathlib import Path
         import sys
 
-        from Zou_lab_control.api import connect
+        from Zou_lab_control.api import WorkspacePaths, connect
 
         workspace = Path(sys.argv[1])
-        experiment = connect("virtual", repository=workspace, seed=7)
+        experiment = connect(
+            "virtual",
+            workspace=WorkspacePaths.for_workspace(
+                Path.cwd(),
+                repository_root=workspace,
+            ),
+            seed=7,
+        )
         try:
             reference = experiment.nodes.calibration.sitemap(frames=4)
             computation = experiment.nodes.calibration.load_calibration_computation(reference)

@@ -155,14 +155,22 @@ def test_final_calibration_reopens_from_disk_with_exact_capture_authority(tmp_pa
         from pathlib import Path
         import sys
 
-        from Zou_lab_control.api import connect
+        from Zou_lab_control.api import WorkspacePaths, connect
         from zlc_neutral_atom.capture.artifact import CaptureRepository
         from zlc_neutral_atom.logic_nodes.readout.calibration.repository import (
             CalibrationRepository,
         )
+        from zlc_storage import decode
 
         workspace = Path(sys.argv[1])
-        experiment = connect("virtual", repository=workspace, seed=7)
+        experiment = connect(
+            "virtual",
+            workspace=WorkspacePaths.for_workspace(
+                Path.cwd(),
+                repository_root=workspace,
+            ),
+            seed=7,
+        )
         reference = experiment.nodes.calibration.sitemap(frames=4)
         resolved = experiment.nodes.calibration.load_calibration(reference)
         computation = experiment.nodes.calibration.load_calibration_computation(reference)
@@ -181,6 +189,12 @@ def test_final_calibration_reopens_from_disk_with_exact_capture_authority(tmp_pa
         captures = CaptureRepository(workspace / "captures")
         calibrations = CalibrationRepository(workspace / "calibrations")
         try:
+            manifest = decode(
+                calibrations._store_authority.read_manifest(
+                    "calibration",
+                    reference.manifest_digest,
+                )
+            )
             reopened = calibrations.admit(
                 reference,
                 captures,
@@ -195,6 +209,7 @@ def test_final_calibration_reopens_from_disk_with_exact_capture_authority(tmp_pa
                     "reopened_grid_shape": list(
                         reopened.artifact.site_map.grid_shape_yx
                     ),
+                    "manifest_run_id": manifest["run_id"],
                 }
             )
         finally:
@@ -210,6 +225,8 @@ def test_final_calibration_reopens_from_disk_with_exact_capture_authority(tmp_pa
     assert result["resolved_matches"] is True
     assert result["reopened_matches"] is True
     assert result["reopened_source_matches"] is True
+    assert isinstance(result["manifest_run_id"], str)
+    assert result["manifest_run_id"]
     assert result["grid_shape"] == [5, 7]
     assert result["reopened_grid_shape"] == [5, 7]
     assert result["model_kinds"] == ["box", "psf", "uniform_psf"]

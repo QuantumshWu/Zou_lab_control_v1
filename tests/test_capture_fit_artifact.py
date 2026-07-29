@@ -8,7 +8,6 @@ import pickle
 import numpy as np
 import pytest
 
-from fpga.pulse_streamer.host.image import DEFAULT_CONFIG_PATH, default_clock_hz
 from zlc_data.axis import (
     AxisId,
     AxisSourceRef,
@@ -64,6 +63,7 @@ from zlc_neutral_atom.capture.triggered import TriggeredCaptureSpec
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
 from zlc_pulse import (
     PulseExecutionForm,
+    load_deployed_geometry_facts,
     load_deployed_pulse_target,
     load_pulse_document,
     pulse_target_manifest_from_lanes,
@@ -208,14 +208,16 @@ class _CaptureCase:
             )
         )
         target = load_deployed_pulse_target()
+        geometry = load_deployed_geometry_facts()
         self.sequencer = VirtualSequencer(
             target,
-            clock_hz=default_clock_hz(DEFAULT_CONFIG_PATH),
+            clock_hz=geometry.clock_hz,
             sleep_scale=0,
         )
         pulse_endpoint = VirtualSequencerExecutionEndpoint(
             self.sequencer,
             pulse_target_manifest_from_lanes(target),
+            geometry_fingerprint=geometry.geometry_fingerprint,
         )
         pulse_port = BoundPulsePort(
             _bind_endpoint(

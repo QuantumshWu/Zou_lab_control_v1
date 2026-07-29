@@ -6,6 +6,8 @@ about real-camera loss statistics or a deployed FPGA.
 
 from __future__ import annotations
 
+from dataclasses import replace
+import math
 import threading
 import time
 
@@ -13,7 +15,6 @@ import numpy as np
 import pytest
 
 from conftest import pulse_backend_completion_for
-from fpga.pulse_streamer.host.image import StreamerParams, build_fingerprint
 from zlc_neutral_atom.devices.camera.contract import (
     CameraCaptureTerminalRecord,
     CameraFrameRecord,
@@ -21,7 +22,6 @@ from zlc_neutral_atom.devices.camera.contract import (
 )
 from zlc_neutral_atom.devices.hardware.config import HardwareInstallationConfig
 from zlc_neutral_atom.devices.hardware.installation import create_hardware_installation
-from zlc_neutral_atom.devices.hardware.qualification import _qualification_document
 from zlc_neutral_atom.devices.camera.pylon import PylonCameraAdapter, PylonCameraConfig
 from zlc_neutral_atom.devices.sequencer.port import (
     PulseTerminalAck,
@@ -39,14 +39,64 @@ from zlc_neutral_atom.runtime.signal_source import SignalAssociationRequest
 from zlc_pulse import (
     PreparedPulseRef,
     PulseCompletion,
+    PulseDocument,
     PulseExecutionForm,
+    PulsePeriod,
     PulseServerSnapshot,
     RemotePulseExecutionClient,
     compile_pulse_artifact,
+    load_deployed_geometry_facts,
     load_deployed_pulse_target,
     pulse_target_manifest_from_lanes,
 )
 from zlc_storage import canonical_digest, decode
+
+
+def _four_trigger_document(
+    *,
+    client: RemotePulseExecutionClient,
+    trigger_lane: str,
+    required_interval_seconds: float,
+) -> PulseDocument:
+    """Build the public Pulse witness required by association contract tests."""
+
+    snapshot = client.snapshot()
+    target = snapshot.target
+    lane_index = target.raw_lanes.index(trigger_lane)
+    owner = next(port for port in target.ports if trigger_lane in port.lanes)
+    tick_ns = 1e9 / snapshot.clock_hz
+    high_ticks = 1
+    interval_ticks = max(
+        high_ticks + 1,
+        math.ceil(required_interval_seconds * snapshot.clock_hz),
+    )
+    low = tuple(0 for _ in target.raw_lanes)
+    high_values = list(low)
+    high_values[lane_index] = 1
+    high = tuple(high_values)
+    periods = [PulsePeriod("initial_safe", tick_ns, "ns", "safe", low)]
+    for index in range(4):
+        periods.extend(
+            (
+                PulsePeriod(
+                    f"trigger_{index}", tick_ns, "ns", "camera trigger", high
+                ),
+                PulsePeriod(
+                    f"safe_{index}",
+                    (interval_ticks - high_ticks) * tick_ns,
+                    "ns",
+                    "safe interval",
+                    low,
+                ),
+            )
+        )
+    return PulseDocument(
+        name=f"four-trigger {trigger_lane} association witness",
+        target=target,
+        time_step_ns=tick_ns,
+        periods=tuple(periods),
+        visible_ports=(owner.key,),
+    )
 
 
 class _TriggerBus:
@@ -71,6 +121,7 @@ class _FakeCamera:
         self.delivered = 0
         self.arm_calls = []
         self.closed = False
+        self.hardware_stamps_enabled = True
         self.read_gate = threading.Event()
         self.read_gate.set()
         self.blocked_read_started = threading.Event()
@@ -110,19 +161,20 @@ class _FakeCamera:
 
     def emit(self, count):
         assert self.armed
-        self.records = [
+        start = len(self.records)
+        self.records.extend(
             CameraFrameRecord(
-                np.full((4, 5), index, dtype=np.uint8),
-                index,
-                index + 1,
-                100 + index,
-                200 + index,
+                np.full((4, 5), source_ordinal, dtype=np.uint8),
+                source_ordinal,
+                source_ordinal + 1,
+                100 + source_ordinal if self.hardware_stamps_enabled else None,
+                200 + source_ordinal if self.hardware_stamps_enabled else None,
                 None,
                 None,
-                time.time_ns() + index,
+                time.time_ns() + source_ordinal,
             )
-            for index in range(count)
-        ]
+            for source_ordinal in range(start, start + count)
+        )
 
     def read_frame_records(self, n, *, timeout, exact):
         if not self.read_gate.is_set():
@@ -139,7 +191,7 @@ class _FakeCamera:
         return CameraCaptureTerminalRecord(self.delivered, True, True, True)
 
     def capture_state(self):
-        return self.armed, max(0, len(self.records) - self.delivered)
+        return self.armed, len(self.records)
 
     def observed_produced_count(self):
         if not self.armed:
@@ -169,14 +221,39 @@ class _FakeRemoteClient(RemotePulseExecutionClient):
         return self._generation
 
     def snapshot(self):
+        geometry = load_deployed_geometry_facts()
+        safe = self._state == "SAFE"
+        prepared_digest = (
+            None if safe or self._prepared is None else self._prepared.fingerprint
+        )
         return PulseServerSnapshot(
-            self._generation,
-            self._manifest,
-            200e6,
-            build_fingerprint(StreamerParams()),
-            self._state,
-            None,
-            {},
+            connection_generation=self._generation,
+            manifest=self._manifest,
+            clock_hz=geometry.clock_hz,
+            geometry_fingerprint=geometry.geometry_fingerprint,
+            state=self._state,
+            prepared_ref=None,
+            physical_state="SAFE" if safe else self._state,
+            physical_prepared_artifact_digest=prepared_digest,
+            physical_scan_point_count=(
+                0
+                if self._prepared is None
+                else len(self._prepared.target_ir.scan_points)
+            ),
+            physical_scan_cursor=None,
+            physical_cursor_sample_count=0,
+            physical_underflow_observed=False,
+            safe_status_word=0 if safe else None,
+            safe_clock_enable_words=(
+                tuple(
+                    0
+                    for _ in range(
+                        (len(self._manifest.target.raw_lanes) + 31) // 32
+                    )
+                )
+                if safe
+                else None
+            ),
         )
 
     def prepare(self, artifact):
@@ -341,9 +418,12 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
 
     bus = _TriggerBus()
     client = _FakeRemoteClient(bus)
+    cameras = []
 
     def camera_factory(config):
-        return _FakeCamera(config, bus)
+        camera = _FakeCamera(config, bus)
+        cameras.append(camera)
+        return camera
 
     plan = (
         InstallationDevicePlan("sequencer", "sequencer", _kind(_FakeRemoteClient), "fake remote"),
@@ -386,7 +466,7 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
                 raise AssertionError(handle.snapshot())
             time.sleep(0.005)
 
-        document = _qualification_document(
+        document = _four_trigger_document(
             client=client,
             trigger_lane="ch11",
             required_interval_seconds=0.0001,
@@ -407,12 +487,33 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
                 session_id,
                 artifact.fingerprint,
                 4,
+                artifact.trigger_schedules[0].fingerprint,
+                artifact.trigger_schedules[0].channel,
+                artifact.trigger_schedules[0].total,
+                artifact.trigger_schedules[0].minimum_interval_ticks,
+                artifact.target_ir.clock_hz,
             )
         )
         reference = client.prepare(artifact)
         client.fire(reference)
         completion = client.complete(reference, timeout=1.0)
         terminal = PulseTerminalAck(session_id, "fake-sequencer-binding", completion)
+        extra_channel_terminal = PulseTerminalAck(
+            session_id,
+            "fake-sequencer-binding",
+            replace(
+                completion,
+                expected_trigger_counts_from_completed_schedule=(
+                    *completion.expected_trigger_counts_from_completed_schedule,
+                    ("ch06", 1),
+                ),
+            ),
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="hardware pulse-terminal trigger count differs",
+        ):
+            cursor.bind_signal_association(token, extra_channel_terminal)
         cursor.bind_signal_association(token, terminal)
         events = tuple(cursor.next_associated_signal(token, 1.0) for _ in range(4))
         evidence = cursor.finish_signal_association(token)
@@ -431,7 +532,12 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
                 "reject-simulated-terminal",
                 "simulated-cause",
                 artifact.fingerprint,
-                1,
+                4,
+                artifact.trigger_schedules[0].fingerprint,
+                artifact.trigger_schedules[0].channel,
+                artifact.trigger_schedules[0].total,
+                artifact.trigger_schedules[0].minimum_interval_ticks,
+                artifact.target_ir.clock_hz,
             )
         )
         simulated = PulseTerminalAck(
@@ -440,7 +546,7 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
             SimulatedPulseReceipt(
                 artifact.fingerprint,
                 "fake-simulator",
-                (("ch11", 1),),
+                (("ch11", 4),),
                 0.0,
                 0.0,
             ),
@@ -450,6 +556,46 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
                 rejected.bind_signal_association(bad_token, simulated)
         finally:
             rejected.close()
+
+        qcamera = cameras[0]
+        qcamera.hardware_stamps_enabled = False
+        missing_stamp = prepared.open_associated_signal_cursor("frame_0")
+        missing_session_id = "missing-hardware-stamp"
+        missing_token = missing_stamp.arm_signal_association(
+            SignalAssociationRequest(
+                "reject-missing-hardware-stamp",
+                missing_session_id,
+                artifact.fingerprint,
+                4,
+                artifact.trigger_schedules[0].fingerprint,
+                artifact.trigger_schedules[0].channel,
+                artifact.trigger_schedules[0].total,
+                artifact.trigger_schedules[0].minimum_interval_ticks,
+                artifact.target_ir.clock_hz,
+            )
+        )
+        reference = client.prepare(artifact)
+        client.fire(reference)
+        completion = client.complete(reference, timeout=1.0)
+        try:
+            deadline = time.monotonic() + 1.0
+            while not handle.snapshot().state.terminal:
+                if time.monotonic() >= deadline:
+                    raise AssertionError(handle.snapshot())
+                time.sleep(0.005)
+            assert views[0].failure is not None
+            assert "E0-qualified hardware stamp" in views[0].failure
+            with pytest.raises(RuntimeError, match="E0-qualified hardware stamp"):
+                missing_stamp.bind_signal_association(
+                    missing_token,
+                    PulseTerminalAck(
+                        missing_session_id,
+                        "fake-sequencer-binding",
+                        completion,
+                    ),
+                )
+        finally:
+            missing_stamp.close()
     finally:
         if not handle.snapshot().state.terminal:
             handle.cancel("hardware association test complete")
@@ -512,6 +658,19 @@ def test_real_camera_association_rejects_an_undrained_pre_fire_frame() -> None:
         qcamera.read_gate.clear()
         assert qcamera.blocked_read_started.wait(1.0)
         qcamera.emit(1)
+        document = _four_trigger_document(
+            client=client,
+            trigger_lane="ch11",
+            required_interval_seconds=0.0001,
+        )
+        snapshot = client.snapshot()
+        artifact = compile_pulse_artifact(
+            document,
+            clock_hz=snapshot.clock_hz,
+            execution_form=PulseExecutionForm.STATIC_ONCE,
+            trigger_channels=("ch11",),
+            live_target=snapshot.target,
+        )
         cursor = prepared.open_associated_signal_cursor("frame_0")
         try:
             with pytest.raises(RuntimeError, match="has produced frames"):
@@ -519,8 +678,13 @@ def test_real_camera_association_rejects_an_undrained_pre_fire_frame() -> None:
                     SignalAssociationRequest(
                         "reject-undrained-frame",
                         "undrained-cause",
-                        "0" * 64,
-                        1,
+                        artifact.fingerprint,
+                        4,
+                        artifact.trigger_schedules[0].fingerprint,
+                        artifact.trigger_schedules[0].channel,
+                        artifact.trigger_schedules[0].total,
+                        artifact.trigger_schedules[0].minimum_interval_ticks,
+                        artifact.target_ir.clock_hz,
                     )
                 )
         finally:

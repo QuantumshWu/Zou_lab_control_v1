@@ -50,6 +50,7 @@ from .window import DataFigureWindow
 def _figure_window_factory(
     loader,
     *,
+    output_root: Path,
     fit_bindings: FitWorkbenchBindings | None = None,
     initial_fit_result_identity: str | None = None,
     initial_display: DataFigureDisplayState | None = None,
@@ -371,12 +372,14 @@ def _figure_window_factory(
         initial_display=initial_display,
         embedded=embedded,
         surface_size_name=size_name,
+        output_root=output_root,
     )
 
 def create_data_figure_pane(
     figure: DataFigure,
     figure_intent: FigureIntent,
     *,
+    output_root: Path,
     initial_display: DataFigureDisplayState | None = None,
     initial_grid_display: DataFigureGridDisplayState | None = None,
     initial_fit_result_identity: str | None = None,
@@ -432,6 +435,7 @@ def create_data_figure_pane(
         )
     return _figure_window_factory(
         lambda: (figure, figure_intent),
+        output_root=output_root,
         fit_bindings=fit_bindings,
         initial_display=initial_display,
         initial_grid_display=initial_grid_display,
@@ -444,6 +448,7 @@ def open_figure_workbench(
     figure_factory,
     source,
     *,
+    output_root: Path,
     intent=None,
     point_ordinals=None,
     preferences=None,
@@ -508,6 +513,7 @@ def open_figure_workbench(
     return launch_qt_window(
         _figure_window_factory(
             lambda: figure_factory(source, **options),
+            output_root=output_root,
             fit_bindings=fit_bindings,
             initial_fit_result_identity=initial_fit_result_identity,
         )

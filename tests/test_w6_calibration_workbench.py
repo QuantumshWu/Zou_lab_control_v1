@@ -39,7 +39,13 @@ def application():
 @pytest.fixture(scope="module")
 def calibration_product(tmp_path_factory):
     workspace = tmp_path_factory.mktemp("w6-calibration-workspace")
-    with zlc.connect("virtual", repository=workspace) as experiment:
+    with zlc.connect(
+        "virtual",
+        workspace=zlc.WorkspacePaths.for_workspace(
+            (workspace / "authored").resolve(),
+            repository_root=workspace.resolve(),
+        ),
+    ) as experiment:
         reference = experiment.nodes.calibration.sitemap(frames=12)
         computation = experiment.nodes.calibration.load_calibration_computation(reference)
         yield experiment, reference, computation, workspace

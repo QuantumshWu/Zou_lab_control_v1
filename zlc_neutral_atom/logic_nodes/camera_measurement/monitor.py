@@ -473,6 +473,11 @@ class PreparedLiveCameraMeasurement:
                 if association_authority is None
                 else port.device.binding_instance_id
             ),
+            operation_deadline_seconds=(
+                None
+                if association_authority is None
+                else capability.max_blocking_call_seconds
+            ),
         )
         self._start_run = start_run
         self._lock = threading.Lock()
@@ -652,6 +657,10 @@ def _association_trigger_channel(capability) -> str:
     if evidence.exact_external_trigger_qualification_digest is None:
         raise ValueError(
             "Camera association requires explicit exact-trigger qualification"
+        )
+    if evidence.exact_external_trigger_quiet_window_seconds is None:
+        raise ValueError(
+            "Camera association requires a qualified quiet-window fact"
         )
     channels = evidence.physical_facts.capture_trigger_channels
     if len(channels) != 1:

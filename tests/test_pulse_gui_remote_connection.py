@@ -16,7 +16,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import QtCore, QtTest, QtWidgets
 
-from conftest import pulse_backend_completion_for
+from conftest import private_pulse_backend_snapshot, pulse_backend_completion_for
+from fpga.pulse_streamer.host.image import StreamerParams
 from zlc_frontend.qt_widgets import ensure_qt_app
 from zlc_neutral_atom.runtime.run import RunState
 from zlc_pulse import (
@@ -31,6 +32,7 @@ from zlc_pulse import (
     save_pulse_document,
 )
 from zlc_pulse.server import serve_pulse_execution_service
+from Zou_lab_control.api import WorkspacePaths
 from Zou_lab_control.workbench import open_pulse_editor
 from gui_user_flow import (
     click_tab as _click_tab,
@@ -48,19 +50,25 @@ class _Backend:
         self.prepared = None
         self.safe = True
         self.actions: list[str] = []
+        self.state = "IDLE"
+        self.scan_points = 0
 
     def prepare(self, artifact) -> None:
         self.prepared = artifact
         self.safe = False
         self.actions.append("prepare")
+        self.state = "PREPARED"
+        self.scan_points = len(artifact.target_ir.scan_points)
 
     def fire(self, artifact) -> None:
         assert artifact is self.prepared
         self.actions.append("fire")
+        self.state = "RUNNING"
 
     def await_completion(self, artifact, _timeout):
         assert artifact is self.prepared
         self.actions.append("complete")
+        self.state = "DONE"
         return pulse_backend_completion_for(
             artifact,
             transport_id="pulse-gui-remote-test",
@@ -75,12 +83,18 @@ class _Backend:
         self.prepared = None
         self.safe = True
         self.actions.append("safe")
+        self.state = "SAFE"
 
     def request_interrupt(self) -> None:
         return None
 
     def snapshot(self):
-        return {"safe": self.safe}
+        return private_pulse_backend_snapshot(
+            state=self.state,
+            raw_lane_count=len(_server_manifest().target.raw_lanes),
+            artifact=self.prepared,
+            scan_point_count=self.scan_points,
+        )
 
 
 def _choose_remote(body) -> None:
@@ -128,8 +142,17 @@ def _server_manifest():
     )
 
 
+def _workspace_paths(root: Path) -> WorkspacePaths:
+    return WorkspacePaths.for_workspace(
+        (root / "authored").resolve(),
+        repository_root=root.resolve(),
+    )
+
+
 def _run_offline_dac_target_gui(workspace: Path, application) -> None:
-    body = open_pulse_editor(repository=workspace / "offline-target")
+    body = open_pulse_editor(
+        workspace=_workspace_paths(workspace / "offline-target")
+    )
     try:
         _exercise_offline_signal_rename(body, application)
         _exercise_offline_dac_round_trip(body, application)
@@ -185,6 +208,7 @@ def _run_remote_gui(workspace: Path) -> None:
         _server_manifest(),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
     )
     server = serve_pulse_execution_service(
         service,
@@ -199,7 +223,10 @@ def _run_remote_gui(workspace: Path) -> None:
 
     application = ensure_qt_app()
     _run_offline_dac_target_gui(workspace, application)
-    body = open_pulse_editor(repository=workspace, document=_scan_document())
+    body = open_pulse_editor(
+        workspace=_workspace_paths(workspace),
+        document=_scan_document(),
+    )
     try:
         _choose_remote(body)
         _enter_address(body, f"127.0.0.1:{unavailable_port}")
@@ -282,7 +309,8 @@ def _run_remote_gui(workspace: Path) -> None:
 
     assert body.worker_idle
     assert server_thread is not None and not server_thread.is_alive()
-    assert service.snapshot()["state"] == "SAFE"
+    assert service.snapshot().state == "SAFE"
+    assert service.snapshot().safe_readback_confirmed
     assert backend.actions.count("prepare") == 2
     assert backend.actions.count("fire") == 2
     assert backend.actions.count("complete") == 1
@@ -292,7 +320,12 @@ def _run_remote_gui(workspace: Path) -> None:
 def _run_load_before_remote(workspace: Path) -> None:
     backend = _Backend()
     deployed = load_deployed_pulse_target()
-    service = PulseExecutionService(_server_manifest(), clock_hz=50e6, backend=backend)
+    service = PulseExecutionService(
+        _server_manifest(),
+        clock_hz=50e6,
+        backend=backend,
+        params=StreamerParams(),
+    )
     server = serve_pulse_execution_service(
         service,
         host="127.0.0.1",
@@ -313,7 +346,7 @@ def _run_load_before_remote(workspace: Path) -> None:
 
     application = ensure_qt_app()
     body = open_pulse_editor(
-        repository=workspace,
+        workspace=_workspace_paths(workspace),
         path=document_path,
         remote_endpoint=f"127.0.0.1:{server.port}",
     )
@@ -332,14 +365,16 @@ def _run_load_before_remote(workspace: Path) -> None:
         server_thread.join(timeout=3.0)
 
     assert not server_thread.is_alive()
-    assert service.snapshot()["state"] == "SAFE"
+    assert service.snapshot().state == "SAFE"
 
 
 def _run_c47_input_projection_gui(workspace: Path) -> None:
     """Exercise the operator-visible local-draft and stable-widget behavior."""
 
     application = ensure_qt_app()
-    body = open_pulse_editor(repository=workspace / "c47-input")
+    body = open_pulse_editor(
+        workspace=_workspace_paths(workspace / "c47-input")
+    )
     controller = body._controller
     try:
         _until(application, lambda: body.worker_idle)
@@ -469,7 +504,7 @@ def test_c47_idle_and_scan_typing_do_not_reproject_the_global_editor(tmp_path) -
 
 def _run_virtual_manifest_gui(workspace: Path) -> None:
     application = ensure_qt_app()
-    body = open_pulse_editor(repository=workspace)
+    body = open_pulse_editor(workspace=_workspace_paths(workspace))
     offline_visible = body.current_document.visible_ports
     offline_available = body._controller.current_target_manifest.available_port_keys
     expected = (

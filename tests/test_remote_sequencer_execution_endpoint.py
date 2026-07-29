@@ -9,7 +9,9 @@ import time
 
 import pytest
 
-from conftest import pulse_backend_completion_for
+from conftest import private_pulse_backend_snapshot, pulse_backend_completion_for
+
+from fpga.pulse_streamer.host.image import StreamerParams
 
 from zlc_neutral_atom.devices.sequencer.remote_pulse import (
     RemotePulseExecutionEndpoint,
@@ -42,6 +44,7 @@ from zlc_pulse import (
     freeze_scan_table,
     load_pulse_document,
     pulse_server_snapshot_from_tree,
+    pulse_server_snapshot_to_tree,
     pulse_target_manifest_from_lanes,
 )
 from zlc_pulse.server import (
@@ -65,15 +68,20 @@ class Backend:
         self.safe = True
         self.completion = None
         self.continuous_failure = None
+        self.state = "IDLE"
+        self.scan_points = 0
 
     def prepare(self, artifact):
         self.actions.append("prepare")
         self.prepared = artifact
         self.safe = False
+        self.state = "PREPARED"
+        self.scan_points = len(artifact.target_ir.scan_points)
 
     def fire(self, artifact):
         assert artifact is self.prepared
         self.actions.append("fire")
+        self.state = "RUNNING"
 
     def await_completion(self, artifact, timeout):
         assert artifact is self.prepared
@@ -82,6 +90,7 @@ class Backend:
             artifact,
             transport_id="remote-test",
         )
+        self.state = "DONE"
         return self.completion
 
     def wait_continuous_failure(self, artifact, timeout):
@@ -93,12 +102,18 @@ class Backend:
         self.actions.append("safe")
         self.prepared = None
         self.safe = True
+        self.state = "SAFE"
 
     def request_interrupt(self):
         return None
 
     def snapshot(self):
-        return {"safe": self.safe}
+        return private_pulse_backend_snapshot(
+            state=self.state,
+            raw_lane_count=_raw_lane_count(),
+            artifact=self.prepared,
+            scan_point_count=self.scan_points,
+        )
 
 
 class Root:
@@ -106,7 +121,7 @@ class Root:
         self.service = service
 
     def current_snapshot(self):
-        return encode(self.service.snapshot())
+        return encode(pulse_server_snapshot_to_tree(self.service.snapshot()))
 
     def current_prepare(self, payload):
         return encode_prepared_ref_message(
@@ -134,7 +149,11 @@ class Root:
         )
 
     def current_interrupt_safe_state(self, generation):
-        return encode(self.service.safe_state_for_generation(generation))
+        return encode(
+            pulse_server_snapshot_to_tree(
+                self.service.safe_state_for_generation(generation)
+            )
+        )
 
 
 class Connection:
@@ -162,9 +181,17 @@ class InProcessRemotePulseExecutionClient(RemotePulseExecutionClient):
         )
         if snapshot.connection_generation != self.connection_generation:
             raise RuntimeError("interrupt safe_state returned another connection generation")
-        if snapshot.state != "SAFE" or snapshot.prepared_ref is not None:
+        if (
+            snapshot.state != "SAFE"
+            or snapshot.prepared_ref is not None
+            or not snapshot.safe_readback_confirmed
+        ):
             raise RuntimeError("pulse server acknowledged safe_state without publishing SAFE")
         return snapshot
+
+
+def _raw_lane_count() -> int:
+    return len(load_pulse_document(IMAGING_TEMPLATE).target.raw_lanes)
 
 
 def _bound_remote(client, endpoint, *, suffix="main"):
@@ -228,6 +255,7 @@ def test_remote_current_endpoint_runs_exact_artifact_and_closes_safe() -> None:
         pulse_target_manifest_from_lanes(document.target),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
     )
     control = Connection(service)
     interrupt = Connection(service)
@@ -266,7 +294,8 @@ def test_remote_current_endpoint_runs_exact_artifact_and_closes_safe() -> None:
     assert terminal.receipt.post_terminal_tail == backend.completion.post_terminal_tail
     assert terminal.artifact_digest == artifact.fingerprint
     assert closed.is_terminal
-    assert service.snapshot()["state"] == "SAFE"
+    assert service.snapshot().state == "SAFE"
+    assert service.snapshot().safe_readback_confirmed
     assert backend.actions == ["prepare", "fire", "wait", "safe"]
 
     broker.shutdown()
@@ -304,25 +333,21 @@ def test_remote_continuous_scan_progress_requires_a_real_cursor_sample() -> None
             self.fired = False
 
         def snapshot(self):
-            return {
-                "schema": "zlc_pulse.DeployedStreamerSessionSnapshot",
-                "state": "RUNNING" if self.fired else "PREPARED",
-                "prepared_artifact_digest": (
-                    None if self.prepared is None else self.prepared.fingerprint
-                ),
-                "scan_points": (
-                    0 if self.prepared is None else len(self.prepared.target_ir.scan_points)
-                ),
-                "last_confirmed_cursor": self.cursor,
-                "cursor_sample_count": self.cursor_sample_count,
-                "underflow_observed": False,
-            }
+            return private_pulse_backend_snapshot(
+                state=self.state,
+                raw_lane_count=_raw_lane_count(),
+                artifact=self.prepared,
+                scan_point_count=self.scan_points,
+                cursor=self.cursor,
+                cursor_sample_count=self.cursor_sample_count,
+            )
 
     backend = ProgressBackend()
     service = PulseExecutionService(
         pulse_target_manifest_from_lanes(document.target),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
     )
     control = Connection(service)
     interrupt = Connection(service)
@@ -384,7 +409,7 @@ def test_remote_continuous_scan_progress_requires_a_real_cursor_sample() -> None
         0.1,
     )
     assert failure == "forced deployed observer failure"
-    assert service.snapshot()["state"] == "FAILED"
+    assert service.snapshot().state == "FAILED"
 
     endpoint.close_session(
         binding,
@@ -419,6 +444,7 @@ def test_interrupt_fences_a_provisional_remote_prepare_before_it_can_fire() -> N
         pulse_target_manifest_from_lanes(document.target),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
     )
     control = Connection(service)
     blocking_root = BlockingBeforeServiceRoot(service)
@@ -481,10 +507,11 @@ def test_interrupt_fences_a_provisional_remote_prepare_before_it_can_fire() -> N
     assert not worker.is_alive()
     assert len(errors) == 1
     assert "superseded by interrupt" in str(errors[0])
-    # The server coalesces the bounded close attempt while it is already SAFE;
-    # the late prepare must still be followed by a second physical SAFE.
+    # The late prepare crossed the first interrupt, so sealing that failed
+    # operation requires one later physical SAFE.  A joined close must reuse
+    # that exact SAFE receipt rather than issue another physical transition.
     assert backend.actions == ["safe", "prepare", "safe"]
-    assert service.snapshot()["state"] == "SAFE"
+    assert service.snapshot().state == "SAFE"
 
     # Reuse remains fenced until a joined, terminally acknowledged close.
     closed = endpoint.close_session(
@@ -492,6 +519,7 @@ def test_interrupt_fences_a_provisional_remote_prepare_before_it_can_fire() -> N
         SessionCloseCommand(command.session_id, 5.0),
     )
     assert closed.is_terminal
+    assert backend.actions == ["safe", "prepare", "safe"]
     acknowledgement = endpoint.execute_command(binding, retry_command)
     assert acknowledgement.session_id == retry_command.session_id
     retry_closed = endpoint.close_session(

@@ -5,7 +5,9 @@ import threading
 import time
 
 import pytest
-from conftest import pulse_backend_completion_for
+from conftest import private_pulse_backend_snapshot, pulse_backend_completion_for
+
+from fpga.pulse_streamer.host.image import StreamerParams
 
 from zlc_pulse import (
     PulseExecutionForm,
@@ -14,6 +16,7 @@ from zlc_pulse import (
     compile_pulse_artifact,
     load_pulse_document,
     pulse_server_snapshot_from_tree,
+    pulse_server_snapshot_to_tree,
     pulse_target_manifest_from_lanes,
 )
 from zlc_pulse.server import (
@@ -61,16 +64,23 @@ class Backend:
     def __init__(self) -> None:
         self.prepared = None
         self.safe = True
+        self.state = "IDLE"
+        self.scan_points = 0
+        self.safe_calls = 0
 
     def prepare(self, artifact):
         self.prepared = artifact
         self.safe = False
+        self.state = "PREPARED"
+        self.scan_points = len(artifact.target_ir.scan_points)
 
     def fire(self, artifact):
         assert artifact is self.prepared
+        self.state = "RUNNING"
 
     def await_completion(self, artifact, timeout):
         assert artifact is self.prepared
+        self.state = "DONE"
         return pulse_backend_completion_for(artifact, transport_id="client-test")
 
     def wait_continuous_failure(self, artifact, timeout):
@@ -78,14 +88,21 @@ class Backend:
         return None
 
     def safe_state(self):
+        self.safe_calls += 1
         self.prepared = None
         self.safe = True
+        self.state = "SAFE"
 
     def request_interrupt(self):
         pass
 
     def snapshot(self):
-        return {"safe": self.safe}
+        return private_pulse_backend_snapshot(
+            state=self.state,
+            raw_lane_count=len(_fixture_manifest().target.raw_lanes),
+            artifact=self.prepared,
+            scan_point_count=self.scan_points,
+        )
 
 
 class Root:
@@ -93,7 +110,7 @@ class Root:
         self.service = service
 
     def current_snapshot(self):
-        return encode(self.service.snapshot())
+        return encode(pulse_server_snapshot_to_tree(self.service.snapshot()))
 
     def current_prepare(self, payload):
         return encode_prepared_ref_message(
@@ -121,7 +138,11 @@ class Root:
         )
 
     def current_interrupt_safe_state(self, generation):
-        return encode(self.service.safe_state_for_generation(generation))
+        return encode(
+            pulse_server_snapshot_to_tree(
+                self.service.safe_state_for_generation(generation)
+            )
+        )
 
 
 class Connection:
@@ -146,9 +167,15 @@ def _fixture():
         pulse_target_manifest_from_lanes(document.target),
         clock_hz=50e6,
         backend=backend,
+        params=StreamerParams(),
     )
     connection = Connection(service)
     return artifact, service, connection
+
+
+def _fixture_manifest():
+    document = load_pulse_document(IMAGING_TEMPLATE)
+    return pulse_target_manifest_from_lanes(document.target)
 
 
 def test_remote_client_runs_one_current_generation_without_legacy_payloads(monkeypatch):
@@ -215,7 +242,7 @@ def test_remote_client_rejects_non_current_snapshot_schema():
 
 def test_snapshot_codec_accepts_only_the_current_server_field_set():
     _artifact, service, _connection = _fixture()
-    tree = service.snapshot()
+    tree = pulse_server_snapshot_to_tree(service.snapshot())
 
     assert set(tree) == {
         "schema",
@@ -225,7 +252,14 @@ def test_snapshot_codec_accepts_only_the_current_server_field_set():
         "geometry_fingerprint",
         "state",
         "prepared_ref",
-        "backend",
+        "physical_state",
+        "physical_prepared_artifact_digest",
+        "physical_scan_point_count",
+        "physical_scan_cursor",
+        "physical_cursor_sample_count",
+        "physical_underflow_observed",
+        "safe_status_word",
+        "safe_clock_enable_words",
     }
     snapshot = pulse_server_snapshot_from_tree(tree)
     assert snapshot.connection_generation == tree["connection_generation"]
@@ -282,7 +316,7 @@ def test_remote_client_serializes_concurrent_close_to_one_safe_request(monkeypat
     assert connection.closed and interrupt_connection.closed
 
 
-def test_remote_client_never_turns_unconfirmed_safe_close_into_later_success(
+def test_remote_client_terminal_close_revokes_sockets_after_unconfirmed_safe(
     monkeypatch,
 ):
     _install_in_process_rpyc_timed(monkeypatch)
@@ -300,8 +334,42 @@ def test_remote_client_never_turns_unconfirmed_safe_close_into_later_success(
 
     with pytest.raises(RuntimeError, match="SAFE unconfirmed"):
         client.close()
-    with pytest.raises(RuntimeError, match="remains fail-closed"):
-        client.close()
-
     assert calls == 1
     assert connection.closed and interrupt_connection.closed
+
+    next_connection = Connection(service)
+    next_interrupt_connection = Connection(service)
+    next_client = RemotePulseExecutionClient(
+        next_connection,
+        next_interrupt_connection,
+    )
+    assert next_client.safe_state().safe_readback_confirmed
+    assert service.snapshot().safe_readback_confirmed
+    next_client.close()
+
+
+def test_explicit_safe_state_failure_can_retry_on_the_same_live_connection(
+    monkeypatch,
+):
+    _install_in_process_rpyc_timed(monkeypatch)
+    _artifact, service, connection = _fixture()
+    interrupt_connection = Connection(service)
+    client = RemotePulseExecutionClient(connection, interrupt_connection)
+    calls = 0
+    original = interrupt_connection.root.current_interrupt_safe_state
+
+    def fail_once(generation):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("SAFE temporarily unconfirmed")
+        return original(generation)
+
+    interrupt_connection.root.current_interrupt_safe_state = fail_once
+
+    with pytest.raises(RuntimeError, match="temporarily unconfirmed"):
+        client.safe_state()
+    assert not connection.closed and not interrupt_connection.closed
+    assert client.safe_state().safe_readback_confirmed
+    assert calls == 2
+    client.close()

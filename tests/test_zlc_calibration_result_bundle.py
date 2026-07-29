@@ -84,16 +84,12 @@ from zlc_neutral_atom.logic_nodes.readout.contracts import (
 )
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.commit import (
-    CommitTarget,
-    PersistentCommitJournal,
-    PublishedManifest,
-    RepositoryCommitCoordinator,
+    PreparedArtifactCommit,
 )
 from zlc_neutral_atom.runtime.resources import ResourceArbiter
 from zlc_neutral_atom.runtime.run import CancelOutcome, RunController, RunPlan
 from zlc_pulse import PulseTarget
 from zlc_storage import RepositoryRootLease
-from zlc_storage.paths import PROJECT_ROOT
 
 
 def _render_current_report(view):
@@ -330,40 +326,28 @@ class _CommittedCalibrationRun:
     ) -> None:
         self.result = result
         self.root_lease = RepositoryRootLease(root)
-        self.journal = PersistentCommitJournal(
-            root / "calibration-commit.journal",
-            result.repository_id,
-        )
-        self.coordinator = RepositoryCommitCoordinator(
-            self.journal,
-            lambda _intent: None,
-            root_lease=self.root_lease,
-        )
         self.resources = ResourceArbiter()
         self.controller = RunController(self.resources)
 
     def start(self):
         result = self.result
-        target = CommitTarget(
-            result.repository_id,
-            "calibration",
-            "zlc.test.calibration",
-            result.target_ref,
-            result.manifest_digest,
-        )
 
         def finalize(context, _executed):
             run_id = context.authorize_commit_preparation()
-            operation = self.coordinator.prepare(
-                f"calibration-final-{run_id}-{result.manifest_digest}",
-                run_id,
-                target,
-                lambda: PublishedManifest(
-                    target.target_ref,
-                    result.manifest_digest,
-                    result,
-                ),
+            borrow = self.root_lease.borrow()
+            operation = PreparedArtifactCommit(
+                run_id=run_id,
+                result=result,
+                manifest_payload=b"calibration-result-bundle-test",
+                publish=lambda _payload: None,
+                inspect=lambda _payload: True,
+                repository_borrow=borrow,
             )
+            try:
+                context.track_prepared_commit(operation)
+            except BaseException:
+                operation.abandon()
+                raise
             return context.commit_final(operation)
 
         return self.controller.start(
@@ -382,7 +366,6 @@ class _CommittedCalibrationRun:
     def close(self) -> None:
         assert self.controller.shutdown(2.0)
         self.resources.shutdown()
-        self.coordinator.close()
         self.root_lease.close()
 
 
@@ -437,14 +420,14 @@ class _SavedCalibrationDependencies:
             raise TimeoutError("focused output writer was not released")
 
 
-def test_saved_task_uses_project_path_preserves_frames_and_rejects_late_cancel(
+def test_saved_task_uses_explicit_output_preserves_frames_and_rejects_late_cancel(
     tmp_path,
     monkeypatch,
 ) -> None:
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
-    relative_folder = f"_output/focused-calibration-{tmp_path.name}"
+    expected_root = (tmp_path / "focused-calibration").resolve()
     source = CaptureArtifactRef("capture-repository", "b" * 64)
     calibration = CalibrationArtifactRef("calibration-repository", "a" * 64)
     child = _CommittedCalibrationRun(tmp_path / "commit-repository", calibration)
@@ -453,9 +436,9 @@ def test_saved_task_uses_project_path_preserves_frames_and_rejects_late_cancel(
     dependencies = _SavedCalibrationDependencies(source, child, writing, release)
     intent = CalibrationTaskIntent(
         source_mode="saved frames",
-        folder=relative_folder,
+        folder=str(expected_root),
         save_frames=False,
-        pulse="pulses/imaging_template.json",
+        pulse="imaging_template.json",
         threshold_method="otsu",
         reference_exposure_s=0.020,
         readout_exposure_s=0.005,
@@ -463,8 +446,6 @@ def test_saved_task_uses_project_path_preserves_frames_and_rejects_late_cancel(
         roi_radius=1,
         camera_role="camera",
     )
-    expected_root = (PROJECT_ROOT / relative_folder).resolve()
-
     try:
         assert Path(intent.folder) == expected_root
         prepared = prepare_calibration_task(intent, dependencies)
@@ -567,7 +548,7 @@ def test_preserve_policy_keeps_admitted_saved_frame_export(
 
 
 def test_custom_sitemap_pulse_is_rebound_to_the_live_profile_target() -> None:
-    base = load_sitemap_pulse()
+    base = load_sitemap_pulse(Path(__file__).resolve().parents[1] / "pulses")
     y_axis = AxisId("camera-y")
     x_axis = AxisId("camera-x")
     frame = CoordinateFrameId("camera-output")

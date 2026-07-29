@@ -26,9 +26,19 @@ IMAGING_PULSE = ROOT / "pulses" / "imaging_template.json"
 MOT_FIELD_PULSE = ROOT / "pulses" / "mot_field_template.json"
 
 
+def _workspace(repository_root: Path) -> zlc.WorkspacePaths:
+    return zlc.WorkspacePaths.for_workspace(
+        ROOT,
+        repository_root=repository_root,
+    )
+
+
 def test_fit_and_figure_run_on_the_virtual_installation() -> None:
     with tempfile.TemporaryDirectory() as workspace:
-        with zlc.connect("virtual", repository=Path(workspace) / "ws") as exp:
+        with zlc.connect(
+            "virtual",
+            workspace=_workspace(Path(workspace) / "ws"),
+        ) as exp:
             capture = exp.run(exp.readout.capture_request(IMAGING_PULSE))
 
             # The axes come from the committed capture rather than being guessed
@@ -112,7 +122,7 @@ def test_mot_task_analyzes_once_and_reuses_that_result_for_every_output(
 
     workspace = tmp_path / "mot-workspace"
     report_folder = tmp_path / "mot-report"
-    with zlc.connect("virtual", repository=workspace) as exp:
+    with zlc.connect("virtual", workspace=_workspace(workspace)) as exp:
         command = exp.nodes.mot_field.prepare_mot_field_task(
             MotFieldTaskIntent(
                 pulse=str(MOT_FIELD_PULSE),

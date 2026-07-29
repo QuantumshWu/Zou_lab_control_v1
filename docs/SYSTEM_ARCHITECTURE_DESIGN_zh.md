@@ -410,11 +410,11 @@ PulseSafeReceipt:
 
 raw backend maps只可附在diagnostics，不能参与neutral分支、artifact admission或SAFE铸造。只有拥有真实session/readback的`DeployedStreamerSession`能在同一connection generation内签发SAFE receipt；retry在同一owner lock串行，失败拒绝本次连接但不建立quarantine。上述values只包装现有status/register/transport事实，不要求RTL、ROM或bitstream增加字段。
 
-Camera与running-signal association使用两种不可互换、single-use的arm receipt：
+Camera与running-signal association使用两种不可互换的既有边界，不建立receipt类型家族：
 
-- `CameraArmedReceipt` 只属于physical finite capture；它证明旧acquisition已经stop/drain、new camera generation已建立、logical counter baseline为零或adapter定义的无歧义起点、预期cardinality和buffer配置已冻结。消费一次后失效。
-- `AssociationArmedReceipt` 只属于FormalPulseScan over an already-running signal；它冻结producer generation、program/schedule digest、publication cardinality、stable counter/event baseline、deadline与qualified quiet-window facts。它由generic association port签发，不持Camera binding、不重arm或重配上游。
-- 两者都绑定exact request/adapter identity、不可跨generation复用；FIRE后的terminal/count/stamp reconciliation必须匹配receipt。receipt缺失、重复消费、identity变化或deadline越界都在artifact commit前使Run失败。
+- physical finite capture复用现有`CaptureStartedAck`：它证明旧acquisition已经stop/drain、new arm建立、source ordinal baseline为零、预期cardinality和buffer配置已冻结；session/binding identity提供single-use边界。
+- FormalPulseScan over an already-running signal复用现有association cursor的私有token：它冻结producer generation、artifact/schedule fingerprint、publication cardinality、stable counter/event baseline、operation deadline与当前working-point quiet fact；generic association port不持Camera binding、不重arm或重配上游。
+- 两者都绑定exact request/adapter identity、不可跨generation复用；FIRE后的terminal/count/stamp reconciliation必须匹配该边界。token缺失、重复消费、identity变化或deadline越界都在artifact commit前使Run失败。
 
 正常 Pulse 与 SCAN_SLOT/MOT 执行只使用现有 bitstream 的 autonomous streamed hardware timing。API-slot 无法无缝更新时才允许既有、显式标记的 segmented `STATIC_ONCE` 路径。不存在逐 cell host fire/wait、software sleep timing 或为了架构偏好新增 trigger FIFO/counter/ROM attestation 的 baseline。
 
@@ -430,13 +430,14 @@ frozen pulse program
 
 它不取得 Camera、Processor 或 Figure 的设备，不启动/停止上游，也不按 producer 类型建立第二条 capture pipeline。普通 cursor 只证明软件交付顺序；正式 scan 必须在 FIRE 前冻结 publication cardinality/association，在 FIRE 后绑定 exact pulse terminal，并在 commit 前验证每个 event、coverage、generation 和 lineage。
 
-qCMOS 正式资格使用现有硬件能力：
+qCMOS 正式资格使用现有硬件能力，并明确区分“路径语义资格”与“本 Run 事实”：
 
 1. 一次 arm 为外触发模式，并按整 Run 的冻结帧数配置；
-2. E0 qualification 对完整工作 envelope 验证 exposure、ROI、frames-per-cycle、最大 burst/count、trigger spacing、SDK ring 和 delivery latency；
-3. preflight 根据冻结 camera mode 与 compiled schedule 验证 timing margin，不满足则 FIRE 前拒绝；
-4. Run 末端比较 expected/emitted/produced/drained count，检查 frame/camera stamp 与 timestamp 的单调性和 quiet-window 稳定性；
-5. 任一缺帧、多帧、乱序、late extra、generation change 或 terminal/coverage 不一致使整 Run INVALID，不能提交、不能自动重跑。
+2. E0 qualification 只主动证明当前 adapter/连接、ROI、binning、readout、trigger wiring/mode 与 counter/stamp 的 ordered one-frame-per-trigger 语义；不得由少量固定 trigger 虚构最大 scan count、最大 delivery latency或无限 sustained-delivery envelope；
+3. 每个 Run 以 pulse artifact 为完整 schedule 的唯一 owner；association 只冻结常数级的 artifact/schedule fingerprint、channel、count、minimum spacing 与 clock，不能把 O(N) schedule arrays 再写入 lineage；
+4. preflight 读取当下冻结 exposure/工作点的真实 minimum trigger interval并核对完整 compiled schedule 的最小间距；不满足则 FIRE 前拒绝。新 finite Capture 在 physical arm 时把设备 buffer 配成该 Run 的 exact cardinality。已经运行的 signal association 绝不重arm、resize或重配上游，而是在 FIRE 前冻结当前 arm/session 与 stable produced/drained/publication baseline，依靠上游持续排空有限 driver ring 和无损 raw stream/FollowTap 交付；ring overrun、少/多/乱序、stream publication failure或期限届满都使整 Run INVALID。它保证 fail-closed 正确性，不承诺任意长 schedule 在固定 ring 上必然成功。只改变 exposure 时，endpoint须证明其它 qualification-scope facts未变并用新 readback重新计算 timing/quiet facts；
+5. Run 末端比较 expected/emitted/produced/observed/drained count，检查 frame/camera stamp 与 timestamp 的单调性，再经过由当前物理 trigger interval 派生的 quiet window确认counter不再增加；普通SDK timeout只作为本次失败期限，不能命名或持久化为“qualified maximum delivery latency”；
+6. 任一缺帧、多帧、乱序、late extra、counter倒退/wrap歧义、generation change 或 terminal/coverage 不一致使整 Run INVALID，不能提交、不能自动重跑。
 
 该保证是 preflight + per-run reconcile，不声称具备现有硬件没有的逐沿 tag。只有 E0 或代码证据证明现有 RTL 真 bug/偏离既定设计时，才单独评估与根因直接相关的最小硬件变更；任何硬件修改都不由本文自动授权。
 
@@ -604,7 +605,7 @@ atomic publish exact canonical manifest + durability barrier
 ### M4：Run、pulse、storage 边界
 
 - 收敛SAFE唯一owner/receipt、typed progress、single geometry loader、neutral→pulse public API；保持RTL/bitstream冻结。
-- 分开CameraArmedReceipt与AssociationArmedReceipt，完成§6.3的E0 envelope、完整schedule preflight与quiet-window reconciliation。
+- 在现有finite-start ack与association token内分开physical arm和running-signal association；按§6.3完成路径语义E0、完整schedule的常数级绑定、当前工作点preflight与per-run quiet-window reconciliation，不新增receipt类型家族。
 - 将hardware lease释放移到SAFE+device-buffer-sealed receipt/capability revoke之后、任何artifact/report之前；以success/failure/cancel覆盖exact-once release，post-safety操作不得持SDK/DMA view或延长busy。
 - 删除commit journal/coordinator/intent/reconcile与无消费者generic framed side journal；实现PreparedArtifactCommit、manifest atomic publish、PendingManifestInspection与success/lost-ack/absent/unreadable/corrupt矩阵。Calibration/Occupancy provenance进canonical manifest；引入composition-owned WorkspacePaths。
 
@@ -623,7 +624,7 @@ atomic publish exact canonical manifest + durability barrier
 
 ### M7：证据与清理
 
-- 完成 point/source-binding/group property tests、same-shot SignalFront/transaction tests、fixed-cardinality/association tests、live/snapshot Fit隔离与nested ROI replay、regular-raster profile、calibration canonical-raster parity、complete-blocker admission/lease-release、semantic widget projection、SAFE retry、manifest pending/lost-ack matrix、E0 full-envelope camera contract和正式product E2E。
+- 完成 point/source-binding/group property tests、same-shot SignalFront/transaction tests、fixed-cardinality/association tests、live/snapshot Fit隔离与nested ROI replay、regular-raster profile、calibration canonical-raster parity、complete-blocker admission/lease-release、semantic widget projection、SAFE retry、manifest pending/lost-ack matrix、Camera路径语义E0+实际Run长schedule对账合同和正式product E2E。
 - 对M1–M6每个slice记录旧树等价能力生产行数比和抽象consumer/invariant清单；>约3倍的slice必须在合并前完成压缩或给出逐项物理/边界理由，不能用测试/codec/历史兼容凑解释。
 - 总清点此前各cut已经同步改写/删除的测试，补齐跨cut property/product E2E；不得在M7才首次处理旧owner测试。清除过期tutorial、重复架构文档和所有死symbol；保留与main视觉合同一致且由唯一style owner注册的Helvetica Light正式资产。
 - 最后才跑 broad suite；这里延期的是整套执行，不是测试源码迁移。失败按仍有效的物理/public contract 判断，绝不恢复旧架构迎合历史测试。
@@ -639,7 +640,7 @@ atomic publish exact canonical manifest + durability barrier
 5. Calibration、TaskConsole、DataFigure、FigureViewer对同一FigureIntent/source/complete display state/size/DPR使用同一canonical PlotPanel base raster与frontend overlay contract；FigureFront含actual bins/group/effective schema及与base raster同compose的RenderedGeometry。source front swap期间gesture锁旧front，resize/DPR invalidation则无final publication地cancel并recompose，绝不跨geometry映射。Cross/Area连续交互同源且无hover；Live Fit期间base持续前进、Edit Fit不影响任一Monitor，overlay携独立source ref并显示CURRENT/LAGGING或隐藏INCOMPATIBLE，Fit params仅EVENT_RESULT。standalone不伪造signal，ROI→ROI→Fit及三个以上retained revisions无presentation/transaction race。
 6. Camera live shape固定`(1,1,*frame)`，finite从progress到FINAL固定`(K,1,*frame)`并以validity表示未完成R；history不影响shape且dtype保持`uint8`。N=3的frame_0/1/2同transaction。MOT Ready→Running/live/FINAL，shape`(R,343,1)`、topology`7×7×7`且不O(N²)。Calibration恰有两linked flat RunId、command host无RunId；Occupancy可显式加载已有CalibrationArtifactRef且current ref只预填。Camera(`camera`, live或finite)+MOT并行；Camera(`mot_camera`, live)+MOT只退休该monitor；Camera(`mot_camera`, finite/formal)明确拒绝且不先停。多资源冲突一次返回完整集合、全退后对同一plan只admit一次；nonpreemptible/外部owner不被自动停止。若camera monitor正供FormalPulseScan使用则不被抢占；纯continuous downstream则随retirement closure正常退出。cancel/post-FINAL warning正确。
 7. 冷启动/崩溃重启均在任何admission前完成geometry handshake+由DeployedStreamerSession基于真实readback铸造的SAFE receipt；故障可重试、并发retry只有一个物理SAFE、无quarantine。artifact lost-ack exact inspection返回同一ref；pending Run非terminal、cancel too-late、wait可超时，hardware lease已释放且新Run可继续。Calibration/Occupancy known-ref manifest都可直接验证run/source provenance，无journal。
-8. 真机按含frames-per-cycle、最大burst/count、spacing range、SDK ring与delivery latency的完整E0 envelope qualification。finite Capture走physical arm/zero baseline；PulseScan over running signal只走AssociationArmedReceipt。FIRE后验typed terminal与compiled expected，再经过qualified quiet window确认counter持续exact；任何late extra/少/多/乱序在PreparedArtifactCommit前整run INVALID，不自动重跑。
+8. 真机E0主动证明当前adapter/连接、固定结构工作点与counter/stamp的ordered one-frame-per-trigger语义，但不由短测试虚构最大count或delivery latency。finite Capture走physical arm/zero baseline并配置exact buffer；PulseScan over running signal走独立association token，冻结已有arm/session与produced/drained/published baseline，不重arm或resize。每个Run对pulse-owned完整schedule做常数级fingerprint/channel/count/min-spacing绑定，以当前工作点readback做preflight；FIRE期间上游持续排空有限driver ring并无损发布，FIRE后验typed terminal、produced/observed/drained/published与stamp order，再经过当前物理quiet window确认counter持续exact。任何ring overrun、stream publication failure、late extra、少/多/乱序/wrap歧义在PreparedArtifactCommit前使整run INVALID，不自动重跑；该模式保证fail-closed，不保证任意长Run都成功。
 9. installation graph对API及TaskConsole requirements的missing/ambiguous/cardinality/cycle启动即失败；两个binder只收frozen narrow facts且不保留catalog。新增/删除纯Logic Node只改叶包；新增物理device才改device leaf/部署配置；无中央concrete switch。唯一系统设计文档、代码、public API、教程和当前合同测试完全一致，无compatibility residue。
 10. M1–M6每个slice都有main等价能力生产行数比与抽象consumer/invariant清单；>约3倍均已压缩或逐项证明物理/边界必要性。不存在只为单一成员/单实例/旧兼容而保留的enum、wrapper、DTO或目录。
 11. 正式Qt快轨确认unit/name/value/selector program编辑不创建全局snapshot或重建无关widgets，Add/Remove/Reorder只修改对应结构；render/submit/hardware/publication边界才冻结。交互性能问题先以profile证明compose/copy/lock根因，再优化唯一owner，不加防抖或假缩放掩盖。

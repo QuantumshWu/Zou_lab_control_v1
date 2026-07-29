@@ -32,10 +32,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--repository",
         type=Path,
-        help=(
-            "Standalone runtime workspace; defaults to ZLC_PULSE_WORKSPACE or "
-            "~/.zlc/pulse-workbench."
-        ),
+        default=Path.home() / ".zlc" / "pulse-workbench",
+        help="Standalone artifact repository root.",
+    )
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path(__file__).resolve().parent,
+        help="Authored workspace containing pulses/ and tasks/.",
     )
     return parser
 
@@ -47,6 +51,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from PyQt5 import QtCore
 
     from zlc_frontend.qt_widgets import ensure_qt_app
+    from Zou_lab_control.api import WorkspacePaths
     from Zou_lab_control.workbench import open_pulse_editor
 
     application = ensure_qt_app()
@@ -61,7 +66,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     editor = open_pulse_editor(
         path=args.document,
         remote_endpoint=remote_endpoint,
-        repository=args.repository,
+        workspace=WorkspacePaths.for_workspace(
+            args.workspace.expanduser().resolve(),
+            repository_root=args.repository.expanduser().resolve(),
+        ),
     )
     auto_close_ms = os.environ.get("ZLC_PULSE_GUI_AUTO_CLOSE_MS")
     if auto_close_ms:

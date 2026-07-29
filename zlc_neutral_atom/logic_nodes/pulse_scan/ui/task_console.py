@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
+
 from zlc_neutral_atom.logic_nodes.pulse_scan.application import PreparedExactScan
 from zlc_neutral_atom.logic_nodes.pulse_scan.declaration import PULSE_SCAN_LOGIC_NODE
 from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import PulseScanBoundRequest
@@ -11,13 +14,26 @@ from zlc_frontend.form import project_authoring_form
 from .task_console_form import pulse_scan_form
 
 
-def pulse_scan_task_console_adapter(*, prepare, read_pulse_template, project_custom):
+def pulse_scan_task_console_adapter(
+    *,
+    prepare,
+    read_pulse_template,
+    build_request,
+    pulses_root: Path,
+    project_custom,
+):
     """Bind PulseScan without letting TaskConsole interpret its physical y."""
 
     if not callable(project_custom):
         raise TypeError("project_custom must be callable")
+    if not callable(build_request):
+        raise TypeError("build_request must be callable")
     path_presentations = {
-        value.field_key: value
+        value.field_key: (
+            replace(value, base_dir=str(Path(pulses_root).resolve()))
+            if value.base_dir == "pulses"
+            else value
+        )
         for value in PULSE_SCAN_LOGIC_NODE.path_presentations
     }
     base_form = project_authoring_form(
@@ -39,7 +55,7 @@ def pulse_scan_task_console_adapter(*, prepare, read_pulse_template, project_cus
 
     def create_node(host, current_spec, values, instance_id):
         resolved = host.bind_inputs(current_spec, values)
-        program = current_spec.build_request(values)
+        program = build_request(values)
         request = PULSE_SCAN_LOGIC_NODE.bind_request(program, resolved.bound)
         if not isinstance(request, PulseScanBoundRequest):
             raise TypeError("PulseScan owner returned another bound request type")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
 
@@ -15,14 +16,24 @@ from .source_binding import PulseScanBoundRequest
 
 
 class PulseScanApi:
-    __slots__ = ("_prepare", "_repository")
+    __slots__ = ("_prepare", "_pulses_root", "_repository")
 
-    def __init__(self, repository: ScanRepository, *, prepare: Callable) -> None:
+    def __init__(
+        self,
+        repository: ScanRepository,
+        *,
+        pulses_root: Path,
+        prepare: Callable,
+    ) -> None:
         if not isinstance(repository, ScanRepository):
             raise TypeError("repository must be ScanRepository")
         if not callable(prepare):
             raise TypeError("prepare must be callable")
+        root = Path(pulses_root).expanduser()
+        if not root.is_absolute():
+            raise ValueError("PulseScan pulses_root must be absolute")
         self._repository = repository
+        self._pulses_root = root.resolve()
         self._prepare = prepare
 
     def close(self) -> tuple[Exception, ...]:

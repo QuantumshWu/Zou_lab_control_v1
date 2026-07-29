@@ -9,7 +9,6 @@ Workbench is named in its concrete port type.
 
 from __future__ import annotations
 
-import os
 import threading
 from pathlib import Path
 from typing import Callable
@@ -21,9 +20,23 @@ from zlc_pulse import PulseDocument
 class _TaskConsoleProjection:
     """Explicit domain-neutral projectors supplied to capability packages."""
 
-    __slots__ = ("_custom", "_processor", "_resolve_final_or_saved", "_run")
+    __slots__ = (
+        "_custom",
+        "_path_roots",
+        "_processor",
+        "_resolve_final_or_saved",
+        "_run",
+    )
 
-    def __init__(self, *, run, processor, custom, resolve_final_or_saved) -> None:
+    def __init__(
+        self,
+        *,
+        run,
+        processor,
+        custom,
+        resolve_final_or_saved,
+        path_roots,
+    ) -> None:
         for value, name in (
             (run, "run"),
             (processor, "processor"),
@@ -36,14 +49,18 @@ class _TaskConsoleProjection:
         self._processor = processor
         self._custom = custom
         self._resolve_final_or_saved = resolve_final_or_saved
+        self._path_roots = dict(path_roots)
 
     def run(self, declaration, **kwargs):
+        kwargs["path_roots"] = self._path_roots
         return self._run(declaration, **kwargs)
 
     def processor(self, declaration, **kwargs):
+        kwargs["path_roots"] = self._path_roots
         return self._processor(declaration, **kwargs)
 
     def custom(self, declaration, **kwargs):
+        kwargs["path_roots"] = self._path_roots
         return self._custom(declaration, **kwargs)
 
     def resolve_final_or_saved(self, binding, **kwargs):
@@ -77,6 +94,7 @@ def task_console_ports(experiment):
         compose_task_console_attachments,
     )
 
+    workspace = experiment._workspace_paths()
     return TaskConsoleApplicationPorts(
         attachments=compose_task_console_attachments(
             experiment.nodes,
@@ -86,26 +104,25 @@ def task_console_ports(experiment):
                 processor=project_processor_declaration,
                 custom=project_custom_declaration,
                 resolve_final_or_saved=resolve_final_or_saved_artifact,
+                path_roots={
+                    "pulses": workspace.pulses_root,
+                    "tasks": workspace.tasks_root,
+                    "output": workspace.output_root,
+                },
             ),
-        )
+        ),
+        tasks_root=workspace.tasks_root,
+        output_root=workspace.output_root,
     )
 
 
-def standalone_pulse_workspace(value: str | Path | None) -> Path:
-    """Resolve the one durable workspace owned by a standalone PulseGUI."""
-
-    if value is not None:
-        return Path(value).expanduser().resolve()
-    configured = os.environ.get("ZLC_PULSE_WORKSPACE", "").strip()
-    if configured:
-        return Path(configured).expanduser().resolve()
-    return (Path.home() / ".zlc" / "pulse-workbench").resolve()
-
-
-def standalone_pulse_connection_factory(workspace: Path):
+def standalone_pulse_connection_factory(workspace):
     """Build standalone virtual/remote connections outside ``zlc_workbench``."""
 
-    root = Path(workspace).expanduser().resolve()
+    from Zou_lab_control.api import WorkspacePaths
+
+    if not isinstance(workspace, WorkspacePaths):
+        raise TypeError("workspace must be WorkspacePaths")
 
     def compose(
         mode: str,
@@ -125,7 +142,7 @@ def standalone_pulse_connection_factory(workspace: Path):
             )
             connection = connect(
                 document,
-                repository=root,
+                workspace=workspace,
                 name="pulse_gui",
             )
         elif mode == "remote":
@@ -140,7 +157,7 @@ def standalone_pulse_connection_factory(workspace: Path):
             )
             connection = connect(
                 document,
-                repository=root,
+                workspace=workspace,
                 name="pulse_gui",
                 required_pulse_document=required_document,
             )
@@ -190,14 +207,14 @@ class ExperimentDeviceAdmin:
         "_lock",
         "_name",
         "_owns_active",
-        "_repository",
+        "_workspace",
         "_terminated",
     )
 
     def __init__(
         self,
         *,
-        repository: str | Path | None = None,
+        workspace=None,
         name: str | None = None,
         active=None,
         owns_active: bool,
@@ -209,22 +226,24 @@ class ExperimentDeviceAdmin:
         if owns_active:
             if active is not None:
                 raise ValueError("standalone DeviceManager starts without an Experiment")
-            if repository is None:
-                raise ValueError("standalone DeviceManager requires a repository")
+            from Zou_lab_control.api import WorkspacePaths
+
+            if not isinstance(workspace, WorkspacePaths):
+                raise TypeError("standalone DeviceManager requires WorkspacePaths")
             resolved_name = "" if name is None else str(name).strip()
             if not resolved_name:
                 raise ValueError("DeviceManager experiment name must be non-empty")
-            self._repository = Path(repository).expanduser().resolve()
+            self._workspace = workspace
             self._name = resolved_name
             self._connect: Callable | None = connect
         else:
             if active is None:
                 raise ValueError("bound DeviceManager requires an Experiment")
-            if repository is not None or name is not None:
+            if workspace is not None or name is not None:
                 raise ValueError(
                     "bound DeviceManager does not own repository or connection settings"
                 )
-            self._repository = None
+            self._workspace = None
             self._name = active.name
             self._connect = None
         self._active = active
@@ -238,16 +257,11 @@ class ExperimentDeviceAdmin:
     def standalone(
         cls,
         *,
-        repository: str | Path | None,
+        workspace,
         name: str,
     ) -> "ExperimentDeviceAdmin":
-        root = (
-            Path.home() / ".zlc" / "device-manager"
-            if repository is None
-            else Path(repository)
-        )
         return cls(
-            repository=root,
+            workspace=workspace,
             name=name,
             active=None,
             owns_active=True,
@@ -317,8 +331,8 @@ class ExperimentDeviceAdmin:
             raise TypeError("candidate must be InstallationConfigDocument")
         with self._lock:
             connect = self._connect
-            repository = self._repository
-            if not self._owns_active or connect is None or repository is None:
+            workspace = self._workspace
+            if not self._owns_active or connect is None or workspace is None:
                 raise RuntimeError("a bound DeviceManager cannot initialize a replacement")
             if self._disposed:
                 raise RuntimeError("Device manager authority is closed")
@@ -332,7 +346,7 @@ class ExperimentDeviceAdmin:
         try:
             active = connect(
                 candidate,
-                repository=repository,
+                workspace=workspace,
                 name=self._name,
             )
         except BaseException:
@@ -401,6 +415,5 @@ __all__ = [
     "ExperimentDeviceAdmin",
     "bound_pulse_mode",
     "standalone_pulse_connection_factory",
-    "standalone_pulse_workspace",
     "task_console_ports",
 ]

@@ -56,7 +56,9 @@ def validate_target_ir_for_geometry(
 
     if not isinstance(ir, TargetIR):
         raise TypeError("validate_target_ir_for_geometry requires TargetIR")
-    geometry = params or StreamerParams()
+    from .deployment import _resolve_streamer_params
+
+    geometry = _resolve_streamer_params(params)
     check_rtl_assumptions(geometry)
     operand_width = SLOT_MULTIPLIER_WIDTH
 

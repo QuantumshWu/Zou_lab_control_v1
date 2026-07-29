@@ -156,6 +156,47 @@ def camera_output_shape_yx(
     )  # type: ignore[return-value]
 
 
+def camera_external_trigger_quiet_window_seconds(
+    required_interval_seconds: float,
+) -> float:
+    """Return the sole late-frame observation interval for a working point."""
+
+    return 1.25 * _nonnegative_real(
+        required_interval_seconds,
+        "required_external_trigger_interval_seconds",
+    )
+
+
+def validate_camera_external_trigger_spacing(
+    *,
+    minimum_trigger_interval_ticks: int | None,
+    clock_hz: int,
+    required_interval_seconds: float,
+) -> None:
+    """Reject a compiled schedule faster than the current camera readback."""
+
+    if isinstance(clock_hz, bool) or not isinstance(clock_hz, int) or clock_hz <= 0:
+        raise ValueError("clock_hz must be a positive integer")
+    required = _positive_finite(
+        required_interval_seconds,
+        "required_external_trigger_interval_seconds",
+    )
+    if minimum_trigger_interval_ticks is None:
+        return
+    if (
+        isinstance(minimum_trigger_interval_ticks, bool)
+        or not isinstance(minimum_trigger_interval_ticks, int)
+        or minimum_trigger_interval_ticks <= 0
+    ):
+        raise ValueError(
+            "minimum_trigger_interval_ticks must be a positive integer or None"
+        )
+    if minimum_trigger_interval_ticks / clock_hz < required:
+        raise ValueError(
+            "compiled trigger schedule is faster than the camera working point"
+        )
+
+
 def validate_camera_frame_schema_facts(
     *,
     spatial_y_axis_id: AxisId,
@@ -1038,6 +1079,17 @@ class CameraPhysicalFacts:
     def output_shape_yx(self) -> tuple[int, int]:
         return camera_output_shape_yx(self.roi_shape_yx, self.binning_yx)
 
+    @property
+    def external_trigger_quiet_window_seconds(self) -> float | None:
+        """Observation interval used to reject late frames after terminal."""
+
+        interval = self.required_external_trigger_interval_seconds
+        return (
+            None
+            if interval is None
+            else camera_external_trigger_quiet_window_seconds(interval)
+        )
+
     def event_setting(self, event_index: int) -> CameraEventReadoutSetting:
         return CameraEventReadoutSetting(
             _nonnegative_int(event_index, "event_index"),
@@ -1237,13 +1289,24 @@ class CameraCapabilityEvidence:
                 qualification,
                 "exact_external_trigger_qualification_digest",
             )
-            if (
+            required_interval = (
                 self.physical_facts.required_external_trigger_interval_seconds
-                is None
-            ):
+            )
+            if required_interval is None or required_interval <= 0.0:
                 raise ValueError(
-                    "exact external-trigger qualification requires trigger-interval readback"
+                    "exact external-trigger qualification requires positive "
+                    "trigger-interval readback"
                 )
+
+    @property
+    def exact_external_trigger_quiet_window_seconds(self) -> float | None:
+        """Derive the current quiet window; never persist a second timing fact."""
+
+        if self.exact_external_trigger_qualification_digest is None:
+            return None
+        interval = self.physical_facts.required_external_trigger_interval_seconds
+        assert interval is not None
+        return camera_external_trigger_quiet_window_seconds(interval)
 
     @property
     def settings_fingerprint(self) -> str:
@@ -1517,7 +1580,10 @@ class CameraAdapter(Protocol):
 
         ...
 
-    def capture_state(self) -> tuple[bool, int]: ...
+    def capture_state(self) -> tuple[bool, int]:
+        """Return ``(active, next_source_ordinal)`` for the current arm."""
+
+        ...
 
 
 @runtime_checkable

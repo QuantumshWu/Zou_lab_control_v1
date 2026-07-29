@@ -301,7 +301,7 @@ def test_formal_histogram_fit_uses_full_samples_and_rejects_changed_view() -> No
         )
 
 
-def test_standalone_data_figure_uses_the_same_histogram_fit_context() -> None:
+def test_standalone_data_figure_uses_the_same_histogram_fit_context(tmp_path) -> None:
     application = ensure_qt_app()
     figure, _snapshot = _figure(0)
     display = HistogramDisplayState(bin_count=60)
@@ -314,6 +314,7 @@ def test_standalone_data_figure_uses_the_same_histogram_fit_context() -> None:
     window = create_data_figure_pane(
         figure,
         figure_intent,
+        output_root=tmp_path / "output",
         initial_display=display,
         local_fit=True,
         open_fit=True,

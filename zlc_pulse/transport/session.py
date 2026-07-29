@@ -135,9 +135,10 @@ class DeployedStreamerSession:
         self._closed = False
         self._closing = False
         self._started = False
-        self._close_failure: BaseException | None = None
         self._operation_epoch = 0
         self._layout_verified = False
+        self._safe_status_word: int | None = None
+        self._safe_clock_enable_words: tuple[int, ...] | None = None
         self._artifact: CompiledPulseArtifact | None = None
         self._artifact_digest: str | None = None
         self._total_points = 0
@@ -173,8 +174,8 @@ class DeployedStreamerSession:
         with self._lock:
             if self._closed:
                 raise RuntimeError("pulse session is closed")
-            if self._closing or self._state == "CLOSE_FAILED":
-                raise RuntimeError("pulse session close failed and cannot be restarted")
+            if self._closing:
+                raise RuntimeError("pulse session close is in progress")
             if self._started:
                 return self
             self.device_lease.acquire()
@@ -189,10 +190,6 @@ class DeployedStreamerSession:
     def close(self) -> None:
         with self._lock:
             if self._closed:
-                if self._close_failure is not None:
-                    raise RuntimeError(
-                        "pulse session was revoked without verified safe closure"
-                    ) from self._close_failure
                 return
             if self._closing:
                 raise RuntimeError("pulse session close is already in progress")
@@ -201,58 +198,22 @@ class DeployedStreamerSession:
             self._operation_stop.set()
             started = self._started
             layout_verified = self._layout_verified
-        failure: BaseException | None = None
         try:
             if started and layout_verified:
-                try:
-                    self.safe_state()
-                except BaseException as error:
-                    failure = error
-        finally:
-            try:
-                self._stop_worker()
-            except BaseException as error:
-                if failure is None:
-                    failure = error
-                else:
-                    failure.add_note(
-                        "pulse worker teardown also failed while closing: "
-                        f"{type(error).__name__}: {error}"
-                    )
-            transport_closed = False
-            try:
-                self.transport.close()
-                transport_closed = True
-            except BaseException as error:
-                if failure is None:
-                    failure = error
-                else:
-                    failure.add_note(
-                        "register transport close also failed: "
-                        f"{type(error).__name__}: {error}"
-                    )
+                self.safe_state()
+            self._stop_worker()
+            self.transport.close()
+            self.device_lease.release()
+        except BaseException:
             with self._lock:
-                self._closed = transport_closed
-                self._close_failure = failure if transport_closed else None
-                self._state = (
-                    "CLOSED"
-                    if transport_closed and failure is None
-                    else "CLOSE_FAILED"
-                )
-                if transport_closed and failure is None:
-                    self._started = False
-                if not transport_closed:
-                    self._closing = False
-            if transport_closed and failure is None:
-                try:
-                    self.device_lease.release()
-                except BaseException as error:
-                    with self._lock:
-                        self._close_failure = error
-                        self._state = "CLOSE_FAILED"
-                    failure = error
-        if failure is not None:
-            raise failure
+                self._closing = False
+            raise
+        with self._lock:
+            self._closed = True
+            self._closing = False
+            self._started = False
+            self._clear_safe_readback_locked()
+            self._state = "CLOSED"
 
     def check_register_layout(self) -> None:
         self._require_started()
@@ -274,6 +235,8 @@ class DeployedStreamerSession:
 
         self.check_register_layout()
         deadline = time.monotonic() + self.action_timeout
+        with self._lock:
+            self._clear_safe_readback_locked()
         self._enter_safe(deadline=deadline)
         bases = region_bases(self.params)
         rows = [
@@ -288,9 +251,10 @@ class DeployedStreamerSession:
             tuple(rows),
             deadline=deadline,
         )
-        self._verify_clock_muxes_disabled(deadline=deadline)
-        self._enter_safe(deadline=deadline)
+        clocks = self._verify_clock_muxes_disabled(deadline=deadline)
+        status = self._enter_safe(deadline=deadline)
         with self._lock:
+            self._record_safe_readback_locked(status, clocks)
             self._state = "SAFE"
 
     def transport_self_test(self, *, count: int = 16) -> None:
@@ -397,6 +361,7 @@ class DeployedStreamerSession:
             self._status_sample_count = 0
             self._cursor_sample_count = 0
             self._underflow_observed = False
+            self._clear_safe_readback_locked()
             self._state = "PREPARING"
 
         # Replacement cancellation and session close have already proved SAFE.
@@ -604,19 +569,27 @@ class DeployedStreamerSession:
                     raise RuntimeError(
                         "pulse SAFE is forbidden before register layout verification"
                     )
+                already_safe = self._safe_readback_current_locked()
                 interrupted = self._state in {"FIRING", "RUNNING"}
                 self._operation_epoch += 1
                 safe_epoch = self._operation_epoch
                 self._operation_stop.set()
-                self._state = "INTERRUPTING"
+                if not already_safe:
+                    self._clear_safe_readback_locked()
+                    self._state = "INTERRUPTING"
                 stop = self._worker_stop
                 if stop is not None:
                     stop.set()
             failure: BaseException | None = None
-            try:
-                self._drive_physical_safe(deadline=deadline)
-            except BaseException as error:
-                failure = error
+            safe_status: int | None = None
+            safe_clocks: tuple[int, ...] | None = None
+            if not already_safe:
+                try:
+                    safe_status, safe_clocks = self._drive_physical_safe(
+                        deadline=deadline
+                    )
+                except BaseException as error:
+                    failure = error
             try:
                 self._stop_worker(timeout=self._remaining_seconds(deadline))
             except BaseException as error:
@@ -633,6 +606,12 @@ class DeployedStreamerSession:
                     self._artifact = None
                     self._artifact_digest = None
                     self._drain_until = 0.0
+                    if failure is None and not already_safe:
+                        assert safe_status is not None and safe_clocks is not None
+                        self._record_safe_readback_locked(
+                            safe_status,
+                            safe_clocks,
+                        )
                     self._state = "SAFE" if failure is None else "SAFE_FAILED"
                     if interrupted and not self._terminal_event.is_set():
                         self._terminal_error = TransportAborted(
@@ -664,6 +643,9 @@ class DeployedStreamerSession:
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             terminal = self._terminal
+            safe_readback_visible = (
+                self._state == "SAFE" and self._safe_readback_current_locked()
+            )
             return {
                 "schema": "zlc_pulse.DeployedStreamerSessionSnapshot",
                 "transport": self.transport.transport_id,
@@ -675,41 +657,23 @@ class DeployedStreamerSession:
                 "scan_chunks": self._total_chunks,
                 "next_monotonic_scan_chunk": self._next_monotonic_chunk,
                 "scan_sweep": self._scan_sweep,
-                "last_confirmed_cursor": self._last_cursor,
+                "last_confirmed_cursor": (
+                    None if self._cursor_sample_count == 0 else self._last_cursor
+                ),
                 "cursor_sample_count": self._cursor_sample_count,
                 "underflow_observed": self._underflow_observed,
+                "safe_status_word": (
+                    self._safe_status_word if safe_readback_visible else None
+                ),
+                "safe_clock_enable_words": (
+                    self._safe_clock_enable_words if safe_readback_visible else None
+                ),
                 "terminal": (
                     None
                     if terminal is None
                     else hardware_terminal_evidence_to_tree(terminal)
                 ),
             }
-
-    def _command(
-        self,
-        command: int,
-        *,
-        wait_mask: int | None = None,
-        timeout: float | None = None,
-        stop: threading.Event | None = None,
-    ) -> bool:
-        effective = float(timeout) if timeout is not None else self.action_timeout
-        deadline = time.monotonic() + max(0.0, effective)
-        self.transport.write_words(
-            (
-                (CtrlWords.COMMAND, 0),
-                (CtrlWords.COMMAND, int(command) & 0xF),
-            ),
-            stop=stop,
-            deadline=deadline,
-        )
-        if wait_mask is None:
-            return True
-        return self._wait_status(
-            wait_mask=wait_mask,
-            timeout=self._remaining_seconds(deadline),
-            stop=stop,
-        )
 
     def _wait_status(
         self,
@@ -737,7 +701,7 @@ class DeployedStreamerSession:
             else:
                 time.sleep(0.01)
 
-    def _enter_safe(self, *, deadline: float | None = None) -> None:
+    def _enter_safe(self, *, deadline: float | None = None) -> int:
         """Issue SAFE and prove the frozen loader consumed it using existing readback."""
 
         # STATUS_ERROR is host-only in the frozen RTL.  Writing it before the
@@ -769,7 +733,7 @@ class DeployedStreamerSession:
             )
             stable_zero = stable_zero + 1 if status == 0 else 0
             if stable_zero >= 2:
-                return
+                return status
             if not retried and time.monotonic() >= retry_at:
                 self.transport.write_words(
                     (
@@ -782,15 +746,19 @@ class DeployedStreamerSession:
             time.sleep(min(0.001, self.terminal_poll_interval))
         raise TimeoutError("pulse streamer did not acknowledge SAFE with stable STATUS=0")
 
-    def _disable_clock_muxes(self, *, deadline: float) -> None:
+    def _disable_clock_muxes(self, *, deadline: float) -> tuple[int, ...]:
         base = region_bases(self.params)["ctrl"] + CtrlWords.CLK_ENABLE
         self.transport.write_words(
             tuple((base + index, 0) for index in range(self.params.clk_enable_words)),
             deadline=deadline,
         )
-        self._verify_clock_muxes_disabled(deadline=deadline)
+        return self._verify_clock_muxes_disabled(deadline=deadline)
 
-    def _drive_physical_safe(self, *, deadline: float) -> None:
+    def _drive_physical_safe(
+        self,
+        *,
+        deadline: float,
+    ) -> tuple[int, tuple[int, ...]]:
         """Execute the frozen streamer's proven three-phase SAFE protocol.
 
         These are hardware state transitions, not independent host writes that may
@@ -799,8 +767,9 @@ class DeployedStreamerSession:
         """
 
         self._enter_safe(deadline=deadline)
-        self._disable_clock_muxes(deadline=deadline)
-        self._enter_safe(deadline=deadline)
+        clocks = self._disable_clock_muxes(deadline=deadline)
+        status = self._enter_safe(deadline=deadline)
+        return status, clocks
 
     def _read_words(
         self,
@@ -817,7 +786,7 @@ class DeployedStreamerSession:
             for address in word_offsets
         )
 
-    def _verify_clock_muxes_disabled(self, *, deadline: float) -> None:
+    def _verify_clock_muxes_disabled(self, *, deadline: float) -> tuple[int, ...]:
         base = region_bases(self.params)["ctrl"] + CtrlWords.CLK_ENABLE
         values = tuple(
             self.transport.read_word(
@@ -830,6 +799,35 @@ class DeployedStreamerSession:
             raise RuntimeError(
                 "pulse SAFE could not verify that every live clock mux is disabled"
             )
+        return values
+
+    def _safe_readback_current_locked(self) -> bool:
+        return (
+            self._safe_status_word == 0
+            and self._safe_clock_enable_words is not None
+            and len(self._safe_clock_enable_words) == self.params.clk_enable_words
+            and not any(self._safe_clock_enable_words)
+        )
+
+    def _clear_safe_readback_locked(self) -> None:
+        self._safe_status_word = None
+        self._safe_clock_enable_words = None
+
+    def _record_safe_readback_locked(
+        self,
+        status_word: int,
+        clock_enable_words: tuple[int, ...],
+    ) -> None:
+        if (
+            isinstance(status_word, bool)
+            or not isinstance(status_word, int)
+            or status_word != 0
+            or len(clock_enable_words) != self.params.clk_enable_words
+            or any(clock_enable_words)
+        ):
+            raise ValueError("physical SAFE readback facts are not safe")
+        self._safe_status_word = status_word
+        self._safe_clock_enable_words = tuple(clock_enable_words)
 
     def _start_worker(self, operation_epoch: int) -> None:
         self._worker_stop = threading.Event()
@@ -936,10 +934,23 @@ class DeployedStreamerSession:
                     return
                 self._terminal_error = error
                 self._state = "FAILED"
+            safety_deadline = time.monotonic() + self.action_timeout
             try:
-                self._drive_physical_safe(
-                    deadline=time.monotonic() + self.action_timeout
-                )
+                if not self._safe_lock.acquire(
+                    timeout=self._remaining_seconds(safety_deadline)
+                ):
+                    raise TimeoutError(
+                        "pulse worker timed out waiting for the safety owner"
+                    )
+                try:
+                    status, clocks = self._drive_physical_safe(
+                        deadline=safety_deadline
+                    )
+                    with self._lock:
+                        if operation_epoch == self._operation_epoch:
+                            self._record_safe_readback_locked(status, clocks)
+                finally:
+                    self._safe_lock.release()
             except BaseException as safety_error:
                 error.add_note(
                     f"CMD_SAFE after worker failure also failed: {safety_error!r}"

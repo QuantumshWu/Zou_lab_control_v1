@@ -151,7 +151,7 @@ class RepositoryRootLease:
     def close_guarded(self, finalize_owner: Callable[[], None]) -> None:
         """Finalize dependent owners while new borrows remain atomically barred.
 
-        Repository-owned journals and other lifetime resources must close while
+        Repository-owned lifetime resources must close while
         the root's OS lease is still held.  The state lock makes the quiescence
         check, dependent finalization, and root release one exclusion region, so
         an operation cannot acquire a late borrow between those steps.

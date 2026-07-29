@@ -5,7 +5,6 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
 
 from zlc_storage import (
     RepositoryRootLease,
@@ -165,7 +164,7 @@ class ResourceLease:
         "_arbiter",
         "_capability",
         "_run_id",
-        "_terminal_lock",
+        "_release_lock",
         "_released",
     )
 
@@ -178,38 +177,26 @@ class ResourceLease:
         self._arbiter = arbiter
         self._capability = capability
         self._run_id = run_id
-        self._terminal_lock = threading.Lock()
+        self._release_lock = threading.Lock()
         self._released = False
 
     @property
     def released(self) -> bool:
-        with self._terminal_lock:
+        with self._release_lock:
             return self._released
 
-    def release_terminal(
-        self,
-        publish: Callable[[], None],
-        after_release: Callable[[], None],
-    ) -> bool:
-        if not callable(publish) or not callable(after_release):
-            raise TypeError("terminal callbacks must be callable")
-        with self._terminal_lock:
-            if self._released:
-                return False
-            self._arbiter._release_terminal(
-                self._capability,
-                self._run_id,
-                publish,
-                after_release,
-            )
-            self._released = True
-            return True
+    def release(self) -> bool:
+        """Release this Run's claims exactly once.
 
-    def _release_unarmed(self) -> bool:
-        with self._terminal_lock:
+        Resource ownership ends at the hardware safety boundary.  Run result
+        publication and artifact work are deliberately outside this atomic
+        resource-table transition.
+        """
+
+        with self._release_lock:
             if self._released:
                 return False
-            self._arbiter._release_unarmed(self._capability, self._run_id)
+            self._arbiter._release(self._capability, self._run_id)
             self._released = True
             return True
 
@@ -259,20 +246,7 @@ class ResourceArbiter:
             self._active[run_id] = (capability, normalized)
         return ResourceLease(self, capability, run_id)
 
-    def _release_terminal(
-        self,
-        capability: object,
-        run_id: str,
-        publish: Callable[[], None],
-        after_release: Callable[[], None],
-    ) -> None:
-        with self._lock:
-            self._require_active(capability, run_id)
-            publish()
-            del self._active[run_id]
-        after_release()
-
-    def _release_unarmed(self, capability: object, run_id: str) -> None:
+    def _release(self, capability: object, run_id: str) -> None:
         with self._lock:
             self._require_active(capability, run_id)
             del self._active[run_id]

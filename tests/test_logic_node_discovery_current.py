@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from Zou_lab_control.api import connect
+from Zou_lab_control.api import WorkspacePaths, connect
 from Zou_lab_control.workbench._composition import task_console_ports
 from zlc_neutral_atom.logic_node_package import discover_logic_node_packages
 
@@ -56,7 +56,13 @@ def test_fixed_namespace_packages_are_unique_and_complete() -> None:
 
 
 def test_experiment_nodes_and_task_console_share_discovered_packages(tmp_path) -> None:
-    experiment = connect("virtual", repository=tmp_path)
+    experiment = connect(
+        "virtual",
+        workspace=WorkspacePaths.for_workspace(
+            ROOT,
+            repository_root=tmp_path,
+        ),
+    )
     try:
         packages = discover_logic_node_packages()
         assert experiment.nodes.names == tuple(

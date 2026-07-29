@@ -52,7 +52,6 @@ from zlc_pulse import (
     PulseExecutionForm,
     scan_column_specs,
 )
-from zlc_storage.paths import project_path, user_output_path
 
 from ._layout import px
 from .controller import (
@@ -73,22 +72,18 @@ from .scan_view import (
 from .schedule_view import PulseScheduleView
 from .target_view import PulseTargetView
 
-_PULSE_FILES_ENV = "ZLC_PULSE_DIR"
-
-
-def _pulse_files_dir() -> Path:
-    configured = os.environ.get(_PULSE_FILES_ENV, "").strip()
-    directory = (
-        Path(configured).expanduser()
-        if configured
-        else project_path("pulses")
-    )
+def _pulse_files_dir(root: Path) -> Path:
+    directory = Path(root).expanduser()
+    if not directory.is_absolute():
+        raise ValueError("Pulse files root must be absolute")
     directory.mkdir(parents=True, exist_ok=True)
     return directory.resolve()
 
 
-def _pulse_figure_dir() -> Path:
-    directory = user_output_path("figures", "pulses")
+def _pulse_figure_dir(root: Path) -> Path:
+    directory = Path(root).expanduser() / "figures" / "pulses"
+    if not directory.is_absolute():
+        raise ValueError("Pulse output root must be absolute")
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 
@@ -109,12 +104,17 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
     def __init__(
         self,
         controller: PulseEditorController,
+        *,
+        pulses_root: Path,
+        output_root: Path,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         if not isinstance(controller, PulseEditorController):
             raise TypeError("controller must be PulseEditorController")
         ensure_qt_app()
         super().__init__(parent)
+        self._pulses_root = Path(pulses_root).expanduser().resolve()
+        self._output_root = Path(output_root).expanduser().resolve()
         self._controller = controller
         self._window = None
         self._last_runtime: PulseRuntimeUpdate | None = None
@@ -750,7 +750,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         return (
             path.parent
             if path is not None
-            else _pulse_files_dir()
+            else _pulse_files_dir(self._pulses_root)
         )
 
     def _request_scan_progress(self) -> None:
@@ -813,7 +813,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
     def _save_document(self) -> None:
         document = self._controller.current_document
         suggested = self._controller.current_path or (
-            _pulse_files_dir()
+            _pulse_files_dir(self._pulses_root)
             / f"{_safe_file_stem(document.name)}.json"
         )
         path, _filter = QtWidgets.QFileDialog.getSaveFileName(
@@ -829,7 +829,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         path, _filter = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Load pulse",
-            str(_pulse_files_dir()),
+            str(_pulse_files_dir(self._pulses_root)),
             "ZLC pulse (*.json)",
         )
         if path:
@@ -837,7 +837,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
 
     def _save_preview(self) -> None:
         document = self._controller.current_document
-        suggested = _pulse_figure_dir() / (
+        suggested = _pulse_figure_dir(self._output_root) / (
             f"{_safe_file_stem(document.name)}.png"
         )
         path, _filter = QtWidgets.QFileDialog.getSaveFileName(
@@ -1682,12 +1682,18 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
 def launch_pulse_editor_window(
     controller: PulseEditorController,
     *,
+    pulses_root: Path,
+    output_root: Path,
     hide_on_close: bool = False,
 ):
     """Launch the one formal body through the shared Fluent window sequence."""
 
     ensure_qt_app()
-    body = PulseEditorWindowBody(controller)
+    body = PulseEditorWindowBody(
+        controller,
+        pulses_root=pulses_root,
+        output_root=output_root,
+    )
 
     def wire(window) -> None:
         body._attach_window(window)

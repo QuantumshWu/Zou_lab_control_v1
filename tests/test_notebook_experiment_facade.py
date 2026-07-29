@@ -44,6 +44,17 @@ IMAGING_PULSE = ROOT / "pulses" / "imaging_template.json"
 MOT_SCAN_PULSE = ROOT / "pulses" / "mot_field_template.json"
 
 
+def _workspace(repository_root: Path) -> zlc.WorkspacePaths:
+    return zlc.WorkspacePaths.for_workspace(
+        ROOT,
+        repository_root=repository_root,
+    )
+
+
+def _connect(repository_root: Path):
+    return zlc.connect("virtual", workspace=_workspace(repository_root))
+
+
 def _expect(error_type, text: str, operation):
     try:
         operation()
@@ -60,7 +71,7 @@ def _assert_repository_roots_released(root: Path) -> None:
 
 
 def _case_capture_and_fit(root: Path) -> None:
-    with zlc.connect("virtual", repository=root) as exp:
+    with _connect(root) as exp:
         request = exp.readout.capture_request(IMAGING_PULSE)
         assert request.camera_ref == exp.device_catalog["camera"].ref
         assert request.sequencer_ref == exp.device_catalog["sequencer"].ref
@@ -144,7 +155,7 @@ def _case_capture_and_fit(root: Path) -> None:
 
 
 def _case_public_authority_and_validation(root: Path) -> None:
-    exp = zlc.connect("virtual", repository=root)
+    exp = _connect(root)
     try:
         forbidden = (BoundDevice, RunPlan)
         public_values = (
@@ -207,7 +218,7 @@ def _case_public_authority_and_validation(root: Path) -> None:
 
 
 def _case_close_retry(root: Path) -> None:
-    exp = zlc.connect("virtual", repository=root)
+    exp = _connect(root)
     services = exp._services
     borrow = services.capture_repository._root_lease.borrow()
     try:
@@ -262,7 +273,7 @@ class _ControlledWorkbenchHandle:
 
 
 def _case_concurrent_close_owner(root: Path) -> None:
-    exp = zlc.connect("virtual", repository=root)
+    exp = _connect(root)
     services = exp._services
     handle = _ControlledWorkbenchHandle()
     with services.operation_lock:
@@ -299,7 +310,7 @@ def _case_concurrent_close_owner(root: Path) -> None:
 
 
 def _case_concurrent_gui_owner_keeps_pumping(root: Path) -> None:
-    exp = zlc.connect("virtual", repository=root)
+    exp = _connect(root)
     services = exp._services
     handle = _ControlledWorkbenchHandle(
         event_owner_thread_id=threading.get_ident(),
@@ -331,7 +342,7 @@ def _case_concurrent_gui_owner_keeps_pumping(root: Path) -> None:
 
 
 def _case_gui_close_retry_preserves_data(root: Path) -> None:
-    exp = zlc.connect("virtual", repository=root)
+    exp = _connect(root)
     services = exp._services
     handle = _ControlledWorkbenchHandle()
     with services.operation_lock:
@@ -363,7 +374,7 @@ def _case_gui_close_retry_preserves_data(root: Path) -> None:
 
 
 def _case_runtime_close_retry_preserves_handles(root: Path) -> None:
-    exp = zlc.connect("virtual", repository=root)
+    exp = _connect(root)
     services = exp._services
     handle = _ControlledWorkbenchHandle(initially_acknowledged=True)
     with services.operation_lock:
@@ -403,7 +414,7 @@ def _case_runtime_close_retry_preserves_handles(root: Path) -> None:
 
 
 def _case_close_race(root: Path, surface: str) -> None:
-    exp = zlc.connect("virtual", repository=root)
+    exp = _connect(root)
     services = exp._services
     passed_initial_lookup = threading.Event()
     backend_calls: list[str] = []
@@ -450,7 +461,7 @@ def _case_close_race(root: Path, surface: str) -> None:
 
 
 def _case_fit_close_drain(root: Path) -> None:
-    exp = zlc.connect("virtual", repository=root)
+    exp = _connect(root)
     services = exp._services
     entered = threading.Barrier(3)
     close_started = threading.Barrier(3)
@@ -523,7 +534,7 @@ def _case_fit_close_drain(root: Path) -> None:
 
 
 def _case_fit_reentrant_close(root: Path) -> None:
-    exp = zlc.connect("virtual", repository=root)
+    exp = _connect(root)
     services = exp._services
     with facade_impl._fit_service_guard(services):
         _expect(
@@ -551,7 +562,7 @@ def _case_failed_public_root(root: Path) -> None:
     error = _expect(
         RuntimeError,
         "public root construction failed",
-        lambda: zlc.connect("virtual", repository=root),
+        lambda: _connect(root),
     )
     assert error.__cause__ is None
     _assert_repository_roots_released(root)
@@ -627,4 +638,7 @@ def test_connect_rejects_implicit_or_non_string_target(tmp_path: Path) -> None:
     with pytest.raises(TypeError):
         zlc.connect("virtual")  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="config must be"):
-        zlc.connect({}, repository=tmp_path / "workspace")  # type: ignore[arg-type]
+        zlc.connect(  # type: ignore[arg-type]
+            {},
+            workspace=_workspace(tmp_path / "workspace"),
+        )

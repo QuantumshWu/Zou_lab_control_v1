@@ -40,13 +40,13 @@ def test_exact_device_claim_sets_are_atomic() -> None:
         (ResourceClaim(camera), ResourceClaim(fpga)),
     )
     assert isinstance(result, ResourceBusy)
-    held._release_unarmed()
+    assert held.release()
 
     first = arbiter.acquire_all(
         "retry", (ResourceClaim(camera), ResourceClaim(fpga))
     )
     assert isinstance(first, ResourceLease)
-    first._release_unarmed()
+    assert first.release()
     arbiter.shutdown()
 
 
@@ -72,26 +72,21 @@ def test_concurrent_exclusive_acquire_has_one_winner() -> None:
     winners = [result for result in results if isinstance(result, ResourceLease)]
     assert len(winners) == 1
     assert sum(isinstance(result, ResourceBusy) for result in results) == 7
-    winners[0]._release_unarmed()
+    assert winners[0].release()
     arbiter.shutdown()
 
 
-def test_terminal_publication_and_release_are_one_transition() -> None:
+def test_release_is_an_exact_once_resource_transition() -> None:
     arbiter = ResourceArbiter()
     resource = key()
     lease = acquire(arbiter, "first", resource)
-    events: list[str] = []
 
-    assert lease.release_terminal(
-        lambda: events.append("published"),
-        lambda: events.append("released"),
-    )
-    assert events == ["published", "released"]
+    assert lease.release()
     assert lease.released
-    assert not lease.release_terminal(lambda: None, lambda: None)
+    assert not lease.release()
 
     next_lease = acquire(arbiter, "next", resource)
-    next_lease._release_unarmed()
+    assert next_lease.release()
     arbiter.shutdown()
 
 
@@ -107,7 +102,7 @@ def test_invalid_claim_sets_and_duplicate_run_ids_are_rejected() -> None:
     lease = acquire(arbiter, "same-run", camera)
     with pytest.raises(RuntimeError, match="already owns"):
         arbiter.acquire_all("same-run", (ResourceClaim(key("device/fpga")),))
-    lease._release_unarmed()
+    assert lease.release()
     arbiter.shutdown()
 
 
@@ -116,7 +111,7 @@ def test_shutdown_refuses_active_ownership_and_is_terminal() -> None:
     lease = acquire(arbiter, "run", key())
     with pytest.raises(RuntimeError, match="active ownership"):
         arbiter.shutdown()
-    lease._release_unarmed()
+    assert lease.release()
     arbiter.shutdown()
     with pytest.raises(RuntimeError, match="shut down"):
         arbiter.acquire_all("late", (ResourceClaim(key()),))

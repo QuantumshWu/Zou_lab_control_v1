@@ -53,7 +53,7 @@ OCCUPANCY_LOGIC_NODE = LogicNodeDeclaration(
             file_filter=(
                 "Calibration pointer (calibration_ref.json);;JSON files (*.json)"
             ),
-            base_dir="_output/calibrations",
+            base_dir="output/calibrations",
         ),
     ),
 )

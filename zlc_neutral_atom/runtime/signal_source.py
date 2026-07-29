@@ -7,6 +7,7 @@ identity/trace; they never receive the producer's physical payload type.
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -83,7 +84,7 @@ class SignalAssociationUnavailable(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class SignalAssociationScheduleRequirement:
-    """Physical trigger schedules an associated producer needs preserved.
+    """One physical trigger schedule an associated producer needs preserved.
 
     This value does not identify a Camera or prescribe how a producer proves
     causation.  It only tells a pulse compiler which physical trigger lanes
@@ -91,18 +92,14 @@ class SignalAssociationScheduleRequirement:
     cardinality remain producer-owned admission checks.
     """
 
-    trigger_channels: tuple[str, ...] = ()
+    trigger_channel: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.trigger_channels, tuple):
-            raise TypeError("association trigger_channels must be a tuple")
-        channels = tuple(
-            canonical_text(channel, "association trigger channel")
-            for channel in self.trigger_channels
+        object.__setattr__(
+            self,
+            "trigger_channel",
+            canonical_text(self.trigger_channel, "association trigger channel"),
         )
-        if len(channels) != len(set(channels)):
-            raise ValueError("association trigger channels must be unique")
-        object.__setattr__(self, "trigger_channels", channels)
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +197,11 @@ class SignalAssociationRequest:
     cause_id: str
     cause_digest: str
     expected_event_count: int
+    trigger_schedule_fingerprint: str
+    trigger_channel: str
+    trigger_count: int
+    minimum_trigger_interval_ticks: int | None
+    clock_hz: int
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -225,6 +227,53 @@ class SignalAssociationRequest:
                 "signal association expected_event_count",
             ),
         )
+        object.__setattr__(
+            self,
+            "trigger_schedule_fingerprint",
+            sha256_text(
+                self.trigger_schedule_fingerprint,
+                "signal association trigger_schedule_fingerprint",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "trigger_channel",
+            canonical_text(
+                self.trigger_channel,
+                "signal association trigger_channel",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "trigger_count",
+            positive_integer(
+                self.trigger_count,
+                "signal association trigger_count",
+            ),
+        )
+        interval = self.minimum_trigger_interval_ticks
+        if interval is not None:
+            interval = positive_integer(
+                interval,
+                "signal association minimum_trigger_interval_ticks",
+            )
+        if self.trigger_count > 1 and interval is None:
+            raise ValueError(
+                "a multi-trigger signal association requires its minimum interval"
+            )
+        object.__setattr__(self, "minimum_trigger_interval_ticks", interval)
+        clock = self.clock_hz
+        if (
+            isinstance(clock, bool)
+            or not isinstance(clock, (int, float))
+            or not math.isfinite(float(clock))
+            or float(clock) <= 0.0
+            or not float(clock).is_integer()
+        ):
+            raise ValueError(
+                "signal association clock_hz must be a positive whole-number frequency"
+            )
+        object.__setattr__(self, "clock_hz", int(clock))
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +307,15 @@ class SignalAssociationEvidence:
             "cause_id": self.request.cause_id,
             "cause_digest": self.request.cause_digest,
             "expected_event_count": self.request.expected_event_count,
+            "trigger_schedule_fingerprint": (
+                self.request.trigger_schedule_fingerprint
+            ),
+            "trigger_channel": self.request.trigger_channel,
+            "trigger_count": self.request.trigger_count,
+            "minimum_trigger_interval_ticks": (
+                self.request.minimum_trigger_interval_ticks
+            ),
+            "clock_hz": self.request.clock_hz,
             "terminal_evidence_digest": terminal_digest,
         }
         if any(payload.get(name) != value for name, value in required.items()):
@@ -283,6 +341,11 @@ def _signal_association_request_to_tree(
         "cause_id": value.cause_id,
         "cause_digest": value.cause_digest,
         "expected_event_count": value.expected_event_count,
+        "trigger_schedule_fingerprint": value.trigger_schedule_fingerprint,
+        "trigger_channel": value.trigger_channel,
+        "trigger_count": value.trigger_count,
+        "minimum_trigger_interval_ticks": value.minimum_trigger_interval_ticks,
+        "clock_hz": value.clock_hz,
     }
 
 
@@ -294,6 +357,11 @@ def _signal_association_request_from_tree(tree: object) -> SignalAssociationRequ
             "cause_id",
             "cause_digest",
             "expected_event_count",
+            "trigger_schedule_fingerprint",
+            "trigger_channel",
+            "trigger_count",
+            "minimum_trigger_interval_ticks",
+            "clock_hz",
         },
         "SignalAssociationRequest",
         discriminator=None,
@@ -303,6 +371,11 @@ def _signal_association_request_from_tree(tree: object) -> SignalAssociationRequ
         data["cause_id"],
         data["cause_digest"],
         data["expected_event_count"],
+        data["trigger_schedule_fingerprint"],
+        data["trigger_channel"],
+        data["trigger_count"],
+        data["minimum_trigger_interval_ticks"],
+        data["clock_hz"],
     )
     if _signal_association_request_to_tree(value) != tree:
         raise ValueError("SignalAssociationRequest tree is non-canonical")
@@ -454,6 +527,10 @@ class SignalEventCursor(Generic[PayloadT]):
     @property
     def start_sequence(self) -> int:
         return self._tap.start_sequence
+
+    @property
+    def next_sequence(self) -> int:
+        return self._tap.next_sequence
 
     def next(self, timeout: float | None = None) -> SignalEvent:
         if self._closed:

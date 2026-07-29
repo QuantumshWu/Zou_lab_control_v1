@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PyQt5 import QtCore, QtTest
 
-from Zou_lab_control.api import connect
+from Zou_lab_control.api import WorkspacePaths, connect
 from zlc_frontend.qt_widgets import ensure_qt_app
 from zlc_pulse import load_deployed_pulse_target, new_pulse_document
 
@@ -25,7 +25,13 @@ def _until(application, predicate, *, timeout: float = 10.0) -> None:
 
 def test_bound_x_hides_and_reopens_same_dirty_editor_then_owner_retires(tmp_path):
     application = ensure_qt_app()
-    experiment = connect("virtual", repository=tmp_path)
+    experiment = connect(
+        "virtual",
+        workspace=WorkspacePaths.for_workspace(
+            (tmp_path / "authored").resolve(),
+            repository_root=tmp_path.resolve(),
+        ),
+    )
     body = experiment.pulse_gui()
     wrapper = body.window()
     try:

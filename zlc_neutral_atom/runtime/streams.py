@@ -1809,6 +1809,34 @@ class AcquisitionStream(Generic[PayloadT]):
         with self._condition:
             return len(self._order)
 
+    def wait_until_sequence(self, end_sequence: int, timeout: float) -> int:
+        """Wait until every event before ``end_sequence`` was published."""
+
+        end = _nonnegative_int(end_sequence, "end_sequence")
+        duration = finite_real(timeout, "timeout")
+        if duration < 0.0:
+            raise ValueError("timeout must be non-negative")
+        deadline = time.monotonic() + duration
+        with self._condition:
+            if self._terminal_error is not None:
+                raise self._terminal_error
+            while self._next_sequence < end:
+                if self._terminal_error is not None:
+                    raise self._terminal_error
+                if self._closed:
+                    raise StreamEndedEarly(
+                        "stream ended before the required publication frontier"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise TimeoutError(
+                        "stream did not reach the required publication frontier"
+                    )
+                self._condition.wait(remaining)
+            if self._terminal_error is not None:
+                raise self._terminal_error
+            return self._next_sequence
+
     def reserve(
         self,
         *,

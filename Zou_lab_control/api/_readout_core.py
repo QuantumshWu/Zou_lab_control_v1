@@ -27,11 +27,11 @@ from zlc_neutral_atom.capture.reference import (
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.runtime.run import RunHandle
-from zlc_pulse import PulseDocument, PulseExecutionForm
+from zlc_pulse import PulseDocument, PulseExecutionForm, load_pulse_document
+from zlc_storage.paths import resolve_under
 
 from ._application_services import (
     ExperimentServices,
-    load_project_pulse,
     resolve_role,
     service_guard,
 )
@@ -55,7 +55,17 @@ class LogicNodeApplicationOperations:
     @property
     def repository_root(self) -> Path:
         with service_guard(self._services) as services:
-            return services.repository_root
+            return services.workspace_paths.repository_root
+
+    @property
+    def pulses_root(self) -> Path:
+        with service_guard(self._services) as services:
+            return services.workspace_paths.pulses_root
+
+    @property
+    def output_root(self) -> Path:
+        with service_guard(self._services) as services:
+            return services.workspace_paths.output_root
 
     @property
     def capture_repository(self):
@@ -172,9 +182,9 @@ class ReadoutFacade:
             )
 
     def prepare_capture(self, request: CaptureRequest) -> PreparedFiniteCapture:
-        if not isinstance(request, CaptureRequest):
-            raise TypeError("request must be CaptureRequest")
         with service_guard(self._services) as services:
+            if not isinstance(request, CaptureRequest):
+                raise TypeError("request must be CaptureRequest")
             return prepare_finite_capture(
                 request,
                 pulse_port=services.runtime.pulse_port(request.sequencer_ref),
@@ -217,15 +227,15 @@ class ReadoutFacade:
         return self.prepare_capture(self.capture_request(pulse, **kwargs)).start()
 
     def load_capture(self, reference: CaptureArtifactRef) -> CaptureArtifact:
-        if not isinstance(reference, CaptureArtifactRef):
-            raise TypeError("reference must be CaptureArtifactRef")
         with service_guard(self._services) as services:
+            if not isinstance(reference, CaptureArtifactRef):
+                raise TypeError("reference must be CaptureArtifactRef")
             return services.capture_repository.load(reference)
 
     def materialize_capture(self, reference: CaptureArtifactRef) -> OwnedSnapshot:
-        if not isinstance(reference, CaptureArtifactRef):
-            raise TypeError("reference must be CaptureArtifactRef")
         with service_guard(self._services) as services:
+            if not isinstance(reference, CaptureArtifactRef):
+                raise TypeError("reference must be CaptureArtifactRef")
             return services.capture_repository.materialize_final(reference)
 
     def _logic_node_operations(self) -> LogicNodeApplicationOperations:
@@ -280,7 +290,11 @@ class ReadoutFacade:
         )
 
     def load_readout_pulse(self, value):
-        return load_project_pulse(value)
+        with service_guard(self._services) as services:
+            pulses_root = services.workspace_paths.pulses_root
+        if isinstance(value, PulseDocument):
+            return value
+        return load_pulse_document(resolve_under(pulses_root, value))
 
     def resolve_readout_camera_ref(self, requested):
         role = self._resolve_camera_role(requested)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
@@ -24,6 +26,7 @@ def build_sitemap_acquisition_profile(
     *,
     camera_port: BoundCapturePort,
     pulse_port: BoundPulsePort,
+    pulses_root: Path,
 ) -> SitemapAcquisitionProfile:
     """Bind one installed apparatus description to its exact live Ports.
 
@@ -57,7 +60,7 @@ def build_sitemap_acquisition_profile(
         geometry=geometry,
         maximum_site_residual_px=DEFAULT_MAXIMUM_SITE_RESIDUAL_PX,
         pulse_document=bind_pulse_document_target(
-            load_sitemap_pulse(),
+            load_sitemap_pulse(pulses_root),
             pulse_port.capability.target,
         ),
         trigger_channel=apparatus.trigger_channel,

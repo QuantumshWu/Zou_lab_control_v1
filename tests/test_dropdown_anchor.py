@@ -36,10 +36,13 @@ def application():
 
 
 @pytest.fixture
-def editor(application):
+def editor(application, tmp_path):
     from zlc_workbench.pulse_editor.app import open_pulse_editor
 
-    editor = open_pulse_editor()
+    editor = open_pulse_editor(
+        pulses_root=tmp_path / "pulses",
+        output_root=tmp_path / "output",
+    )
     window = editor.window()
     window.show()
     for _ in range(5):

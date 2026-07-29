@@ -90,7 +90,9 @@ def compile_pulse_document(
     if not isinstance(execution_form, PulseExecutionForm):
         raise TypeError("execution_form must be PulseExecutionForm")
     frequency = validate_pulse_document_clock_grid(document, clock_hz)
-    geometry = params or StreamerParams()
+    from .deployment import _resolve_streamer_params
+
+    geometry = _resolve_streamer_params(params)
     if live_target is not None:
         if not isinstance(live_target, PulseTarget):
             raise TypeError("live_target must be PulseTarget")
@@ -163,7 +165,9 @@ def compile_pulse_artifact(
             raise ValueError(
                 f"trigger lane {channel!r} belongs to {owner.kind!r}, not a digital port"
             )
-    geometry = params or StreamerParams()
+    from .deployment import _resolve_streamer_params
+
+    geometry = _resolve_streamer_params(params)
     _validate_target_geometry(document.target, geometry)
     target_ir = compile_pulse_document(
         document,

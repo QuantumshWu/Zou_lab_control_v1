@@ -11,9 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from zlc_storage.paths import PROJECT_ROOT
-from zlc_storage import canonical_digest
-
 from .document import PulseDocument, load_pulse_document, pulse_document_path
 from .scan_columns import (
     ScanColumnSpec,
@@ -44,21 +41,6 @@ def _slot_target(document: PulseDocument, field) -> str:
     if field.kind == "dac":
         return f"{field.port}@{period_indices[field.period_id]}"
     return str(field.port)
-
-
-def _source_identity(path: Path) -> str:
-    source = path.resolve(strict=False)
-    project_root = PROJECT_ROOT.resolve(strict=False)
-    try:
-        key = "project:" + source.relative_to(project_root).as_posix()
-    except ValueError:
-        key = "external:" + source.as_posix()
-    return canonical_digest(
-        {
-            "owner": "zlc_pulse.PulseTemplateDescription.source",
-            "source": key,
-        }
-    )
 
 
 def describe_pulse_template(path: str | Path) -> PulseTemplateDescription:
@@ -107,7 +89,7 @@ def describe_pulse_template(path: str | Path) -> PulseTemplateDescription:
         api_column_specs(document),
         scan_column_specs(document),
         program,
-        _source_identity(source),
+        document.fingerprint,
     )
 
 

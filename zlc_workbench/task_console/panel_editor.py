@@ -40,7 +40,6 @@ from zlc_frontend.plot_kind import PlotKind
 from zlc_frontend.figure.model import ViewIntent
 from zlc_frontend.panel_params import panel_display_value_range_keys
 from zlc_frontend.render_style import panel_display_size
-from zlc_storage.paths import display_path, user_output_path
 
 
 #: Containers the Save row offers.  A container is a DATA-layer choice (which file
@@ -210,7 +209,9 @@ class PanelEditor(QtWidgets.QWidget):
         # the DATA behind it is already owned by the run's repository, and a second copy
         # written by the GUI would be a second answer to what was measured.
         section("Save")
-        default_output_dir = user_output_path("figures", "task-console")
+        default_output_dir = (
+            self.console._output_root / "figures" / "task-console"
+        )
         self.save_dir_edit = FluentPathEdit(
             self.console._last_save_dir or str(default_output_dir),
             mode="dir",
@@ -791,7 +792,7 @@ class PanelEditor(QtWidgets.QWidget):
         text = self.save_dir_edit.text().strip() if hasattr(self, "save_dir_edit") else ""
         base = Path(text) if text else Path(
             self.console._last_save_dir
-            or user_output_path("figures", "task-console")
+            or self.console._output_root / "figures" / "task-console"
         )
         # a bare folder (blank default / trailing sep / an existing dir) -> the file is
         # <folder>/<title>; otherwise the path already names the file stem.
@@ -820,7 +821,7 @@ class PanelEditor(QtWidgets.QWidget):
             "" if self.card.config.kind is PlotKind.SITE_MAP else " + .npz"
         )
         self.save_preview.setText(
-            f"{display_path(str(self._save_stem(None)))}."
+            f"{self._save_stem(None)}."
             f"{self._save_image_ext()}{archive_suffix}")
 
     def save(self) -> None:

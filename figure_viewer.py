@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -22,6 +23,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("path", nargs="?", default=None,
                         help="current Figure .npz, or a PNG/JPEG with a same-stem .npz")
     parser.add_argument("--scale", type=float, default=None, help="UI scale factor (default: auto).")
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path.home() / ".zlc" / "figure-viewer" / "output",
+        help="Explicit root for fitted figures and image exports.",
+    )
     args = parser.parse_args(argv)
 
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
@@ -32,7 +39,11 @@ def main(argv: list[str] | None = None) -> int:
     from zlc_workbench.figure_viewer.app import open_figure_viewer
 
     app = ensure_qt_app()
-    viewer = open_figure_viewer(path=args.path, scale=args.scale)
+    viewer = open_figure_viewer(
+        path=args.path,
+        scale=args.scale,
+        output_root=args.output_root.expanduser().resolve(),
+    )
 
     auto_close_ms = os.environ.get("ZLC_FIGURE_VIEWER_AUTO_CLOSE_MS")
     if auto_close_ms:

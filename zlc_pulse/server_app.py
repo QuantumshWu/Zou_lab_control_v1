@@ -13,13 +13,14 @@ from typing import Protocol
 from fpga.pulse_streamer.host.image import (
     FROZEN_CLOCK_HZ,
     StreamerParams,
-    default_clock_hz,
-    default_params,
-    load_streamer_config,
 )
 
 from .artifact import CompiledPulseArtifact
-from .deployment import APPROVED_DEPLOYED_TARGET_ABI, validate_deployed_target
+from .deployment import (
+    APPROVED_DEPLOYED_TARGET_ABI,
+    _load_deployed_streamer_config,
+    validate_deployed_target,
+)
 from .evidence import PulseBackendCompletion
 from .manifest import PulseTargetManifest, pulse_target_manifest_from_xdc
 from .server import PulseExecutionService, serve_pulse_execution_service
@@ -94,31 +95,31 @@ class PulseServerRuntime:
                 except BaseException as error:
                     failure = error
             if not self._session_closed:
-                safety_error: BaseException | None = None
                 try:
                     self.service.safe_state()
                 except BaseException as error:
-                    safety_error = error
-                try:
-                    # A successful session.close() is itself a verified SAFE retry
-                    # followed by transport revocation, so it recovers a transient
-                    # first safe_state failure.
-                    self.session.close()
-                    self._session_closed = True
-                    safety_error = None
-                except BaseException as error:
-                    if safety_error is not None:
-                        error.add_note(
-                            "the preceding explicit safe_state also failed: "
-                            f"{type(safety_error).__name__}: {safety_error}"
-                        )
                     if failure is None:
                         failure = error
                     else:
                         failure.add_note(
-                            "pulse session close also failed: "
+                            "pulse physical SAFE also failed: "
                             f"{type(error).__name__}: {error}"
                         )
+                else:
+                    try:
+                        # The session owns the physical SAFE receipt.  close()
+                        # observes that receipt and revokes transport ownership;
+                        # it must not issue the same physical SAFE a second time.
+                        self.session.close()
+                        self._session_closed = True
+                    except BaseException as error:
+                        if failure is None:
+                            failure = error
+                        else:
+                            failure.add_note(
+                                "pulse session close also failed: "
+                                f"{type(error).__name__}: {error}"
+                            )
             self._closed = self._rpc_closed and self._session_closed
             if failure is not None:
                 raise failure
@@ -128,14 +129,16 @@ def build_service_for_session(
     manifest: PulseTargetManifest,
     session: DeployedStreamerSession,
     *,
-    params: StreamerParams | None = None,
-    clock_hz: float | None = None,
+    params: StreamerParams,
+    clock_hz: float,
 ) -> PulseExecutionService:
     if not isinstance(manifest, PulseTargetManifest):
         raise TypeError("manifest must be PulseTargetManifest")
     target = manifest.target
-    geometry = params or default_params()
-    clock = float(default_clock_hz() if clock_hz is None else clock_hz)
+    if not isinstance(params, StreamerParams):
+        raise TypeError("params must be StreamerParams")
+    geometry = params
+    clock = float(clock_hz)
     if clock != FROZEN_CLOCK_HZ:
         raise ValueError(
             f"deployment clock must match the frozen RTL ({FROZEN_CLOCK_HZ:g} Hz)"
@@ -164,13 +167,22 @@ def bring_up_frozen_session(session: DeployedStreamerSession) -> None:
         session.clear_host_config()
         session.transport_self_test()
         session.safe_state()
-    except BaseException:
+    except BaseException as primary:
         if layout_verified:
             try:
                 session.safe_state()
-            except BaseException:
-                pass
-        session.close()
+            except BaseException as error:
+                primary.add_note(
+                    "pulse bring-up SAFE also failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+        try:
+            session.close()
+        except BaseException as error:
+            primary.add_note(
+                "pulse bring-up session close also failed: "
+                f"{type(error).__name__}: {error}"
+            )
         raise
 
 
@@ -216,15 +228,17 @@ def build_server_runtime(
     port: int = 18861,
     uart_port: str | None = None,
     uart_baud: int = 3_000_000,
-    params: StreamerParams | None = None,
-    clock_hz: float | None = None,
+    params: StreamerParams,
+    clock_hz: float,
     start: bool = False,
 ) -> PulseServerRuntime:
     if not isinstance(manifest, PulseTargetManifest):
         raise TypeError("manifest must be PulseTargetManifest")
     target = manifest.target
-    geometry = params or default_params()
-    clock = float(default_clock_hz() if clock_hz is None else clock_hz)
+    if not isinstance(params, StreamerParams):
+        raise TypeError("params must be StreamerParams")
+    geometry = params
+    clock = float(clock_hz)
     if clock != FROZEN_CLOCK_HZ:
         raise ValueError(
             f"deployment clock must match the frozen RTL ({FROZEN_CLOCK_HZ:g} Hz)"
@@ -256,11 +270,21 @@ def build_server_runtime(
             port=port,
             start=False,
         )
-    except BaseException:
+    except BaseException as primary:
         try:
             session.safe_state()
-        finally:
+        except BaseException as error:
+            primary.add_note(
+                "pulse RPC startup SAFE also failed: "
+                f"{type(error).__name__}: {error}"
+            )
+        try:
             session.close()
+        except BaseException as error:
+            primary.add_note(
+                "pulse RPC startup session close also failed: "
+                f"{type(error).__name__}: {error}"
+            )
         raise
     runtime = PulseServerRuntime(service, rpc_server, session)
     if start:
@@ -269,35 +293,6 @@ def build_server_runtime(
         finally:
             runtime.close()
     return runtime
-
-
-def load_deployed_streamer_config(
-    path: str | Path | None = None,
-) -> tuple[StreamerParams, float, Path]:
-    """Load the explicit frozen deployment geometry without fallback.
-
-    Offline authoring and resource estimation may use the image owner's
-    documented defaults.  A process about to connect to physical hardware may
-    not: the exact config file and every deployed field must have loaded
-    successfully before the independent register-layout handshake runs.
-    """
-
-    config = load_streamer_config(path)
-    source = config["source"]
-    warnings = tuple(str(item) for item in config["warnings"])
-    if source is None:
-        raise FileNotFoundError(
-            "deployed streamer_config.json was not found; refusing hardware startup"
-        )
-    if warnings:
-        raise ValueError(
-            "deployed streamer config is not exact: " + "; ".join(warnings)
-        )
-    params = config["params"]
-    if not isinstance(params, StreamerParams):
-        raise TypeError("streamer config returned another geometry type")
-    clock_hz = float(config["clock_hz"])
-    return params, clock_hz, Path(source).resolve()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -331,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
     arguments = build_arg_parser().parse_args(argv)
     target = load_pulse_target(arguments.target)
     manifest = pulse_target_manifest_from_xdc(target, arguments.xdc)
-    params, clock_hz, config_path = load_deployed_streamer_config()
+    params, clock_hz, config_path = _load_deployed_streamer_config()
     logging.info("deployment geometry loaded from %s", config_path)
     build_server_runtime(
         manifest,
@@ -359,7 +354,6 @@ __all__ = [
     "build_arg_parser",
     "build_server_runtime",
     "build_service_for_session",
-    "load_deployed_streamer_config",
     "main",
     "open_deployed_session",
     "validate_deployed_target",

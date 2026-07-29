@@ -15,11 +15,13 @@ from zlc_neutral_atom.devices.sequencer.application import PulseTargetDescriptor
 from zlc_pulse import (
     PulseDocument,
     load_deployed_pulse_target,
+    load_deployed_geometry_facts,
     pulse_target_manifest_from_lanes,
     restrict_pulse_document_to_manifest,
     validate_pulse_document_clock_grid,
 )
 from zlc_workbench.pulse_editor.session import PulseEditorSession
+from zlc_storage.paths import resolve_under
 
 from .controller import PulseEditorController, PulseRunFacade
 from .window import launch_pulse_editor_window
@@ -33,6 +35,7 @@ def _editor_session(
     path: str | Path | None,
     target,
     time_step_ns: float,
+    pulses_root: Path,
 ) -> PulseEditorSession:
     if document is not None and path is not None:
         raise ValueError("provide document or path, not both")
@@ -41,7 +44,7 @@ def _editor_session(
             raise TypeError("document must be PulseDocument or None")
         return PulseEditorSession(document)
     if path is not None:
-        return PulseEditorSession.load(path)
+        return PulseEditorSession.load(resolve_under(pulses_root, path))
     return PulseEditorSession.new(target, time_step_ns=time_step_ns)
 
 
@@ -54,6 +57,8 @@ def open_pulse_editor(
     document: PulseDocument | None = None,
     path: str | Path | None = None,
     remote_endpoint: str | None = None,
+    pulses_root: Path,
+    output_root: Path,
 ):
     """Open the unchanged Pulse surface on explicitly composed capabilities."""
 
@@ -82,6 +87,7 @@ def open_pulse_editor(
             path=path,
             target=descriptor.target,
             time_step_ns=descriptor.time_step_ns,
+            pulses_root=pulses_root,
         )
         session.bind_target(descriptor.target)
         session.replace_document(
@@ -98,7 +104,12 @@ def open_pulse_editor(
             authoring_manifest=descriptor.manifest,
             initial_connection_mode=initial_connection_mode,
         )
-        return launch_pulse_editor_window(controller, hide_on_close=True)
+        return launch_pulse_editor_window(
+            controller,
+            pulses_root=pulses_root,
+            output_root=output_root,
+            hide_on_close=True,
+        )
 
     if initial_connection_mode not in (None, "offline"):
         raise ValueError("an unbound Pulse editor must initially be offline")
@@ -106,13 +117,14 @@ def open_pulse_editor(
         raise ValueError("remote_endpoint requires an explicit connection_factory")
 
     target = load_deployed_pulse_target()
-    from zlc_neutral_atom.timing.clock import default_time_step_ns
+    geometry = load_deployed_geometry_facts()
 
     session = _editor_session(
         document=document,
         path=path,
         target=target,
-        time_step_ns=default_time_step_ns(),
+        time_step_ns=1_000_000_000.0 / geometry.clock_hz,
+        pulses_root=pulses_root,
     )
     controller = PulseEditorController(
         session,
@@ -122,7 +134,11 @@ def open_pulse_editor(
         connection_factory=connection_factory,
         initial_connection_mode="offline",
     )
-    body = launch_pulse_editor_window(controller)
+    body = launch_pulse_editor_window(
+        controller,
+        pulses_root=pulses_root,
+        output_root=output_root,
+    )
     if remote_endpoint is not None:
         controller.connect("remote", remote_endpoint)
     return body

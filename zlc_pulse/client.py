@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import threading
-from dataclasses import dataclass
 
 from zlc_storage import decode
 
@@ -17,72 +16,9 @@ from .server import (
     decode_prepared_ref_message,
     encode_artifact_message,
     encode_prepared_ref_message,
-    prepared_pulse_ref_from_tree,
+    PulseServerSnapshot,
+    pulse_server_snapshot_from_tree,
 )
-from .manifest import PulseTargetManifest, pulse_target_manifest_from_tree
-from .target import PulseTarget
-
-
-@dataclass(frozen=True)
-class PulseServerSnapshot:
-    connection_generation: str
-    manifest: PulseTargetManifest
-    clock_hz: float
-    geometry_fingerprint: int
-    state: str
-    prepared_ref: PreparedPulseRef | None
-    backend: dict[str, object]
-
-    @property
-    def target(self) -> PulseTarget:
-        return self.manifest.target
-
-
-def pulse_server_snapshot_from_tree(tree: object) -> PulseServerSnapshot:
-    fields = {
-        "schema",
-        "connection_generation",
-        "manifest",
-        "clock_hz",
-        "geometry_fingerprint",
-        "state",
-        "prepared_ref",
-        "backend",
-    }
-    if not isinstance(tree, dict) or set(tree) != fields:
-        raise ValueError("PulseExecutionSnapshot has an unknown field set")
-    if tree["schema"] != "zlc_pulse.PulseExecutionSnapshot":
-        raise ValueError("PulseExecutionSnapshot schema differs")
-    generation = tree["connection_generation"]
-    state = tree["state"]
-    if not isinstance(generation, str) or not generation:
-        raise ValueError("PulseExecutionSnapshot connection generation is invalid")
-    if not isinstance(state, str) or not state:
-        raise ValueError("PulseExecutionSnapshot state is invalid")
-    clock = tree["clock_hz"]
-    geometry = tree["geometry_fingerprint"]
-    if (
-        isinstance(clock, bool)
-        or not isinstance(clock, (int, float))
-        or not math.isfinite(float(clock))
-        or clock <= 0
-    ):
-        raise ValueError("PulseExecutionSnapshot clock is invalid")
-    if isinstance(geometry, bool) or not isinstance(geometry, int) or not 0 <= geometry <= 0xFFFFFFFF:
-        raise ValueError("PulseExecutionSnapshot geometry fingerprint is invalid")
-    backend = tree["backend"]
-    if not isinstance(backend, dict):
-        raise TypeError("PulseExecutionSnapshot backend must be a map")
-    raw_ref = tree["prepared_ref"]
-    return PulseServerSnapshot(
-        generation,
-        pulse_target_manifest_from_tree(tree["manifest"]),
-        float(clock),
-        geometry,
-        state,
-        None if raw_ref is None else prepared_pulse_ref_from_tree(raw_ref),
-        dict(backend),
-    )
 
 
 class RemotePulseExecutionClient:
@@ -129,7 +65,6 @@ class RemotePulseExecutionClient:
         self._safe_state_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._closed = False
-        self._close_failure_summary: str | None = None
         snapshot = self.snapshot()
         self._generation = snapshot.connection_generation
 
@@ -301,7 +236,11 @@ class RemotePulseExecutionClient:
         snapshot = pulse_server_snapshot_from_tree(decode(bytes(payload)))
         if snapshot.connection_generation != self._generation:
             raise RuntimeError("interrupt safe_state returned another connection generation")
-        if snapshot.state != "SAFE" or snapshot.prepared_ref is not None:
+        if (
+            snapshot.state != "SAFE"
+            or snapshot.prepared_ref is not None
+            or not snapshot.safe_readback_confirmed
+        ):
             raise RuntimeError("pulse server acknowledged safe_state without publishing SAFE")
         return snapshot
 
@@ -309,11 +248,6 @@ class RemotePulseExecutionClient:
         with self._safe_state_lock:
             with self._close_lock:
                 if self._closed:
-                    if self._close_failure_summary is not None:
-                        raise RuntimeError(
-                            "remote pulse client remains fail-closed after an "
-                            "unconfirmed shutdown: " + self._close_failure_summary
-                        )
                     return
             failure: BaseException | None = None
             try:
@@ -321,22 +255,19 @@ class RemotePulseExecutionClient:
             except BaseException as error:
                 failure = error
             try:
+                # close() is terminal even when its final SAFE attempt fails.
+                # Explicit safe_state() remains retryable; a rejected/abandoned
+                # connection must not leak either RPC transport.
                 self._close_connections()
             except BaseException as error:
                 if failure is None:
                     failure = error
                 else:
-                    try:
-                        failure.add_note(
-                            "closing the remote pulse transports also failed: "
-                            f"{type(error).__name__}: {error}"
-                        )
-                    except BaseException:
-                        pass
+                    failure.add_note(
+                        "pulse transports also failed to close: "
+                        f"{type(error).__name__}: {error}"
+                    )
             if failure is not None:
-                summary = f"{type(failure).__name__}: {failure}"
-                with self._close_lock:
-                    self._close_failure_summary = summary
                 raise failure
 
     def _abort_connections(self) -> None:
@@ -359,19 +290,24 @@ class RemotePulseExecutionClient:
         with self._close_lock:
             if self._closed:
                 return
+            failure: BaseException | None = None
+            for connection in (self._connection, self._interrupt_connection):
+                close = getattr(connection, "close", None)
+                if not callable(close):
+                    continue
+                try:
+                    close()
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+                    else:
+                        failure.add_note(
+                            "the other pulse transport also failed to close: "
+                            f"{type(error).__name__}: {error}"
+                        )
+            if failure is not None:
+                raise failure
             self._closed = True
-        close = getattr(self._connection, "close", None)
-        try:
-            if callable(close):
-                close()
-        finally:
-            close_interrupt = getattr(
-                self._interrupt_connection,
-                "close",
-                None,
-            )
-            if callable(close_interrupt):
-                close_interrupt()
 
     def _validate_reference(self, reference: PreparedPulseRef) -> None:
         self._require_open()
@@ -386,7 +322,5 @@ class RemotePulseExecutionClient:
 
 
 __all__ = [
-    "PulseServerSnapshot",
     "RemotePulseExecutionClient",
-    "pulse_server_snapshot_from_tree",
 ]

@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import QtCore, QtTest
 
-from Zou_lab_control.api import connect
+from Zou_lab_control.api import WorkspacePaths, connect
 from zlc_frontend.qt_widgets import ensure_qt_app
 from zlc_neutral_atom.runtime.run import RunState
 from zlc_pulse import (
@@ -54,7 +54,13 @@ def test_operator_observes_holds_steps_and_stops_virtual_scan(tmp_path) -> None:
             ((1000,), (2000,), (3000,)),
         ),
     )
-    experiment = connect("virtual", repository=tmp_path)
+    experiment = connect(
+        "virtual",
+        workspace=WorkspacePaths.for_workspace(
+            (tmp_path / "authored").resolve(),
+            repository_root=tmp_path.resolve(),
+        ),
+    )
     body = experiment.pulse_gui(document=document)
     try:
         QtTest.QTest.mouseClick(

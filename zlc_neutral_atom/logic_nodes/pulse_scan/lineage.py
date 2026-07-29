@@ -42,6 +42,7 @@ from zlc_neutral_atom.runtime.signal_source import (
 )
 from zlc_pulse import CompiledPulseArtifact, PulseExecutionForm
 from zlc_storage import (
+    canonical_digest,
     canonical_text,
     encode,
     exact_mapping,
@@ -233,6 +234,54 @@ def _event_ref_from_tree(tree: object) -> EventRef:
     return value
 
 
+def _validate_association_for_execution(
+    evidence: SignalAssociationEvidence,
+    artifact: CompiledPulseArtifact,
+    terminal: PulseTerminalAck,
+    *,
+    expected_event_count: int,
+) -> None:
+    """Bind persisted producer evidence back to its exact pulse execution."""
+
+    schedules = artifact.trigger_schedules
+    if len(schedules) != 1:
+        raise ValueError(
+            "PulseScan signal association requires one physical trigger schedule"
+        )
+    schedule = schedules[0]
+    request = evidence.request
+    expected = (
+        terminal.session_id,
+        artifact.fingerprint,
+        expected_event_count,
+        schedule.fingerprint,
+        schedule.channel,
+        schedule.total,
+        schedule.minimum_interval_ticks,
+        artifact.target_ir.clock_hz,
+    )
+    actual = (
+        request.cause_id,
+        request.cause_digest,
+        request.expected_event_count,
+        request.trigger_schedule_fingerprint,
+        request.trigger_channel,
+        request.trigger_count,
+        request.minimum_trigger_interval_ticks,
+        request.clock_hz,
+    )
+    if actual != expected:
+        raise ValueError(
+            "signal association is not bound to its exact pulse artifact and session"
+        )
+    if evidence.terminal_evidence_digest != canonical_digest(
+        pulse_terminal_ack_to_tree(terminal)
+    ):
+        raise ValueError(
+            "signal association is not bound to its exact pulse terminal"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class AutonomousScanExecution:
     program: AutonomousScanSlotProgram
@@ -255,6 +304,14 @@ class AutonomousScanExecution:
         expected = self.program.repeat_count * self.program.point_table.row_count
         if self.source.count != expected:
             raise ValueError("source event count differs from autonomous R by P")
+        if len(self.source.associations) != 1:
+            raise ValueError("autonomous scan requires one signal association")
+        _validate_association_for_execution(
+            self.source.associations[0],
+            self.artifact,
+            self.terminal,
+            expected_event_count=expected,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +362,19 @@ class ApiSegmentedScanExecution:
             raise TypeError("source must be SignalEventSequence")
         if self.source.count != self.program.segment_count:
             raise ValueError("source event count differs from API R by P")
+        if len(self.source.associations) != len(segments):
+            raise ValueError("API segments require one signal association per cell")
+        for association, segment in zip(
+            self.source.associations,
+            segments,
+            strict=True,
+        ):
+            _validate_association_for_execution(
+                association,
+                segment.artifact,
+                segment.terminal,
+                expected_event_count=1,
+            )
         object.__setattr__(self, "segments", segments)
 
 

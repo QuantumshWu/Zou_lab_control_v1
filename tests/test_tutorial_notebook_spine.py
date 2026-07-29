@@ -43,6 +43,10 @@ _REQUIRED_CURRENT_CODE = (
     "aggregate_fidelity",
     "global_fidelity",
     "schema.cell_schema.data_shape",
+    "schema.point_table.columns",
+    "WorkspacePaths.for_workspace",
+    "workspace=WORKSPACE",
+    "WORKSPACE.pulses_root",
 )
 
 _FORBIDDEN_OLD_OR_RAW_CODE = (
@@ -67,6 +71,10 @@ _FORBIDDEN_OLD_OR_RAW_CODE = (
     "triggered_frames(",
     "detection_time(",
     "fit_temperature(",
+    "user_output_path",
+    "repository=",
+    "ZLC_TUTORIAL_WORKSPACE",
+    "schema.point_axes",
 )
 
 
@@ -104,7 +112,11 @@ def test_the_checked_in_tutorial_executes_on_the_virtual_installation(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv(
-        "ZLC_TUTORIAL_WORKSPACE",
+        "ZLC_TUTORIAL_AUTHORED_ROOT",
+        str(ROOT),
+    )
+    monkeypatch.setenv(
+        "ZLC_TUTORIAL_REPOSITORY_ROOT",
         str(tmp_path / "tutorial-workspace"),
     )
     notebook = _load_notebook()
@@ -113,7 +125,7 @@ def test_the_checked_in_tutorial_executes_on_the_virtual_installation(
         timeout=120,
         kernel_name="python3",
         allow_errors=False,
-    ).execute(cwd=str(TUTORIALS))
+    ).execute(cwd=str(ROOT))
 
     code_cells = [cell for cell in executed.cells if cell.cell_type == "code"]
     assert code_cells

@@ -253,10 +253,44 @@ class StartCaptureCommand:
 class CaptureStartedAck:
     session_id: str
     binding_instance_id: str
+    settings_fingerprint: str
+    capability_fingerprint: str
+    capture_spec_fingerprint: str
+    expected_total_events: int
+    buffer_frame_count: int
+    source_ordinal_baseline: int
 
     def __post_init__(self) -> None:
         for name in ("session_id", "binding_instance_id"):
             _canonical_text(getattr(self, name), name)
+        for name in (
+            "settings_fingerprint",
+            "capability_fingerprint",
+            "capture_spec_fingerprint",
+        ):
+            _sha256(getattr(self, name), name)
+        object.__setattr__(
+            self,
+            "expected_total_events",
+            _positive_int(self.expected_total_events, "expected_total_events"),
+        )
+        object.__setattr__(
+            self,
+            "buffer_frame_count",
+            _positive_int(self.buffer_frame_count, "buffer_frame_count"),
+        )
+        object.__setattr__(
+            self,
+            "source_ordinal_baseline",
+            _nonnegative_int(
+                self.source_ordinal_baseline,
+                "source_ordinal_baseline",
+            ),
+        )
+        if self.buffer_frame_count != self.expected_total_events:
+            raise ValueError(
+                "finite camera arm buffer must cover the exact event cardinality"
+            )
 
 
 @dataclass(frozen=True)

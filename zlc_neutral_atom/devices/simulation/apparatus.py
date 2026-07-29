@@ -21,7 +21,9 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraCaptureTerminalRecord,
     CameraFrameRecord,
     CameraWorkingPoint,
+    validate_camera_external_trigger_spacing,
 )
+from zlc_neutral_atom.runtime.signal_source import SignalAssociationRequest
 from zlc_pulse import (
     CompiledPulseArtifact,
     PulsePlayback,
@@ -1055,6 +1057,7 @@ class _VirtualCameraSignalAssociation:
 
     association_id: str
     cause_digest: str
+    trigger_schedule_fingerprint: str
     expected_trigger_count: int
     trigger_group_size: int
     expected_group_count: int
@@ -1142,9 +1145,7 @@ class VirtualCamera:
 
     def arm_signal_event_association(
         self,
-        association_id: str,
-        cause_digest: str,
-        expected_trigger_count: int,
+        request: SignalAssociationRequest,
         trigger_group_size: int,
         expected_group_count: int,
     ) -> tuple[object, int]:
@@ -1155,11 +1156,30 @@ class VirtualCamera:
         callback and the physical frame ordinal counter under the same lock.
         """
 
-        identity = canonical_text(association_id, "association_id")
-        digest = sha256_text(cause_digest, "cause_digest")
-        trigger_count = _positive_int(
-            expected_trigger_count,
-            "expected_trigger_count",
+        if not isinstance(request, SignalAssociationRequest):
+            raise TypeError("request must be SignalAssociationRequest")
+        identity = request.association_id
+        digest = request.cause_digest
+        schedule_fingerprint = request.trigger_schedule_fingerprint
+        channel = request.trigger_channel
+        if channel != self.capture_trigger_channels[0]:
+            raise ValueError(
+                "virtual signal association schedule belongs to another trigger wire"
+            )
+        trigger_count = request.trigger_count
+        required_interval = (
+            self.capture_working_point().required_external_trigger_interval_seconds
+        )
+        if required_interval is None:
+            raise RuntimeError(
+                "virtual camera lacks external-trigger interval readback"
+            )
+        validate_camera_external_trigger_spacing(
+            minimum_trigger_interval_ticks=(
+                request.minimum_trigger_interval_ticks
+            ),
+            clock_hz=request.clock_hz,
+            required_interval_seconds=required_interval,
         )
         group_size = _positive_int(trigger_group_size, "trigger_group_size")
         group_count = _positive_int(
@@ -1210,6 +1230,7 @@ class VirtualCamera:
             association = _VirtualCameraSignalAssociation(
                 identity,
                 digest,
+                schedule_fingerprint,
                 trigger_count,
                 group_size,
                 group_count,
@@ -1254,8 +1275,7 @@ class VirtualCamera:
                     "virtual camera terminal belongs to another pulse artifact"
                 )
             channel = self.capture_trigger_channels[0]
-            matching = tuple(count for name, count in counts if name == channel)
-            if matching != (association.expected_trigger_count,):
+            if counts != ((channel, association.expected_trigger_count),):
                 raise RuntimeError(
                     "virtual pulse terminal trigger count differs from camera association"
                 )
@@ -1610,20 +1630,22 @@ class VirtualCamera:
                         raise RuntimeError(
                             "virtual camera observed another artifact after association arm"
                         )
+                    matching_schedules = tuple(
+                        schedule
+                        for schedule in artifact.trigger_schedules
+                        if schedule.channel == self.capture_trigger_channels[0]
+                    )
+                    if (
+                        len(matching_schedules) != 1
+                        or matching_schedules[0].fingerprint
+                        != association.trigger_schedule_fingerprint
+                    ):
+                        raise RuntimeError(
+                            "virtual FIRE trigger schedule differs from association preflight"
+                        )
                     if trigger_count != association.expected_trigger_count:
                         raise RuntimeError(
                             "virtual FIRE trigger count differs from the associated group"
-                        )
-                    expected_groups = (
-                        (association.trigger_group_size,)
-                        * association.expected_group_count
-                    )
-                    observed_groups = playback.trigger_group_sizes(
-                        self.capture_trigger_channels
-                    )
-                    if observed_groups != expected_groups:
-                        raise RuntimeError(
-                            "virtual FIRE trigger grouping differs from the associated cycles"
                         )
                     if self._produced != association.physical_start_ordinal:
                         raise RuntimeError(
@@ -2104,7 +2126,7 @@ class VirtualCamera:
 
     def capture_state(self) -> tuple[bool, int]:
         with self._condition:
-            return self._armed, len(self._pending)
+            return self._armed, self._produced
 
     def observed_produced_count(self) -> int:
         """Return the exact virtual sensor production ordinal without draining."""

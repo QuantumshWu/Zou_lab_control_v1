@@ -34,16 +34,54 @@ from .evidence import (
     validate_backend_completion_for_artifact,
     validate_backend_completion_intrinsic,
 )
-from .manifest import PulseTargetManifest, pulse_target_manifest_to_tree
+from .manifest import (
+    PulseTargetManifest,
+    pulse_target_manifest_from_tree,
+    pulse_target_manifest_to_tree,
+)
+from .target import PulseTarget
 from .validation import validate_target_ir_for_target
 
 
 PREPARED_PULSE_REF_SCHEMA = "zlc_pulse.PreparedPulseRef"
 PULSE_COMPLETION_SCHEMA = "zlc_pulse.PulseCompletion"
 PULSE_CONTINUOUS_FAILURE_SCHEMA = "zlc_pulse.ContinuousFailure"
+PULSE_SERVER_SNAPSHOT_SCHEMA = "zlc_pulse.PulseExecutionSnapshot"
 
 
-class PulseExecutionBackend(Protocol):
+def _typed_backend_observation(snapshot: object) -> dict[str, object]:
+    """Rename one private session observation for the public value owner."""
+
+    required = {
+        "schema",
+        "state",
+        "prepared_artifact_digest",
+        "scan_points",
+        "last_confirmed_cursor",
+        "cursor_sample_count",
+        "underflow_observed",
+        "safe_status_word",
+        "safe_clock_enable_words",
+    }
+    if not isinstance(snapshot, dict) or not required.issubset(snapshot):
+        raise ValueError("pulse backend snapshot lacks current typed observation fields")
+    if snapshot["schema"] != "zlc_pulse.DeployedStreamerSessionSnapshot":
+        raise ValueError("pulse backend snapshot schema differs")
+    return {
+        "physical_state": snapshot["state"],
+        "physical_prepared_artifact_digest": snapshot[
+            "prepared_artifact_digest"
+        ],
+        "physical_scan_point_count": snapshot["scan_points"],
+        "physical_scan_cursor": snapshot["last_confirmed_cursor"],
+        "physical_cursor_sample_count": snapshot["cursor_sample_count"],
+        "physical_underflow_observed": snapshot["underflow_observed"],
+        "safe_status_word": snapshot["safe_status_word"],
+        "safe_clock_enable_words": snapshot["safe_clock_enable_words"],
+    }
+
+
+class _PulseExecutionBackend(Protocol):
     """The narrow existing-hardware seam consumed by :class:`PulseExecutionService`."""
 
     def prepare(self, artifact: CompiledPulseArtifact) -> None: ...
@@ -91,6 +129,135 @@ class PreparedPulseRef:
 
 
 @dataclass(frozen=True)
+class PulseServerSnapshot:
+    """One exact public observation of service and deployed physical state."""
+
+    connection_generation: str
+    manifest: PulseTargetManifest
+    clock_hz: float
+    geometry_fingerprint: int
+    state: str
+    prepared_ref: PreparedPulseRef | None
+    physical_state: str
+    physical_prepared_artifact_digest: str | None
+    physical_scan_point_count: int
+    physical_scan_cursor: int | None
+    physical_cursor_sample_count: int
+    physical_underflow_observed: bool
+    safe_status_word: int | None
+    safe_clock_enable_words: tuple[int, ...] | None
+
+    def __post_init__(self) -> None:
+        _text(self.connection_generation, "connection_generation")
+        if not isinstance(self.manifest, PulseTargetManifest):
+            raise TypeError("PulseServerSnapshot manifest has another type")
+        if (
+            isinstance(self.clock_hz, bool)
+            or not isinstance(self.clock_hz, (int, float))
+            or not math.isfinite(float(self.clock_hz))
+            or self.clock_hz <= 0
+        ):
+            raise ValueError("PulseServerSnapshot clock is invalid")
+        object.__setattr__(self, "clock_hz", float(self.clock_hz))
+        if (
+            isinstance(self.geometry_fingerprint, bool)
+            or not isinstance(self.geometry_fingerprint, int)
+            or not 0 <= self.geometry_fingerprint <= 0xFFFFFFFF
+        ):
+            raise ValueError("PulseServerSnapshot geometry fingerprint is invalid")
+        for name in ("state", "physical_state"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"PulseServerSnapshot {name} is invalid")
+        if self.prepared_ref is not None and not isinstance(
+            self.prepared_ref,
+            PreparedPulseRef,
+        ):
+            raise TypeError("PulseServerSnapshot prepared_ref has another type")
+        if (
+            self.prepared_ref is not None
+            and self.prepared_ref.connection_generation
+            != self.connection_generation
+        ):
+            raise ValueError(
+                "PulseServerSnapshot prepared_ref belongs to another generation"
+            )
+        if self.physical_prepared_artifact_digest is not None:
+            _sha256(
+                self.physical_prepared_artifact_digest,
+                "physical_prepared_artifact_digest",
+            )
+        for name in ("physical_scan_point_count", "physical_cursor_sample_count"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"PulseServerSnapshot {name} must be non-negative")
+        cursor = self.physical_scan_cursor
+        if self.physical_cursor_sample_count == 0:
+            if cursor is not None:
+                raise ValueError("unsampled pulse progress cannot publish a cursor")
+        elif (
+            isinstance(cursor, bool)
+            or not isinstance(cursor, int)
+            or not 0 <= cursor < self.physical_scan_point_count
+        ):
+            raise ValueError("sampled pulse cursor is outside the scan table")
+        if not isinstance(self.physical_underflow_observed, bool):
+            raise TypeError("physical_underflow_observed must be bool")
+        status = self.safe_status_word
+        if status is not None and (
+            isinstance(status, bool)
+            or not isinstance(status, int)
+            or not 0 <= status <= 0xFFFFFFFF
+        ):
+            raise ValueError("safe_status_word must be an unsigned 32-bit integer")
+        clocks = self.safe_clock_enable_words
+        if clocks is not None:
+            clocks = tuple(clocks)
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= 0xFFFFFFFF
+                for value in clocks
+            ):
+                raise ValueError("safe_clock_enable_words must be unsigned words")
+            expected_words = (len(self.manifest.target.raw_lanes) + 31) // 32
+            if len(clocks) != expected_words:
+                raise ValueError(
+                    "safe_clock_enable_words cardinality differs from target geometry"
+                )
+            object.__setattr__(self, "safe_clock_enable_words", clocks)
+        if (status is None) != (clocks is None):
+            raise ValueError("SAFE readback facts must be present or absent together")
+        if status is not None and (
+            status != 0
+            or any(clocks)
+            or self.physical_state != "SAFE"
+            or self.physical_prepared_artifact_digest is not None
+        ):
+            raise ValueError("SAFE readback facts do not prove current physical SAFE")
+        if self.physical_state == "SAFE" and not self.safe_readback_confirmed:
+            raise ValueError("physical SAFE state lacks exact readback")
+        if self.state == "SAFE" and (
+            not self.safe_readback_confirmed or self.prepared_ref is not None
+        ):
+            raise ValueError("server SAFE requires an exact physical SAFE readback")
+
+    @property
+    def target(self) -> PulseTarget:
+        return self.manifest.target
+
+    @property
+    def safe_readback_confirmed(self) -> bool:
+        return (
+            self.safe_status_word == 0
+            and self.safe_clock_enable_words is not None
+            and not any(self.safe_clock_enable_words)
+            and self.physical_state == "SAFE"
+            and self.physical_prepared_artifact_digest is None
+        )
+
+
+@dataclass(frozen=True)
 class PulseCompletion:
     prepared_ref: PreparedPulseRef
     hardware_terminal: StaticOnceTerminalEvidence | AutonomousTableTerminalEvidence
@@ -130,8 +297,8 @@ class PulseExecutionService:
         manifest: PulseTargetManifest,
         *,
         clock_hz: float,
-        backend: PulseExecutionBackend,
-        params: StreamerParams | None = None,
+        backend: _PulseExecutionBackend,
+        params: StreamerParams,
         connection_generation: str | None = None,
     ) -> None:
         if not isinstance(manifest, PulseTargetManifest):
@@ -152,7 +319,9 @@ class PulseExecutionService:
         self._target = manifest.target
         self._clock_hz = float(clock_hz)
         self._backend = backend
-        self._params = params or StreamerParams()
+        if not isinstance(params, StreamerParams):
+            raise TypeError("params must be StreamerParams")
+        self._params = params
         self._geometry_fingerprint = build_fingerprint(self._params) & 0xFFFFFFFF
         self._generation = connection_generation or uuid.uuid4().hex
         _text(self._generation, "connection_generation")
@@ -173,34 +342,33 @@ class PulseExecutionService:
         """Invalidate every prepared reference before admitting a new RPC owner."""
 
         with self._lock:
-            if self._state not in {"IDLE", "SAFE"}:
+            if self._state != "SAFE":
                 raise RuntimeError(
                     f"cannot renew connection generation while pulse service is {self._state}"
                 )
+            self._snapshot_locked()
             self._generation = uuid.uuid4().hex
             self._artifact = None
             self._prepared_ref = None
             self._completion = None
             return self._generation
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self) -> PulseServerSnapshot:
         with self._lock:
             return self._snapshot_locked()
 
-    def _snapshot_locked(self) -> dict[str, object]:
+    def _snapshot_locked(self) -> PulseServerSnapshot:
         prepared = self._prepared_ref
-        return {
-            "schema": "zlc_pulse.PulseExecutionSnapshot",
-            "connection_generation": self._generation,
-            "manifest": pulse_target_manifest_to_tree(self._manifest),
-            "clock_hz": self._clock_hz,
-            "geometry_fingerprint": self._geometry_fingerprint,
-            "state": self._state,
-            "prepared_ref": (
-                None if prepared is None else prepared_pulse_ref_to_tree(prepared)
-            ),
-            "backend": dict(self._backend.snapshot()),
-        }
+        physical = _typed_backend_observation(self._backend.snapshot())
+        return PulseServerSnapshot(
+            connection_generation=self._generation,
+            manifest=self._manifest,
+            clock_hz=self._clock_hz,
+            geometry_fingerprint=self._geometry_fingerprint,
+            state=self._state,
+            prepared_ref=prepared,
+            **physical,
+        )
 
     def prepare(self, artifact: CompiledPulseArtifact) -> PreparedPulseRef:
         with self._lock:
@@ -443,7 +611,7 @@ class PulseExecutionService:
         self,
         *,
         expected_generation: str | None,
-    ) -> tuple[dict[str, object], BaseException | None]:
+    ) -> tuple[PulseServerSnapshot, BaseException | None]:
         with self._safe_state_lock:
             return self._safe_state_owned(expected_generation=expected_generation)
 
@@ -451,7 +619,7 @@ class PulseExecutionService:
         self,
         *,
         expected_generation: str | None,
-    ) -> tuple[dict[str, object], BaseException | None]:
+    ) -> tuple[PulseServerSnapshot, BaseException | None]:
         with self._lock:
             if (
                 expected_generation is not None
@@ -459,7 +627,15 @@ class PulseExecutionService:
             ):
                 raise RuntimeError("interrupt connection generation is stale")
             if self._state == "SAFE" and self._prepared_ref is None:
-                return self._snapshot_locked(), None
+                try:
+                    current_safe = self._snapshot_locked()
+                except Exception:
+                    current_safe = None
+                if (
+                    current_safe is not None
+                    and current_safe.safe_readback_confirmed
+                ):
+                    return current_safe, None
             self._operation_epoch += 1
             operation_epoch = self._operation_epoch
             self._state = "INTERRUPTING"
@@ -493,7 +669,7 @@ class PulseExecutionService:
             self._state = "SAFE"
             return self._snapshot_locked(), interrupt_error
 
-    def safe_state_for_generation(self, generation: str) -> dict[str, object]:
+    def safe_state_for_generation(self, generation: str) -> PulseServerSnapshot:
         """Authorize a separate abort connection without granting normal control."""
 
         _text(generation, "connection_generation")
@@ -574,6 +750,92 @@ def prepared_pulse_ref_from_tree(tree: object) -> PreparedPulseRef:
     return PreparedPulseRef(
         tree["connection_generation"],
         tree["artifact_digest"],
+    )
+
+
+def pulse_server_snapshot_to_tree(
+    value: PulseServerSnapshot,
+) -> dict[str, object]:
+    if not isinstance(value, PulseServerSnapshot):
+        raise TypeError("value must be PulseServerSnapshot")
+    return {
+        "schema": PULSE_SERVER_SNAPSHOT_SCHEMA,
+        "connection_generation": value.connection_generation,
+        "manifest": pulse_target_manifest_to_tree(value.manifest),
+        "clock_hz": value.clock_hz,
+        "geometry_fingerprint": value.geometry_fingerprint,
+        "state": value.state,
+        "prepared_ref": (
+            None
+            if value.prepared_ref is None
+            else prepared_pulse_ref_to_tree(value.prepared_ref)
+        ),
+        "physical_state": value.physical_state,
+        "physical_prepared_artifact_digest": (
+            value.physical_prepared_artifact_digest
+        ),
+        "physical_scan_point_count": value.physical_scan_point_count,
+        "physical_scan_cursor": value.physical_scan_cursor,
+        "physical_cursor_sample_count": value.physical_cursor_sample_count,
+        "physical_underflow_observed": value.physical_underflow_observed,
+        "safe_status_word": value.safe_status_word,
+        "safe_clock_enable_words": (
+            None
+            if value.safe_clock_enable_words is None
+            else list(value.safe_clock_enable_words)
+        ),
+    }
+
+
+def pulse_server_snapshot_from_tree(tree: object) -> PulseServerSnapshot:
+    fields = {
+        "schema",
+        "connection_generation",
+        "manifest",
+        "clock_hz",
+        "geometry_fingerprint",
+        "state",
+        "prepared_ref",
+        "physical_state",
+        "physical_prepared_artifact_digest",
+        "physical_scan_point_count",
+        "physical_scan_cursor",
+        "physical_cursor_sample_count",
+        "physical_underflow_observed",
+        "safe_status_word",
+        "safe_clock_enable_words",
+    }
+    if not isinstance(tree, dict) or set(tree) != fields:
+        raise ValueError("PulseExecutionSnapshot has an unknown field set")
+    if tree["schema"] != PULSE_SERVER_SNAPSHOT_SCHEMA:
+        raise ValueError("PulseExecutionSnapshot schema differs")
+    raw_ref = tree["prepared_ref"]
+    raw_clocks = tree["safe_clock_enable_words"]
+    if raw_clocks is not None and not isinstance(raw_clocks, list):
+        raise TypeError(
+            "PulseExecutionSnapshot SAFE clock words must be a list or null"
+        )
+    return PulseServerSnapshot(
+        connection_generation=tree["connection_generation"],
+        manifest=pulse_target_manifest_from_tree(tree["manifest"]),
+        clock_hz=tree["clock_hz"],
+        geometry_fingerprint=tree["geometry_fingerprint"],
+        state=tree["state"],
+        prepared_ref=(
+            None if raw_ref is None else prepared_pulse_ref_from_tree(raw_ref)
+        ),
+        physical_state=tree["physical_state"],
+        physical_prepared_artifact_digest=(
+            tree["physical_prepared_artifact_digest"]
+        ),
+        physical_scan_point_count=tree["physical_scan_point_count"],
+        physical_scan_cursor=tree["physical_scan_cursor"],
+        physical_cursor_sample_count=tree["physical_cursor_sample_count"],
+        physical_underflow_observed=tree["physical_underflow_observed"],
+        safe_status_word=tree["safe_status_word"],
+        safe_clock_enable_words=(
+            None if raw_clocks is None else tuple(raw_clocks)
+        ),
     )
 
 
@@ -697,6 +959,10 @@ def serve_pulse_execution_service(
             if not owns_connection:
                 return
             try:
+                # Admission is a live recovery attempt.  A prior disconnect SAFE
+                # failure blocks only until this serialized owner obtains a
+                # current receipt; no failure state survives successful readback.
+                service.safe_state()
                 service.renew_connection_generation()
             except BaseException:
                 with connection_lock:
@@ -726,7 +992,7 @@ def serve_pulse_execution_service(
 
         def exposed_current_snapshot(self):
             self._require_owner()
-            return encode(service.snapshot())
+            return encode(pulse_server_snapshot_to_tree(service.snapshot()))
 
         def exposed_current_prepare(self, artifact_bytes):
             self._require_owner()
@@ -763,7 +1029,9 @@ def serve_pulse_execution_service(
 
         def exposed_current_interrupt_safe_state(self, connection_generation):
             return encode(
-                service.safe_state_for_generation(str(connection_generation))
+                pulse_server_snapshot_to_tree(
+                    service.safe_state_for_generation(str(connection_generation))
+                )
             )
 
     server = ThreadedServer(
@@ -781,10 +1049,11 @@ __all__ = [
     "PREPARED_PULSE_REF_SCHEMA",
     "PULSE_COMPLETION_SCHEMA",
     "PULSE_CONTINUOUS_FAILURE_SCHEMA",
+    "PULSE_SERVER_SNAPSHOT_SCHEMA",
     "PreparedPulseRef",
     "PulseCompletion",
-    "PulseExecutionBackend",
     "PulseExecutionService",
+    "PulseServerSnapshot",
     "decode_artifact_message",
     "decode_completion_message",
     "decode_continuous_failure_message",
@@ -797,5 +1066,7 @@ __all__ = [
     "prepared_pulse_ref_to_tree",
     "pulse_completion_from_tree",
     "pulse_completion_to_tree",
+    "pulse_server_snapshot_from_tree",
+    "pulse_server_snapshot_to_tree",
     "serve_pulse_execution_service",
 ]
