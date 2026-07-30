@@ -998,16 +998,29 @@ def _reduce_arrays(
         raise RuntimeError("ReductionSpec did not resolve to a physical axis")
     if values.dtype.kind in "fc" and np.any(np.logical_and(validity, ~np.isfinite(values))):
         raise ValueError("reduction received a valid non-finite value")
-    counts = np.sum(validity, axis=axes, dtype=np.int64)
+    reduction_size = math.prod(values.shape[axis] for axis in axes)
+    all_valid = bool(np.all(validity))
+    output_shape = tuple(
+        size for index, size in enumerate(values.shape) if index not in axes
+    )
+    counts = (
+        reduction_size
+        if all_valid
+        else np.sum(validity, axis=axes, dtype=np.int64)
+    )
     if policy is ValidityPolicy.REQUIRE_ALL:
-        output_validity = counts == math.prod(values.shape[axis] for axis in axes)
+        output_validity = counts == reduction_size
     elif policy is ValidityPolicy.MIN_COUNT:
         assert minimum_valid_count is not None
         output_validity = counts >= minimum_valid_count
     else:
         output_validity = counts > 0
+    output_validity = np.broadcast_to(
+        np.asarray(output_validity, dtype=bool),
+        output_shape,
+    )
     if method in (ReductionMethod.MEAN, ReductionMethod.SUM):
-        safe = np.where(validity, values, 0)
+        safe = values if all_valid else np.where(validity, values, 0)
         if method is ReductionMethod.SUM and values.dtype.kind in "biu":
             summed = checked_numeric_sum(safe, axes, output_dtype=output_dtype)
         else:
@@ -1017,15 +1030,15 @@ def _reduce_arrays(
             if np.any((counts > 0) & ~np.isfinite(summed)):
                 raise OverflowError("floating reduction overflowed its canonical output dtype")
         if method is ReductionMethod.MEAN:
-            result = np.zeros(np.shape(summed), dtype=output_dtype)
-            np.divide(summed, counts, out=result, where=counts > 0)
+            result = np.asarray(summed, dtype=output_dtype)
+            np.divide(result, counts, out=result, where=np.asarray(counts) > 0)
         else:
             result = np.asarray(summed, dtype=output_dtype)
     else:
         masked = np.ma.array(values, mask=~validity)
         reduced = masked.min(axis=axes) if method is ReductionMethod.MIN else masked.max(axis=axes)
         result = np.asarray(np.ma.filled(reduced, 0), dtype=output_dtype)
-    result = np.where(output_validity, result, np.zeros((), dtype=output_dtype))
+    np.copyto(result, np.zeros((), dtype=output_dtype), where=~output_validity)
     return np.asarray(result, dtype=output_dtype), np.asarray(output_validity, dtype=bool)
 
 

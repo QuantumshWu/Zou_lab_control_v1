@@ -1,4 +1,4 @@
-"""Named-axis fit contracts, packing, models, and artifact codecs."""
+"""Named-axis fit contracts, execution, models, and artifact codecs."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ from zlc_data.fit_model import (
     fit_model_definition,
     initialize_fit_model,
 )
-from zlc_data.fit_problem import bind_fit, build_fit_problem
+from zlc_data.fit_problem import bind_fit
 from zlc_data.layout import AxisLayout
 from zlc_data.schema import (
     DatasetSchema,
@@ -66,7 +66,13 @@ from zlc_data.schema import (
     ValueSchema,
 )
 from zlc_data.selection import Selection
-from zlc_data.transform import DataTransformSpec, commit_transform
+from zlc_data.transform import (
+    DataTransformSpec,
+    ReductionMethod,
+    ReductionSpec,
+    ValidityPolicy,
+    commit_transform,
+)
 from zlc_data.validity import (
     VALID,
     CellValidity,
@@ -684,12 +690,15 @@ def test_sparse_implicit_fit_tracks_present_rows_and_preserves_axis_unit():
         "gaussian_offset",
     )
     bound = bind_fit(spec, snapshot.block.schema)
-    problem = build_fit_problem(bound, snapshot)
+    result = bound.run(snapshot)
 
     np.testing.assert_array_equal(
-        problem.independent_values[0],
+        result.fit_axis_specs[0].coordinates,
         (0.0, float(logical_size - 1)),
     )
+    np.testing.assert_array_equal(result.present_observation_counts, (2,))
+    np.testing.assert_array_equal(result.used_observation_counts, (2,))
+    assert result.statuses == (FitBatchStatus.INSUFFICIENT_POINTS,)
     assert bound.parameter_units == ("count", "count", "MHz", "MHz")
 
 
@@ -766,7 +775,7 @@ def test_identity_and_committed_transform_keep_complete_source_lineage():
     np.testing.assert_allclose(transformed.parameter_values[0], (3.0, 1.2, 0.8, 0.7))
 
 
-def test_fit_packing_rejects_a_subclass_that_skips_proof_admission():
+def test_fit_execution_rejects_a_subclass_that_skips_proof_admission():
     snapshot, scan = gaussian_snapshot(repeat=1)
 
     class UncheckedBoundFit(BoundFit):
@@ -775,7 +784,7 @@ def test_fit_packing_rejects_a_subclass_that_skips_proof_admission():
 
     forged = UncheckedBoundFit(gaussian_spec(snapshot, scan), snapshot.block.schema)
     with pytest.raises(TypeError, match="bound must be BoundFit"):
-        build_fit_problem(forged, snapshot)
+        forged.run(snapshot)
 
 
 def test_grid_site_batch_uses_component_validity_without_collapsing_sites():
@@ -880,15 +889,24 @@ def test_mixed_cell_data_batch_plan_matches_source_values():
     group_indices = np.asarray(tuple(item[0] for item in mapping))
     scan_indices = np.asarray(tuple(item[1] for item in mapping))
     values = np.empty((2, len(mapping), site.size), dtype=np.float64)
+    expected_parameters = {}
     for repeat_index in range(2):
-        for point_ordinal in range(len(mapping)):
+        for group_index in (0, 2):
+            rows = np.flatnonzero(group_indices == group_index)
+            coordinates = np.asarray(scan.coordinates)[scan_indices[rows]]
             for site_index in range(site.size):
-                values[repeat_index, point_ordinal, site_index] = (
-                    100 * repeat_index
-                    + 10 * group_indices[point_ordinal]
-                    + site_index
-                    + scan_indices[point_ordinal] / 10
+                parameters = (
+                    2.0 + site_index,
+                    0.2 + 0.1 * repeat_index,
+                    0.8,
+                    -0.2 + 0.1 * group_index,
                 )
+                values[repeat_index, rows, site_index] = evaluate_fit_model(
+                    "gaussian_offset",
+                    (coordinates,),
+                    parameters,
+                )
+                expected_parameters[(site_index, group_index, repeat_index)] = parameters
     points = PointTable(
         len(mapping),
         (
@@ -918,7 +936,7 @@ def test_mixed_cell_data_batch_plan_matches_source_values():
         ),
         "gaussian_offset",
     )
-    problem = build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
+    result = bind_fit(spec, snapshot.block.schema).run(snapshot)
 
     present_groups = tuple(sorted(set(int(item) for item in group_indices)))
     expected_keys = {
@@ -928,61 +946,97 @@ def test_mixed_cell_data_batch_plan_matches_source_values():
         for repeat_index in range(repeat_axis.size)
     }
     actual_keys = tuple(
-        problem.batch_layout.multi_index(index)
-        for index in range(problem.batch_layout.storage_size)
+        result.batch_layout.multi_index(index)
+        for index in range(result.batch_layout.storage_size)
     )
     assert set(actual_keys) == expected_keys
-    for batch_index, (site_index, group_index, repeat_index) in enumerate(actual_keys):
-        rows = np.flatnonzero(group_indices == group_index)
-        rows = rows[np.argsort(scan_indices[rows], kind="stable")]
-        start, stop = problem.batch_offsets[batch_index : batch_index + 2]
-        np.testing.assert_array_equal(
-            problem.present_observation_counts[batch_index],
-            rows.size,
-        )
+    assert result.statuses == (FitBatchStatus.CONVERGED,) * len(actual_keys)
+    for batch_index, key in enumerate(actual_keys):
+        np.testing.assert_array_equal(result.present_observation_counts[batch_index], 6)
+        np.testing.assert_array_equal(result.used_observation_counts[batch_index], 6)
         np.testing.assert_allclose(
-            problem.independent_values[0][start:stop],
-            np.asarray(scan.coordinates)[scan_indices[rows]],
-        )
-        np.testing.assert_allclose(
-            problem.observations[start:stop],
-            values[repeat_index, rows, site_index],
+            result.parameter_values[batch_index],
+            expected_parameters[key],
+            rtol=1e-5,
+            atol=1e-5,
         )
 
 
-def test_large_radial_image_uses_every_valid_observation_and_fits_2d():
-    x_values = np.linspace(-3.0, 3.0, 160)
-    y_values = np.linspace(-2.0, 2.0, 120)
-    x = axis("x", SPATIAL_X, x_values.size, coordinates=x_values, unit="mm", frame="camera")
-    y = axis("y", SPATIAL_Y, y_values.size, coordinates=y_values, unit="mm", frame="camera")
-    xx, yy = np.meshgrid(x_values, y_values, indexing="ij")
-    expected = (4.0, 0.5, 1.1, 0.4, -0.3)
-    image = evaluate_fit_model("radial_gaussian_center", (xx, yy), expected)
+def test_repeat_mean_radial_roi_preserves_validity_and_absolute_coordinates():
+    x = axis(
+        "x",
+        SPATIAL_X,
+        160,
+        coordinates=range(160),
+        unit="px",
+        frame="camera",
+    )
+    y = axis(
+        "y",
+        SPATIAL_Y,
+        120,
+        coordinates=range(120),
+        unit="px",
+        frame="camera",
+    )
+    xx, yy = np.meshgrid(np.arange(x.size), np.arange(y.size), indexing="ij")
+    expected = (180.0, 20.0, 14.0, 83.2, 57.6)
+    base = evaluate_fit_model("radial_gaussian_center", (xx, yy), expected)
+    images = np.stack(
+        tuple(
+            np.clip(np.rint(base + offset), 0, 255)
+            for offset in (0.0, 1.0, 3.0)
+        )
+    ).astype(np.uint8)
+    validity = np.ones((3, 1, x.size, y.size), dtype=bool)
+    validity[0, 0, 30:34, 20:23] = False
+    validity[:, 0, 35:37, 25:28] = False
     snapshot = snapshot_for(
-        repeat=1,
+        repeat=3,
         points=PointTable(1),
         data_axes=(x, y),
-        values=image.reshape(1, 1, *image.shape),
+        values=images[:, np.newaxis, ...],
+        validity=DatasetComponentValidity((x.axis_id, y.axis_id), validity),
+        validity_contract=ValidityContract.components(x.axis_id, y.axis_id),
+        dtype=np.dtype("uint8"),
+    )
+    repeat_source = AxisSourceRef.tensor(snapshot.block.schema.repeat_axis.axis_id)
+    committed = commit_transform(
+        snapshot.block.schema,
+        DataTransformSpec(
+            (
+                ReductionSpec(
+                    (repeat_source,),
+                    ReductionMethod.MEAN,
+                    validity_policy=ValidityPolicy.OMIT_INVALID,
+                ),
+                Selection.index_range(x.axis_id, 20, 141),
+                Selection.index_range(y.axis_id, 10, 111),
+            )
+        ),
     )
     spec = FitSpec(
-        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        committed,
         (AxisSourceRef.tensor(x.axis_id), AxisSourceRef.tensor(y.axis_id)),
         (),
         "radial_gaussian_center",
     )
-    bound = bind_fit(spec, snapshot.block.schema)
-    problem = build_fit_problem(bound, snapshot)
-    assert problem.present_observation_counts[0] == image.size
-    assert problem.valid_observation_counts[0] == image.size
-    assert problem.used_observation_counts[0] == image.size
-    assert problem.observations.size == image.size
-    assert tuple(values.size for values in problem.independent_values) == (
-        image.size,
-        image.size,
-    )
-    result = bound.run(snapshot)
+    source_values = snapshot.block.values
+    result = bind_fit(spec, snapshot.block.schema).run(snapshot)
+
+    assert snapshot.block.values is source_values
+    assert source_values.dtype == np.dtype("uint8")
+    assert committed.effective_output_schema.cell_schema.dtype == np.dtype("<f8")
     assert result.statuses == (FitBatchStatus.CONVERGED,)
-    np.testing.assert_allclose(result.parameter_values[0], expected, rtol=2e-3, atol=2e-3)
+    assert result.present_observation_counts[0] == 121 * 101
+    assert result.valid_observation_counts[0] == 121 * 101 - 6
+    assert result.used_observation_counts[0] == 121 * 101 - 6
+    np.testing.assert_allclose(
+        result.parameter_values[0, 2:5],
+        expected[2:5],
+        rtol=2e-2,
+        atol=0.2,
+    )
 
 
 def test_megapixel_radial_fit_scores_every_camera_pixel():
@@ -1116,9 +1170,7 @@ def test_radial_roi_keeps_absolute_coordinate_less_centers_and_index_units():
         (),
         "radial_gaussian_center",
     )
-    roi_bound = bind_fit(roi_spec, snapshot.block.schema)
-    roi_problem = build_fit_problem(roi_bound, snapshot)
-    roi = roi_bound.run(snapshot)
+    roi = bind_fit(roi_spec, snapshot.block.schema).run(snapshot)
 
     assert full.statuses == roi.statuses == (FitBatchStatus.CONVERGED,)
     np.testing.assert_allclose(full.parameter_values[0], expected, rtol=1e-5, atol=1e-5)
@@ -1127,14 +1179,8 @@ def test_radial_roi_keeps_absolute_coordinate_less_centers_and_index_units():
     assert tuple(axis.unit for axis in roi.fit_axis_specs) == (None, None)
     assert tuple(axis.coordinates for axis in roi.fit_axis_specs) == (None, None)
     assert tuple(axis.index_origin for axis in roi.fit_axis_specs) == (20, 5)
-    np.testing.assert_array_equal(
-        np.unique(roi_problem.independent_values[0]),
-        np.arange(20.0, 41.0),
-    )
-    np.testing.assert_array_equal(
-        np.unique(roi_problem.independent_values[1]),
-        np.arange(5.0, 26.0),
-    )
+    assert roi.present_observation_counts[0] == 21 * 21
+    assert roi.used_observation_counts[0] == 21 * 21
 
 
 def test_full_2d_fit_keeps_a_narrow_feature():
@@ -1166,11 +1212,9 @@ def test_full_2d_fit_keeps_a_narrow_feature():
         "radial_gaussian_center",
     )
 
-    problem = build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
-    assert problem.used_observation_counts[0] == image.size
-    assert np.max(problem.observations) == pytest.approx(5_100.0)
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
     assert result.statuses == (FitBatchStatus.CONVERGED,)
+    assert result.used_observation_counts[0] == image.size
     np.testing.assert_allclose(result.parameter_values[0], expected, rtol=2e-3, atol=2e-3)
 
 
@@ -1259,7 +1303,7 @@ def test_noisy_radial_seed_tracks_coherent_bright_and_dark_features(amplitude):
     )
 
 
-def test_valid_nonfinite_is_included_fail_closed_while_invalid_nonfinite_is_absent():
+def test_invalid_nonfinite_observation_is_excluded_from_fit():
     coordinate_values = np.linspace(-5.0, 5.0, 100)
     scan = axis(
         "nonfinite_scan",
@@ -1268,7 +1312,7 @@ def test_valid_nonfinite_is_included_fail_closed_while_invalid_nonfinite_is_abse
         coordinates=coordinate_values,
     )
     signal = 0.5 + 3.0 * np.exp(-((coordinate_values - 0.7) ** 2) / (2.0 * 1.1**2))
-    signal[90:92] = np.nan
+    signal[91] = np.nan
     validity = np.ones((1, scan.size), dtype=bool)
     validity[0, 91] = False
     snapshot = snapshot_for(
@@ -1284,10 +1328,34 @@ def test_valid_nonfinite_is_included_fail_closed_while_invalid_nonfinite_is_abse
         "gaussian_offset",
     )
 
-    problem = build_fit_problem(bind_fit(spec, snapshot.block.schema), snapshot)
-    assert np.count_nonzero(np.isnan(problem.observations)) == 1
-    assert coordinate_values[90] in problem.independent_values[0]
-    assert coordinate_values[91] not in problem.independent_values[0]
+    result = bind_fit(spec, snapshot.block.schema).run(snapshot)
+    assert result.statuses == (FitBatchStatus.CONVERGED,)
+    assert result.valid_observation_counts[0] == scan.size - 1
+    assert result.used_observation_counts[0] == scan.size - 1
+
+
+def test_valid_nonfinite_observation_fails_closed():
+    coordinate_values = np.linspace(-5.0, 5.0, 100)
+    scan = axis(
+        "nonfinite_scan",
+        SCAN_POINT,
+        coordinate_values.size,
+        coordinates=coordinate_values,
+    )
+    signal = 0.5 + 3.0 * np.exp(-((coordinate_values - 0.7) ** 2) / (2.0 * 1.1**2))
+    signal[90] = np.nan
+    snapshot = snapshot_for(
+        repeat=1,
+        points=point_table(scan),
+        values=signal.reshape(1, -1),
+    )
+    spec = FitSpec(
+        commit_transform(snapshot.block.schema, DataTransformSpec()),
+        (AxisSourceRef.point_coordinate(scan.axis_id),),
+        (),
+        "gaussian_offset",
+    )
+
     result = bind_fit(spec, snapshot.block.schema).run(snapshot)
     assert result.statuses == (FitBatchStatus.NUMERIC_ERROR,)
 
@@ -1376,7 +1444,7 @@ def test_2d_grid_fit_recovers_center_and_ignores_authored_row_permutation():
     )
 
 
-def test_fit_packing_is_invariant_to_explicit_physical_row_permutation():
+def test_fit_result_is_invariant_to_explicit_physical_row_permutation():
     coordinate_values = np.linspace(-5.0, 5.0, 1_000)
     scan = axis("scan", SCAN_POINT, 1_000, coordinates=coordinate_values, unit="MHz")
     logical_signal = evaluate_fit_model(
@@ -1952,15 +2020,18 @@ def test_cancel_is_checked_inside_model_evaluations_and_host_deadline_aborts():
         (),
         "gaussian_offset",
     )
-    packing_checks = 0
+    representation_checks = 0
 
-    def cancel_packing() -> bool:
-        nonlocal packing_checks
-        packing_checks += 1
-        return packing_checks >= 5
+    def cancel_representation() -> bool:
+        nonlocal representation_checks
+        representation_checks += 1
+        return representation_checks >= 5
 
     with pytest.raises(FitCancelled):
-        bind_fit(large_spec, large.block.schema).run(large, cancel_check=cancel_packing)
+        bind_fit(large_spec, large.block.schema).run(
+            large,
+            cancel_check=cancel_representation,
+        )
 
 
 def test_complex_observations_are_rejected_before_float_conversion():
@@ -1994,10 +2065,7 @@ def test_complex_observations_are_rejected_before_float_conversion():
         ),
     )
     with pytest.raises(ValueError, match="not exactly float64-representable"):
-        build_fit_problem(
-            bind_fit(integer_spec, integer_snapshot.block.schema),
-            integer_snapshot,
-        )
+        bind_fit(integer_spec, integer_snapshot.block.schema).run(integer_snapshot)
 
     ordered_integers = np.array(
         [0, 1, 2, 3, 4, 5, 2**53, 2**53 + 1],
@@ -2017,10 +2085,7 @@ def test_complex_observations_are_rejected_before_float_conversion():
         ),
     )
     with pytest.raises(ValueError, match="not exactly float64-representable"):
-        build_fit_problem(
-            bind_fit(ordered_spec, ordered_snapshot.block.schema),
-            ordered_snapshot,
-        )
+        bind_fit(ordered_spec, ordered_snapshot.block.schema).run(ordered_snapshot)
 
 
 def test_fit_result_strict_codec_embeds_the_current_fit_spec():

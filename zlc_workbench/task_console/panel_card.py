@@ -1028,6 +1028,8 @@ class PanelCard(FluentGroupBox):
         overlays,
         error: str | None,
         overlay_error: str | None = None,
+        *,
+        summary: str | None = None,
     ) -> bool:
         """Accept a result only into the surface that submitted its exact pair."""
 
@@ -1056,11 +1058,11 @@ class PanelCard(FluentGroupBox):
             request,
             overlays,
         )
-        converged = sum(status.value == "CONVERGED" for status in result.statuses)
         fault = overlay_error or presentation_error
-        message = (
-            f"fit {result.spec.model_id}: {converged}/{len(result.statuses)} converged"
-        )
+        if not isinstance(summary, str) or not summary.strip():
+            self.set_status("Fit worker returned no result summary", error=True)
+            return True
+        message = summary
         if fault:
             message += f"; overlay unavailable ({fault})"
         self.set_status(message, error=False)

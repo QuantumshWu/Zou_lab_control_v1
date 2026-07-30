@@ -976,7 +976,11 @@ class DataFigureWindow(FrozenRasterWindow):
         if self._fit_future is not None:
             raise RuntimeError("Fit worker already has active work")
         try:
-            future = submit_compute(function, *args)
+            future = submit_compute(
+                function,
+                *args,
+                latency_sensitive=kind == "prepare",
+            )
         except BaseException as error:
             self._status.setText("FIT SUBMISSION FAILED")
             self._diagnostic.setText(error_summary(error))

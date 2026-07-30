@@ -46,17 +46,6 @@ def bind_fit(spec: FitSpec, expected_schema: DatasetSchema) -> BoundFit:
     return BoundFit(spec, expected_schema)
 
 
-def build_fit_problem(
-    bound: BoundFit,
-    snapshot: OwnedSnapshot,
-    *,
-    abort_check: Callable[[], None] | None = None,
-) -> FitProblem:
-    """Pack valid observations without flattening or reinterpreting R/P authority."""
-
-    return _build_problem(bound, snapshot, abort_check, prefer_regular=False)
-
-
 def _build_solver_problem(
     bound: BoundFit,
     snapshot: OwnedSnapshot,
@@ -205,17 +194,15 @@ def _try_regular_problem(
     This path is deliberately structural, not heuristic: every surviving
     dimension maps one-to-one to a declared independent source, coordinates are
     finite axis vectors, validity stays aligned as a compact/broadcast view, and
-    observations remain a view of the immutable source.  Anything else uses the
-    general packed representation above.
+    observations remain a view of the immutable transformed carrier.  A
+    committed reduction may legitimately change dtype and storage (for
+    example, repeat MEAN over uint8 produces float64); that compact result is
+    still the authoritative regular raster.  Anything else uses the general
+    packed representation above.
     """
 
-    source_values = snapshot.block.values
     values = transformed.values
-    if (
-        len(bound.spec.independent_sources) not in (1, 2)
-        or values.dtype != source_values.dtype
-        or not np.shares_memory(values, source_values)
-    ):
+    if len(bound.spec.independent_sources) not in (1, 2):
         return None
 
     source_tokens = tuple(
@@ -259,7 +246,7 @@ def _try_regular_problem(
             row_ids,
             batch_by_source,
         )
-        if not np.shares_memory(observation_view, source_values):
+        if not np.shares_memory(observation_view, values):
             return None
         dimension_order = _canonical_dimension_order(bound, view_tokens)
         canonical_tokens = tuple(view_tokens[index] for index in dimension_order)

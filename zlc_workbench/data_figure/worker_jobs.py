@@ -27,11 +27,9 @@ from zlc_frontend import (
     HistogramBinProjection,
     validate_fit_authoring_options,
 )
-from zlc_frontend.data_figure_presentation import (
-    DataFigureDisplayState,
-    fit_result_draft_summary,
-)
+from zlc_frontend.data_figure_presentation import DataFigureDisplayState
 from zlc_frontend.data_figure_render import encode_data_figure_front_png
+from zlc_frontend.fit_projection import fit_result_draft_summary
 from zlc_frontend.plot_layout import PanelSurfaceGeometry
 from zlc_workbench.window_runtime import stage_and_replace_export
 

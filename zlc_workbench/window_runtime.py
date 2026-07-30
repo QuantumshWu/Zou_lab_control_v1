@@ -14,14 +14,25 @@ _COMPUTE_EXECUTOR = ThreadPoolExecutor(
     max_workers=2,
     thread_name_prefix="zlc-compute-work",
 )
+_LATENCY_SENSITIVE_COMPUTE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="zlc-compute-interactive",
+)
 
 
-def submit_compute(function, *args) -> Future:
-    """Submit non-raster compute through the Workbench composition owner."""
+def submit_compute(function, *args, latency_sensitive: bool = False) -> Future:
+    """Submit non-raster work without letting bulk Fit starve interaction."""
 
     if not callable(function):
         raise TypeError("compute work must be callable")
-    return _COMPUTE_EXECUTOR.submit(function, *args)
+    if type(latency_sensitive) is not bool:
+        raise TypeError("latency_sensitive must be bool")
+    executor = (
+        _LATENCY_SENSITIVE_COMPUTE_EXECUTOR
+        if latency_sensitive
+        else _COMPUTE_EXECUTOR
+    )
+    return executor.submit(function, *args)
 
 
 def stage_and_replace_export(

@@ -20,10 +20,10 @@ from zlc_data.axis import (
     CoordinateFrameId,
 )
 from zlc_data.fit import fit_spec_for
+from zlc_data.fit_contract import FitBatchStatus
 from zlc_data.fit_model import evaluate_fit_model
 from zlc_data.fit_problem import (
     bind_fit,
-    build_fit_problem,
     validate_fit_result_source_binding,
 )
 from zlc_data.layout import AxisLayout
@@ -98,16 +98,19 @@ def test_arbitrary_multidimensional_data_axes_remain_named_batches(axis_order):
             "count",
         ),
     )
-    values = np.arange(
-        np.prod(schema.physical_shape),
-        dtype=np.float64,
-    ).reshape(schema.physical_shape)
-    validity = np.ones(schema.physical_shape, dtype=bool)
+    values = np.zeros(schema.physical_shape, dtype=np.float64)
+    validity = np.zeros(schema.physical_shape, dtype=bool)
     invalid_by_name = {"component": 1, "site": 2, "readout": 3}
-    invalid_data_index = tuple(invalid_by_name[name] for name in axis_order)
-    invalid_repeat = 1
-    invalid_scan = 2
-    validity[(invalid_repeat, invalid_scan, *invalid_data_index)] = False
+    selected_data_index = tuple(invalid_by_name[name] for name in axis_order)
+    selected_repeat = 1
+    coordinates = np.asarray(scan.coordinates)
+    expected = (2.5, 0.7, 0.8, 0.25)
+    values[(selected_repeat, slice(None), *selected_data_index)] = evaluate_fit_model(
+        "gaussian_offset",
+        (coordinates,),
+        expected,
+    )
+    validity[(selected_repeat, slice(None), *selected_data_index)] = True
     block = DataBlock(
         BlockId("fit-many-data-axes"),
         DatasetRevision(1),
@@ -134,29 +137,41 @@ def test_arbitrary_multidimensional_data_axes_remain_named_batches(axis_order):
         independent_sources=independent,
         batch_sources=batch,
     )
-    problem = build_fit_problem(bind_fit(spec, schema), snapshot)
+    result = bind_fit(spec, schema).run(snapshot)
 
     assert spec.independent_sources == independent
     assert spec.batch_sources == batch
-    assert problem.batch_layout.logical_shape == (
+    assert result.batch_layout.logical_shape == (
         2,
         *(axis.size for axis in data_axes),
     )
-    assert np.all(problem.present_observation_counts == scan.size)
-    assert np.count_nonzero(problem.used_observation_counts == scan.size - 1) == 1
-    assert np.count_nonzero(problem.used_observation_counts == scan.size) == (
-        problem.batch_layout.storage_size - 1
+    assert np.all(result.present_observation_counts == scan.size)
+    assert np.count_nonzero(result.used_observation_counts == scan.size) == 1
+    assert np.count_nonzero(result.used_observation_counts == 0) == (
+        result.batch_layout.storage_size - 1
     )
     for storage_index, batch_index in enumerate(
-        np.ndindex(problem.batch_layout.logical_shape)
+        np.ndindex(result.batch_layout.logical_shape)
     ):
-        assert problem.batch_layout.multi_index(storage_index) == batch_index
-        expected = values[(batch_index[0], slice(None), *batch_index[1:])]
-        if batch_index == (invalid_repeat, *invalid_data_index):
-            expected = np.delete(expected, invalid_scan)
-        start = int(problem.batch_offsets[storage_index])
-        stop = int(problem.batch_offsets[storage_index + 1])
-        np.testing.assert_array_equal(problem.observations[start:stop], expected)
+        assert result.batch_layout.multi_index(storage_index) == batch_index
+    selected_batch = (selected_repeat, *selected_data_index)
+    selected_storage = next(
+        index
+        for index in range(result.batch_layout.storage_size)
+        if result.batch_layout.multi_index(index) == selected_batch
+    )
+    assert result.statuses[selected_storage] is FitBatchStatus.CONVERGED
+    np.testing.assert_allclose(
+        result.parameter_values[selected_storage],
+        expected,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    assert all(
+        status is FitBatchStatus.NO_VALID_DATA
+        for index, status in enumerate(result.statuses)
+        if index != selected_storage
+    )
 
 
 def _gaussian_snapshot() -> OwnedSnapshot:

@@ -6,6 +6,7 @@ their own module; this file owns only the application window and their wiring.
 
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import CancelledError, Future
 import inspect
 import os
@@ -161,6 +162,7 @@ def _execute_figure_fit(request):
     from zlc_data import FitResultBatch
     from zlc_data.fit import bind_fit
     from zlc_frontend import FigureSource
+    from zlc_frontend.fit_projection import fit_result_draft_summary
 
     def raise_if_cancelled() -> None:
         if request.cancelled.is_set():
@@ -180,6 +182,10 @@ def _execute_figure_fit(request):
     if not isinstance(result, FitResultBatch):
         raise TypeError("Fit engine returned another result type")
     raise_if_cancelled()
+    summary = fit_result_draft_summary(
+        result,
+        check_cancelled=raise_if_cancelled,
+    )
     overlays = None
     overlay_error = None
     try:
@@ -196,7 +202,7 @@ def _execute_figure_fit(request):
         raise
     except Exception as error:
         overlay_error = error_summary(error)
-    return result, outputs, overlays, overlay_error
+    return result, outputs, overlays, overlay_error, summary
 
 
 # ====================================================================== console
@@ -243,7 +249,7 @@ class TaskConsole(QtWidgets.QWidget):
         self._fit_lock = threading.Lock()
         self._fit_active: dict[str, tuple[Future, object]] = {}
         self._fit_pending: dict[str, object] = {}
-        self._fit_completions: list[tuple[str, Future]] = []
+        self._fit_completions: deque[tuple[str, Future]] = deque()
         # One published EVENT_RESULT route per panel.  The surface id retained
         # in each entry makes Clear/Edit retirement withdraw only the surface
         # that actually committed the current parameter bundle.
@@ -354,7 +360,11 @@ class TaskConsole(QtWidgets.QWidget):
             self,
             accept_completion=self._accept_render_completion,
             request_shutdown_wake=self.request_owner_wake,
-            submit_compute=submit_compute,
+            submit_compute=lambda function, *args: submit_compute(
+                function,
+                *args,
+                latency_sensitive=True,
+            ),
         )
         self._raster_pixel_ratio_observer = RasterPixelRatioObserver(
             self,
@@ -2919,57 +2929,58 @@ class TaskConsole(QtWidgets.QWidget):
         self._request_fit_owner_wake()
 
     def _drain_fit_completions(self) -> None:
-        """Accept completed Fit results and fairly advance each latest mailbox."""
+        """Accept one small result per Qt turn and advance its latest mailbox."""
 
         with self._fit_lock:
-            completions = tuple(self._fit_completions)
-            self._fit_completions.clear()
-        for surface_id, future in completions:
-            with self._fit_lock:
-                active = self._fit_active.get(surface_id)
-                if active is None or active[0] is not future:
-                    continue
+            if not self._fit_completions:
+                return
+            surface_id, future = self._fit_completions.popleft()
+            more_completions = bool(self._fit_completions)
+            active = self._fit_active.get(surface_id)
+            if active is None or active[0] is not future:
+                request = None
+                pending = None
+            else:
                 _active_future, request = self._fit_active.pop(surface_id)
                 pending = (
                     None
                     if self._fit_closing
                     else self._fit_pending.pop(surface_id, None)
                 )
-            if request.cancelled.is_set():
-                result = None
-                outputs = None
-                overlays = None
-                overlay_error = None
-                error = None
-            else:
-                try:
-                    result, outputs, overlays, overlay_error = future.result()
-                except CancelledError:
-                    request.cancelled.set()
-                    result = None
-                    outputs = None
-                    overlays = None
-                    overlay_error = None
-                    error = None
-                except Exception as fit_error:
-                    result = None
-                    outputs = None
-                    overlays = None
-                    overlay_error = None
-                    error = error_summary(fit_error)
-                else:
-                    error = None
-            if not request.cancelled.is_set():
-                self._accept_fit_completion(
-                    request,
-                    result,
-                    outputs,
-                    overlays,
-                    error,
-                    overlay_error,
-                )
-            if pending is not None:
-                self._start_fit_request(pending)
+        if more_completions:
+            self._request_fit_owner_wake()
+        if request is None:
+            return
+        # Queue the latest candidate before formatting/publishing this result;
+        # another surface's Qt work cannot delay compute admission.
+        if pending is not None:
+            self._start_fit_request(pending)
+        if request.cancelled.is_set():
+            return
+        try:
+            result, outputs, overlays, overlay_error, summary = future.result()
+        except CancelledError:
+            request.cancelled.set()
+            return
+        except Exception as fit_error:
+            result = None
+            outputs = None
+            overlays = None
+            overlay_error = None
+            summary = None
+            error = error_summary(fit_error)
+        else:
+            error = None
+        if not request.cancelled.is_set():
+            self._accept_fit_completion(
+                request,
+                result,
+                outputs,
+                overlays,
+                error,
+                overlay_error,
+                summary,
+            )
 
     def _forget_fit_surface(self, surface_id: str) -> None:
         """Cancel one surface without disturbing another panel or snapshot."""
@@ -2980,6 +2991,7 @@ class TaskConsole(QtWidgets.QWidget):
             pending = self._fit_pending.pop(identity, None)
         if active is not None:
             active[1].cancelled.set()
+            active[0].cancel()
         if pending is not None:
             pending.cancelled.set()
 
@@ -2997,6 +3009,7 @@ class TaskConsole(QtWidgets.QWidget):
                 pending = ()
         for _future, request in active:
             request.cancelled.set()
+            _future.cancel()
         for request in pending:
             request.cancelled.set()
         return not active
@@ -3009,6 +3022,7 @@ class TaskConsole(QtWidgets.QWidget):
         overlays,
         error: str | None,
         overlay_error: str | None,
+        summary: str | None,
     ) -> None:
         """Atomically publish one surface result; overlay remains optional."""
 
@@ -3043,6 +3057,7 @@ class TaskConsole(QtWidgets.QWidget):
                 overlays,
                 None,
                 overlay_error,
+                summary=summary,
             )
             return
         if outputs is None:
@@ -3052,6 +3067,7 @@ class TaskConsole(QtWidgets.QWidget):
                 overlays,
                 None,
                 overlay_error,
+                summary=summary,
             )
             return
         if not card._fit_completion_is_current(request):
@@ -3105,6 +3121,7 @@ class TaskConsole(QtWidgets.QWidget):
             overlays,
             None,
             overlay_error,
+            summary=summary,
         ):
             self._data.withdraw_derived(owner_id)
             self._fit_output_routes.pop(card.panel_id, None)
@@ -3367,7 +3384,6 @@ class TaskConsole(QtWidgets.QWidget):
                 editor.set_running(True)
                 editor.set_status("running", error=False)
         self._sync_terminal_poll_timer()
-        self._continue_pending_window_action()
 
     def _mark_dirty(self, *_args) -> None:
         if self._building:
@@ -3447,6 +3463,12 @@ class TaskConsole(QtWidgets.QWidget):
             self._update_summary()
         if self._owner_retiring:
             self._advance_owner_retirement()
+        elif self._pending_window_action is not None:
+            # Window retirement waits on node, raster, selector, and Fit work.
+            # Any one of those owner completions must be able to advance the
+            # same close transition; tying the retry only to Run polling can
+            # strand a window after the final Fit completion.
+            self._continue_pending_window_action()
 
     # ------------------------------------------------- reading the frozen tick
     def _signal_values(self, name):

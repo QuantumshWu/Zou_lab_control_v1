@@ -2,16 +2,9 @@
 
 from __future__ import annotations
 
-from collections import Counter
-from collections.abc import Callable
 from dataclasses import dataclass
-import math
 
-from zlc_data import (
-    AxisSourceRef,
-    FitBatchStatus,
-    FitResultBatch,
-)
+from zlc_data import AxisSourceRef
 from zlc_data.codec import dataset_revision_ref_to_tree
 from .data_figure import DataFigure, FigurePanelRegion
 from .meter_display import MeterDisplayState
@@ -61,49 +54,6 @@ def data_figure_summary(figure: DataFigure) -> str:
         f"document revision {document.revision}"
     )
 
-
-def fit_result_draft_summary(
-    result: FitResultBatch,
-    *,
-    check_cancelled: Callable[[], None] | None = None,
-) -> str:
-    """Format one unsaved Fit result through the sole Figure text policy."""
-
-    if not isinstance(result, FitResultBatch):
-        raise TypeError("draft Fit summary requires FitResultBatch")
-    if check_cancelled is not None and not callable(check_cancelled):
-        raise TypeError("check_cancelled must be callable or None")
-    counts = Counter(status.value for status in result.statuses)
-    status_text = ", ".join(
-        f"{name.lower()}={count}" for name, count in sorted(counts.items())
-    )
-    quality_min = math.inf
-    quality_max = -math.inf
-    for index, (status, rss, used) in enumerate(
-        zip(
-            result.statuses,
-            result.residual_sum_squares,
-            result.used_observation_counts,
-            strict=True,
-        )
-    ):
-        if check_cancelled is not None and index % 1024 == 0:
-            check_cancelled()
-        if status is not FitBatchStatus.CONVERGED or int(used) <= 0:
-            continue
-        value = math.sqrt(float(rss) / int(used))
-        if math.isfinite(value):
-            quality_min = min(quality_min, value)
-            quality_max = max(quality_max, value)
-    quality_text = (
-        "no converged RMSE"
-        if not math.isfinite(quality_min)
-        else f"RMSE {quality_min:.4g}–{quality_max:.4g}"
-    )
-    return (
-        f"{result.spec.model_id} · {len(result.statuses)} named batch cell(s) · "
-        f"{status_text} · {quality_text} · draft is not saved"
-    )
 
 def classify_single_data_figure(
     figure: DataFigure,
@@ -618,7 +568,6 @@ __all__ = [
     "data_figure_payload_intent",
     "data_figure_summary",
     "default_data_figure_display_state",
-    "fit_result_draft_summary",
     "same_exact_data_owners",
     "validate_rendered_data_figure_payload",
 ]

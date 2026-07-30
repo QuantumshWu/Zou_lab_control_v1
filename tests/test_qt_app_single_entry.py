@@ -20,6 +20,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -187,6 +188,34 @@ print(len(queued_calls), len(replay_calls))
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "1 2"
+
+
+def test_bulk_compute_cannot_starve_latency_sensitive_owner_work() -> None:
+    """Two active Fits leave the existing interaction seam runnable."""
+
+    from zlc_workbench.window_runtime import submit_compute
+
+    release = threading.Event()
+    started = (threading.Event(), threading.Event())
+
+    def block(index: int) -> int:
+        started[index].set()
+        if not release.wait(5.0):
+            raise TimeoutError("test did not release bulk compute")
+        return index
+
+    bulk = tuple(submit_compute(block, index) for index in range(2))
+    try:
+        assert all(event.wait(2.0) for event in started)
+        interactive = submit_compute(
+            lambda: "selector-ready",
+            latency_sensitive=True,
+        )
+        assert interactive.result(timeout=2.0) == "selector-ready"
+    finally:
+        release.set()
+        for future in bulk:
+            future.result(timeout=2.0)
 
 
 def _call_name(node: ast.Call) -> str:
