@@ -91,7 +91,10 @@ _DEFAULT_STYLE: dict[str, Any] = {
     "ytick.minor.right": False,
     "xtick.minor.bottom": False,
     "ytick.minor.left": False,
-    "font.family": "sans-serif",
+    # A direct ordered family list keeps Helvetica Light as the byte-identical
+    # primary face while allowing Matplotlib's per-glyph fallback for symbols
+    # the bundled face does not contain (notably the pulse repeat infinity).
+    "font.family": SANS_SERIF,
     "font.sans-serif": SANS_SERIF,
     "xtick.direction": "in",
     "ytick.direction": "in",

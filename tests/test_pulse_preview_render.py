@@ -114,8 +114,8 @@ def preview_body(tmp_path):
     from zlc_workbench.pulse_editor.app import open_pulse_editor
 
     body = open_pulse_editor(
-        path=PULSE_PATH,
-        pulses_root=tmp_path / "pulses",
+        path=PULSE_PATH.name,
+        pulses_root=PULSE_PATH.parent,
         output_root=tmp_path / "output",
     )
     _until(
@@ -216,8 +216,8 @@ def test_preview_keeps_the_placeholder_until_the_first_complete_front(
         blocked_render,
     )
     body = open_pulse_editor(
-        path=PULSE_PATH,
-        pulses_root=tmp_path / "pulses",
+        path=PULSE_PATH.name,
+        pulses_root=PULSE_PATH.parent,
         output_root=tmp_path / "output",
     )
     try:
@@ -682,11 +682,11 @@ from zlc_frontend.qt_widgets import ensure_qt_app
 from zlc_workbench.pulse_editor.app import open_pulse_editor
 
 app = ensure_qt_app()
-path = Path("pulses/imaging_template.json").resolve()
+path = "imaging_template.json"
 root = Path(os.environ["ZLC_TEST_WORKSPACE"]).resolve()
 body = open_pulse_editor(
     path=path,
-    pulses_root=root / "pulses",
+    pulses_root=Path("pulses").resolve(),
     output_root=root / "output",
 )
 index = body.tabs.indexOf(body.preview_view)

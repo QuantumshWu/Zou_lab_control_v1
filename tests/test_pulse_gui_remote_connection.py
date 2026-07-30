@@ -331,7 +331,9 @@ def _run_load_before_remote(workspace: Path) -> None:
     )
     server_thread = threading.Thread(target=server.start, daemon=True)
     server_thread.start()
-    document_path = workspace / "incompatible-document.json"
+    workspace_paths = _workspace_paths(workspace)
+    workspace_paths.pulses_root.mkdir(parents=True, exist_ok=True)
+    document_path = workspace_paths.pulses_root / "incompatible-document.json"
     save_pulse_document(
         new_pulse_document(
             deployed,
@@ -343,8 +345,8 @@ def _run_load_before_remote(workspace: Path) -> None:
 
     application = ensure_qt_app()
     body = open_pulse_editor(
-        workspace=_workspace_paths(workspace),
-        path=document_path,
+        workspace=workspace_paths,
+        path=document_path.name,
         remote_endpoint=f"127.0.0.1:{server.port}",
     )
     try:

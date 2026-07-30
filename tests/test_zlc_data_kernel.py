@@ -28,7 +28,6 @@ from zlc_data.schema import (
     ValueSchema,
 )
 from zlc_data.validity import (
-    INVALID,
     VALID,
     CellValidity,
     ComponentValidity,
@@ -41,9 +40,6 @@ from zlc_data.value import (
     DatasetRevision,
     StreamGenerationId,
     Value,
-    ValuePayloadContract,
-    canonical_value_array,
-    expand_component_validity,
     expand_value_validity,
 )
 
@@ -334,62 +330,6 @@ def test_schema_fingerprint_covers_point_rows_topology_and_component_validity():
     assert value_only.fingerprint != sparse.fingerprint
 
 
-def test_canonical_value_array_normalizes_invalid_component_fillers():
-    schema = image_schema(component_validity=True)
-    x = schema.data_axes[1]
-    validity = ComponentValidity(
-        (x.axis_id,),
-        np.array([True, False, True, False]),
-    )
-    left_values = np.arange(12, dtype=np.uint16).reshape(3, 4)
-    right_values = np.array(left_values, copy=True)
-    right_values[:, 1] = 500
-    right_values[:, 3] = 700
-    canonical_valid = canonical_value_array(left_values, VALID, schema)
-    assert canonical_valid is not None
-    assert np.shares_memory(canonical_valid, left_values)
-    canonical_left = canonical_value_array(left_values, validity, schema)
-    canonical_right = canonical_value_array(right_values, validity, schema)
-    assert canonical_left is not None and canonical_right is not None
-    assert np.array_equal(canonical_left, canonical_right)
-    assert np.all(canonical_left[:, (1, 3)] == 0)
-    canonical_mask = expand_component_validity(validity, schema)
-    canonical_validity = ComponentValidity(
-        schema.validity_contract.component_axis_ids,
-        canonical_mask,
-    )
-    assert np.array_equal(
-        canonical_left,
-        canonical_value_array(left_values, canonical_validity, schema),
-    )
-
-    changed_valid = np.array(right_values, copy=True)
-    changed_valid[0, 0] += 1
-    assert (
-        contract.digest_content(changed_valid, validity)
-        != contract.digest_content(left_values, validity)
-    )
-
-    value_schema = image_schema(component_validity=False)
-    value_contract = ValuePayloadContract(value_schema)
-    assert canonical_value_array(left_values, INVALID, value_schema) is None
-    assert value_contract.digest_content(left_values, INVALID) == value_contract.digest_content(
-        right_values,
-        INVALID,
-    )
-
-    all_valid = np.ones(schema.data_shape, dtype=bool)
-    all_invalid = np.zeros(schema.data_shape, dtype=bool)
-    assert contract.digest_content(left_values, VALID) == contract.digest_content(
-        left_values,
-        ComponentValidity(schema.validity_contract.component_axis_ids, all_valid),
-    )
-    assert contract.digest_content(left_values, INVALID) == contract.digest_content(
-        right_values,
-        ComponentValidity(schema.validity_contract.component_axis_ids, all_invalid),
-    )
-
-
 def test_schema_fingerprint_normalizes_dtype_endianness():
     little = ValueSchema.scalar(np.dtype("<i2"))
     big = ValueSchema.scalar(np.dtype(">i2"))
@@ -493,39 +433,12 @@ def test_repeat_role_has_exactly_one_structural_owner():
         )
 
 
-def test_invalid_digest_still_validates_shape_and_dtype():
-    schema = image_schema(component_validity=False)
-    contract = ValuePayloadContract(schema)
-    with pytest.raises(ValueError, match="shape"):
-        contract.digest_content(np.zeros((1,), dtype=np.uint16), INVALID)
-    with pytest.raises(TypeError, match="dtype"):
-        contract.digest_content(np.zeros(schema.data_shape, dtype=np.float32), INVALID)
-
-
-def test_value_canonicalization_accepts_endian_equivalent_input():
+def test_value_accepts_endian_equivalent_input():
     schema = ValueSchema.scalar(np.dtype("<i2"))
     source = np.array([513], dtype=">i2")
-    canonical = canonical_value_array(source, VALID, schema)
-    assert canonical is not None
-    assert canonical.dtype == np.dtype("<i2")
-    assert canonical.item() == 513
-
-
-def test_big_endian_complex_nan_payloads_have_one_content_identity():
-    sample = axis("sample", SITE, 1)
-    schema = ValueSchema((sample,), ValidityContract.value(), np.dtype("<c8"))
-    first = np.zeros(1, dtype=">c8")
-    second = np.zeros(1, dtype=">c8")
-    first.view(">u4")[:] = (0x7FC00001, 0x3F800000)
-    second.view(">u4")[:] = (0x7FA12345, 0x3F800000)
-
-    first_canonical = canonical_value_array(first, VALID, schema)
-    second_canonical = canonical_value_array(second, VALID, schema)
-    assert first_canonical is not None and second_canonical is not None
-    assert first_canonical.dtype == np.dtype("<c8")
-    assert first_canonical.tobytes() == second_canonical.tobytes()
-    contract = ValuePayloadContract(schema)
-    assert contract.digest_content(first, VALID) == contract.digest_content(second, VALID)
+    value = Value(source, VALID, schema)
+    assert value.values.dtype == np.dtype("<i2")
+    assert value.values.item() == 513
 
 
 def test_import_is_headless_and_does_not_pull_legacy_domain():

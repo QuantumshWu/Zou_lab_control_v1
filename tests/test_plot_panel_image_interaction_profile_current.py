@@ -25,7 +25,6 @@ class _ImageHarness:
     application: object
     value: object
     composer: object
-    provenance: object
     display: object
     host: object
     logical_size: tuple[int, int]
@@ -114,7 +113,7 @@ def _image_value(*, revision: int, side: int, dtype) -> object:
 def _harness(*, side: int = 512) -> _ImageHarness:
     from zlc_frontend import ImageDisplayState
     from zlc_frontend.figure import ViewIntent, suggest_view
-    from zlc_frontend.panel_render import PanelComposer, PanelProvenance
+    from zlc_frontend.panel_render import PanelComposer
     from zlc_frontend.plot_layout import panel_surface_geometry
     from zlc_frontend.qt_widgets import SinglePanelHost, ensure_qt_app
 
@@ -127,12 +126,10 @@ def _harness(*, side: int = 512) -> _ImageHarness:
         intent=ViewIntent.IMAGE,
         view=view,
     )
-    provenance = PanelProvenance("profile-run", "profile-epoch", "0" * 64)
     display = ImageDisplayState()
     frame, _figure = composer.compose_with_figure(
         value.snapshot,
         display=display,
-        provenance=provenance,
     )
     logical_size = panel_surface_geometry("2x2").logical_size
     host = SinglePanelHost("profile-image", group="profile-image")
@@ -144,7 +141,6 @@ def _harness(*, side: int = 512) -> _ImageHarness:
         application,
         value,
         composer,
-        provenance,
         display,
         host,
         logical_size,
@@ -169,7 +165,6 @@ def _answer_viewport_commands(harness, commands, *, start: int = 0) -> int:
         frame, _figure = harness.composer.compose_with_figure(
             harness.value.snapshot,
             display=harness.display,
-            provenance=harness.provenance,
         )
         harness.host.present_frame(frame, logical_size=harness.logical_size)
         harness.application.processEvents()
@@ -310,10 +305,7 @@ def test_pending_render_keeps_cross_and_area_on_exact_painted_front() -> None:
             pos=centre,
         )
         assert len(crosses) == 1
-        assert (
-            crosses[0].origin.presentation.panel_revision
-            == old_viewport.viewport_revision
-        )
+        assert crosses[0].origin.painted_revision == old_viewport.viewport_revision
 
         # Begin Area on that same exact front, then admit the delayed viewport
         # answer before release.  The board may retain the new front, but the
@@ -332,7 +324,6 @@ def test_pending_render_keeps_cross_and_area_on_exact_painted_front() -> None:
         answer, _figure = harness.composer.compose_with_figure(
             harness.value.snapshot,
             display=harness.display,
-            provenance=harness.provenance,
         )
         harness.host.present_frame(answer, logical_size=harness.logical_size)
         harness.application.processEvents()

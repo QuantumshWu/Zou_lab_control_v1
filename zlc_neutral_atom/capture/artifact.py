@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 from zlc_data import OwnedSnapshot
+from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
 from zlc_neutral_atom.devices.camera.capture_port import (
     CaptureTerminalAck,
     capture_terminal_ack_from_tree,
@@ -413,6 +414,35 @@ def load_capture_artifact(
     )
 
 
+def project_capture_dataset_source(
+    captures_root: Path,
+    ref: CaptureArtifactRef,
+    *,
+    materialize: bool = False,
+    abort_check: Callable[[], None] | None = None,
+) -> ArtifactDatasetSource:
+    """Project a capture through the capture owner's dataset contract."""
+
+    artifact = load_capture_artifact(
+        captures_root,
+        ref,
+        materialize=False,
+    )
+    if abort_check is not None:
+        abort_check()
+    snapshot = (
+        artifact.materialize_snapshot(abort_check=abort_check)
+        if materialize
+        else None
+    )
+    source = artifact.frame_source
+    return ArtifactDatasetSource(
+        source.schema,
+        source.ref(artifact.provenance.generation),
+        snapshot,
+    )
+
+
 def compile_capture_artifact_pipeline(
     spec: MinimalPipelineSpec | TriggeredCaptureSpec,
     captures_root: Path,
@@ -479,5 +509,6 @@ __all__ = [
     "CaptureArtifact",
     "compile_capture_artifact_pipeline",
     "load_capture_artifact",
+    "project_capture_dataset_source",
     "write_capture_artifact",
 ]

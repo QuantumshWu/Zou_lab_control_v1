@@ -12,7 +12,7 @@ from zlc_storage.canonical import (
     sha256_text,
 )
 
-from ._arrays import canonical_dtype, immutable_array
+from ._arrays import immutable_array
 from .axis import AxisId
 from .schema import DatasetSchema, ValueSchema
 from .validity import (
@@ -92,65 +92,6 @@ class Value:
             shape=self.schema.data_shape,
         )
         object.__setattr__(self, "values", array)
-
-
-def canonical_value_array(
-    values: np.ndarray,
-    validity: Valid | Invalid | ComponentValidity,
-    schema: ValueSchema,
-) -> np.ndarray | None:
-    """Return canonical values, or ``None`` for schema-level invalid values."""
-
-    if not isinstance(schema, ValueSchema):
-        raise TypeError("schema must be ValueSchema")
-    array = np.asarray(values)
-    if canonical_dtype(array.dtype) != schema.dtype:
-        raise TypeError(
-            f"values dtype {array.dtype} does not match schema dtype {schema.dtype}"
-        )
-    if array.shape != schema.data_shape:
-        raise ValueError(
-            f"values shape {array.shape} does not match expected {schema.data_shape}"
-        )
-    _validate_value_validity(validity, schema)
-    if (
-        isinstance(validity, Invalid)
-        and schema.validity_contract.mode is not ValidityMode.COMPONENTS
-    ):
-        return None
-    normalized: np.ndarray
-    owns_normalized = False
-    if isinstance(validity, (Invalid, ComponentValidity)):
-        expanded = expand_value_validity(validity, schema)
-        if not np.all(expanded):
-            # Build the canonical array from zero rather than copying and then
-            # indexing with ``~expanded``.  The latter materializes another
-            # dense boolean frame for component validity and doubles that
-            # normalization step's large-image scratch work.
-            normalized = np.zeros(schema.data_shape, dtype=schema.dtype, order="C")
-            np.copyto(normalized, array, where=expanded)
-            owns_normalized = True
-        else:
-            normalized = np.ascontiguousarray(array, dtype=schema.dtype)
-    else:
-        normalized = np.ascontiguousarray(array, dtype=schema.dtype)
-    if not owns_normalized:
-        owns_normalized = not np.shares_memory(normalized, array)
-    if normalized.dtype.kind in "fc" and np.any(np.isnan(normalized)):
-        if not owns_normalized:
-            normalized = np.array(array, copy=True, order="C")
-            owns_normalized = True
-        if normalized.dtype.kind == "f":
-            canonical_nan = np.array(float("nan"), dtype=normalized.dtype)
-            np.copyto(normalized, canonical_nan, where=np.isnan(normalized))
-        else:
-            component_dtype = np.dtype(
-                "<f4" if normalized.dtype.itemsize == 8 else "<f8"
-            )
-            components = normalized.reshape(-1).view(component_dtype)
-            canonical_nan = np.array(float("nan"), dtype=component_dtype)
-            np.copyto(components, canonical_nan, where=np.isnan(components))
-    return normalized
 
 
 @dataclass(frozen=True)
@@ -448,7 +389,6 @@ __all__ = [
     "VALID",
     "Value",
     "ValuePayloadContract",
-    "canonical_value_array",
     "compact_dataset_validity",
     "dataset_cell_value",
     "expand_dataset_validity",

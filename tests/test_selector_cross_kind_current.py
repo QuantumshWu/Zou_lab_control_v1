@@ -100,7 +100,6 @@ def _composed_front(intent, *, revision: int, faceted: bool):
     from zlc_frontend.panel_render import (
         FacetedPanelFocus,
         PanelComposer,
-        PanelProvenance,
     )
 
     snapshot, scan, site = _source(revision=revision)
@@ -123,7 +122,6 @@ def _composed_front(intent, *, revision: int, faceted: bool):
         intent=intent,
         view=suggestion.spec,
     )
-    provenance = PanelProvenance("run", "epoch", "a" * 64)
     display = (
         CurveDisplayState()
         if intent.value == "CURVE"
@@ -133,7 +131,6 @@ def _composed_front(intent, *, revision: int, faceted: bool):
         frame, figure = composer.compose_with_figure(
             snapshot,
             display=display,
-            provenance=provenance,
         )
         return composer, snapshot, scan, site, frame, figure
 
@@ -145,7 +142,6 @@ def _composed_front(intent, *, revision: int, faceted: bool):
     overview = composer.compose_faceted(
         snapshot,
         display=faceted_display,
-        provenance=provenance,
     )
     assert overview.overview is not None
     region = overview.overview.regions[1]
@@ -153,7 +149,6 @@ def _composed_front(intent, *, revision: int, faceted: bool):
     focused = composer.compose_faceted(
         snapshot,
         display=faceted_display,
-        provenance=provenance,
         focus=focus,
     )
     assert focused.frame is not None

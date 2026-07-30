@@ -128,8 +128,6 @@ def test_api_slot_edit_dirties_applied_intent_and_on_pulse_clears_it():
                 run_id=run_id,
                 state=RunState.RUNNING,
                 phase="holding-pulse",
-                final_committed=False,
-                commit_publication_warning=None,
                 primary_error=None,
                 cleanup_errors=(),
             )
@@ -220,8 +218,6 @@ def test_owner_wake_without_new_fact_is_silent_and_runtime_poll_stays_narrow():
         run_id=RunId("narrow-runtime-update"),
         state=RunState.RUNNING,
         phase="execute",
-        final_committed=False,
-        commit_publication_warning=None,
         primary_error=None,
         cleanup_errors=(),
     )
@@ -255,8 +251,6 @@ def test_owner_wake_without_new_fact_is_silent_and_runtime_poll_stays_narrow():
         run_id=running.run_id,
         state=RunState.RUNNING,
         phase="queued",
-        final_committed=False,
-        commit_publication_warning=None,
         primary_error=None,
         cleanup_errors=(),
     )
@@ -451,8 +445,6 @@ def test_borrowed_experiment_retirement_detaches_before_runtime_timer_poll():
         run_id=RunId("active-before-owner-close"),
         state=RunState.RUNNING,
         phase="execute",
-        final_committed=False,
-        commit_publication_warning=None,
         primary_error=None,
         cleanup_errors=(),
     )

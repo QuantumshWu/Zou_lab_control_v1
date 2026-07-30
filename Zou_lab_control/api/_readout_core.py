@@ -10,14 +10,17 @@ from __future__ import annotations
 from pathlib import Path
 
 from zlc_data import OwnedSnapshot
-from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
 from zlc_neutral_atom.artifact_dispatch import ArtifactCapability
 from zlc_neutral_atom.capture.application import (
     CaptureRequest,
     PreparedFiniteCapture,
     prepare_finite_capture,
 )
-from zlc_neutral_atom.capture.artifact import CaptureArtifact, load_capture_artifact
+from zlc_neutral_atom.capture.artifact import (
+    CaptureArtifact,
+    load_capture_artifact,
+    project_capture_dataset_source,
+)
 from zlc_neutral_atom.capture.reference import (
     CAPTURE_ARTIFACT_REF_SCHEMA,
     CaptureArtifactRef,
@@ -156,23 +159,11 @@ class ReadoutFacade:
         abort_check=None,
     ):
         with service_guard(self._services) as services:
-            artifact = load_capture_artifact(
+            return project_capture_dataset_source(
                 services.captures_root,
                 reference,
                 materialize=materialize,
-            )
-            if abort_check is not None:
-                abort_check()
-            source = artifact.frame_source
-            snapshot = (
-                artifact.materialize_snapshot(abort_check=abort_check)
-                if materialize
-                else None
-            )
-            return ArtifactDatasetSource(
-                source.schema,
-                source.ref(artifact.provenance.generation),
-                snapshot,
+                abort_check=abort_check,
             )
 
     def _artifact_capabilities(self) -> tuple[ArtifactCapability, ...]:
