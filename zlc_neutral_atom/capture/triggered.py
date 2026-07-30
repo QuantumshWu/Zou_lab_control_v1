@@ -275,7 +275,6 @@ def compile_triggered_pipeline(
             raise TypeError("triggered capture finalize requires its compiler result")
         if result.capture.run_id != context.run_id.value:
             raise ValueError("triggered capture result belongs to another Run")
-        context.checkpoint()
         return result
 
     return RunPlan(
@@ -290,7 +289,6 @@ def compile_triggered_pipeline(
             *pulse_port.interrupt_operations,
             *camera_port.interrupt_operations,
         ),
-        requires_final_commit=False,
     )
 
 

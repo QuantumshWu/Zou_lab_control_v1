@@ -5,7 +5,6 @@ from __future__ import annotations
 from zlc_neutral_atom.devices.rf import (
     CompleteRfTable,
     PrepareRfTable,
-    RF_DETUNING_CONTROL_KEY,
     RfTableCapabilitySnapshot,
     RfTableTerminal,
 )
@@ -14,8 +13,6 @@ from zlc_neutral_atom.runtime.ports import (
     SessionCloseCommand,
     SessionClosedAck,
 )
-from zlc_neutral_atom.runtime.resources import device_binding_stamp_to_tree
-from zlc_storage import canonical_digest
 
 from .apparatus import VirtualRfSource
 
@@ -27,43 +24,25 @@ class VirtualRfTableEndpoint:
         self._source = source
 
     def capability_probe(self, binding: BoundDevice) -> RfTableCapabilitySnapshot:
-        fingerprint = canonical_digest(
-            {
-                "owner": "zlc_neutral_atom.virtual-rf-table",
-                "binding_stamp": device_binding_stamp_to_tree(binding.binding_stamp),
-                "control_key": RF_DETUNING_CONTROL_KEY,
-                "unit": "Gamma",
-                "clock_source": "sequencer-scan-point",
-            }
-        )
         return RfTableCapabilitySnapshot(
             binding.binding_stamp,
             1.0,
-            fingerprint,
         )
 
     def execute_command(self, binding: BoundDevice, command: object) -> object:
         if isinstance(command, PrepareRfTable):
-            capability = self.capability_probe(binding)
-            if command.capability_fingerprint != capability.capability_fingerprint:
-                raise RuntimeError("RF prepare uses another capability generation")
-            self._source.prepare_table(
+            return self._source.prepare_table(
                 command.session_id,
-                command.table.pulse_artifact_digest,
-                command.table.digest,
-                command.table.detuning_gamma,
+                command.table,
             )
-            return command.table.digest
         if isinstance(command, CompleteRfTable):
-            count, digest = self._source.complete_table(
+            point_indices = self._source.complete_table(
                 command.session_id,
-                command.table_digest,
+                command.table,
             )
             return RfTableTerminal(
                 command.session_id,
-                command.table_digest,
-                count,
-                digest,
+                point_indices,
             )
         raise TypeError(f"unsupported RF command {type(command).__name__}")
 
@@ -79,13 +58,6 @@ class VirtualRfTableEndpoint:
             True,
             True,
             True,
-            canonical_digest(
-                {
-                    "owner": "zlc_neutral_atom.virtual-rf-table.close",
-                    "session_id": command.session_id,
-                    "binding_instance_id": binding.binding_instance_id,
-                }
-            ),
         )
 
     def interrupt(self) -> None:

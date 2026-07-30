@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Callable
-import uuid
 
 from zlc_data import ValueSchema
 from zlc_neutral_atom.catalog import DefinitionKey
@@ -15,34 +12,12 @@ from zlc_neutral_atom.dataset_output import (
     LiveDatasetOutput,
 )
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
-from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
 from zlc_neutral_atom.runtime.signal_source import SignalEventSource
 from .signal_plane import SignalDataPlane, SignalPublication, SignalValue
 
 __all__ = [
     "HostedProcessor",
-    "ProcessorPublication",
 ]
-
-
-@dataclass(frozen=True, slots=True)
-class ProcessorPublication:
-    """One complete typed Processor result transaction."""
-
-    outputs: Mapping[str, LiveDatasetOutput]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.outputs, Mapping) or not self.outputs:
-            raise ValueError("Processor publication requires typed outputs")
-        outputs = dict(self.outputs)
-        if any(
-            not isinstance(name, str) or not name or name.strip() != name
-            for name in outputs
-        ):
-            raise ValueError("Processor publication names must be canonical text")
-        if any(not isinstance(value, LiveDatasetOutput) for value in outputs.values()):
-            raise TypeError("Processor publication values must be LiveDatasetOutput")
-        object.__setattr__(self, "outputs", MappingProxyType(outputs))
 
 
 class HostedProcessor:
@@ -65,7 +40,7 @@ class HostedProcessor:
         initial_publication: SignalPublication,
         prepare_application: Callable[[], object],
         materialize_publication: Callable[
-            [object, SignalValue], ProcessorPublication
+            [object, SignalValue], Mapping[str, LiveDatasetOutput]
         ],
         qualify_output: Callable[[str], str],
         data_plane: SignalDataPlane,
@@ -123,23 +98,22 @@ class HostedProcessor:
         self._signal_event_source: SignalEventSource | None = None
         self._signal_events_close_requested = False
         self._signal_events_closed = False
-        self._source_signal_generation = initial_publication.generation
+        initial_ref = initial_publication.event_ref
+        self._source_signal_generation = initial_ref.generation
         self._initial_publication: SignalPublication | None = initial_publication
-        self._source_run_id = initial_source.run_id
-        self._source_epoch_id = initial_source.epoch_id
         self._prepare_application = prepare_application
         self._prepared_application: object | None = None
         self._materialize_publication = materialize_publication
         self._qualify_output = qualify_output
         self._data_plane = data_plane
         self._request_owner_wake = request_owner_wake
-        self._run_id = RunId(f"processor-{uuid.uuid4().hex}")
-        self._state: RunState | None = None
+        self._started = False
+        self._terminal = False
         self._phase = "not started"
         self._error: str | None = None
         self._cancel_requested = False
         self._processor_lane_retired = False
-        self._pending_terminal_state: RunState | None = None
+        self._pending_terminal_phase: str | None = None
         self._pending_terminal_error: str | None = None
 
     @property
@@ -175,7 +149,19 @@ class HostedProcessor:
 
     @property
     def running(self) -> bool:
-        return self._state is RunState.RUNNING
+        return self._started and not self._terminal
+
+    @property
+    def terminal(self) -> bool:
+        """Whether the hosted node and its optional event worker are stopped."""
+
+        return self._terminal
+
+    @property
+    def phase(self) -> str:
+        """Current operator-facing node phase; this is not a domain Run state."""
+
+        return self._phase
 
     @property
     def last_error(self) -> str | None:
@@ -200,9 +186,9 @@ class HostedProcessor:
     def start(self) -> None:
         if self.running:
             return
-        if self._state is not None:
+        if self._started:
             raise RuntimeError("Processor nodes are one-shot")
-        self._state = RunState.RUNNING
+        self._started = True
         self._phase = "preparing Processor application"
         publication, self._initial_publication = self._initial_publication, None
         if publication is None:
@@ -218,26 +204,28 @@ class HostedProcessor:
             self._fail(error)
 
     def cancel(self, _reason: str = "Host requested stop") -> None:
-        if self._state is None or self._state.terminal:
+        if not self._started or self._terminal:
             return
         self._cancel_requested = True
         self._phase = "stopping after current Processor evaluation"
-        if self._pending_terminal_state is None:
-            self._pending_terminal_state = RunState.CANCELLED
+        if self._pending_terminal_phase is None:
+            self._pending_terminal_phase = "cancelled"
         self._request_signal_events_close()
         idle = self._data_plane.cancel_latest_only_processor(self)
         if idle and not self._processor_lane_retired:
             self._processor_lane_retired = True
         self._finish_pending_terminal()
 
-    def poll(self) -> RunSnapshot | None:
-        if self._state is None:
+    def poll(self) -> HostedProcessor | None:
+        """Advance terminal cleanup and return this node's minimal status owner."""
+
+        if not self._started:
             return None
-        if self._state.terminal:
-            return self._snapshot()
-        if self._pending_terminal_state is not None:
+        if self._terminal:
+            return self
+        if self._pending_terminal_phase is not None:
             self._finish_pending_terminal()
-            return self._snapshot()
+            return self
         signal_source = self._signal_event_source
         signal_error = (
             None if signal_source is None else getattr(signal_source, "error", None)
@@ -246,8 +234,7 @@ class HostedProcessor:
             if not isinstance(signal_error, Exception):
                 signal_error = RuntimeError(str(signal_error))
             self._fail(signal_error)
-            return self._snapshot()
-        return self._snapshot()
+        return self
 
     def shutdown(self) -> None:
         self.cancel("Host is closing")
@@ -263,19 +250,11 @@ class HostedProcessor:
             raise ValueError("Processor received another selected signal")
         if not isinstance(source.coverage, MonitorCoverage):
             raise ValueError("Processor source requires typed monitor coverage")
-        if (
-            source.run_id != self._source_run_id
-            or source.epoch_id != self._source_epoch_id
-        ):
-            raise RuntimeError(
-                "selected signal now belongs to another run or epoch; "
-                "restart the Processor to bind the new producer generation"
-            )
 
     def processor_application_ready(self, application: object) -> None:
         if not callable(getattr(application, "evaluate", None)):
             raise TypeError("Processor prepare returned no evaluable application")
-        if self._state is not RunState.RUNNING or self._cancel_requested:
+        if not self.running or self._cancel_requested:
             return
         self._prepared_application = application
         start_signal_events = getattr(application, "start_signal_events", None)
@@ -288,15 +267,10 @@ class HostedProcessor:
                 _generation,
                 upstream,
                 _output_name,
-                transform,
             ) = self._data_plane.signal_event_binding(
                 self._source_signal,
                 expected_generation=self._source_signal_generation,
             )
-            if transform is not None:
-                raise ValueError(
-                    "latest-only Processor event input must be a direct output"
-                )
             derived = start_signal_events(upstream)
             try:
                 self._validate_signal_event_source(derived)
@@ -309,15 +283,14 @@ class HostedProcessor:
             self._signal_events_close_requested = False
             self._signal_events_closed = False
             self._data_plane.bind_processor_event_source(self, derived)
-        self._phase = "waiting for a new source revision"
+        # A reactive Processor is one continuously running node. Per-source
+        # evaluation is worker diagnostics, not an operator-facing lifecycle
+        # transition; exposing it here makes the Logic row oscillate (or look
+        # idle while a newer revision is already being evaluated).
+        self._phase = "running"
 
     def processor_work_started(self, source: SignalValue) -> None:
         self.validate_processor_source(source)
-        if self._state is RunState.RUNNING and not self._cancel_requested:
-            self._phase = (
-                "processing source revision "
-                f"{source.snapshot.ref.revision.value}"
-            )
 
     def accept_processor_result(
         self,
@@ -325,23 +298,22 @@ class HostedProcessor:
         source_publication: SignalPublication,
         result: object,
     ) -> None:
-        if self._state is not RunState.RUNNING or self._cancel_requested:
+        if not self.running or self._cancel_requested:
             return
         self.validate_processor_source(source)
-        publication = self._materialize_publication(result, source)
-        if not isinstance(publication, ProcessorPublication):
-            raise TypeError("Processor result adapter returned another value")
+        outputs = self._materialize_publication(result, source)
+        if not isinstance(outputs, Mapping):
+            raise TypeError("Processor result adapter returned no output mapping")
         self._data_plane.publish_processor(
             self,
-            publication.outputs,
+            outputs,
             source_publication=source_publication,
         )
-        self._phase = "waiting for a new source revision"
 
     def accept_processor_failure(self, error: Exception) -> None:
-        if self._state is None or self._state.terminal:
+        if not self._started or self._terminal:
             return
-        self._pending_terminal_state = RunState.FAILED
+        self._pending_terminal_phase = "failed"
         self._pending_terminal_error = f"{type(error).__name__}: {error}"
         self._processor_lane_retired = True
         self._request_signal_events_close()
@@ -349,9 +321,9 @@ class HostedProcessor:
         self._finish_pending_terminal()
 
     def accept_processor_cancelled(self) -> None:
-        if self._state is RunState.RUNNING:
-            if self._pending_terminal_state is None:
-                self._pending_terminal_state = RunState.CANCELLED
+        if self.running:
+            if self._pending_terminal_phase is None:
+                self._pending_terminal_phase = "cancelled"
             self._processor_lane_retired = True
             self._request_signal_events_close()
             self._finish_pending_terminal()
@@ -360,9 +332,9 @@ class HostedProcessor:
         self._request_owner_wake()
 
     def _fail(self, error: Exception) -> None:
-        if self._state is None or self._state.terminal:
+        if not self._started or self._terminal:
             return
-        self._pending_terminal_state = RunState.FAILED
+        self._pending_terminal_phase = "failed"
         self._pending_terminal_error = f"{type(error).__name__}: {error}"
         self._request_signal_events_close()
         idle = self._data_plane.cancel_latest_only_processor(self)
@@ -424,29 +396,15 @@ class HostedProcessor:
         return True
 
     def _finish_pending_terminal(self) -> bool:
-        state = self._pending_terminal_state
-        if state is None or not self._processor_lane_retired:
+        terminal_phase = self._pending_terminal_phase
+        if terminal_phase is None or not self._processor_lane_retired:
             return False
         if not self._join_signal_events_if_idle():
             self._phase = "waiting for Processor event worker to stop"
             return False
-        self._state = state
+        self._terminal = True
         self._error = self._pending_terminal_error
-        self._phase = "failed" if state is RunState.FAILED else "cancelled"
-        self._pending_terminal_state = None
+        self._phase = terminal_phase
+        self._pending_terminal_phase = None
         self._pending_terminal_error = None
         return True
-
-    def _snapshot(self) -> RunSnapshot:
-        state = self._state
-        if state is None:
-            raise RuntimeError("Processor has not started")
-        return RunSnapshot(
-            run_id=self._run_id,
-            state=state,
-            phase=self._phase,
-            final_committed=False,
-            commit_publication_warning=None,
-            primary_error=self._error,
-            cleanup_errors=(),
-        )

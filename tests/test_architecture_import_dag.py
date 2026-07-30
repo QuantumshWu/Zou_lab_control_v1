@@ -319,9 +319,7 @@ import sys
 import zlc_data
 
 forbidden = (
-    'zlc_storage.content_store',
     'zlc_storage.durability',
-    'zlc_storage.repository_lease',
 )
 loaded = tuple(name for name in forbidden if name in sys.modules)
 if loaded:
@@ -634,11 +632,9 @@ def _readout_logic_sources():
 
 def test_readout_artifacts_do_not_restore_edit_counter_metadata():
     forbidden = {
-        "algorithm_id",
         "algorithm_version",
         "default_model_policy",
         "gate_passed",
-        "model_id",
         "model_version",
         "policy_version",
         "quality_gate_version",
@@ -669,8 +665,8 @@ def test_readout_artifacts_do_not_restore_edit_counter_metadata():
             if candidate in forbidden:
                 violations.append(f"{relative}:{node.lineno} restores {candidate}")
     assert not violations, (
-        "readout identity is CalibrationArtifactRef + ReadoutModelKind; descriptive "
-        "durable format names and CAS bytes replace edit-counter metadata:\n"
+        "readout identity uses typed refs plus explicit domain provenance; numeric "
+        "edit counters and policy-stage type families must stay absent:\n"
         + "\n".join(violations)
     )
 
@@ -843,140 +839,46 @@ def test_headless_api_import_does_not_load_frontend_renderer():
     subprocess.run([sys.executable, "-c", code], cwd=ROOT, check=True)
 
 
-#: The declared single owner of the ContentRef tree and CAS addressing.  It is
-#: named -- and therefore skipped -- rather than left outside the scan: the guard
-#: below shipped without ``zlc_storage`` among its roots, so "storage has ONE
-#: owner" was asserted while the storage package was never looked at.  An owner
-#: you exempt is a decision; an owner you forget to scan is a hole.
-CONTENT_REF_OWNER = Path("zlc_storage/content_store.py")
-
-
-def test_content_ref_codec_and_cas_address_have_one_storage_owner():
-    violations = []
-    for source in _source_files():
-        relative = source.relative_to(ROOT)
-        if relative == CONTENT_REF_OWNER:
-            continue
-        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(relative))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Dict):
-                literal_keys = {
-                    key.value
-                    for key in node.keys
-                    if isinstance(key, ast.Constant)
-                    and isinstance(key.value, str)
-                }
-                if len(node.keys) == 2 and literal_keys == {"digest", "size"}:
-                    violations.append(
-                        f"{relative}:{node.lineno} duplicates the ContentRef tree"
-                    )
-            if isinstance(node, ast.Set):
-                literal_fields = {
-                    item.value
-                    for item in node.elts
-                    if isinstance(item, ast.Constant)
-                    and isinstance(item.value, str)
-                }
-                if len(node.elts) == 2 and literal_fields == {"digest", "size"}:
-                    violations.append(
-                        f"{relative}:{node.lineno} duplicates the ContentRef field set"
-                    )
-            if (
-                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and node.name
-                in {
-                    "content_ref_to_tree",
-                    "content_ref_from_tree",
-                    "_content_ref_to_tree",
-                    "_content_ref_from_tree",
-                }
-            ):
-                violations.append(
-                    f"{relative}:{node.lineno} redefines the storage ContentRef codec"
-                )
-            if not isinstance(node, ast.Call) or len(node.args) < 2:
-                continue
-            function_name = (
-                node.func.id
-                if isinstance(node.func, ast.Name)
-                else node.func.attr
-                if isinstance(node.func, ast.Attribute)
-                else None
-            )
-            if function_name != "ContentRef":
-                continue
-            digest_call, size_call = node.args[:2]
-            digest_function_names = {
-                call.func.id
-                if isinstance(call.func, ast.Name)
-                else call.func.attr
-                if isinstance(call.func, ast.Attribute)
-                else ""
-                for call in ast.walk(digest_call)
-                if isinstance(call, ast.Call)
-            }
-            size_uses_len = any(
-                isinstance(call.func, ast.Name) and call.func.id == "len"
-                for call in ast.walk(size_call)
-                if isinstance(call, ast.Call)
-            )
-            if (
-                any("sha256" in name.lower() for name in digest_function_names)
-                and size_uses_len
-            ):
-                violations.append(
-                    f"{relative}:{node.lineno} mints a CAS address outside storage"
-                )
-
-    for relative in (
-        Path("zlc_neutral_atom/capture/artifact.py"),
-        Path("zlc_neutral_atom/logic_nodes/readout/calibration/repository.py"),
-    ):
-        tree = ast.parse(
-            (ROOT / relative).read_text(encoding="utf-8"),
-            filename=str(relative),
-        )
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Subscript)
-                and isinstance(node.value, ast.Attribute)
-                and node.value.attr == "target_ref"
-            ):
-                violations.append(
-                    f"{relative}:{node.lineno} slices typed target_ref grammar"
-                )
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "startswith"
-                and isinstance(node.func.value, ast.Attribute)
-                and node.func.value.attr == "target_ref"
-            ):
-                violations.append(
-                    f"{relative}:{node.lineno} reparses typed target_ref grammar"
-                )
-
-    assert not violations, (
-        "ContentRef tree/address belong to zlc_storage and each typed Ref owns its "
-        "target_ref grammar:\n" + "\n".join(violations)
+def test_ordinary_artifacts_have_no_cas_or_payload_digest_owner():
+    retired_modules = (
+        Path("zlc_storage/content_store.py"),
+        Path("zlc_storage/repository_lease.py"),
+        Path("zlc_neutral_atom/runtime/commit.py"),
     )
+    assert not [path for path in retired_modules if (ROOT / path).exists()]
 
-
-def test_artifact_finalizers_do_not_replay_published_payload_digests():
+    forbidden = (
+        "ContentAddressedStore",
+        "ContentRef",
+        "ContentStoreAuthority",
+        "RepositoryRootLease",
+        "PreparedArtifactCommit",
+        "PendingManifestInspection",
+        "repository_root",
+        "join_digest",
+        "derivation_digest",
+        "payload_digest",
+        "span_digest",
+    )
     violations = []
-    for relative in (Path("zlc_neutral_atom/capture/artifact.py"),):
-        path = ROOT / relative
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "digest_components"
-            ):
-                violations.append(f"{relative}:{node.lineno}")
+    for source in _source_files(
+        roots=(
+            "Zou_lab_control",
+            "zlc_data",
+            "zlc_frontend",
+            "zlc_neutral_atom",
+            "zlc_pulse",
+            "zlc_storage",
+            "zlc_workbench",
+        )
+    ):
+        text = source.read_text(encoding="utf-8")
+        for token in forbidden:
+            if token in text:
+                violations.append(f"{source.relative_to(ROOT)} contains {token}")
     assert not violations, (
-        "payload content digest belongs to stream publication; artifact/finalizer "
-        "code must consume EventRef provenance instead of re-reading arrays:\n"
+        "ordinary artifacts use direct domain records and typed path refs; CAS, "
+        "repository leases and payload-derived identity must stay deleted:\n"
         + "\n".join(violations)
     )
 

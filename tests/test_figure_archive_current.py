@@ -20,7 +20,7 @@ from zlc_frontend.figure import ViewIntent  # noqa: E402
 from zlc_frontend.display_range import RelimMode  # noqa: E402
 from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app  # noqa: E402
 from zlc_workbench.figure_viewer.app import open_figure_viewer  # noqa: E402
-from zlc_workbench.data_figure.archive_repository import (  # noqa: E402
+from zlc_workbench.data_figure.archive_io import (  # noqa: E402
     load_figure_archive,
     save_figure_archive,
 )
@@ -407,6 +407,33 @@ def test_archive_codec_preserves_faceted_histogram_display():
     assert _display_state_from_tree(_display_state_to_tree(display)) == display
 
 
+def test_standalone_launcher_passes_output_root_without_duplicate_figures(
+    monkeypatch,
+    tmp_path,
+):
+    import figure_viewer as launcher
+    import zlc_frontend.qt_widgets as qt_widgets
+    import zlc_workbench.figure_viewer.app as viewer_app
+
+    class _App:
+        @staticmethod
+        def exec_():
+            return 0
+
+    observed = {}
+
+    def open_viewer(**kwargs):
+        observed.update(kwargs)
+        return object()
+
+    monkeypatch.delenv("ZLC_FIGURE_VIEWER_AUTO_CLOSE_MS", raising=False)
+    monkeypatch.setattr(qt_widgets, "ensure_qt_app", lambda: _App())
+    monkeypatch.setattr(viewer_app, "open_figure_viewer", open_viewer)
+
+    assert launcher.main(["--workspace", str(tmp_path)]) == 0
+    assert observed["output_root"] == tmp_path.resolve() / "_output"
+
+
 def test_formal_viewer_loads_only_on_committed_human_path_and_keeps_good_pane(
     application,
     tmp_path,
@@ -445,7 +472,7 @@ def test_formal_viewer_loads_only_on_committed_human_path_and_keeps_good_pane(
         )
         assert pane is not None and pane.isVisible()
         assert board is not None and board.isVisible()
-        digest = viewer.archive.archive.payload_digest
+        accepted_archive = viewer.archive
         assert not wrapper.grab().isNull()
 
         missing = tmp_path / "missing.npz"
@@ -462,7 +489,7 @@ def test_formal_viewer_loads_only_on_committed_human_path_and_keeps_good_pane(
             lambda: viewer.worker_idle and status.severity == "error",
         )
         assert viewer.figure_pane is pane
-        assert viewer.archive.archive.payload_digest == digest
+        assert viewer.archive is accepted_archive
     finally:
         wrapper.close()
         _until(application, lambda: viewer._closed)
@@ -663,8 +690,7 @@ def test_notebook_no_argument_entry_opens_the_same_session_independent_viewer(
     experiment = zlc.connect(
         "virtual",
         workspace=zlc.WorkspacePaths.for_workspace(
-            (tmp_path / "authored").resolve(),
-            repository_root=(tmp_path / "repository").resolve(),
+            (tmp_path / "workspace").resolve()
         ),
     )
     viewer = None

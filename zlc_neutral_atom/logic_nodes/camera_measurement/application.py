@@ -50,7 +50,10 @@ def start_camera_measurement_command(
         if not callable(factory):
             raise TypeError("Camera live start requires a live-output host")
         live_factory = factory(output_owner=command)
-        return command.start_with_view(factory=live_factory)
+        return command.start_with_view(
+            factory=live_factory,
+            lifecycle_owner=command_context,
+        )
     if not isinstance(command, PreparedFiniteCameraMeasurement):
         raise TypeError("Camera command has another type")
     open_exact_dataset = getattr(live_output_host, "open_exact_dataset", None)
@@ -60,7 +63,10 @@ def start_camera_measurement_command(
         command.preview_spec,
         projection=command.live_projection(),
     )
-    return command.start(preview)
+    return command.start(
+        preview,
+        lifecycle_owner=command_context,
+    )
 
 
 __all__ = [

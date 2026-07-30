@@ -2,10 +2,8 @@
 
 Calibration stores only facts needed to reproduce readout: the source capture,
 the complete camera frame contract, one site map, and a closed set of feature
-models.  Statistical diagnostics belong to :mod:`.analysis`; content identity
-and durability belong to the repository/CAS.  Keeping those responsibilities
-out of these values prevents the same fact being re-hashed and re-validated at
-every layer.
+models.  Statistical diagnostics belong to :mod:`.analysis`; direct record-last
+durability belongs to :mod:`.repository`.
 """
 
 from __future__ import annotations
@@ -669,7 +667,7 @@ def _validate_calibration_artifact_source_compatibility(
     *,
     checkpoint: Callable[[], None] | None = None,
 ) -> _ResolvedCalibrationSource:
-    """Compare one admitted source while honoring cancellation/resource bounds."""
+    """Compare one loaded source while honoring cancellation/resource bounds."""
 
     if not isinstance(artifact, CalibrationArtifact):
         raise TypeError("artifact must be CalibrationArtifact")
@@ -696,7 +694,7 @@ def derive_calibration_readout_physical_context(
     *,
     checkpoint: Callable[[], None] | None = None,
 ) -> ReadoutPhysicalContext:
-    """Derive calibration applicability only from admitted pulse/camera lineage."""
+    """Derive calibration applicability only from loaded pulse/camera lineage."""
 
     if not isinstance(layout, CalibrationCaptureLayout):
         raise TypeError("layout must be CalibrationCaptureLayout")
@@ -985,90 +983,22 @@ class CalibrationArtifact:
         raise KeyError(selected)
 
 
-_RESOLVED_CALIBRATION_TOKEN = object()
-
-
+@dataclass(frozen=True, slots=True)
 class ResolvedCalibration:
-    """Process-local proof that one exact calibration target was committed."""
+    """One cold-opened Calibration value and its persisted Run provenance."""
 
-    __slots__ = (
-        "_token",
-        "_repository_token",
-        "_reference",
-        "_artifact",
-    )
+    reference: CalibrationArtifactRef
+    artifact: CalibrationArtifact
+    run_id: str
 
-    def __init_subclass__(cls, **_kwargs) -> None:
-        raise TypeError("ResolvedCalibration is final and cannot be subclassed")
-
-    def __init__(self, *_args, **_kwargs) -> None:
-        raise TypeError(
-            "ResolvedCalibration is returned by CalibrationRepository.admit; "
-            "reference/artifact pairs cannot be assembled by callers"
-        )
-
-    def __setattr__(self, _name: str, _value: object) -> None:
-        raise AttributeError("ResolvedCalibration is immutable")
-
-    def __reduce__(self):
-        raise TypeError("ResolvedCalibration is process-local and cannot be serialized")
-
-    def __reduce_ex__(self, _protocol: int):
-        raise TypeError("ResolvedCalibration is process-local and cannot be serialized")
-
-    @classmethod
-    def _from_admission(
-        cls,
-        token: object,
-        *,
-        repository_token: object,
-        reference: CalibrationArtifactRef,
-        artifact: CalibrationArtifact,
-    ) -> "ResolvedCalibration":
-        if token is not _RESOLVED_CALIBRATION_TOKEN:
-            raise PermissionError(
-                "ResolvedCalibration can only be minted by CalibrationRepository.admit"
-            )
-        if repository_token is None:
-            raise ValueError("ResolvedCalibration repository authority is absent")
-        if not isinstance(reference, CalibrationArtifactRef):
+    def __post_init__(self) -> None:
+        if not isinstance(self.reference, CalibrationArtifactRef):
             raise TypeError("reference must be CalibrationArtifactRef")
-        if not isinstance(artifact, CalibrationArtifact):
+        if not isinstance(self.artifact, CalibrationArtifact):
             raise TypeError("artifact must be CalibrationArtifact")
-        resolved = object.__new__(cls)
-        object.__setattr__(resolved, "_token", token)
-        object.__setattr__(resolved, "_repository_token", repository_token)
-        object.__setattr__(resolved, "_reference", reference)
-        object.__setattr__(resolved, "_artifact", artifact)
-        return resolved
+        from zlc_storage import canonical_text
 
-    def _require_authority(self) -> None:
-        if (
-            type(self) is not ResolvedCalibration
-            or self._token is not _RESOLVED_CALIBRATION_TOKEN
-            or self._repository_token is None
-        ):
-            raise PermissionError("ResolvedCalibration authority is invalid")
-
-    @property
-    def reference(self) -> CalibrationArtifactRef:
-        self._require_authority()
-        return self._reference
-
-    @property
-    def artifact(self) -> CalibrationArtifact:
-        self._require_authority()
-        return self._artifact
-
-    def _matches_admission(self, other: object) -> bool:
-        self._require_authority()
-        if type(other) is not ResolvedCalibration:
-            return False
-        other._require_authority()
-        return (
-            self._repository_token is other._repository_token
-            and self._reference == other._reference
-        )
+        canonical_text(self.run_id, "run_id")
 
 
 @dataclass(frozen=True)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -21,8 +22,34 @@ from zlc_data.value import Value
 ROOT = Path(__file__).parents[1]
 
 
+@pytest.mark.parametrize(
+    "alias",
+    (
+        "occupancy-run//occupancy.json",
+        "occupancy-run/./occupancy.json",
+        "occupancy\\alias/occupancy.json",
+    ),
+)
+def test_occupancy_artifact_ref_rejects_noncanonical_path_aliases(
+    alias: str,
+) -> None:
+    from zlc_neutral_atom.logic_nodes.readout.occupancy.reference import (
+        OccupancyArtifactRef,
+    )
+
+    with pytest.raises(ValueError):
+        OccupancyArtifactRef(alias)
+
+
 def _axis(name: str, role, size: int) -> AxisSpec:
     return AxisSpec(AxisId(name), name, role, size, tuple(range(size)))
+
+
+def _workspace_with_pulse(root: Path, name: str) -> Path:
+    pulses = root / "pulses"
+    pulses.mkdir(parents=True)
+    shutil.copy2(ROOT / "pulses" / name, pulses / name)
+    return root
 
 
 def _run_isolated(script: str, workspace: Path) -> dict[str, object]:
@@ -48,6 +75,10 @@ def _run_isolated(script: str, workspace: Path) -> dict[str, object]:
 
 
 def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_path):
+    workspace = _workspace_with_pulse(
+        tmp_path / "occupancy-current",
+        "imaging_template.json",
+    )
     result = _run_isolated(
         """
         from dataclasses import replace
@@ -57,23 +88,16 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
 
         import numpy as np
         from Zou_lab_control.api import WorkspacePaths, connect
-        from zlc_neutral_atom.capture.artifact import CaptureRepository
-        from zlc_neutral_atom.logic_nodes.readout.calibration.repository import (
-            CalibrationRepository,
-        )
-        from zlc_neutral_atom.logic_nodes.readout.occupancy.repository import (
-            OccupancyRepository,
+        from zlc_neutral_atom.logic_nodes.readout.occupancy.artifact import (
+            load_occupancy_artifact,
         )
         from zlc_pulse import RepeatRegion, load_pulse_document
-        from zlc_storage import content_ref_from_tree, decode
+        from zlc_storage import decode
 
         workspace = Path(sys.argv[1])
         experiment = connect(
             "virtual",
-            workspace=WorkspacePaths.for_workspace(
-                Path.cwd(),
-                repository_root=workspace,
-            ),
+            workspace=WorkspacePaths.for_workspace(workspace),
             seed=7,
         )
         try:
@@ -171,43 +195,41 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
         finally:
             experiment.close()
 
-        captures = CaptureRepository(workspace / "captures")
-        calibrations = CalibrationRepository(workspace / "calibrations")
-        occupancies = OccupancyRepository(workspace / "occupancy")
-        try:
-            reopened = occupancies.admit(
-                occupancy_ref,
-                captures,
-                calibrations,
-            )
-            manifest = decode(
-                occupancies._store_authority.read_manifest(
-                    "occupancy",
-                    occupancy_ref.manifest_digest,
-                )
-            )
-            metadata_ref = content_ref_from_tree(manifest["metadata_blob"])
-            metadata = decode(
-                occupancies._store_authority.read_blob(metadata_ref)
-            )
-            result.update(
-                {
-                    "reopened_capture_ref_matches": (
-                        reopened.artifact.source_capture_ref == capture_ref
-                    ),
-                    "reopened_calibration_ref_matches": (
-                        reopened.artifact.calibration_reference == calibration_ref
-                    ),
-                    "canonical_run_id": metadata["run_id"],
-                }
-            )
-        finally:
-            occupancies.close()
-            calibrations.close()
-            captures.close()
+        output = workspace / "_output"
+        occupancy_root = output / "occupancy"
+        reopened = load_occupancy_artifact(
+            occupancy_root,
+            output / "captures",
+            output / "calibrations",
+            occupancy_ref,
+        )
+        record_path = occupancy_root / occupancy_ref.record_path
+        record = decode(record_path.read_bytes())
+        result.update(
+            {
+                "reopened_capture_ref_matches": (
+                    reopened.artifact.source_capture_ref == capture_ref
+                ),
+                "reopened_calibration_ref_matches": (
+                    reopened.artifact.calibration_reference == calibration_ref
+                ),
+                "canonical_run_id": record["run_id"],
+                "record_path": occupancy_ref.record_path,
+                "record_fields": sorted(record),
+                "counts_dtype": str(
+                    np.load(record_path.parent / "counts.npy", allow_pickle=False).dtype
+                ),
+                "occupied_dtype": str(
+                    np.load(record_path.parent / "occupied.npy", allow_pickle=False).dtype
+                ),
+                "validity_dtype": str(
+                    np.load(record_path.parent / "validity.npy", allow_pickle=False).dtype
+                ),
+            }
+        )
         print("RESULT_JSON=" + json.dumps(result, sort_keys=True))
         """,
-        tmp_path / "occupancy-current",
+        workspace,
     )
     assert result["capture_descriptor_shape"] == [2, 1, 96, 128]
     assert result["counts_shape"] == [2, 1, 35]
@@ -228,5 +250,158 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
     assert result["reopened_calibration_ref_matches"] is True
     assert isinstance(result["canonical_run_id"], str)
     assert result["canonical_run_id"]
+    assert result["record_path"].endswith("/occupancy.json")
+    assert result["record_fields"] == [
+        "calibration_ref",
+        "counts_schema",
+        "model_kind",
+        "occupied_schema",
+        "readout_binding",
+        "readout_event_axis_id",
+        "run_id",
+        "schema",
+        "source_capture_ref",
+    ]
+    assert result["counts_dtype"] == "float64"
+    assert result["occupied_dtype"] == "bool"
+    assert result["validity_dtype"] == "bool"
     assert result["invalid_count_fillers_are_zero"] is True
     assert result["invalid_occupied_fillers_are_false"] is True
+
+
+def _direct_output_artifact():
+    from zlc_data import (
+        REPEAT,
+        SITE,
+        AxisId,
+        AxisSpec,
+        DataBlock,
+        DatasetComponentValidity,
+        DatasetRevision,
+        DatasetSchema,
+        PointTable,
+        ValidityContract,
+        ValueSchema,
+    )
+    from zlc_neutral_atom.capture.reference import CaptureArtifactRef
+    from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
+        CalibrationArtifactRef,
+    )
+    from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
+    from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
+        OCCUPANCY_COUNTS_BLOCK_ID,
+        OCCUPANCY_OCCUPIED_BLOCK_ID,
+        OccupancyArtifact,
+    )
+
+    site = AxisSpec(
+        AxisId("site"),
+        "site",
+        SITE,
+        2,
+        (0, 1),
+    )
+    repeat = AxisSpec(
+        AxisId("repeat"),
+        "repeat",
+        REPEAT,
+        1,
+        (0,),
+    )
+    validity_contract = ValidityContract.components(site.axis_id)
+    counts_schema = DatasetSchema(
+        repeat,
+        PointTable(1),
+        None,
+        ValueSchema((site,), validity_contract, np.dtype("<f8"), "count"),
+    )
+    occupied_schema = DatasetSchema(
+        repeat,
+        PointTable(1),
+        None,
+        ValueSchema((site,), validity_contract, np.dtype(bool), "occupation"),
+    )
+    validity = DatasetComponentValidity(
+        (site.axis_id,),
+        np.array([[[True, False]]], dtype=bool),
+    )
+    revision = DatasetRevision(3)
+    return OccupancyArtifact(
+        CaptureArtifactRef("source/capture.json"),
+        CalibrationArtifactRef("calibration/calibration.json"),
+        AxisId("readout-event"),
+        ReadoutModelKind.BOX,
+        "occupancy-run",
+        DataBlock(
+            OCCUPANCY_COUNTS_BLOCK_ID,
+            revision,
+            np.array([[[7.5, 0.0]]], dtype="<f8"),
+            validity,
+            counts_schema,
+        ),
+        DataBlock(
+            OCCUPANCY_OCCUPIED_BLOCK_ID,
+            revision,
+            np.array([[[True, False]]], dtype=bool),
+            validity,
+            occupied_schema,
+        ),
+    )
+
+
+def test_direct_output_writes_original_arrays_before_record(tmp_path):
+    from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
+    from zlc_neutral_atom.logic_nodes.readout.occupancy.artifact import (
+        write_occupancy_artifact,
+    )
+    from zlc_storage import decode
+
+    root = (tmp_path / "occupancy").resolve()
+    artifact = _direct_output_artifact()
+    reference = write_occupancy_artifact(
+        root,
+        artifact,
+        readout_binding=ReadoutBindingKey("camera"),
+        run_id=artifact.run_id,
+    )
+    record_path = root / reference.record_path
+    record = decode(record_path.read_bytes())
+    assert reference.record_path == "occupancy-run/occupancy.json"
+    assert record["run_id"] == artifact.run_id
+    assert np.load(record_path.parent / "counts.npy", allow_pickle=False).dtype == np.dtype(
+        "<f8"
+    )
+    assert np.load(
+        record_path.parent / "occupied.npy",
+        allow_pickle=False,
+    ).dtype == np.dtype(bool)
+    assert np.load(
+        record_path.parent / "validity.npy",
+        allow_pickle=False,
+    ).dtype == np.dtype(bool)
+
+
+def test_record_failure_leaves_no_visible_occupancy_artifact(tmp_path, monkeypatch):
+    import zlc_neutral_atom.logic_nodes.readout.occupancy.artifact as artifact_io
+    from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
+
+    root = (tmp_path / "occupancy").resolve()
+    artifact = _direct_output_artifact()
+
+    def fail_record(_target, _payload):
+        raise OSError("synthetic record publication failure")
+
+    monkeypatch.setattr(artifact_io, "atomic_write_bytes", fail_record)
+    with pytest.raises(OSError, match="record publication failure"):
+        artifact_io.write_occupancy_artifact(
+            root,
+            artifact,
+            readout_binding=ReadoutBindingKey("camera"),
+            run_id=artifact.run_id,
+        )
+
+    run_directory = root / artifact.run_id
+    assert (run_directory / "counts.npy").is_file()
+    assert (run_directory / "occupied.npy").is_file()
+    assert (run_directory / "validity.npy").is_file()
+    assert not (run_directory / "occupancy.json").exists()

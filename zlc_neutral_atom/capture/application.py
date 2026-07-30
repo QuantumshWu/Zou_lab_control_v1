@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import threading
 from typing import Callable
 from uuid import uuid4
 
 from zlc_data import AxisId, AxisSpec, BlockId, DatasetSchema, READOUT_EVENT, REPEAT
-from .artifact import CaptureRepository, compile_capture_artifact_pipeline
+from .artifact import compile_capture_artifact_pipeline
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
 from zlc_neutral_atom.capture.pipeline import (
@@ -16,7 +17,10 @@ from zlc_neutral_atom.capture.pipeline import (
     CapturePreviewSpec,
     MinimalPipelineSpec,
 )
-from zlc_neutral_atom.runtime.preview import notify_preview_failure
+from zlc_neutral_atom.runtime.preview import (
+    ExactDatasetPreviewPort,
+    notify_preview_failure,
+)
 from zlc_neutral_atom.runtime.run import RunHandle, RunPlan
 from zlc_neutral_atom.capture.triggered import TriggeredCaptureSpec
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
@@ -91,7 +95,6 @@ class PlanDescriptor:
     expected_frames: int
     output_schema: DatasetSchema
     compiled_pulse_digest: str
-    resource_claims: tuple[str, ...]
 
 
 class PreparedFiniteCapture:
@@ -104,7 +107,7 @@ class PreparedFiniteCapture:
         "_preview_block_id",
         "_preview_edge",
         "_preview_schema",
-        "_repository",
+        "_captures_root",
         "_start_run",
         "_started",
         "_triggered",
@@ -113,7 +116,7 @@ class PreparedFiniteCapture:
     def __init__(
         self,
         triggered: TriggeredCaptureSpec,
-        repository: CaptureRepository,
+        captures_root: Path,
         start_run: Callable[[RunPlan], RunHandle],
         descriptor: PlanDescriptor,
     ) -> None:
@@ -121,13 +124,13 @@ class PreparedFiniteCapture:
             raise TypeError("triggered must be TriggeredCaptureSpec")
         if not isinstance(descriptor, PlanDescriptor):
             raise TypeError("descriptor must be PlanDescriptor")
-        if type(repository) is not CaptureRepository:
-            raise TypeError("repository must be CaptureRepository")
+        if not isinstance(captures_root, Path):
+            raise TypeError("captures_root must be Path")
         if not callable(start_run):
             raise TypeError("start_run must be callable")
         self._triggered = triggered
         self._pipeline = triggered.capture
-        self._repository = repository
+        self._captures_root = captures_root.expanduser().resolve()
         self._start_run = start_run
         self._descriptor = descriptor
         self._preview_block_id = BlockId(f"capture-preview-{uuid4().hex}")
@@ -166,18 +169,27 @@ class PreparedFiniteCapture:
             self._preview_schema = self._preview_edge.schema
             return self._preview_schema
 
-    def start(self, *, lifecycle_owner: object | None = None) -> RunHandle:
+    def start(
+        self,
+        *,
+        exact_preview: ExactDatasetPreviewPort | None = None,
+    ) -> RunHandle:
         self._claim_start()
-        plan = compile_capture_artifact_pipeline(
-            self._triggered,
-            self._repository,
-        )
-        return self._start_run(
-            plan.with_lifecycle(
-                owner=self if lifecycle_owner is None else lifecycle_owner,
-                preemptible=False,
+        try:
+            plan = compile_capture_artifact_pipeline(
+                self._triggered,
+                self._captures_root,
+                exact_preview=exact_preview,
             )
-        )
+            return self._start_run(
+                plan.with_lifecycle(
+                    owner=self,
+                    preemptible=False,
+                )
+            )
+        except BaseException as error:
+            notify_preview_failure(exact_preview, error)
+            raise
 
     def start_with_preview(
         self,
@@ -202,7 +214,7 @@ class PreparedFiniteCapture:
         try:
             plan = compile_capture_artifact_pipeline(
                 self._triggered,
-                self._repository,
+                self._captures_root,
                 preview=preview,
             )
             return self._start_run(
@@ -254,10 +266,6 @@ def bind_finite_capture_spec(
         binding.expected_frames,
         binding.capture.capture_contract.dataset_schema,
         binding.compiled_artifact.fingerprint,
-        (
-            str(binding.pulse_port.resource_claim.key),
-            str(binding.capture.capture_port.resource_claim.key),
-        ),
     )
     return triggered, descriptor
 
@@ -267,7 +275,7 @@ def prepare_finite_capture(
     *,
     pulse_port: BoundPulsePort,
     camera_port: BoundCapturePort,
-    repository: CaptureRepository,
+    captures_root: Path,
     start_run: Callable[[RunPlan], RunHandle],
 ) -> PreparedFiniteCapture:
     """Bind one ordinary finite request into a narrow one-shot command."""
@@ -285,7 +293,7 @@ def prepare_finite_capture(
         execution_form=request.execution_form,
         name_prefix="Capture",
     )
-    return PreparedFiniteCapture(triggered, repository, start_run, descriptor)
+    return PreparedFiniteCapture(triggered, captures_root, start_run, descriptor)
 
 
 def bind_finite_capture_request(

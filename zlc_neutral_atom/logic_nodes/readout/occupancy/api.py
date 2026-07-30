@@ -1,30 +1,30 @@
-"""Public Experiment API owned by Occupancy and its detection artifact."""
+"""Public Experiment API owned by Occupancy and its direct artifacts."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
 
+from zlc_neutral_atom.capture.artifact import load_capture_artifact
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.logic_nodes.camera_measurement.output_binding import (
     CameraFrameOutputBinding,
 )
-from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
-    ResolvedCalibration,
-)
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
 )
-from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
-from zlc_neutral_atom.runtime.run import RunHandle
-from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
-
-from .application import (
-    DetectionRequest,
-    build_detection_request,
+from zlc_neutral_atom.logic_nodes.readout.calibration.repository import (
+    load_calibration_artifact,
 )
+from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
+from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
+from zlc_neutral_atom.runtime.run import RunHandle
+
+from .application import DetectionRequest, build_detection_request, prepare_detection_plan
 from .cell import (
     OccupancyCellDomain,
+    inspect_occupancy_cell_domain,
+    load_exact_occupancy_cell_source,
 )
 from .processor import ResolvedOccupancy
 from .processor_application import (
@@ -33,20 +33,17 @@ from .processor_application import (
     prepare_occupancy_processor,
 )
 from .reference import OccupancyArtifactRef
-from .repository import OccupancyRepository
+from .artifact import load_occupancy_artifact
 
 
 class OccupancyApi:
     __slots__ = (
-        "_admit_capture",
         "_calibration",
-        "_inspect_cell",
-        "_load_cell",
-        "_load_occupancy_operation",
+        "_calibrations_root",
+        "_captures_root",
+        "_occupancy_root",
         "_open_ui",
-        "_repository",
-        "_repository_path",
-        "_start_detection_operation",
+        "_start_run",
         "_wait_run",
     )
 
@@ -54,54 +51,31 @@ class OccupancyApi:
         self,
         calibration,
         *,
-        repository_path: Path,
+        captures_root: Path,
+        calibrations_root: Path,
+        occupancy_root: Path,
+        start_run: Callable,
         wait_run: Callable,
-        admit_capture: Callable,
-        start_detection: Callable,
-        load_occupancy: Callable,
-        inspect_cell: Callable,
-        load_cell: Callable,
         open_ui: Callable,
     ) -> None:
-        if not isinstance(repository_path, Path):
-            raise TypeError("repository_path must be Path")
-        operations = (
-            wait_run,
-            admit_capture,
-            start_detection,
-            load_occupancy,
-            inspect_cell,
-            load_cell,
-            open_ui,
-        )
-        if any(not callable(operation) for operation in operations):
+        for field, value in (
+            ("captures_root", captures_root),
+            ("calibrations_root", calibrations_root),
+            ("occupancy_root", occupancy_root),
+        ):
+            if not isinstance(value, Path) or not value.is_absolute():
+                raise TypeError(f"{field} must be an absolute Path")
+        if any(not callable(operation) for operation in (start_run, wait_run, open_ui)):
             raise TypeError("Occupancy API operations must be callable")
         self._calibration = calibration
-        self._repository_path = repository_path
+        self._captures_root = captures_root.resolve()
+        self._calibrations_root = calibrations_root.resolve()
+        self._occupancy_root = occupancy_root.resolve()
+        self._start_run = start_run
         self._wait_run = wait_run
-        self._admit_capture = admit_capture
-        self._start_detection_operation = start_detection
-        self._load_occupancy_operation = load_occupancy
-        self._inspect_cell = inspect_cell
-        self._load_cell = load_cell
         self._open_ui = open_ui
-        self._repository: OccupancyRepository | None = None
-
-    def _occupancy_repository(self) -> OccupancyRepository:
-        repository = self._repository
-        if repository is None:
-            repository = OccupancyRepository(self._repository_path)
-            self._repository = repository
-        return repository
 
     def close(self) -> tuple[Exception, ...]:
-        repository = self._repository
-        if repository is None:
-            return ()
-        try:
-            repository.close()
-        except Exception as error:
-            return (error,)
         return ()
 
     def prepare_occupancy_processor_request(
@@ -110,7 +84,11 @@ class OccupancyApi:
     ) -> PreparedOccupancyProcessor:
         if not isinstance(request, OccupancyProcessorRequest):
             raise TypeError("request must be OccupancyProcessorRequest")
-        resolved = self._calibration.load_calibration(request.calibration_ref)
+        resolved = load_calibration_artifact(
+            self._calibrations_root,
+            self._captures_root,
+            request.calibration_ref,
+        )
         return prepare_occupancy_processor(request, resolved)
 
     def prepare_occupancy_processor(
@@ -144,26 +122,23 @@ class OccupancyApi:
             raise TypeError("calibration_ref must be CalibrationArtifactRef or None")
         return reference
 
-    def prepare_saved_occupancy_processor(
+    def _reference_from_record_path(
         self,
-        camera_output_binding: CameraFrameOutputBinding,
-        *,
-        calibration_ref_file: str | Path,
-        model_kind: ReadoutModelKind | None = None,
-    ) -> PreparedOccupancyProcessor:
-        resolved = self._calibration.load_saved_calibration(calibration_ref_file)
-        return self.prepare_occupancy_processor_request(
-            OccupancyProcessorRequest(
-                camera_output_binding,
-                resolved.reference,
-                model_kind,
-            )
-        )
+        path: str | Path,
+    ) -> CalibrationArtifactRef:
+        """Validate one explicit ``calibration.json`` and freeze its typed ref."""
 
-    def load_saved_calibration(self, path: str | Path) -> ResolvedCalibration:
-        """Admit one saved Calibration pointer for Occupancy authoring."""
-
-        return self._calibration.load_saved_calibration(path)
+        record_path = Path(path).expanduser().resolve()
+        try:
+            relative = record_path.relative_to(self._calibrations_root)
+        except ValueError as error:
+            raise ValueError(
+                "Calibration record must be inside the current project's "
+                "_output/calibrations directory"
+            ) from error
+        reference = CalibrationArtifactRef(relative.as_posix())
+        self._calibration.load_calibration(reference)
+        return reference
 
     def detection_request(
         self,
@@ -173,20 +148,26 @@ class OccupancyApi:
         model_kind: ReadoutModelKind | None = None,
     ) -> DetectionRequest:
         reference = self._resolve_calibration_ref(calibration)
-        request = build_detection_request(
-            self._admit_capture(source),
-            self._calibration.load_calibration(reference),
+        return build_detection_request(
+            load_capture_artifact(self._captures_root, source),
+            load_calibration_artifact(
+                self._calibrations_root,
+                self._captures_root,
+                reference,
+            ),
             model_kind=model_kind,
         )
-        return request
 
     def start_detection(self, request: DetectionRequest) -> RunHandle:
         if not isinstance(request, DetectionRequest):
             raise TypeError("request must be DetectionRequest")
-        return self._start_detection_operation(
+        plan = prepare_detection_plan(
             request,
-            self._occupancy_repository(),
+            captures_root=self._captures_root,
+            calibrations_root=self._calibrations_root,
+            occupancy_root=self._occupancy_root,
         )
+        return self._start_run(plan)
 
     def detect(self, request: DetectionRequest) -> OccupancyArtifactRef:
         if not isinstance(request, DetectionRequest):
@@ -197,11 +178,12 @@ class OccupancyApi:
         self,
         reference: OccupancyArtifactRef,
     ) -> ResolvedOccupancy:
-        resolved = self._load_occupancy_operation(
+        return load_occupancy_artifact(
+            self._occupancy_root,
+            self._captures_root,
+            self._calibrations_root,
             reference,
-            self._occupancy_repository(),
         )
-        return resolved
 
     def _project_figure(
         self,
@@ -226,8 +208,12 @@ class OccupancyApi:
     ) -> OccupancyCellDomain:
         if not isinstance(reference, OccupancyArtifactRef):
             raise TypeError("reference must be OccupancyArtifactRef")
-        domain = self._inspect_cell(reference, self._occupancy_repository())
-        return domain
+        return inspect_occupancy_cell_domain(
+            reference,
+            self._occupancy_root,
+            self._captures_root,
+            self._calibrations_root,
+        )
 
     def _load_occupancy_cell_source(
         self,
@@ -245,9 +231,11 @@ class OccupancyApi:
             OccupancyCellDomain,
         ):
             raise TypeError("expected_navigation must be OccupancyCellDomain or None")
-        source = self._load_cell(
+        source = load_exact_occupancy_cell_source(
             reference,
-            self._occupancy_repository(),
+            self._occupancy_root,
+            self._captures_root,
+            self._calibrations_root,
             address,
             expected_domain_identity=(
                 None
@@ -287,6 +275,4 @@ class OccupancyApi:
         )
 
 
-__all__ = [
-    "OccupancyApi",
-]
+__all__ = ["OccupancyApi"]

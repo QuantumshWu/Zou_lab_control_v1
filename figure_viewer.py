@@ -24,10 +24,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="current Figure .npz, or a PNG/JPEG with a same-stem .npz")
     parser.add_argument("--scale", type=float, default=None, help="UI scale factor (default: auto).")
     parser.add_argument(
-        "--output-root",
+        "--workspace",
         type=Path,
-        default=Path.home() / ".zlc" / "figure-viewer" / "output",
-        help="Explicit root for fitted figures and image exports.",
+        default=Path(__file__).resolve().parent,
+        help="Project root whose _output contains user-visible results.",
     )
     args = parser.parse_args(argv)
 
@@ -42,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     viewer = open_figure_viewer(
         path=args.path,
         scale=args.scale,
-        output_root=args.output_root.expanduser().resolve(),
+        output_root=args.workspace.expanduser().resolve() / "_output",
     )
 
     auto_close_ms = os.environ.get("ZLC_FIGURE_VIEWER_AUTO_CLOSE_MS")

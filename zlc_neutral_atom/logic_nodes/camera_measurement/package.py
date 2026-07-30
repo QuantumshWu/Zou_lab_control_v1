@@ -23,7 +23,7 @@ def _bind_api(
         camera_port,
         camera_monitor_port,
         association_authorities,
-        capture_repository,
+        captures_root,
         start_run,
     ) = facts
 
@@ -40,7 +40,7 @@ def _bind_api(
         return prepare_finite_camera_measurement(
             request,
             camera_port=camera_port(request.camera_ref),
-            repository=capture_repository,
+            captures_root=captures_root,
             start_run=start_run,
         )
 
@@ -76,7 +76,7 @@ LOGIC_NODE_PACKAGE = LogicNodePackage(
         "camera_port",
         "camera_monitor_port",
         "camera_signal_association_authorities",
-        "capture_repository",
+        "captures_root",
         "start_run",
     ),
     bind_api=_bind_api,

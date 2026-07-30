@@ -16,10 +16,7 @@ from zlc_neutral_atom.runtime.ports import (
 )
 from zlc_neutral_atom.runtime.resources import DeviceBindingStamp, ResourceClaim
 from zlc_neutral_atom.runtime.run import RunContext
-from zlc_storage import canonical_digest, canonical_text, positive_integer, positive_real
-
-
-RF_DETUNING_CONTROL_KEY = "two_photon_detuning_gamma"
+from zlc_storage import canonical_text, positive_real
 
 
 def _table(values: object) -> tuple[float, ...]:
@@ -46,7 +43,6 @@ def _table(values: object) -> tuple[float, ...]:
 class RfTableCapabilitySnapshot:
     binding_stamp: DeviceBindingStamp
     max_blocking_call_seconds: float
-    capability_fingerprint: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.binding_stamp, DeviceBindingStamp):
@@ -59,7 +55,6 @@ class RfTableCapabilitySnapshot:
                 "RF max_blocking_call_seconds",
             ),
         )
-        canonical_text(self.capability_fingerprint, "RF capability_fingerprint")
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,86 +66,47 @@ class RfDetuningTable:
         canonical_text(self.pulse_artifact_digest, "pulse_artifact_digest")
         object.__setattr__(self, "detuning_gamma", _table(self.detuning_gamma))
 
-    @property
-    def digest(self) -> str:
-        return canonical_digest(
-            {
-                "control_key": RF_DETUNING_CONTROL_KEY,
-                "unit": "Gamma",
-                "clock_source": "sequencer-scan-point",
-                "pulse_artifact_digest": self.pulse_artifact_digest,
-                "detuning_gamma": self.detuning_gamma,
-            }
-        )
-
-    @property
-    def advancement_digest(self) -> str:
-        """Evidence for the only valid table walk: every index, once, in order."""
-
-        return canonical_digest(
-            {
-                "pulse_artifact_digest": self.pulse_artifact_digest,
-                "table_digest": self.digest,
-                "advanced_points": tuple(range(len(self.detuning_gamma))),
-            }
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class PrepareRfTable:
     session_id: str
     table: RfDetuningTable
-    capability_fingerprint: str
 
     def __post_init__(self) -> None:
         canonical_text(self.session_id, "RF session_id")
         if not isinstance(self.table, RfDetuningTable):
             raise TypeError("table must be RfDetuningTable")
-        canonical_text(self.capability_fingerprint, "RF capability_fingerprint")
 
 
 @dataclass(frozen=True, slots=True)
 class CompleteRfTable:
     session_id: str
-    table_digest: str
+    table: RfDetuningTable
 
     def __post_init__(self) -> None:
         canonical_text(self.session_id, "RF session_id")
-        canonical_text(self.table_digest, "RF table_digest")
+        if not isinstance(self.table, RfDetuningTable):
+            raise TypeError("table must be RfDetuningTable")
 
 
 @dataclass(frozen=True, slots=True)
 class RfTableTerminal:
     session_id: str
-    table_digest: str
-    advanced_points: int
-    advancement_digest: str
+    point_indices: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        for field in ("session_id", "table_digest", "advancement_digest"):
-            canonical_text(getattr(self, field), f"RF {field}")
-        object.__setattr__(
-            self,
-            "advanced_points",
-            positive_integer(self.advanced_points, "RF advanced_points"),
-        )
-
-
-def rf_table_terminal_to_tree(
-    value: RfTableTerminal | None,
-) -> dict[str, object] | None:
-    """Project completed RF-table evidence for cross-owner provenance."""
-
-    if value is None:
-        return None
-    if not isinstance(value, RfTableTerminal):
-        raise TypeError("value must be RfTableTerminal or None")
-    return {
-        "session_id": value.session_id,
-        "table_digest": value.table_digest,
-        "advanced_points": value.advanced_points,
-        "advancement_digest": value.advancement_digest,
-    }
+        canonical_text(self.session_id, "RF session_id")
+        if not isinstance(self.point_indices, tuple):
+            raise TypeError("RF point_indices must be a tuple")
+        if not self.point_indices:
+            raise ValueError("RF point_indices must not be empty")
+        if any(
+            isinstance(index, bool) or not isinstance(index, int)
+            for index in self.point_indices
+        ):
+            raise TypeError("RF point_indices must contain integers")
+        if any(index < 0 for index in self.point_indices):
+            raise ValueError("RF point_indices must contain non-negative integers")
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,14 +154,15 @@ class BoundRfTablePort:
             is not self.capability
         ):
             raise RuntimeError("RF capability attestation changed")
-        observed_digest = context.device(self.device.key).execute(
+        observed_table = context.device(self.device.key).execute(
             PrepareRfTable(
                 session_id,
                 table,
-                self.capability.capability_fingerprint,
             )
         )
-        if observed_digest != table.digest:
+        if type(observed_table) is not RfDetuningTable:
+            raise TypeError("RF endpoint returned another prepared table type")
+        if observed_table != table:
             raise RuntimeError("RF endpoint prepared another table")
 
     def complete(
@@ -215,15 +172,13 @@ class BoundRfTablePort:
         table: RfDetuningTable,
     ) -> RfTableTerminal:
         terminal = context.device(self.device.key).execute(
-            CompleteRfTable(session_id, table.digest)
+            CompleteRfTable(session_id, table)
         )
         if not isinstance(terminal, RfTableTerminal):
             raise TypeError("RF endpoint returned another terminal type")
         if (
             terminal.session_id != session_id
-            or terminal.table_digest != table.digest
-            or terminal.advanced_points != len(table.detuning_gamma)
-            or terminal.advancement_digest != table.advancement_digest
+            or terminal.point_indices != tuple(range(len(table.detuning_gamma)))
         ):
             raise RuntimeError("RF terminal does not cover the frozen table")
         return terminal
@@ -243,9 +198,7 @@ __all__ = [
     "BoundRfTablePort",
     "CompleteRfTable",
     "PrepareRfTable",
-    "RF_DETUNING_CONTROL_KEY",
     "RfDetuningTable",
     "RfTableCapabilitySnapshot",
     "RfTableTerminal",
-    "rf_table_terminal_to_tree",
 ]

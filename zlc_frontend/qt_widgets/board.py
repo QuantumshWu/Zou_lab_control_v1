@@ -54,7 +54,6 @@ from ._raster_front import (
     _hold_matches_frame,
     _panel_bounds,
     _panel_image_geometry,
-    _panel_presentation,
     _panel_semantics_changed,
     _prepared_qimage,
     _validated_panel_layout,
@@ -812,7 +811,7 @@ class QtRasterBoard(QtWidgets.QWidget):
                 if (
                     pending_color is not None
                     and _image_payload(target_panel) is not None
-                    and _panel_presentation(target_panel).panel_revision
+                    and _image_payload(target_panel).viewport.viewport_revision
                     == pending_color.display_revision
                     and not pending_color.matches(target_panel)
                 ):
@@ -2672,10 +2671,6 @@ class QtRasterBoard(QtWidgets.QWidget):
             if payload is None:
                 raise ValueError(
                     f"{kind} interaction requires exact {kind.title()}PanelPayload"
-                )
-            if _panel_presentation(panel).panel_revision != payload.viewport.display_revision:
-                raise ValueError(
-                    f"{kind} payload viewport revision differs from its presentation"
                 )
             viewport = payload.viewport
         if panel_id in self._numeric_bindings:

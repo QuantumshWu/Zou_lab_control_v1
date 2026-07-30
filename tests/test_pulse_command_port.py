@@ -91,14 +91,14 @@ def test_pulse_run_request_freezes_intent_without_a_hardware_callback() -> None:
 def test_current_workbench_entry_points_never_accept_a_raw_sequencer() -> None:
     parameters = inspect.signature(open_pulse_editor).parameters
 
-    assert tuple(parameters) == (
-        "experiment",
-        "document",
-        "path",
-        "remote_endpoint",
-        "repository",
+    assert {"experiment", "document", "path", "remote_endpoint", "workspace"} <= set(
+        parameters
     )
-    assert "sequencer" not in parameters and "command_port" not in parameters
+    assert not {
+        "sequencer",
+        "command_port",
+        "repository",
+    }.intersection(parameters)
 
 
 def test_standalone_launcher_composes_the_current_product_surface() -> None:

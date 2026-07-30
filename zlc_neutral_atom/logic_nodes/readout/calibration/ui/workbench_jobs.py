@@ -9,7 +9,7 @@ import threading
 
 import numpy as np
 
-from zlc_data.axis import AxisSourceRef
+from zlc_data.axis import SCALAR_AXIS, AxisSourceRef
 from zlc_data.value import OwnedSnapshot
 from zlc_frontend import (
     AxisViewRole,
@@ -20,7 +20,6 @@ from zlc_frontend import (
     FixedIndex,
     HistogramCellThresholds,
     HistogramDisplayState,
-    PanelProvenance,
     PlotKind,
     PlotReportDocument,
     SourceViewBinding,
@@ -47,7 +46,6 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.projection import (
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
 from zlc_neutral_atom.processing.signal_plane import SignalPublication
 from zlc_neutral_atom.runtime.hosted_run import HostedRun
-from zlc_storage import canonical_digest
 
 
 _SITE_MAP_FIGURE = FigureIntent(
@@ -60,10 +58,6 @@ _SITE_MAP_FIGURE = FigureIntent(
 def calibration_site_map_figure(
     snapshot: OwnedSnapshot,
     context: CalibrationSiteMapContext,
-    *,
-    coherence_identity: str,
-    run_id: str,
-    provenance_epoch_id: str,
 ) -> tuple[FigureIntent, FigureSource]:
     """Project the sole Calibration SiteMap intent from physical context."""
 
@@ -78,10 +72,6 @@ def calibration_site_map_figure(
         coordinate_frame=context.coordinate_frame,
         centers_xy=context.centers_xy,
         site_validity=context.site_validity,
-        site_geometry_identity=context.calibration_identity,
-        coherence_identity=coherence_identity,
-        run_id=run_id,
-        provenance_epoch_id=provenance_epoch_id,
         summary=(
             f"{context.calibration_identity} | reference average | "
             f"valid sites={valid_count}/{context.site_axis.size}"
@@ -95,6 +85,7 @@ def project_calibration_signal_presentation(
     node: object,
     output_name: str,
     publication: SignalPublication,
+    _direct_parents: tuple[SignalPublication, ...],
 ):
     """Project the Calibration SiteMap from one exact FINAL publication."""
 
@@ -112,37 +103,12 @@ def project_calibration_signal_presentation(
     figure, source = calibration_site_map_figure(
         value.snapshot,
         context,
-        coherence_identity=value.join_digest,
-        run_id=value.run_id,
-        provenance_epoch_id=value.epoch_id,
     )
     return figure, source.site_map
 
 
 def _format_metric(value: float) -> str:
     return "N/A" if not math.isfinite(value) else f"{value:.4f}"
-
-
-def _provenance(
-    view: CalibrationReportProjection,
-    key: str,
-    snapshot: OwnedSnapshot,
-) -> PanelProvenance:
-    return PanelProvenance(
-        f"calibration-report-{view.calibration_identity}",
-        snapshot.ref.stream_generation.value,
-        canonical_digest(
-            {
-                "owner": "zlc_neutral_atom.calibration-report-front",
-                "calibration_identity": view.calibration_identity,
-                "key": key,
-                "block_id": snapshot.ref.block_id.value,
-                "revision": snapshot.ref.revision.value,
-                "stream_generation": snapshot.ref.stream_generation.value,
-                "schema_fingerprint": snapshot.ref.schema_fingerprint,
-            }
-        ),
-    )
 
 
 def _site_map_page(view: CalibrationReportProjection, snapshot: OwnedSnapshot):
@@ -155,15 +121,11 @@ def _site_map_page(view: CalibrationReportProjection, snapshot: OwnedSnapshot):
             view.site_validity,
             view.calibration_identity,
         ),
-        coherence_identity=view.source_capture_identity,
-        run_id=f"calibration-report-{view.calibration_identity}",
-        provenance_epoch_id=snapshot.ref.stream_generation.value,
     )
     return plot_report_page(
         "overview",
         figure=figure,
         source=source,
-        provenance=_provenance(view, "overview", snapshot),
     )
 
 
@@ -173,10 +135,9 @@ def _histogram_page(
     snapshot: OwnedSnapshot,
 ):
     schema = snapshot.block.schema
-    if len(schema.point_table.columns) != 1 or len(schema.cell_schema.data_axes) != 1:
+    if len(schema.point_table.columns) != 1 or not schema.cell_schema.is_scalar:
         raise ValueError("calibration histogram Dataset has an invalid declared shape")
     site_column = schema.point_table.columns[0]
-    population_axis = schema.cell_schema.data_axes[0]
     spec = ViewSpec(
         schema.fingerprint,
         ViewIntent.HISTOGRAM,
@@ -190,14 +151,13 @@ def _histogram_page(
                 AxisViewRole.FACET,
             ),
             SourceViewBinding(
-                AxisSourceRef.tensor(population_axis.axis_id),
-                AxisViewRole.BATCH,
+                AxisSourceRef.tensor(SCALAR_AXIS.axis_id),
+                AxisViewRole.SELECTED,
+                selector=FixedIndex(0),
             ),
         ),
     )
-    base_display = HistogramDisplayState(
-        bin_count=max(5, int(np.asarray(model.bin_edges).size) - 1),
-    )
+    base_display = HistogramDisplayState()
     cell_thresholds = tuple(
         HistogramCellThresholds(
             (
@@ -207,7 +167,7 @@ def _histogram_page(
                 ),
             ),
             (
-                (0.0,)
+                (float(model.runtime_thresholds[site]),)
                 if math.isfinite(float(model.runtime_thresholds[site]))
                 else ()
             ),
@@ -228,64 +188,11 @@ def _histogram_page(
         figure=FigureIntent(
             PlotKind.GRID if faceted else PlotKind.HISTOGRAM,
             f"{model.label} | per-site readout distributions",
-            (
-                f"{view.frame_schema.value_unit} - runtime threshold"
-                if view.frame_schema.value_unit
-                else "Signal - runtime threshold"
-            ),
+            view.frame_schema.value_unit or "Signal",
             view=spec,
         ),
         source=FigureSource(snapshot),
         display=display,
-        provenance=_provenance(view, f"hist-{model.label}", snapshot),
-    )
-
-
-def _pooled_page(
-    view: CalibrationReportProjection,
-    model: CalibrationModelReportProjection,
-    snapshot: OwnedSnapshot,
-):
-    schema = snapshot.block.schema
-    if (
-        len(schema.point_table.columns) != 1
-        or len(schema.cell_schema.data_axes) != 1
-    ):
-        raise ValueError("calibration pooled Dataset has an invalid declared shape")
-    population_axis = schema.cell_schema.data_axes[0]
-    spec = ViewSpec(
-        schema.fingerprint,
-        ViewIntent.HISTOGRAM,
-        (
-            SourceViewBinding(
-                AxisSourceRef.tensor(schema.repeat_axis.axis_id),
-                AxisViewRole.SAMPLE,
-            ),
-            SourceViewBinding(
-                AxisSourceRef.point_rows(),
-                AxisViewRole.SAMPLE,
-            ),
-            SourceViewBinding(
-                AxisSourceRef.tensor(population_axis.axis_id),
-                AxisViewRole.BATCH,
-            ),
-        ),
-    )
-    return plot_report_page(
-        f"pooled-{model.label}",
-        figure=FigureIntent(
-            PlotKind.HISTOGRAM,
-            f"{model.label} | threshold-centred populations",
-            (
-                f"{view.frame_schema.value_unit} - runtime threshold"
-                if view.frame_schema.value_unit
-                else "Signal - runtime threshold"
-            ),
-            view=spec,
-        ),
-        source=FigureSource(snapshot),
-        display=HistogramDisplayState(bin_count=60, thresholds=(0.0,)),
-        provenance=_provenance(view, f"pooled-{model.label}", snapshot),
     )
 
 
@@ -327,7 +234,6 @@ def _fidelity_page(view: CalibrationReportProjection, snapshot: OwnedSnapshot):
             relim_mode=RelimMode.FIXED,
             fixed_y_limits=(0.45, 1.01),
         ),
-        provenance=_provenance(view, "fidelity", snapshot),
     )
 
 
@@ -374,7 +280,6 @@ def _psf_page(
             view=spec,
         ),
         source=FigureSource(snapshot),
-        provenance=_provenance(view, "psf-kernels", snapshot),
     )
 
 
@@ -392,7 +297,6 @@ def project_calibration_plot_report(
     ]
     for model in view.models:
         pages.append(_histogram_page(view, model, datasets[f"hist-{model.label}"]))
-        pages.append(_pooled_page(view, model, datasets[f"hist-{model.label}"]))
     psf = _psf_page(view, datasets.get("psf-kernels"))
     if psf is not None:
         pages.append(psf)

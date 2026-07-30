@@ -57,7 +57,7 @@ def _archive_path(path: Path) -> Path:
 def _load_archive(path: Path):
     """Decode and project one archive entirely on the shared worker lane."""
 
-    from zlc_workbench.data_figure.archive_repository import load_figure_archive
+    from zlc_workbench.data_figure.archive_io import load_figure_archive
 
     archive = load_figure_archive(path)
     return archive, project_figure_info(archive)
@@ -102,7 +102,6 @@ class FigureViewer(QtWidgets.QWidget):
         root.setSpacing(window_pad(0.5))
         self.info_pane = FigureInfoPane(
             label_names=(
-                "payload_digest",
                 "schema_fingerprint",
                 "coordinate_frame",
             ),
@@ -286,7 +285,7 @@ class FigureViewer(QtWidgets.QWidget):
             figure_intent,
             output_root=self._output_root,
             initial_fit_result_identity=(
-                value.payload_digest
+                f"figure-archive:{archive.path}"
                 if value.figure.has_fit_overlays
                 else None
             ),
@@ -379,7 +378,7 @@ class FigureViewer(QtWidgets.QWidget):
 
         if self._closing or self.figure_pane is not pane:
             return
-        from zlc_workbench.data_figure.archive_repository import LoadedFigureArchive
+        from zlc_workbench.data_figure.archive_io import LoadedFigureArchive
 
         if not isinstance(handle, LoadedFigureArchive):
             # FigureViewer only injects local archive persistence.  A durable

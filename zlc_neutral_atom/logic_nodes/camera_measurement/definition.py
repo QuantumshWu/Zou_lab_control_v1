@@ -34,14 +34,13 @@ from zlc_neutral_atom.dataset_output import (
     DatasetOutputDeclaration,
     FinalDatasetOutput,
     LiveDatasetOutput,
-    final_dataset_join_digest,
 )
 from zlc_neutral_atom.runtime.dataset import (
     MonitorCoverage,
     MonitorDatasetSnapshot,
 )
 from zlc_neutral_atom.runtime.streams import event_ref_to_tree
-from zlc_storage import canonical_digest, canonical_text, positive_integer
+from zlc_storage import canonical_text, positive_integer
 from zlc_storage import positive_real
 
 from zlc_neutral_atom.authoring import (
@@ -246,16 +245,8 @@ def _camera_frame_ref(
     event_index: int,
     output_schema: DatasetSchema,
 ) -> DatasetRevisionRef:
-    identity = canonical_digest(
-        {
-            "owner": "zlc_neutral_atom.camera-measurement.frame-output",
-            "source_block_id": source.ref.block_id.value,
-            "readout_event_axis_id": event_axis_id,
-            "readout_event_index": event_index,
-        }
-    )
     return DatasetRevisionRef(
-        BlockId(f"camera-frame-{identity[:32]}"),
+        BlockId(f"camera-frame/{event_axis_id}/{event_index}"),
         source.ref.stream_generation,
         output_schema.fingerprint,
         source.ref.revision,
@@ -394,12 +385,6 @@ def camera_measurement_final_outputs(
         declaration.name: FinalDatasetOutput(
             declaration,
             snapshot,
-            final_dataset_join_digest(
-                owner="camera-measurement",
-                declaration=declaration,
-                source_identity=source_identity,
-                snapshot=snapshot,
-            ),
         )
         for declaration, snapshot in zip(
             declarations,
@@ -489,22 +474,10 @@ def project_camera_monitor_outputs(
             missed_events=source.coverage.missed_events,
             current_gap=source.coverage.current_gap,
         )
-        join_digest = canonical_digest(
-            {
-                "owner": "zlc_neutral_atom.camera-monitor-output",
-                "source": dataset_revision_ref_to_tree(source.snapshot.ref),
-                "output_name": output_name,
-                "events": tuple(
-                    None if ref is None else event_ref_to_tree(ref)
-                    for ref in selected_refs
-                ),
-            }
-        )
         projected[output_name] = LiveDatasetOutput(
             declaration,
             snapshot,
             coverage,
-            join_digest,
         )
     return projected
 
@@ -560,21 +533,6 @@ class CameraMeasurementRequest:
         return camera_frame_output_declarations(self.frames_per_cycle)
 
 
-@dataclass(frozen=True)
-class CameraMeasurementDescriptor:
-    name: str
-    camera_role: str
-    output_schema: DatasetSchema
-    resource_claim: str
-
-    def __post_init__(self) -> None:
-        canonical_text(self.name, "camera measurement name")
-        canonical_text(self.camera_role, "camera role")
-        if not isinstance(self.output_schema, DatasetSchema):
-            raise TypeError("output_schema must be DatasetSchema")
-        canonical_text(self.resource_claim, "resource_claim")
-
-
 def _camera_request_outputs(
     request: object,
 ) -> tuple[OutputPresentation, ...]:
@@ -623,7 +581,6 @@ __all__ = [
     "CAMERA_MEASUREMENT_DEFINITION",
     "CAMERA_MEASUREMENT_KEY",
     "CAMERA_MEASUREMENT_LOGIC_NODE",
-    "CameraMeasurementDescriptor",
     "CameraMeasurementIntent",
     "CameraMeasurementRequest",
     "CAMERA_FRAME_OUTPUT_CONTRACT_ID",

@@ -16,7 +16,6 @@ from zlc_pulse import (
     compile_pulse_artifact,
     load_pulse_document,
     pulse_server_snapshot_from_tree,
-    pulse_server_snapshot_to_tree,
     pulse_target_manifest_from_lanes,
 )
 from zlc_pulse.server import (
@@ -25,6 +24,7 @@ from zlc_pulse.server import (
     encode_completion_message,
     encode_continuous_failure_message,
     encode_prepared_ref_message,
+    pulse_server_snapshot_to_tree,
 )
 from zlc_storage import encode
 

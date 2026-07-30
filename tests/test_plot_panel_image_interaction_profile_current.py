@@ -106,12 +106,8 @@ def _image_value(*, revision: int, side: int, dtype) -> object:
     )
     return SignalValue(
         name="image",
-        source_instance_id="profile-camera",
         snapshot=snapshot,
         coverage=None,
-        run_id=f"profile-run-{revision}",
-        epoch_id=f"profile-epoch-{revision}",
-        join_digest="0" * 64,
     )
 
 

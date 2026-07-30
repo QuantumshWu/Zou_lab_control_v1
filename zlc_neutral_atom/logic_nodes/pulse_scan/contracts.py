@@ -17,7 +17,7 @@ from zlc_data.transform_codec import (
     committed_transform_from_tree,
     committed_transform_to_tree,
 )
-from zlc_storage import canonical_digest, exact_mapping
+from zlc_storage import exact_mapping
 from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
 from zlc_neutral_atom.timing.pulse_parameter_scan import (
     PULSE_PARAMETER_SCAN_PROGRAM_SCHEMA,
@@ -57,15 +57,6 @@ class ScanOutputContract:
             != self.committed_transform.effective_output_schema
         ):
             raise ValueError("output schema differs from the committed transform")
-
-    @property
-    def output_schema_fingerprint(self) -> str:
-        return self.output_dataset_schema.fingerprint
-
-    @property
-    def fingerprint(self) -> str:
-        return canonical_digest(scan_output_contract_to_tree(self))
-
 
 def bind_scan_output_contract(
     input_schema: DatasetSchema,

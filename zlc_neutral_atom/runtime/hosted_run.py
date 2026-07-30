@@ -17,6 +17,7 @@ from __future__ import annotations
 import threading
 from typing import Callable
 
+from zlc_data import StreamGenerationId
 from zlc_neutral_atom.artifact_output import ArtifactOutputDeclaration
 from zlc_neutral_atom.catalog import DefinitionKey
 from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
@@ -36,13 +37,34 @@ class _StartSuppressed(Exception):
 class _HostedCommandContext:
     """Narrow sequential-child capability owned by one HostedRun generation."""
 
-    __slots__ = ("_owner",)
+    __slots__ = ("_owner", "_signal_generation_ref")
 
     def __init__(self, owner: "HostedRun") -> None:
         self._owner = owner
+        self._signal_generation_ref: tuple[str, StreamGenerationId] | None = None
+
+    @property
+    def signal_generation_ref(self) -> tuple[str, StreamGenerationId] | None:
+        """Exact signal generation hosted by this command, when it publishes data."""
+
+        return self._signal_generation_ref
+
+    def bind_signal_generation(self, generation: StreamGenerationId) -> None:
+        """Bind the generation minted by the application-owned SignalDataPlane."""
+
+        if not isinstance(generation, StreamGenerationId):
+            raise TypeError("hosted signal generation must be StreamGenerationId")
+        reference = (self._owner.instance_id, generation)
+        existing = self._signal_generation_ref
+        if existing is not None and existing != reference:
+            raise RuntimeError("HostedRun signal generation is already bound")
+        self._signal_generation_ref = reference
 
     def cancel_requested(self) -> bool:
         return self._owner.cancel_requested
+
+    def start_if_not_cancelled(self, starter: Callable[[], object]):
+        return self._owner.start_if_not_cancelled(starter)
 
     def start_and_wait(self, starter: Callable[[], RunHandle]):
         return self._owner._start_child_and_wait(starter)
@@ -332,6 +354,11 @@ class HostedRun:
 
         return self._command_context
 
+    def bind_signal_generation(self, generation: StreamGenerationId) -> None:
+        """Bind the SignalDataPlane reservation before submitting this node."""
+
+        self._command_context.bind_signal_generation(generation)
+
     # ------------------------------------------------------------ lifecycle
     def bind_starter(self, start: Callable[[object], object]) -> None:
         """Fix how THIS node starts, so a caller with no such knowledge can start it.
@@ -435,9 +462,9 @@ class HostedRun:
                 raise _StartSuppressed()
             self._handle = None
         # Do not hold the host gate across application admission.  The starter
-        # may retire a conflicting Run before the SignalPlane calls the same
-        # host's short start_if_not_cancelled gate.  Holding this lock here
-        # would both self-deadlock that final admission and prevent Stop from
+        # may first retire a conflicting Run before the Experiment calls this
+        # command context's short start_if_not_cancelled gate.  Holding the lock
+        # here would self-deadlock that final admission and prevent Stop from
         # setting the cancellation token during retirement.
         handle = starter()
         if not isinstance(handle, RunHandle):

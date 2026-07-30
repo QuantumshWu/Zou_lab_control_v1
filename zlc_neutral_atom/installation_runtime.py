@@ -21,7 +21,6 @@ from zlc_neutral_atom.runtime.ports import DeviceBroker
 from zlc_neutral_atom.runtime.resources import DeviceIdentityEvidenceKind, PhysicalDeviceIdentity, ResourceArbiter
 from zlc_neutral_atom.runtime.run import RunController, RunHandle, RunPlan
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
-from zlc_storage import canonical_digest
 
 from .installation_assets import InstallationAsset, InstallationAssetMap
 
@@ -37,14 +36,6 @@ def _identity_for(
     return PhysicalDeviceIdentity(
         stable_device_identity=asset.expected_identity,
         evidence_kind=asset.evidence_kind,
-        evidence_digest=canonical_digest(
-            {
-                "asset_id": asset.asset_id,
-                "role": asset.role,
-                "adapter_kind": asset.adapter_kind,
-                "expected_identity": asset.expected_identity,
-            }
-        ),
         asset_map_revision=asset_map_revision,
     )
 

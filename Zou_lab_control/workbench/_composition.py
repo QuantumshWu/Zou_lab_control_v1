@@ -166,8 +166,8 @@ def open_fit_capable_figure_gui(
     )
     from Zou_lab_control.api._dataset_sources import project_final_dataset_source
     from Zou_lab_control.api._figure_projection import data_figure_for_services
-    from zlc_data import FitSpec
-    from zlc_neutral_atom.artifacts import FitExecution
+    from zlc_data import FitResultBatch, FitSpec
+    from zlc_neutral_atom.artifacts import execute_fit
 
     def source_schema():
         with service_guard(services_owner):
@@ -226,7 +226,7 @@ def open_fit_capable_figure_gui(
                     closing = services.state != "OPEN"
                 return closing or bool(cancel_check())
 
-            return services.fit_repository.execute(
+            return execute_fit(
                 artifact_operations,
                 fit_source,
                 spec,
@@ -234,13 +234,10 @@ def open_fit_capable_figure_gui(
                 deadline_monotonic=deadline_monotonic,
             )
 
-    def save_fit_execution(execution):
-        if not isinstance(execution, FitExecution):
-            raise TypeError("Fit save requires FitExecution")
-        if execution.source_artifact_ref != fit_source:
-            raise ValueError("Fit execution belongs to another source artifact")
-        with service_guard(services_owner):
-            return execution.save()
+    def save_fit_result(result):
+        if not isinstance(result, FitResultBatch):
+            raise TypeError("Fit save requires FitResultBatch")
+        return experiment.save_fit(fit_source, result)
 
     def reload_fit_result(reference):
         admitted = experiment.load_fit(reference)
@@ -304,7 +301,7 @@ def open_fit_capable_figure_gui(
             preferences=preferences,
             fit_preparer=prepare_fit,
             fit_executor=execute_fit,
-            fit_saver=save_fit_execution,
+            fit_saver=save_fit_result,
             fit_reloader=reload_fit_result,
             fit_selected_model=selected_model,
             fit_initial_selection=initial_selection,

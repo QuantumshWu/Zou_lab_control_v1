@@ -175,10 +175,9 @@ class _RuntimeFixture:
             ),
         )
         identity = PhysicalDeviceIdentity(
-            "fixture-camera",
-            DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-            "fixture-camera-evidence",
-            "fixture-assets-v1",
+            stable_device_identity="fixture-camera",
+            evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+            asset_map_revision="fixture-assets-v1",
         )
         proof = self.broker.verify_identity(lambda: identity)
         binding = None
@@ -217,10 +216,9 @@ class _RuntimeFixture:
             geometry_fingerprint=geometry.geometry_fingerprint,
         )
         pulse_identity = PhysicalDeviceIdentity(
-            "fixture-sequencer",
-            DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-            "fixture-sequencer-evidence",
-            "fixture-assets-v1",
+            stable_device_identity="fixture-sequencer",
+            evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+            asset_map_revision="fixture-assets-v1",
         )
         pulse_proof = self.broker.verify_identity(lambda: pulse_identity)
         pulse_binding = None
@@ -344,7 +342,7 @@ def test_terminal_count_mismatch_fails_the_run_without_a_dataset(tmp_path) -> No
         )
         with pytest.raises(RunFailed, match="terminal"):
             handle.result(3.0)
-        assert not handle.snapshot().final_committed
+        assert handle.snapshot().state.value == "FAILED"
         assert fixture.camera.capture_state() == (False, 0)
     finally:
         fixture.close()
@@ -376,8 +374,6 @@ def test_compiled_plan_is_reusable_only_with_fresh_runtime_authority(tmp_path) -
             first.capture.dataset.block.values,
             second.capture.dataset.block.values,
         )
-        assert first.capture.dataset.provenance.trace_binding.run_id != (
-            second.capture.dataset.provenance.trace_binding.run_id
-        )
+        assert first.capture.run_id != second.capture.run_id
     finally:
         fixture.close()

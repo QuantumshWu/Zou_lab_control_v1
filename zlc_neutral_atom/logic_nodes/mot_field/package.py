@@ -23,8 +23,7 @@ def _bind_api(
 ) -> MotFieldApi:
     (
         pulses_root,
-        output_root,
-        capture_repository,
+        captures_root,
         installed_camera_ref,
         resolve_sequencer_ref,
         camera_port,
@@ -51,16 +50,12 @@ def _bind_api(
             request,
             pulse_port=pulse_port(request.sequencer_ref),
             camera_port=camera_port(request.camera_ref),
+            captures_root=captures_root,
+            start_run=start_run,
         )
 
     def bind_task(intent, api):
-        return prepare_mot_field_task(
-            intent,
-            api,
-            capture_repository=capture_repository,
-            output_root=output_root,
-            start_run=start_run,
-        )
+        return prepare_mot_field_task(intent, api)
 
     return MotFieldApi(
         load_pulse=load_pulse,
@@ -77,9 +72,6 @@ def _prepare_hosted(api, request, event_source):
     command = api.prepare_mot_field_task(request)
     if not isinstance(command, PreparedMotFieldTask):
         raise TypeError("MOT-field preparer returned another command type")
-    from .ui.view_projection import mot_field_figure_intent
-
-    command._bind_figure_intent(mot_field_figure_intent(command.output_schema))
     return command
 
 
@@ -93,23 +85,12 @@ def _availability(catalog, _apparatus):
     return None
 
 
-def _project_signal_presentation(node, output_name, publication):
-    from .ui.view_projection import project_mot_field_signal_presentation
-
-    return project_mot_field_signal_presentation(
-        node,
-        output_name,
-        publication,
-    )
-
-
 LOGIC_NODE_PACKAGE = LogicNodePackage(
     api_name="mot_field",
     declaration=MOT_FIELD_LOGIC_NODE,
     api_requirements=(
         "pulses_root",
-        "output_root",
-        "capture_repository",
+        "captures_root",
         "resolve_camera_ref",
         "resolve_sequencer_ref",
         "camera_port",
@@ -121,7 +102,6 @@ LOGIC_NODE_PACKAGE = LogicNodePackage(
     availability=_availability,
     dynamic_choice_fact="camera_roles",
     start_prepared=start_mot_field_task_command,
-    project_signal_presentation=_project_signal_presentation,
 )
 
 __all__ = ["LOGIC_NODE_PACKAGE"]

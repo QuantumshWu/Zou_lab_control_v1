@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import threading
 import time
 import uuid
@@ -14,16 +13,11 @@ from typing import Callable, Generic, Protocol, TypeVar
 
 from zlc_data import DataBlock, StreamGenerationId, Value
 from zlc_storage import (
-    canonical_digest,
     canonical_text as _canonical_text,
-    decode,
-    encode,
     exact_mapping as _exact_mapping,
     finite_real,
     nonnegative_integer as _nonnegative_int,
     positive_integer as _positive_int,
-    sha256_digest,
-    sha256_text as _digest,
 )
 
 
@@ -38,24 +32,16 @@ _STREAM_TOKEN = object()
 _PRODUCER_TOKEN = object()
 _READINESS_TOKEN = object()
 _EVENT_SPAN_REF_SCHEMA = "zlc_neutral_atom.EventSpanRef"
-_ARTIFACT_INPUT_REF_SCHEMA = "zlc_neutral_atom.ArtifactInputRef"
-_PROCESSOR_STAGE_PROVENANCE_SCHEMA = (
-    "zlc_neutral_atom.ProcessorStageProvenance"
-)
 
 
 class PayloadContract(Protocol[PayloadT]):
-    fingerprint: str
-
     def snapshot(self, payload: PayloadT) -> PayloadT: ...
 
-    def digest(self, payload: PayloadT) -> str: ...
+    def validate(self, payload: PayloadT) -> None: ...
 
 
 class JoinKeyContract(Protocol):
     """Generation owner whose snapshot validates and freezes one join key."""
-
-    fingerprint: str
 
     def snapshot(self, key: object) -> object: ...
 
@@ -99,24 +85,11 @@ class StreamId:
         return self.value
 
 
-@dataclass(frozen=True, order=True)
-class EventId:
-    value: str
-
-    def __post_init__(self) -> None:
-        _canonical_text(self.value, "EventId")
-
-    def __str__(self) -> str:
-        return self.value
-
-
 @dataclass(frozen=True)
 class EventRef:
     stream_id: StreamId
     generation: StreamGenerationId
     sequence: int
-    event_id: EventId
-    payload_digest: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.stream_id, StreamId):
@@ -124,24 +97,6 @@ class EventRef:
         if not isinstance(self.generation, StreamGenerationId):
             raise TypeError("generation must be StreamGenerationId")
         object.__setattr__(self, "sequence", _nonnegative_int(self.sequence, "sequence"))
-        if not isinstance(self.event_id, EventId):
-            raise TypeError("event_id must be EventId")
-        _digest(self.payload_digest, "payload_digest")
-
-
-def event_id_for_sequence(
-    stream_id: StreamId,
-    generation: StreamGenerationId,
-    sequence: int,
-) -> EventId:
-    """Return the one owner-defined identity for a generated stream event."""
-
-    if not isinstance(stream_id, StreamId):
-        raise TypeError("stream_id must be StreamId")
-    if not isinstance(generation, StreamGenerationId):
-        raise TypeError("generation must be StreamGenerationId")
-    sequence = _nonnegative_int(sequence, "sequence")
-    return EventId(f"{stream_id.value}:{generation.value}:{sequence}")
 
 
 def event_ref_to_tree(reference: EventRef) -> dict[str, object]:
@@ -153,9 +108,26 @@ def event_ref_to_tree(reference: EventRef) -> dict[str, object]:
         "stream_id": reference.stream_id.value,
         "generation": reference.generation.value,
         "sequence": reference.sequence,
-        "event_id": reference.event_id.value,
-        "payload_digest": reference.payload_digest,
     }
+
+
+def event_ref_from_tree(tree: object) -> EventRef:
+    """Decode the canonical field projection owned beside ``EventRef``."""
+
+    data = _exact_mapping(
+        tree,
+        {"stream_id", "generation", "sequence"},
+        "EventRef",
+        discriminator=None,
+    )
+    value = EventRef(
+        StreamId(data["stream_id"]),
+        StreamGenerationId(data["generation"]),
+        data["sequence"],
+    )
+    if event_ref_to_tree(value) != tree:
+        raise ValueError("EventRef tree is non-canonical")
+    return value
 
 
 @dataclass(frozen=True)
@@ -164,8 +136,6 @@ class EventSpanRef:
     generation: StreamGenerationId
     start_sequence: int
     end_sequence: int
-    count: int
-    ordered_digest: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.stream_id, StreamId):
@@ -174,180 +144,14 @@ class EventSpanRef:
             raise TypeError("generation must be StreamGenerationId")
         start = _nonnegative_int(self.start_sequence, "start_sequence")
         end = _nonnegative_int(self.end_sequence, "end_sequence")
-        count = _nonnegative_int(self.count, "count")
-        if end < start or count != end - start:
-            raise ValueError("EventSpanRef count must equal end_sequence - start_sequence")
-        _digest(self.ordered_digest, "ordered_digest")
+        if end < start:
+            raise ValueError("EventSpanRef end_sequence precedes start_sequence")
         object.__setattr__(self, "start_sequence", start)
         object.__setattr__(self, "end_sequence", end)
-        object.__setattr__(self, "count", count)
-
-
-class OrderedEventSpanHasher:
-    """Shared O(1)-memory owner for one contiguous ordered EventRef span."""
-
-    __slots__ = (
-        "_stream_id",
-        "_generation",
-        "_start_sequence",
-        "_next_sequence",
-        "_hasher",
-        "_sealed",
-    )
-
-    def __init__(
-        self,
-        stream_id: StreamId,
-        generation: StreamGenerationId,
-        start_sequence: int,
-    ) -> None:
-        if not isinstance(stream_id, StreamId):
-            raise TypeError("stream_id must be StreamId")
-        if not isinstance(generation, StreamGenerationId):
-            raise TypeError("generation must be StreamGenerationId")
-        start = _nonnegative_int(start_sequence, "start_sequence")
-        self._stream_id = stream_id
-        self._generation = generation
-        self._start_sequence = start
-        self._next_sequence = start
-        self._hasher = hashlib.sha256()
-        self._hasher.update(b"zlc_neutral_atom.OrderedEventRefs\x00")
-        self._sealed = False
-
-    def update(self, reference: EventRef) -> None:
-        if self._sealed:
-            raise RuntimeError("ordered event span is already sealed")
-        if not isinstance(reference, EventRef):
-            raise TypeError("reference must be EventRef")
-        if (
-            reference.stream_id != self._stream_id
-            or reference.generation != self._generation
-            or reference.sequence != self._next_sequence
-        ):
-            raise ValueError(
-                "EventRef differs from the ordered span stream/generation/sequence"
-            )
-        encoded = encode(event_ref_to_tree(reference))
-        self._hasher.update(len(encoded).to_bytes(8, "big"))
-        self._hasher.update(encoded)
-        self._next_sequence += 1
-
-    def seal(self, end_sequence: int) -> EventSpanRef:
-        if self._sealed:
-            raise RuntimeError("ordered event span is already sealed")
-        end = _nonnegative_int(end_sequence, "end_sequence")
-        if end != self._next_sequence:
-            raise ValueError("ordered event span does not cover the requested interval")
-        self._sealed = True
-        return EventSpanRef(
-            self._stream_id,
-            self._generation,
-            self._start_sequence,
-            end,
-            end - self._start_sequence,
-            self._hasher.hexdigest(),
-        )
-
-
-@dataclass(frozen=True)
-class ArtifactInputRef:
-    """Immutable, owner-encoded identity of one direct artifact dependency.
-
-    Runtime deliberately does not interpret foreign artifact reference types.
-    The owning domain serializes its typed reference with its canonical codec;
-    this value snapshots those bytes and binds both their schema and content.
-    """
-
-    reference_schema_id: str
-    canonical_reference: bytes
-    content_digest: str
-
-    def __post_init__(self) -> None:
-        schema_id = _canonical_text(self.reference_schema_id, "reference_schema_id")
-        if not isinstance(self.canonical_reference, bytes):
-            raise TypeError("canonical_reference must be immutable bytes")
-        raw = self.canonical_reference
-        if not raw:
-            raise ValueError("canonical_reference must not be empty")
-        try:
-            tree = decode(raw)
-        except Exception as error:
-            raise ValueError("canonical_reference is not canonical owner data") from error
-        if not isinstance(tree, dict) or tree.get("schema") != schema_id:
-            raise ValueError(
-                "canonical_reference schema does not match reference_schema_id"
-            )
-        if encode(tree) != raw:
-            raise ValueError("canonical_reference is not byte-canonical")
-        object.__setattr__(self, "reference_schema_id", schema_id)
-        _digest(self.content_digest, "content_digest")
 
     @property
-    def reference_digest(self) -> str:
-        return sha256_digest(self.canonical_reference)
-
-    @property
-    def fingerprint(self) -> str:
-        return canonical_digest(
-            {
-                "contract": "zlc_neutral_atom.ArtifactInputRef",
-                "reference_schema_id": self.reference_schema_id,
-                "reference_digest": self.reference_digest,
-                "content_digest": self.content_digest,
-            }
-        )
-
-
-def _owned_artifact_input_ref(reference: ArtifactInputRef) -> ArtifactInputRef:
-    """Reconstruct a direct dependency so caller reflection cannot rewrite history."""
-
-    if not isinstance(reference, ArtifactInputRef):
-        raise TypeError("artifact input must be ArtifactInputRef")
-    return ArtifactInputRef(
-        reference.reference_schema_id,
-        reference.canonical_reference,
-        reference.content_digest,
-    )
-
-
-@dataclass(frozen=True)
-class ProcessorStageProvenance:
-    """Inspectable identity of one direct processor dependency set."""
-
-    processor_binding_digest: str
-    direct_artifact_inputs: tuple[ArtifactInputRef, ...] = ()
-
-    def __post_init__(self) -> None:
-        _digest(self.processor_binding_digest, "processor_binding_digest")
-        if not isinstance(self.direct_artifact_inputs, tuple):
-            raise TypeError("direct_artifact_inputs must be an immutable tuple")
-        inputs = tuple(item for item in self.direct_artifact_inputs)
-        if any(not isinstance(item, ArtifactInputRef) for item in inputs):
-            raise TypeError(
-                "direct_artifact_inputs must contain ArtifactInputRef values"
-            )
-        identities = tuple(item.fingerprint for item in inputs)
-        if len(set(identities)) != len(identities):
-            raise ValueError("processor stage repeats an artifact input")
-        # Frozen dataclasses are an API contract, not a security boundary:
-        # ``object.__setattr__`` can still rewrite a caller-owned instance.  The
-        # provenance owner therefore retains reconstructed references only.
-        object.__setattr__(
-            self,
-            "direct_artifact_inputs",
-            tuple(_owned_artifact_input_ref(item) for item in inputs),
-        )
-
-
-def _validated_processor_stage_chain(
-    processor_stages: tuple[ProcessorStageProvenance, ...],
-) -> tuple[ProcessorStageProvenance, ...]:
-    """Validate the processor chain shared by live and durable lineage."""
-
-    stages = tuple(processor_stages)
-    if any(not isinstance(stage, ProcessorStageProvenance) for stage in stages):
-        raise TypeError("processor_stages contains an unsupported value")
-    return stages
+    def count(self) -> int:
+        return self.end_sequence - self.start_sequence
 
 
 def event_span_ref_to_tree(value: EventSpanRef) -> dict[str, object]:
@@ -361,8 +165,6 @@ def event_span_ref_to_tree(value: EventSpanRef) -> dict[str, object]:
         "generation": value.generation.value,
         "start_sequence": value.start_sequence,
         "end_sequence": value.end_sequence,
-        "count": value.count,
-        "ordered_digest": value.ordered_digest,
     }
 
 
@@ -377,8 +179,6 @@ def event_span_ref_from_tree(tree: object) -> EventSpanRef:
             "generation",
             "start_sequence",
             "end_sequence",
-            "count",
-            "ordered_digest",
         },
         _EVENT_SPAN_REF_SCHEMA,
     )
@@ -387,156 +187,9 @@ def event_span_ref_from_tree(tree: object) -> EventSpanRef:
         generation=StreamGenerationId(data["generation"]),
         start_sequence=data["start_sequence"],
         end_sequence=data["end_sequence"],
-        count=data["count"],
-        ordered_digest=data["ordered_digest"],
     )
     if event_span_ref_to_tree(value) != tree:
         raise ValueError("EventSpanRef tree is typed but non-canonical")
-    return value
-
-
-def artifact_input_ref_to_tree(value: ArtifactInputRef) -> dict[str, object]:
-    """Project one opaque direct artifact dependency without interpreting it."""
-
-    if not isinstance(value, ArtifactInputRef):
-        raise TypeError("value must be ArtifactInputRef")
-    return {
-        "schema": _ARTIFACT_INPUT_REF_SCHEMA,
-        "reference_schema_id": value.reference_schema_id,
-        "canonical_reference": value.canonical_reference,
-        "content_digest": value.content_digest,
-    }
-
-
-def artifact_input_ref_from_tree(tree: object) -> ArtifactInputRef:
-    """Decode only the current exact ArtifactInputRef representation."""
-
-    data = _exact_mapping(
-        tree,
-        {
-            "schema",
-            "reference_schema_id",
-            "canonical_reference",
-            "content_digest",
-        },
-        _ARTIFACT_INPUT_REF_SCHEMA,
-    )
-    value = ArtifactInputRef(
-        reference_schema_id=data["reference_schema_id"],
-        canonical_reference=data["canonical_reference"],
-        content_digest=data["content_digest"],
-    )
-    if artifact_input_ref_to_tree(value) != tree:
-        raise ValueError("ArtifactInputRef tree is typed but non-canonical")
-    return value
-
-
-def processor_stage_provenance_to_tree(
-    value: ProcessorStageProvenance,
-) -> dict[str, object]:
-    """Project one processor stage and its direct artifact dependencies."""
-
-    if not isinstance(value, ProcessorStageProvenance):
-        raise TypeError("value must be ProcessorStageProvenance")
-    return {
-        "schema": _PROCESSOR_STAGE_PROVENANCE_SCHEMA,
-        "processor_binding_digest": value.processor_binding_digest,
-        "direct_artifact_inputs": [
-            artifact_input_ref_to_tree(reference)
-            for reference in value.direct_artifact_inputs
-        ],
-    }
-
-
-def processor_stage_provenance_from_tree(
-    tree: object,
-) -> ProcessorStageProvenance:
-    """Decode only the current exact ProcessorStageProvenance representation."""
-
-    data = _exact_mapping(
-        tree,
-        {"schema", "processor_binding_digest", "direct_artifact_inputs"},
-        _PROCESSOR_STAGE_PROVENANCE_SCHEMA,
-    )
-    inputs = data["direct_artifact_inputs"]
-    if not isinstance(inputs, list):
-        raise ValueError("direct_artifact_inputs must be a list")
-    value = ProcessorStageProvenance(
-        processor_binding_digest=data["processor_binding_digest"],
-        direct_artifact_inputs=tuple(
-            artifact_input_ref_from_tree(reference) for reference in inputs
-        ),
-    )
-    if processor_stage_provenance_to_tree(value) != tree:
-        raise ValueError(
-            "ProcessorStageProvenance tree is typed but non-canonical"
-        )
-    return value
-
-
-CausationRef = EventRef | EventSpanRef | ArtifactInputRef
-
-
-@dataclass(frozen=True)
-class TraceContext:
-    run_id: str | None
-    source_id: str
-    correlation_id: str
-    causation_refs: tuple[CausationRef, ...] = ()
-    config_revision: int | None = None
-    control_revision: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.run_id is not None:
-            _canonical_text(self.run_id, "run_id")
-        _canonical_text(self.source_id, "source_id")
-        _canonical_text(self.correlation_id, "correlation_id")
-        refs = tuple(self.causation_refs)
-        if any(not isinstance(ref, (EventRef, EventSpanRef, ArtifactInputRef)) for ref in refs):
-            raise TypeError("causation_refs contains an unsupported reference")
-        object.__setattr__(self, "causation_refs", refs)
-        for field in ("config_revision", "control_revision"):
-            value = getattr(self, field)
-            if value is not None:
-                object.__setattr__(self, field, _nonnegative_int(value, field))
-
-
-@dataclass(frozen=True)
-class TraceBinding:
-    """Stable formal-run identity shared by every event in one reservation."""
-
-    run_id: str
-    source_id: str
-
-    def __post_init__(self) -> None:
-        _canonical_text(self.run_id, "run_id")
-        _canonical_text(self.source_id, "source_id")
-
-    def validate(self, trace: TraceContext) -> None:
-        if not isinstance(trace, TraceContext):
-            raise TypeError("trace must be TraceContext")
-        if trace.run_id != self.run_id or trace.source_id != self.source_id:
-            raise StreamError("event trace differs from the reserved formal run/source")
-
-
-def trace_binding_to_tree(value: TraceBinding) -> dict[str, object]:
-    """Project the embedded run/source identity through its stream owner."""
-
-    if not isinstance(value, TraceBinding):
-        raise TypeError("value must be TraceBinding")
-    return {"run_id": value.run_id, "source_id": value.source_id}
-
-
-def trace_binding_from_tree(tree: object) -> TraceBinding:
-    data = _exact_mapping(
-        tree,
-        {"run_id", "source_id"},
-        "trace binding",
-        discriminator=None,
-    )
-    value = TraceBinding(data["run_id"], data["source_id"])
-    if trace_binding_to_tree(value) != tree:
-        raise ValueError("TraceBinding tree is typed but non-canonical")
     return value
 
 
@@ -545,11 +198,9 @@ class Envelope(Generic[PayloadT]):
     event_ref: EventRef
     emitted_at: float
     captured_at: float
-    payload_contract_fingerprint: str
-    trace: TraceContext
+    direct_parent_refs: tuple[EventRef, ...]
     payload: PayloadT
     join_key: object | None = None
-    join_key_schema_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         if _contains_materialization(self.payload):
@@ -558,25 +209,21 @@ class Envelope(Generic[PayloadT]):
             raise TypeError("event_ref must be EventRef")
         object.__setattr__(self, "emitted_at", finite_real(self.emitted_at, "emitted_at"))
         object.__setattr__(self, "captured_at", finite_real(self.captured_at, "captured_at"))
-        _digest(self.payload_contract_fingerprint, "payload_contract_fingerprint")
-        if not isinstance(self.trace, TraceContext):
-            raise TypeError("trace must be TraceContext")
-        if (self.join_key is None) != (self.join_key_schema_fingerprint is None):
-            raise ValueError("join_key and join_key_schema_fingerprint must be supplied together")
+        parents = tuple(self.direct_parent_refs)
+        if any(not isinstance(parent, EventRef) for parent in parents):
+            raise TypeError("direct_parent_refs must contain EventRef values")
+        if len(set(parents)) != len(parents):
+            raise ValueError("direct_parent_refs cannot contain duplicates")
+        object.__setattr__(self, "direct_parent_refs", parents)
         if self.join_key is not None:
             try:
                 hash(self.join_key)
             except TypeError as exc:
                 raise TypeError("join_key must be frozen and hashable") from exc
-            _digest(self.join_key_schema_fingerprint, "join_key_schema_fingerprint")
 
     @property
     def ref(self) -> EventRef:
         return self.event_ref
-
-    @property
-    def event_id(self) -> EventId:
-        return self.event_ref.event_id
 
     @property
     def stream_id(self) -> StreamId:
@@ -589,10 +236,6 @@ class Envelope(Generic[PayloadT]):
     @property
     def sequence(self) -> int:
         return self.event_ref.sequence
-
-    @property
-    def payload_digest(self) -> str:
-        return self.event_ref.payload_digest
 
 
 class EndOfStream:
@@ -759,7 +402,6 @@ class ExactReservation(Generic[PayloadT]):
         token: object,
         start_sequence: int,
         end_sequence: int,
-        trace_binding: TraceBinding,
     ) -> None:
         if authority is not _RESERVATION_TOKEN:
             raise PermissionError("ExactReservation can only be minted by AcquisitionStream")
@@ -767,7 +409,6 @@ class ExactReservation(Generic[PayloadT]):
         self._token = token
         self.start_sequence = start_sequence
         self.end_sequence = end_sequence
-        self.trace_binding = trace_binding
         self._ack_sequence = start_sequence
         self._state = ReservationState.RESERVED
         self._cursor: AcquisitionCursor[PayloadT] | None = None
@@ -820,16 +461,11 @@ class ExactReservation(Generic[PayloadT]):
         self,
         consumer: object,
         *,
-        source_contract_digest: str,
-        source_schedule_digest: str,
-        source_key_sequence_digest: str,
-        chain_contract_digest: str,
         terminal: bool = False,
         downstream: "ExactConsumerReadiness | None" = None,
         owner_liveness: Callable[[], None] | None = None,
         owner_completion: Callable[[float], object] | None = None,
         owner_cancel: Callable[[str | None], bool] | None = None,
-        processor_stage: ProcessorStageProvenance | None = None,
     ) -> "ExactConsumerReadiness":
         """Bind this authority to its sole formal consumer.
 
@@ -841,16 +477,11 @@ class ExactReservation(Generic[PayloadT]):
         return self._stream._claim_consumer(
             self,
             consumer,
-            source_contract_digest=source_contract_digest,
-            source_schedule_digest=source_schedule_digest,
-            source_key_sequence_digest=source_key_sequence_digest,
-            chain_contract_digest=chain_contract_digest,
             terminal=terminal,
             downstream=downstream,
             owner_liveness=owner_liveness,
             owner_completion=owner_completion,
             owner_cancel=owner_cancel,
-            processor_stage=processor_stage,
         )
 
     def validate_delivery(
@@ -1009,17 +640,12 @@ class ExactConsumerReadiness:
     __slots__ = (
         "_source_reservation",
         "_source_consumer",
-        "_source_contract_digest",
-        "_source_schedule_digest",
-        "_source_key_sequence_digest",
-        "_chain_contract_digest",
         "_terminal_reservation",
         "_terminal_consumer",
         "_binding_owner",
         "_owner_liveness",
         "_owner_completion",
         "_owner_cancel",
-        "_processor_stages",
     )
 
     def __init__(
@@ -1028,39 +654,22 @@ class ExactConsumerReadiness:
         *,
         source_reservation: ExactReservation,
         source_consumer: object,
-        source_contract_digest: str,
-        source_schedule_digest: str,
-        source_key_sequence_digest: str,
-        chain_contract_digest: str,
         terminal_reservation: ExactReservation,
         terminal_consumer: object,
         owner_liveness: tuple[Callable[[], None], ...],
         owner_completion: Callable[[float], object] | None,
         owner_cancel: Callable[[str | None], bool] | None,
-        processor_stages: tuple[ProcessorStageProvenance, ...],
     ) -> None:
         if authority is not _READINESS_TOKEN:
             raise PermissionError(
                 "ExactConsumerReadiness is minted by an exact stream authority"
             )
-        _digest(source_contract_digest, "source contract digest")
-        _digest(source_schedule_digest, "source schedule digest")
-        _digest(source_key_sequence_digest, "source key-sequence digest")
-        _digest(chain_contract_digest, "chain contract digest")
         object.__setattr__(self, "_source_reservation", source_reservation)
         object.__setattr__(
             self,
             "_source_consumer",
             _ObjectReference(source_consumer),
         )
-        object.__setattr__(self, "_source_contract_digest", source_contract_digest)
-        object.__setattr__(self, "_source_schedule_digest", source_schedule_digest)
-        object.__setattr__(
-            self,
-            "_source_key_sequence_digest",
-            source_key_sequence_digest,
-        )
-        object.__setattr__(self, "_chain_contract_digest", chain_contract_digest)
         object.__setattr__(self, "_terminal_reservation", terminal_reservation)
         object.__setattr__(
             self,
@@ -1083,22 +692,8 @@ class ExactConsumerReadiness:
             "_owner_cancel",
             None if owner_cancel is None else _CallbackReference(owner_cancel),
         )
-        object.__setattr__(
-            self,
-            "_processor_stages",
-            _validated_processor_stage_chain(processor_stages),
-        )
-
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("ExactConsumerReadiness is immutable")
-
-    @property
-    def chain_contract_digest(self) -> str:
-        return self._chain_contract_digest
-
-    @property
-    def processor_stages(self) -> tuple[ProcessorStageProvenance, ...]:
-        return self._processor_stages
 
     def _resolved_owner_liveness(self) -> tuple[Callable[[], None], ...]:
         return tuple(reference.resolve() for reference in self._owner_liveness)
@@ -1136,42 +731,18 @@ class ExactConsumerReadiness:
         self,
         *,
         reservation: ExactReservation,
-        trace_binding: TraceBinding,
-        payload_contract_fingerprint: str,
-        join_key_contract_fingerprint: str,
-        source_contract_digest: str,
-        source_schedule_digest: str,
-        source_key_sequence_digest: str,
         total_events: int,
     ) -> None:
-        """Revalidate every source identity plus the live terminal sink."""
+        """Revalidate the exact source interval plus the live terminal sink."""
 
         if reservation is not self._source_reservation:
             raise ReservationStateError("exact readiness belongs to another reservation")
-        _digest(payload_contract_fingerprint, "payload contract fingerprint")
-        _digest(join_key_contract_fingerprint, "join key contract fingerprint")
-        _digest(source_contract_digest, "source contract digest")
-        _digest(source_schedule_digest, "source schedule digest")
-        _digest(source_key_sequence_digest, "source key-sequence digest")
         expected_total = _positive_int(total_events, "total_events")
         stream = reservation._stream
         with stream._condition:
             self._require_live_source_locked(reservation, "exact readiness")
-            if reservation.trace_binding != trace_binding:
-                raise ReservationStateError("exact readiness trace binding differs")
             if reservation.end_sequence - reservation.start_sequence != expected_total:
                 raise ReservationStateError("exact readiness event interval differs")
-            if stream.payload_contract_fingerprint != payload_contract_fingerprint:
-                raise ReservationStateError("exact readiness payload contract differs")
-            key_contract = stream._join_key_contract
-            if key_contract is None or key_contract.fingerprint != join_key_contract_fingerprint:
-                raise ReservationStateError("exact readiness join-key contract differs")
-            if self._source_contract_digest != source_contract_digest:
-                raise ReservationStateError("exact readiness source contract differs")
-            if self._source_schedule_digest != source_schedule_digest:
-                raise ReservationStateError("exact readiness source schedule differs")
-            if self._source_key_sequence_digest != source_key_sequence_digest:
-                raise ReservationStateError("exact readiness source key sequence differs")
         self._validate_terminal_sink()
 
     def _validate_terminal_sink(self) -> None:
@@ -1196,17 +767,10 @@ class ExactConsumerReadiness:
         self,
         *,
         stream: "AcquisitionStream",
-        trace_binding: TraceBinding,
-        payload_contract_fingerprint: str,
-        join_key_contract_fingerprint: str,
-        source_key_sequence_digest: str,
         total_events: int,
     ) -> None:
         """Cross-bind one producer to this proof's immediate source interval."""
 
-        _digest(payload_contract_fingerprint, "payload contract fingerprint")
-        _digest(join_key_contract_fingerprint, "join key contract fingerprint")
-        _digest(source_key_sequence_digest, "source key-sequence digest")
         expected_total = _positive_int(total_events, "total_events")
         reservation = self._source_reservation
         if reservation._stream is not stream:
@@ -1215,29 +779,9 @@ class ExactConsumerReadiness:
             )
         with stream._condition:
             self._require_live_source_locked(reservation, "downstream readiness")
-            if reservation.trace_binding != trace_binding:
-                raise ReservationStateError(
-                    "downstream readiness trace binding differs from output producer"
-                )
             if reservation.end_sequence - reservation.start_sequence != expected_total:
                 raise ReservationStateError(
                     "downstream readiness event interval differs"
-                )
-            if stream.payload_contract_fingerprint != payload_contract_fingerprint:
-                raise ReservationStateError(
-                    "downstream readiness payload contract differs"
-                )
-            key_contract = stream._join_key_contract
-            if (
-                key_contract is None
-                or key_contract.fingerprint != join_key_contract_fingerprint
-            ):
-                raise ReservationStateError(
-                    "downstream readiness join-key contract differs"
-                )
-            if self._source_key_sequence_digest != source_key_sequence_digest:
-                raise ReservationStateError(
-                    "downstream readiness source key sequence differs"
                 )
         self._validate_terminal_sink()
 
@@ -1692,13 +1236,13 @@ class AcquisitionProducer(Generic[PayloadT]):
         payload: PayloadT,
         *,
         captured_at: float,
-        trace: TraceContext,
+        direct_parent_refs: tuple[EventRef, ...] = (),
         join_key: object | None = None,
     ) -> Envelope[PayloadT]:
         return self._stream._emit(
             payload,
             captured_at=captured_at,
-            trace=trace,
+            direct_parent_refs=direct_parent_refs,
             join_key=join_key,
         )
 
@@ -1730,19 +1274,12 @@ class AcquisitionStream(Generic[PayloadT]):
             raise TypeError("stream_id must be StreamId")
         if not isinstance(generation, StreamGenerationId):
             raise TypeError("generation must be StreamGenerationId")
-        try:
-            payload_contract_fingerprint = payload_contract.fingerprint
-        except AttributeError as exc:
-            raise TypeError("payload_contract does not implement PayloadContract") from exc
-        _digest(payload_contract_fingerprint, "payload contract fingerprint")
         self.stream_id = stream_id
         self.generation = generation
-        self.payload_contract_fingerprint = payload_contract_fingerprint
-        for method in ("snapshot", "validate", "digest"):
+        for method in ("snapshot", "validate"):
             if not callable(getattr(payload_contract, method, None)):
                 raise TypeError(f"payload_contract.{method} must be callable")
         if join_key_contract is not None:
-            _digest(join_key_contract.fingerprint, "join key contract fingerprint")
             if not callable(getattr(join_key_contract, "snapshot", None)):
                 raise TypeError("join_key_contract.snapshot must be callable")
         self._payload_contract = payload_contract
@@ -1841,11 +1378,8 @@ class AcquisitionStream(Generic[PayloadT]):
         self,
         *,
         total_events: int,
-        trace_binding: TraceBinding,
     ) -> ExactReservation[PayloadT]:
         total = _positive_int(total_events, "total_events")
-        if not isinstance(trace_binding, TraceBinding):
-            raise TypeError("trace_binding must be TraceBinding")
         with self._condition:
             if self._closed:
                 raise StreamEndedEarly("cannot reserve a closed stream")
@@ -1868,7 +1402,6 @@ class AcquisitionStream(Generic[PayloadT]):
                 token=token,
                 start_sequence=self._next_sequence,
                 end_sequence=self._next_sequence + total,
-                trace_binding=trace_binding,
             )
             self._reservations[token] = reservation
             return reservation
@@ -1922,21 +1455,16 @@ class AcquisitionStream(Generic[PayloadT]):
         payload: PayloadT,
         *,
         captured_at: float,
-        trace: TraceContext,
+        direct_parent_refs: tuple[EventRef, ...] = (),
         join_key: object | None = None,
     ) -> Envelope[PayloadT]:
         payload = self._payload_contract.snapshot(payload)
-        payload_digest = _digest(
-            self._payload_contract.digest(payload),
-            "payload digest",
-        )
+        self._payload_contract.validate(payload)
         if self._join_key_contract is None:
             if join_key is not None:
                 raise ValueError("this stream generation does not declare a join key")
-            join_key_schema_fingerprint = None
         else:
             join_key = self._join_key_contract.snapshot(join_key)
-            join_key_schema_fingerprint = self._join_key_contract.fingerprint
         with self._condition:
             if self._closed:
                 if self._terminal_error is not None:
@@ -1969,7 +1497,6 @@ class AcquisitionStream(Generic[PayloadT]):
                     raise ReservationStateError(
                         "formal stream reservation differs from its frozen interval"
                     )
-                reservation.trace_binding.validate(trace)
             for reservation in self._reservations.values():
                 if (
                     reservation._state
@@ -1984,27 +1511,18 @@ class AcquisitionStream(Generic[PayloadT]):
                     raise ReservationStateError(
                         "exact data cannot be emitted before its formal consumer is bound"
                     )
-            selected_event_id = event_id_for_sequence(
-                self.stream_id,
-                self.generation,
-                sequence,
-            )
             event_ref = EventRef(
                 self.stream_id,
                 self.generation,
                 sequence,
-                selected_event_id,
-                payload_digest,
             )
             envelope = Envelope(
                 event_ref=event_ref,
                 emitted_at=time.time(),
                 captured_at=captured_at,
-                payload_contract_fingerprint=self.payload_contract_fingerprint,
-                trace=trace,
+                direct_parent_refs=direct_parent_refs,
                 payload=payload,
                 join_key=join_key,
-                join_key_schema_fingerprint=join_key_schema_fingerprint,
             )
             committed_next_sequence = sequence + 1
             # This counter is the first authoritative mutation of publication.
@@ -2242,7 +1760,6 @@ class AcquisitionStream(Generic[PayloadT]):
         stored = self._records.get(envelope.sequence)
         if stored is not envelope:
             raise PermissionError("Delivery no longer names its retained stream event")
-        reservation.trace_binding.validate(envelope.trace)
         return cursor
 
     def _ack_consumer(
@@ -2312,21 +1829,12 @@ class AcquisitionStream(Generic[PayloadT]):
         reservation: ExactReservation[PayloadT],
         consumer: object,
         *,
-        source_contract_digest: str,
-        source_schedule_digest: str,
-        source_key_sequence_digest: str,
-        chain_contract_digest: str,
         terminal: bool = False,
         downstream: ExactConsumerReadiness | None = None,
         owner_liveness: Callable[[], None] | None = None,
         owner_completion: Callable[[float], object] | None = None,
         owner_cancel: Callable[[str | None], bool] | None = None,
-        processor_stage: ProcessorStageProvenance | None = None,
     ) -> ExactConsumerReadiness:
-        _digest(source_contract_digest, "source contract digest")
-        _digest(source_schedule_digest, "source schedule digest")
-        _digest(source_key_sequence_digest, "source key-sequence digest")
-        _digest(chain_contract_digest, "chain contract digest")
         if terminal == (downstream is not None):
             raise ValueError(
                 "exact consumer must be either a terminal dataset sink or bind one downstream"
@@ -2338,8 +1846,6 @@ class AcquisitionStream(Generic[PayloadT]):
             raise ValueError(
                 "terminal dataset sink does not accept processor lifecycle callbacks"
             )
-        if terminal and processor_stage is not None:
-            raise ValueError("terminal dataset sink does not declare a processor stage")
         if downstream is not None and not all(
             callable(callback)
             for callback in (owner_liveness, owner_completion, owner_cancel)
@@ -2347,11 +1853,6 @@ class AcquisitionStream(Generic[PayloadT]):
             raise TypeError(
                 "processor exact consumer requires liveness, completion, and cancel callbacks"
             )
-        if downstream is not None and not isinstance(
-            processor_stage,
-            ProcessorStageProvenance,
-        ):
-            raise TypeError("processor exact consumer requires processor_stage")
         with self._condition:
             if self._reservations.get(reservation._token) is not reservation:
                 raise ReservationStateError("exact consumer reservation is not registered")
@@ -2375,31 +1876,21 @@ class AcquisitionStream(Generic[PayloadT]):
                     owner_liveness,
                     *downstream._resolved_owner_liveness(),
                 )
-                processor_stages = (
-                    processor_stage,
-                    *downstream._processor_stages,
-                )
             else:
                 terminal_reservation = reservation
                 terminal_consumer = consumer
                 owner_liveness = ()
                 owner_completion = None
                 owner_cancel = None
-                processor_stages = ()
             readiness = ExactConsumerReadiness(
                 _READINESS_TOKEN,
                 source_reservation=reservation,
                 source_consumer=consumer,
-                source_contract_digest=source_contract_digest,
-                source_schedule_digest=source_schedule_digest,
-                source_key_sequence_digest=source_key_sequence_digest,
-                chain_contract_digest=chain_contract_digest,
                 terminal_reservation=terminal_reservation,
                 terminal_consumer=terminal_consumer,
                 owner_liveness=owner_liveness,
                 owner_completion=owner_completion,
                 owner_cancel=owner_cancel,
-                processor_stages=processor_stages,
             )
             if downstream is not None:
                 downstream._claim_binding(consumer)
@@ -2538,18 +2029,14 @@ __all__ = [
     "AcquisitionCursor",
     "AcquisitionProducer",
     "AcquisitionStream",
-    "ArtifactInputRef",
-    "artifact_input_ref_from_tree",
-    "artifact_input_ref_to_tree",
     "Delivery",
     "Envelope",
     "EndOfStream",
-    "EventId",
     "EventRef",
     "EventSpanRef",
+    "event_ref_from_tree",
     "event_span_ref_from_tree",
     "event_span_ref_to_tree",
-    "event_id_for_sequence",
     "event_ref_to_tree",
     "ExactConsumerReadiness",
     "ExactReservation",
@@ -2557,11 +2044,7 @@ __all__ = [
     "JoinKeyContract",
     "MonitorTap",
     "MonitorUpdate",
-    "OrderedEventSpanHasher",
     "PayloadContract",
-    "ProcessorStageProvenance",
-    "processor_stage_provenance_from_tree",
-    "processor_stage_provenance_to_tree",
     "ReservationState",
     "ReservationStateError",
     "SchemaChanged",
@@ -2570,8 +2053,4 @@ __all__ = [
     "StreamError",
     "StreamGap",
     "StreamId",
-    "TraceContext",
-    "TraceBinding",
-    "trace_binding_from_tree",
-    "trace_binding_to_tree",
 ]

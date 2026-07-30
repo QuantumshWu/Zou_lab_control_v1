@@ -14,7 +14,6 @@ from zlc_data import (
     PointColumn,
     PointTable,
 )
-from zlc_data.codec import grid_topology_to_tree, point_table_to_tree
 from zlc_neutral_atom.authoring import AuthoringChoice, AuthoringField, AuthoringSchema, MINIMUM_POSITIVE_FLOAT
 from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
 from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
@@ -41,7 +40,7 @@ from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
 from zlc_neutral_atom.capture.binding import TriggeredCameraBinding
 from zlc_pulse import PulseDocument, build_pulse_playback
-from zlc_storage import canonical_digest, canonical_text, finite_real, normalized_text, positive_integer
+from zlc_storage import canonical_text, finite_real, normalized_text, positive_integer
 
 
 GREY_MOLASSES_DETUNING_KEY = DefinitionKey(
@@ -337,21 +336,6 @@ class _GreyMolassesDetuningProgram:
             for value in coordinates
         )
 
-    @property
-    def fingerprint(self) -> str:
-        return canonical_digest(
-            {
-                "owner": "zlc_neutral_atom.grey-molasses-detuning-program",
-                "pulse_document": self.document.fingerprint,
-                "point_table": point_table_to_tree(self.point_table),
-                "grid_topology": (
-                    None
-                    if self.grid_topology is None
-                    else grid_topology_to_tree(self.grid_topology)
-                ),
-            }
-        )
-
 
 def _build_grey_molasses_detuning_program(
     request: GreyMolassesDetuningRequest,
@@ -361,8 +345,8 @@ def _build_grey_molasses_detuning_program(
 
     if not isinstance(request, GreyMolassesDetuningRequest):
         raise TypeError("request must be GreyMolassesDetuningRequest")
-    if type(calibration) is not ResolvedCalibration:
-        raise TypeError("calibration must be an admitted ResolvedCalibration")
+    if not isinstance(calibration, ResolvedCalibration):
+        raise TypeError("calibration must be a loaded ResolvedCalibration")
     if calibration.reference != request.calibration_ref:
         raise ValueError("resolved calibration differs from the request")
     document = freeze_release_recapture_rows(

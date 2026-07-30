@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -164,11 +163,6 @@ class ValuePayloadContract:
         if not isinstance(self.schema, ValueSchema):
             raise TypeError("schema must be ValueSchema")
 
-    @property
-    def fingerprint(self) -> str:
-        source = f"zlc.value-payload:{self.schema.fingerprint}".encode("ascii")
-        return hashlib.sha256(source).hexdigest()
-
     def snapshot(self, payload: Value) -> Value:
         self.validate(payload)
         return payload
@@ -180,54 +174,6 @@ class ValuePayloadContract:
             raise TypeError(
                 "Value payload must share the generation-owned ValueSchema instance"
             )
-
-    def digest(self, payload: Value) -> str:
-        """Canonical content identity including schema, values, and validity."""
-
-        self.validate(payload)
-        return self.digest_content(payload.values, payload.validity)
-
-    def digest_content(
-        self,
-        values: np.ndarray,
-        validity: Valid | Invalid | ComponentValidity,
-    ) -> str:
-        """Digest owner-shaped content without constructing another ``Value``.
-
-        Durable artifacts already own immutable arrays at a wider dataset shape.
-        This method lets them verify one cell through the same payload owner while
-        avoiding a full image copy merely to reconstruct the transient wrapper.
-        """
-
-        canonical_values = canonical_value_array(values, validity, self.schema)
-        hasher = hashlib.sha256()
-        hasher.update(b"zlc_data.ValuePayloadContent\x00")
-
-        def update(part: bytes | memoryview) -> None:
-            hasher.update(len(part).to_bytes(8, "big"))
-            hasher.update(part)
-
-        update(self.schema.fingerprint.encode("ascii"))
-        if self.schema.validity_contract.mode is ValidityMode.COMPONENTS:
-            canonical_validity = expand_component_validity(validity, self.schema)
-            update(b"components")
-            for axis_id in self.schema.validity_contract.component_axis_ids:
-                update(axis_id.value.encode("utf-8"))
-            update(memoryview(np.ascontiguousarray(canonical_validity)).cast("B"))
-        elif isinstance(validity, Valid):
-            update(b"valid")
-        elif isinstance(validity, Invalid):
-            update(b"invalid")
-            # Invalid values are semantically absent.  Keep their event digest
-            # independent of frame size and arbitrary producer filler bytes.
-            update(b"canonical-invalid-values")
-            return hasher.hexdigest()
-        else:  # pragma: no cover - validation closes VALUE validity above
-            raise TypeError("VALUE validity requires Valid or Invalid")
-        assert canonical_values is not None
-        update(memoryview(canonical_values).cast("B"))
-        return hasher.hexdigest()
-
 
 @dataclass(frozen=True, eq=False)
 class DataBlock:
@@ -351,9 +297,9 @@ def expand_component_validity(
 ) -> np.ndarray:
     """Return validity over the schema's declared component axes only.
 
-    This is the canonical mask stored by materialization and hashed by payload
-    identity, independent of whether a producer supplied a scalar Valid/Invalid
-    marker or a mask over a smaller named-axis subset.
+    This is the canonical mask stored by materialization, independent of whether
+    a producer supplied a scalar Valid/Invalid marker or a mask over a smaller
+    named-axis subset.
     """
 
     _validate_value_validity(validity, schema)

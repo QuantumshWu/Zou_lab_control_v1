@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 import struct
 import threading
@@ -14,11 +13,8 @@ from typing import Callable, Generic, Protocol, TypeVar
 
 import numpy as np
 from zlc_storage import (
-    canonical_digest,
-    encode,
     exact_mapping as _exact_mapping,
     nonnegative_integer as _nonnegative_integer,
-    sha256_text as _sha256_digest,
 )
 
 from zlc_data import (
@@ -43,14 +39,12 @@ from zlc_data import (
     Value,
     ValueSchema,
 )
-from zlc_data.codec import axis_to_tree, point_table_to_tree
 from zlc_data.value import expand_component_validity
 
 from ._failure import record_secondary_failure
 
 from .streams import (
     AcquisitionStream,
-    ArtifactInputRef,
     Delivery,
     EndOfStream,
     Envelope,
@@ -63,21 +57,11 @@ from .streams import (
     MonitorTap,
     MonitorUpdate,
     ReservationState,
-    ProcessorStageProvenance,
-    processor_stage_provenance_from_tree,
-    processor_stage_provenance_to_tree,
     StreamId,
-    TraceBinding,
-    trace_binding_from_tree,
-    trace_binding_to_tree,
-    _validated_processor_stage_chain,
 )
 
 
 PayloadT = TypeVar("PayloadT")
-_DATASET_DERIVATION_PROVENANCE_SCHEMA = (
-    "zlc_neutral_atom.DatasetDerivationProvenance"
-)
 _DATASET_SEAL_PROVENANCE_SCHEMA = "zlc_neutral_atom.DatasetSealProvenance"
 
 
@@ -87,20 +71,15 @@ class DatasetEventAdapter(Protocol[PayloadT]):
     payload_contract: object
     value_schema: ValueSchema
     metadata_contract: "DatasetMetadataContract[PayloadT]"
-    operator_fingerprint: str
 
     def value(self, payload: PayloadT) -> Value: ...
 
 
 
 class DatasetMetadataContract(Protocol[PayloadT]):
-    fingerprint: str
-
     def snapshot(self, payload: PayloadT) -> object | None: ...
 
     def validate(self, metadata: object | None) -> None: ...
-
-    def digest(self, metadata: object | None) -> str: ...
 
 
 class DatasetError(RuntimeError):
@@ -205,30 +184,6 @@ class DatasetCellAddress:
             object.__setattr__(self, field, int(value))
 
 
-def dataset_cell_permutation_digest(
-    schema: DatasetSchema,
-    cells: Iterable[DatasetCellAddress],
-) -> str:
-    """Canonical identity of one complete event-ordinal to dataset-cell plan."""
-
-    key_fingerprint = DatasetCellKeyContract.from_schema(schema).fingerprint
-    key_permutation_digest = _ordered_cell_digest(
-        "zlc_neutral_atom.DatasetCellKeyPermutation",
-        key_fingerprint,
-        (
-            cell
-            for _ordinal, cell, _linear in _validated_cell_permutation(
-                schema,
-                cells,
-            )
-        ),
-    )
-    return _dataset_schema_schedule_digest(
-        schema.fingerprint,
-        key_permutation_digest,
-    )
-
-
 def _validated_cell_permutation(
     schema: DatasetSchema,
     cells: Iterable[DatasetCellAddress],
@@ -259,102 +214,12 @@ def _validated_cell_permutation(
         raise ValueError("cell permutation length differs from DatasetSchema")
 
 
-def _new_ordered_cell_hasher(contract: str, owner_fingerprint: str):
-    _sha256_digest(owner_fingerprint, "owner_fingerprint")
-    digest = hashlib.sha256()
-    digest.update(contract.encode("utf-8"))
-    digest.update(b"\x00")
-    digest.update(owner_fingerprint.encode("ascii"))
-    digest.update(b"\x00")
-    return digest
-
-
-def _update_ordered_cell_hasher(digest, cell: DatasetCellAddress) -> None:
-    if not isinstance(cell, DatasetCellAddress):
-        raise TypeError("cells must contain DatasetCellAddress values")
-    digest.update(str(cell.repeat_index).encode("ascii"))
-    digest.update(b",")
-    digest.update(str(cell.point_ordinal).encode("ascii"))
-    digest.update(b";")
-
-
-def _ordered_cell_digest(
-    contract: str,
-    owner_fingerprint: str,
-    cells: Iterable[DatasetCellAddress],
-) -> str:
-    """Stream one ordered cell identity without constructing an O(N) tree."""
-
-    digest = _new_ordered_cell_hasher(contract, owner_fingerprint)
-    for cell in cells:
-        _update_ordered_cell_hasher(digest, cell)
-    return digest.hexdigest()
-
-
-def _dataset_schema_schedule_digest(
-    dataset_schema_fingerprint: str,
-    key_permutation_digest: str,
-) -> str:
-    return canonical_digest(
-        {
-            "contract": "zlc_neutral_atom.DatasetCellPermutation",
-            "dataset_schema_fingerprint": _sha256_digest(
-                dataset_schema_fingerprint,
-                "dataset_schema_fingerprint",
-            ),
-            "key_permutation_digest": _sha256_digest(
-                key_permutation_digest,
-                "key_permutation_digest",
-            ),
-        }
-    )
-
-
-def _dataset_key_sequence_digest(
-    key_contract_fingerprint: str,
-    key_permutation_digest: str,
-) -> str:
-    return canonical_digest(
-        {
-            "contract": "zlc_neutral_atom.DatasetKeySequence",
-            "key_contract_fingerprint": _sha256_digest(
-                key_contract_fingerprint,
-                "key_contract_fingerprint",
-            ),
-            "key_permutation_digest": _sha256_digest(
-                key_permutation_digest,
-                "key_permutation_digest",
-            ),
-        }
-    )
-
-
-def _dataset_consumer_contract_digest_from_schedule(
-    dataset_schema_fingerprint: str,
-    schedule_digest: str,
-    metadata_contract_fingerprint: str,
-    event_adapter_operator_fingerprint: str,
-) -> str:
-    return canonical_digest(
-        {
-            "contract": "zlc_neutral_atom.DatasetConsumerContract",
-            "dataset_schema_fingerprint": dataset_schema_fingerprint,
-            "join_plan_digest": schedule_digest,
-            "metadata_contract_fingerprint": metadata_contract_fingerprint,
-            "event_adapter_operator_fingerprint": (
-                event_adapter_operator_fingerprint
-            ),
-        }
-    )
-
-
 @dataclass(frozen=True)
 class DatasetCellKeyContract:
     """Join-key domain containing repeat and point rows, never cell values."""
 
     repeat_axis: AxisSpec
     point_table: PointTable
-    _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.repeat_axis, AxisSpec) or self.repeat_axis.role != REPEAT:
@@ -365,27 +230,12 @@ class DatasetCellKeyContract:
             column.coordinate_id for column in self.point_table.columns
         }:
             raise ValueError("repeat and point coordinate ids must be distinct")
-        object.__setattr__(
-            self,
-            "_fingerprint",
-            canonical_digest(
-                {
-                    "contract": "zlc_neutral_atom.DatasetCellKeyContract",
-                    "repeat_axis": axis_to_tree(self.repeat_axis),
-                    "point_table": point_table_to_tree(self.point_table),
-                }
-            ),
-        )
 
     @classmethod
     def from_schema(cls, schema: DatasetSchema) -> "DatasetCellKeyContract":
         if not isinstance(schema, DatasetSchema):
             raise TypeError("schema must be DatasetSchema")
         return cls(schema.repeat_axis, schema.point_table)
-
-    @property
-    def fingerprint(self) -> str:
-        return self._fingerprint
 
     def snapshot(self, key: object) -> DatasetCellAddress:
         if not isinstance(key, DatasetCellAddress):
@@ -450,10 +300,8 @@ class DatasetCellSchedule:
     __slots__ = (
         "_cell_count",
         "_integer_width",
-        "_key_contract_fingerprint",
-        "_key_sequence_digest",
+        "_key_contract",
         "_packed",
-        "_permutation_digest",
         "_point_count",
         "_repeat_count",
     )
@@ -465,24 +313,22 @@ class DatasetCellSchedule:
         self,
         token: object,
         *,
-        key_contract_fingerprint: str,
+        key_contract: DatasetCellKeyContract,
         repeat_count: int,
         point_count: int,
         integer_width: int,
         packed: bytes,
-        permutation_digest: str,
-        key_sequence_digest: str,
     ) -> None:
         if token is not _DATASET_CELL_SCHEDULE_TOKEN:
             raise TypeError("DatasetCellSchedule must be built with from_cells()")
-        object.__setattr__(self, "_key_contract_fingerprint", key_contract_fingerprint)
+        if not isinstance(key_contract, DatasetCellKeyContract):
+            raise TypeError("key_contract must be DatasetCellKeyContract")
+        object.__setattr__(self, "_key_contract", key_contract)
         object.__setattr__(self, "_repeat_count", repeat_count)
         object.__setattr__(self, "_point_count", point_count)
         object.__setattr__(self, "_cell_count", repeat_count * point_count)
         object.__setattr__(self, "_integer_width", integer_width)
         object.__setattr__(self, "_packed", packed)
-        object.__setattr__(self, "_permutation_digest", permutation_digest)
-        object.__setattr__(self, "_key_sequence_digest", key_sequence_digest)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("DatasetCellSchedule is immutable")
@@ -495,7 +341,7 @@ class DatasetCellSchedule:
     ) -> "DatasetCellSchedule":
         if not isinstance(schema, DatasetSchema):
             raise TypeError("schema must be DatasetSchema")
-        key_fingerprint = DatasetCellKeyContract.from_schema(schema).fingerprint
+        key_contract = DatasetCellKeyContract.from_schema(schema)
         repeat_count = schema.repeat_axis.size
         point_count = schema.point_table.row_count
         total = repeat_count * point_count
@@ -507,35 +353,20 @@ class DatasetCellSchedule:
             raise DatasetError("cell schedule exceeds the packed u64 range")
         pack_format = "<I" if integer_width == 4 else "<Q"
         packed = bytearray(total * integer_width)
-        schedule_hasher = _new_ordered_cell_hasher(
-            "zlc_neutral_atom.DatasetCellKeyPermutation",
-            key_fingerprint,
-        )
         for ordinal, cell, linear in _validated_cell_permutation(schema, cells):
             struct.pack_into(pack_format, packed, ordinal * integer_width, linear)
-            _update_ordered_cell_hasher(schedule_hasher, cell)
-        permutation_digest = schedule_hasher.hexdigest()
         return cls(
             _DATASET_CELL_SCHEDULE_TOKEN,
-            key_contract_fingerprint=key_fingerprint,
+            key_contract=key_contract,
             repeat_count=repeat_count,
             point_count=point_count,
             integer_width=integer_width,
             packed=bytes(packed),
-            permutation_digest=permutation_digest,
-            key_sequence_digest=_dataset_key_sequence_digest(
-                key_fingerprint,
-                permutation_digest,
-            ),
         )
 
     @property
-    def key_contract_fingerprint(self) -> str:
-        return self._key_contract_fingerprint
-
-    @property
-    def key_sequence_digest(self) -> str:
-        return self._key_sequence_digest
+    def key_contract(self) -> DatasetCellKeyContract:
+        return self._key_contract
 
     def __len__(self) -> int:
         return self._cell_count
@@ -566,26 +397,19 @@ class DatasetCellSchedule:
         if not isinstance(schema, DatasetSchema):
             raise TypeError("schema must be DatasetSchema")
         if (
-            DatasetCellKeyContract.from_schema(schema).fingerprint
-            != self._key_contract_fingerprint
+            DatasetCellKeyContract.from_schema(schema) != self._key_contract
             or schema.repeat_axis.size != self._repeat_count
             or schema.point_table.row_count != self._point_count
         ):
             raise DatasetError("cell schedule belongs to a different DatasetSchema")
 
-    def digest_for_schema(self, schema: DatasetSchema) -> str:
-        self.validate_schema(schema)
-        return _dataset_schema_schedule_digest(
-            schema.fingerprint,
-            self._permutation_digest,
-        )
-
     def same_order_as(self, other: object) -> bool:
         return (
             isinstance(other, DatasetCellSchedule)
-            and self._key_contract_fingerprint == other._key_contract_fingerprint
-            and self._permutation_digest == other._permutation_digest
+            and self._key_contract == other._key_contract
             and self._cell_count == other._cell_count
+            and self._integer_width == other._integer_width
+            and self._packed == other._packed
         )
 
     def __eq__(self, other: object) -> bool:
@@ -593,47 +417,32 @@ class DatasetCellSchedule:
             return True
         return self.same_order_as(other)
 
-    def __hash__(self) -> int:
-        return hash((self._key_contract_fingerprint, self._permutation_digest))
-
     def __repr__(self) -> str:
         return (
             "DatasetCellSchedule("
-            f"cells={self._cell_count}, packed_nbytes={len(self._packed)}, "
-            f"permutation_digest={self._permutation_digest!r})"
+            f"cells={self._cell_count}, packed_nbytes={len(self._packed)})"
         )
 
 
 @dataclass(frozen=True)
 class FrozenDatasetEdge(Generic[PayloadT]):
-    """Single owner for a payload-to-dataset edge and every derived digest.
+    """Single owner for a payload-to-dataset projection and exact schedule.
 
     ``DatasetSchema``, value projection, metadata projection, and the optional
-    exact ordinal schedule are one contract.  Callers cannot independently
-    report digests that describe a different cell schema or projection.
+    exact ordinal schedule are one structural contract.
     """
 
     schema: DatasetSchema
     event_adapter: DatasetEventAdapter[PayloadT]
     cell_schedule: DatasetCellSchedule | None = None
-    schedule_digest: str | None = field(init=False)
-    key_sequence_digest: str | None = field(init=False)
-    consumer_contract_digest: str | None = field(init=False)
     _payload_contract: object = field(init=False, repr=False, compare=False)
-    _payload_contract_fingerprint: str = field(init=False, repr=False, compare=False)
     _metadata_contract: DatasetMetadataContract = field(
         init=False,
         repr=False,
         compare=False,
     )
-    _metadata_contract_fingerprint: str = field(
-        init=False,
-        repr=False,
-        compare=False,
-    )
     _value_schema: ValueSchema = field(init=False, repr=False, compare=False)
-    _operator_fingerprint: str = field(init=False, repr=False, compare=False)
-    _key_contract_fingerprint: str = field(
+    _key_contract: DatasetCellKeyContract = field(
         init=False,
         repr=False,
         compare=False,
@@ -656,7 +465,6 @@ class FrozenDatasetEdge(Generic[PayloadT]):
             payload_contract = adapter.payload_contract
             value_schema = adapter.value_schema
             metadata = adapter.metadata_contract
-            operator_fingerprint = adapter.operator_fingerprint
             value_operator = adapter.value
         except AttributeError as error:
             raise TypeError(
@@ -685,119 +493,62 @@ class FrozenDatasetEdge(Generic[PayloadT]):
                 raise TypeError(
                     f"{name} fields must contain only intrinsically immutable values"
                 )
-        payload_fingerprint = _sha256_digest(
-            payload_contract.fingerprint,
-            "payload contract fingerprint",
-        )
-        operator_fingerprint = _sha256_digest(
-            operator_fingerprint,
-            "event adapter operator fingerprint",
-        )
-        for member in ("snapshot", "digest"):
+        for member in ("snapshot", "validate"):
             if not callable(getattr(payload_contract, member, None)):
                 raise TypeError(f"event_adapter.payload_contract.{member} must be callable")
-        metadata_fingerprint = _sha256_digest(
-            metadata.fingerprint,
-            "metadata contract fingerprint",
-        )
-        for member in ("snapshot", "validate", "digest"):
+        for member in ("snapshot", "validate"):
             if not callable(getattr(metadata, member, None)):
                 raise TypeError(f"metadata_contract.{member} must be callable")
         object.__setattr__(self, "_payload_contract", payload_contract)
-        object.__setattr__(
-            self,
-            "_payload_contract_fingerprint",
-            payload_fingerprint,
-        )
         object.__setattr__(self, "_metadata_contract", metadata)
-        object.__setattr__(
-            self,
-            "_metadata_contract_fingerprint",
-            metadata_fingerprint,
-        )
         object.__setattr__(self, "_value_schema", value_schema)
-        object.__setattr__(self, "_operator_fingerprint", operator_fingerprint)
         object.__setattr__(self, "_value_operator", value_operator)
         schedule = self.cell_schedule
+        key_contract = DatasetCellKeyContract.from_schema(schema)
         if schedule is None:
-            key_contract_fingerprint = DatasetCellKeyContract.from_schema(
-                schema
-            ).fingerprint
-            schedule_digest = None
-            consumer_digest = None
-            key_sequence_digest = None
+            pass
         else:
             if not isinstance(schedule, DatasetCellSchedule):
                 raise TypeError("cell_schedule must be DatasetCellSchedule or None")
-            schedule_digest = schedule.digest_for_schema(schema)
-            consumer_digest = _dataset_consumer_contract_digest_from_schedule(
-                schema.fingerprint,
-                schedule_digest,
-                metadata_fingerprint,
-                operator_fingerprint,
-            )
-            key_contract_fingerprint = schedule.key_contract_fingerprint
-            key_sequence_digest = schedule.key_sequence_digest
+            schedule.validate_schema(schema)
+            key_contract = schedule.key_contract
         object.__setattr__(
             self,
-            "_key_contract_fingerprint",
-            key_contract_fingerprint,
+            "_key_contract",
+            key_contract,
         )
-        object.__setattr__(self, "schedule_digest", schedule_digest)
-        object.__setattr__(self, "key_sequence_digest", key_sequence_digest)
-        object.__setattr__(self, "consumer_contract_digest", consumer_digest)
 
     @property
     def payload_contract(self) -> object:
         return self._payload_contract
 
     @property
-    def payload_contract_fingerprint(self) -> str:
-        return self._payload_contract_fingerprint
-
-    @property
     def metadata_contract(self) -> DatasetMetadataContract:
         return self._metadata_contract
-
-    @property
-    def metadata_contract_fingerprint(self) -> str:
-        return self._metadata_contract_fingerprint
 
     @property
     def value_schema(self) -> ValueSchema:
         return self._value_schema
 
-    @property
-    def operator_fingerprint(self) -> str:
-        return self._operator_fingerprint
-
     def project_value(self, payload: PayloadT) -> Value:
         return self._value_operator(payload)
 
     @property
-    def key_contract_fingerprint(self) -> str:
-        return self._key_contract_fingerprint
-
-    @property
-    def exact_key_sequence_digest(self) -> str:
-        if self.cell_schedule is None or self.key_sequence_digest is None:
-            raise DatasetError("rolling dataset edge has no exact key sequence")
-        return self.key_sequence_digest
+    def key_contract(self) -> DatasetCellKeyContract:
+        return self._key_contract
 
     def validate_payload_stream(self, stream: AcquisitionStream[PayloadT]) -> None:
         if not isinstance(stream, AcquisitionStream):
             raise TypeError("stream must be AcquisitionStream")
         if stream._payload_contract is not self.payload_contract:
             raise DatasetError("dataset edge must share the stream PayloadContract owner")
-        if stream.payload_contract_fingerprint != self.payload_contract_fingerprint:
-            raise DatasetError("dataset edge payload fingerprint differs from stream")
 
     def validate_stream(self, stream: AcquisitionStream[PayloadT]) -> None:
         self.validate_payload_stream(stream)
         key_contract = stream._join_key_contract
         if not isinstance(key_contract, DatasetCellKeyContract):
             raise DatasetError("dataset source must declare DatasetCellKeyContract")
-        if key_contract.fingerprint != self.key_contract_fingerprint:
+        if key_contract != self.key_contract:
             raise DatasetError("dataset source join-key contract differs from edge schema")
 
 
@@ -973,115 +724,34 @@ class MonitorDatasetSnapshot:
 
 
 @dataclass(frozen=True)
-class DatasetDerivationProvenance:
-    """Bounded root-to-terminal provenance for a processed exact dataset."""
-
-    chain_contract_digest: str
-    root_input_span: EventSpanRef
-    stages: tuple[ProcessorStageProvenance, ...]
+class DatasetSealProvenance:
+    output_span: EventSpanRef
+    direct_parent_span: EventSpanRef | None = None
 
     def __post_init__(self) -> None:
-        _sha256_digest(self.chain_contract_digest, "chain_contract_digest")
-        if not isinstance(self.root_input_span, EventSpanRef):
-            raise TypeError("root_input_span must be EventSpanRef")
-        stages = _validated_processor_stage_chain(tuple(self.stages))
-        if not stages:
-            raise TypeError("stages must contain ProcessorStageProvenance values")
-        object.__setattr__(self, "stages", stages)
+        if not isinstance(self.output_span, EventSpanRef):
+            raise TypeError("output_span must be EventSpanRef")
+        if self.direct_parent_span is not None and not isinstance(
+            self.direct_parent_span,
+            EventSpanRef,
+        ):
+            raise TypeError("direct_parent_span must be EventSpanRef or None")
 
     @property
-    def artifact_inputs(self) -> tuple[ArtifactInputRef, ...]:
-        ordered: list[ArtifactInputRef] = []
-        seen: set[str] = set()
-        for stage in self.stages:
-            for reference in stage.direct_artifact_inputs:
-                identity = reference.fingerprint
-                if identity not in seen:
-                    seen.add(identity)
-                    ordered.append(reference)
-        return tuple(ordered)
+    def stream_id(self) -> StreamId:
+        return self.output_span.stream_id
 
+    @property
+    def generation(self) -> StreamGenerationId:
+        return self.output_span.generation
 
-@dataclass(frozen=True)
-class DatasetSealProvenance:
-    stream_id: StreamId
-    generation: StreamGenerationId
-    start_sequence: int
-    end_sequence: int
-    join_plan_digest: str
-    ordered_metadata_digest: str
-    metadata_contract_fingerprint: str
-    trace_binding: TraceBinding
-    derivation: DatasetDerivationProvenance | None = None
+    @property
+    def start_sequence(self) -> int:
+        return self.output_span.start_sequence
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.stream_id, StreamId):
-            raise TypeError("stream_id must be StreamId")
-        if not isinstance(self.generation, StreamGenerationId):
-            raise TypeError("generation must be StreamGenerationId")
-        start = _nonnegative_integer(self.start_sequence, "start_sequence")
-        end = _nonnegative_integer(self.end_sequence, "end_sequence")
-        if end < start:
-            raise ValueError("end_sequence cannot precede start_sequence")
-        object.__setattr__(self, "start_sequence", start)
-        object.__setattr__(self, "end_sequence", end)
-        _sha256_digest(self.join_plan_digest, "join_plan_digest")
-        _sha256_digest(self.ordered_metadata_digest, "ordered_metadata_digest")
-        _sha256_digest(
-            self.metadata_contract_fingerprint,
-            "metadata_contract_fingerprint",
-        )
-        if not isinstance(self.trace_binding, TraceBinding):
-            raise TypeError("trace_binding must be TraceBinding")
-        if self.derivation is not None and not isinstance(
-            self.derivation,
-            DatasetDerivationProvenance,
-        ):
-            raise TypeError("derivation must be DatasetDerivationProvenance or None")
-
-
-def dataset_derivation_provenance_to_tree(
-    value: DatasetDerivationProvenance,
-) -> dict[str, object]:
-    """Project one complete exact processor-chain derivation."""
-
-    if not isinstance(value, DatasetDerivationProvenance):
-        raise TypeError("value must be DatasetDerivationProvenance")
-    return {
-        "schema": _DATASET_DERIVATION_PROVENANCE_SCHEMA,
-        "chain_contract_digest": value.chain_contract_digest,
-        "root_input_span": event_span_ref_to_tree(value.root_input_span),
-        "stages": [
-            processor_stage_provenance_to_tree(stage) for stage in value.stages
-        ],
-    }
-
-
-def dataset_derivation_provenance_from_tree(
-    tree: object,
-) -> DatasetDerivationProvenance:
-    """Decode only the current exact derivation representation."""
-
-    data = _exact_mapping(
-        tree,
-        {"schema", "chain_contract_digest", "root_input_span", "stages"},
-        _DATASET_DERIVATION_PROVENANCE_SCHEMA,
-    )
-    stages = data["stages"]
-    if not isinstance(stages, list):
-        raise ValueError("dataset derivation stages must be a list")
-    value = DatasetDerivationProvenance(
-        chain_contract_digest=data["chain_contract_digest"],
-        root_input_span=event_span_ref_from_tree(data["root_input_span"]),
-        stages=tuple(
-            processor_stage_provenance_from_tree(stage) for stage in stages
-        ),
-    )
-    if dataset_derivation_provenance_to_tree(value) != tree:
-        raise ValueError(
-            "DatasetDerivationProvenance tree is typed but non-canonical"
-        )
-    return value
+    @property
+    def end_sequence(self) -> int:
+        return self.output_span.end_sequence
 
 
 def dataset_seal_provenance_to_tree(
@@ -1093,18 +763,11 @@ def dataset_seal_provenance_to_tree(
         raise TypeError("value must be DatasetSealProvenance")
     return {
         "schema": _DATASET_SEAL_PROVENANCE_SCHEMA,
-        "stream_id": value.stream_id.value,
-        "generation": value.generation.value,
-        "start_sequence": value.start_sequence,
-        "end_sequence": value.end_sequence,
-        "join_plan_digest": value.join_plan_digest,
-        "ordered_metadata_digest": value.ordered_metadata_digest,
-        "metadata_contract_fingerprint": value.metadata_contract_fingerprint,
-        "trace_binding": trace_binding_to_tree(value.trace_binding),
-        "derivation": (
+        "output_span": event_span_ref_to_tree(value.output_span),
+        "direct_parent_span": (
             None
-            if value.derivation is None
-            else dataset_derivation_provenance_to_tree(value.derivation)
+            if value.direct_parent_span is None
+            else event_span_ref_to_tree(value.direct_parent_span)
         ),
     }
 
@@ -1116,32 +779,18 @@ def dataset_seal_provenance_from_tree(tree: object) -> DatasetSealProvenance:
         tree,
         {
             "schema",
-            "stream_id",
-            "generation",
-            "start_sequence",
-            "end_sequence",
-            "join_plan_digest",
-            "ordered_metadata_digest",
-            "metadata_contract_fingerprint",
-            "trace_binding",
-            "derivation",
+            "output_span",
+            "direct_parent_span",
         },
         _DATASET_SEAL_PROVENANCE_SCHEMA,
     )
-    derivation = data["derivation"]
+    direct_parent_span = data["direct_parent_span"]
     value = DatasetSealProvenance(
-        stream_id=StreamId(data["stream_id"]),
-        generation=StreamGenerationId(data["generation"]),
-        start_sequence=data["start_sequence"],
-        end_sequence=data["end_sequence"],
-        join_plan_digest=data["join_plan_digest"],
-        ordered_metadata_digest=data["ordered_metadata_digest"],
-        metadata_contract_fingerprint=data["metadata_contract_fingerprint"],
-        trace_binding=trace_binding_from_tree(data["trace_binding"]),
-        derivation=(
+        output_span=event_span_ref_from_tree(data["output_span"]),
+        direct_parent_span=(
             None
-            if derivation is None
-            else dataset_derivation_provenance_from_tree(derivation)
+            if direct_parent_span is None
+            else event_span_ref_from_tree(direct_parent_span)
         ),
     )
     if dataset_seal_provenance_to_tree(value) != tree:
@@ -1156,45 +805,22 @@ def raw_dataset_seal_provenance_to_tree(
 
     if not isinstance(value, DatasetSealProvenance):
         raise TypeError("value must be DatasetSealProvenance")
-    if value.derivation is not None:
-        raise ValueError("raw dataset provenance cannot contain derivation")
+    if value.direct_parent_span is not None:
+        raise ValueError("raw dataset provenance cannot contain a parent span")
     return {
-        "stream_id": value.stream_id.value,
-        "generation": value.generation.value,
-        "start_sequence": value.start_sequence,
-        "end_sequence": value.end_sequence,
-        "join_plan_digest": value.join_plan_digest,
-        "ordered_metadata_digest": value.ordered_metadata_digest,
-        "metadata_contract_fingerprint": value.metadata_contract_fingerprint,
-        "trace_binding": trace_binding_to_tree(value.trace_binding),
+        "output_span": event_span_ref_to_tree(value.output_span),
     }
 
 
 def raw_dataset_seal_provenance_from_tree(tree: object) -> DatasetSealProvenance:
     data = _exact_mapping(
         tree,
-        {
-            "stream_id",
-            "generation",
-            "start_sequence",
-            "end_sequence",
-            "join_plan_digest",
-            "ordered_metadata_digest",
-            "metadata_contract_fingerprint",
-            "trace_binding",
-        },
+        {"output_span"},
         "raw dataset seal provenance",
         discriminator=None,
     )
     value = DatasetSealProvenance(
-        StreamId(data["stream_id"]),
-        StreamGenerationId(data["generation"]),
-        data["start_sequence"],
-        data["end_sequence"],
-        data["join_plan_digest"],
-        data["ordered_metadata_digest"],
-        data["metadata_contract_fingerprint"],
-        trace_binding_from_tree(data["trace_binding"]),
+        event_span_ref_from_tree(data["output_span"]),
     )
     if raw_dataset_seal_provenance_to_tree(value) != tree:
         raise ValueError("raw DatasetSealProvenance tree is non-canonical")
@@ -1208,6 +834,7 @@ class SealedDatasetArtifact:
         "_snapshot",
         "_coverage",
         "_provenance",
+        "_cell_schedule",
         "_event_metadata",
         "_terminal_reservation",
     )
@@ -1218,35 +845,30 @@ class SealedDatasetArtifact:
         *,
         snapshot: OwnedSnapshot,
         coverage: DatasetCoverage,
-        stream_id,
-        generation,
-        start_sequence: int,
-        end_sequence: int,
-        join_plan_digest: str,
-        ordered_metadata_digest: str,
-        metadata_contract_fingerprint: str,
-        trace_binding: TraceBinding,
+        output_span: EventSpanRef,
+        cell_schedule: DatasetCellSchedule,
         event_metadata: tuple[object | None, ...],
         terminal_reservation: ExactReservation,
-        derivation: DatasetDerivationProvenance | None = None,
+        direct_parent_span: EventSpanRef | None = None,
     ) -> None:
         if authority is not _SEALED_TOKEN:
             raise PermissionError("SealedDatasetArtifact can only be minted by DatasetBuilder")
         object.__setattr__(self, "_snapshot", snapshot)
         object.__setattr__(self, "_coverage", coverage)
+        if not isinstance(cell_schedule, DatasetCellSchedule):
+            raise TypeError("cell_schedule must be DatasetCellSchedule")
+        cell_schedule.validate_schema(snapshot.block.schema)
+        if not isinstance(output_span, EventSpanRef):
+            raise TypeError("output_span must be EventSpanRef")
+        if len(cell_schedule) != output_span.count:
+            raise ValueError("cell_schedule cardinality differs from event interval")
+        object.__setattr__(self, "_cell_schedule", cell_schedule)
         object.__setattr__(
             self,
             "_provenance",
             DatasetSealProvenance(
-                stream_id=stream_id,
-                generation=generation,
-                start_sequence=start_sequence,
-                end_sequence=end_sequence,
-                join_plan_digest=join_plan_digest,
-                ordered_metadata_digest=ordered_metadata_digest,
-                metadata_contract_fingerprint=metadata_contract_fingerprint,
-                trace_binding=trace_binding,
-                derivation=derivation,
+                output_span=output_span,
+                direct_parent_span=direct_parent_span,
             ),
         )
         object.__setattr__(self, "_event_metadata", tuple(event_metadata))
@@ -1279,79 +901,50 @@ class SealedDatasetArtifact:
     def event_metadata(self) -> tuple[object | None, ...]:
         return self._event_metadata
 
+    @property
+    def cell_schedule(self) -> DatasetCellSchedule:
+        return self._cell_schedule
+
     def _belongs_to_terminal_reservation(self, reservation: object) -> bool:
         """Process-local ownership proof used only by PipelineResult minting."""
 
         return reservation is not None and self._terminal_reservation is reservation
 
-    def _with_derivation(
+    def _with_direct_parent_span(
         self,
         readiness: ExactConsumerReadiness,
-        root_input_span: EventSpanRef,
+        direct_parent_span: EventSpanRef,
     ) -> "SealedDatasetArtifact":
-        """Return an enriched immutable result authorized by one exact chain."""
+        """Bind a processed result to its exact immediate input interval."""
 
         if not isinstance(readiness, ExactConsumerReadiness):
             raise TypeError("readiness must be ExactConsumerReadiness")
-        if not isinstance(root_input_span, EventSpanRef):
-            raise TypeError("root_input_span must be EventSpanRef")
+        if not isinstance(direct_parent_span, EventSpanRef):
+            raise TypeError("direct_parent_span must be EventSpanRef")
         reservation = readiness._source_reservation
         source = reservation._stream
         if (
-            root_input_span.stream_id != source.stream_id
-            or root_input_span.generation != source.generation
-            or root_input_span.start_sequence != reservation.start_sequence
-            or root_input_span.end_sequence != reservation.end_sequence
+            direct_parent_span.stream_id != source.stream_id
+            or direct_parent_span.generation != source.generation
+            or direct_parent_span.start_sequence != reservation.start_sequence
+            or direct_parent_span.end_sequence != reservation.end_sequence
         ):
-            raise DatasetError("root input span differs from readiness source interval")
+            raise DatasetError("direct parent span differs from readiness source interval")
         if self._terminal_reservation is not readiness._terminal_reservation:
             raise DatasetError("sealed dataset belongs to another terminal readiness")
-        stages = readiness.processor_stages
-        if not stages:
-            raise DatasetError("processed derivation requires at least one stage")
-        derivation = DatasetDerivationProvenance(
-            readiness.chain_contract_digest,
-            root_input_span,
-            stages,
-        )
+        if readiness._source_reservation is readiness._terminal_reservation:
+            raise DatasetError("direct datasets do not need a root input span")
         provenance = self._provenance
         return SealedDatasetArtifact(
             _SEALED_TOKEN,
             snapshot=self._snapshot,
             coverage=self._coverage,
-            stream_id=provenance.stream_id,
-            generation=provenance.generation,
-            start_sequence=provenance.start_sequence,
-            end_sequence=provenance.end_sequence,
-            join_plan_digest=provenance.join_plan_digest,
-            ordered_metadata_digest=provenance.ordered_metadata_digest,
-            metadata_contract_fingerprint=provenance.metadata_contract_fingerprint,
-            trace_binding=provenance.trace_binding,
+            output_span=provenance.output_span,
+            cell_schedule=self._cell_schedule,
             event_metadata=self._event_metadata,
             terminal_reservation=self._terminal_reservation,
-            derivation=derivation,
+            direct_parent_span=direct_parent_span,
         )
-
-
-class OrderedDatasetMetadataHasher:
-    """Single owner of the metadata-order digest used by exact datasets."""
-
-    __slots__ = ("_hasher",)
-
-    def __init__(self, metadata_contract_fingerprint: str) -> None:
-        fingerprint = _sha256_digest(
-            metadata_contract_fingerprint,
-            "metadata_contract_fingerprint",
-        )
-        self._hasher = hashlib.sha256()
-        self._hasher.update(fingerprint.encode("ascii"))
-
-    def update(self, metadata_digest: str) -> None:
-        digest = _sha256_digest(metadata_digest, "metadata_digest")
-        self._hasher.update(digest.encode("ascii"))
-
-    def digest(self) -> str:
-        return self._hasher.copy().hexdigest()
 
 
 def _new_validity_storage(schema: DatasetSchema) -> np.ndarray:
@@ -1386,9 +979,7 @@ def _materialized_validity(schema: DatasetSchema, validity: np.ndarray):
 def _project_payload(
     edge: FrozenDatasetEdge[PayloadT],
     payload: PayloadT,
-    *,
-    include_metadata_digest: bool,
-) -> tuple[Value, object | None, str | None]:
+) -> tuple[Value, object | None]:
     value = edge.project_value(payload)
     if not isinstance(value, Value):
         raise TypeError("DatasetEventAdapter.value must return Value")
@@ -1399,12 +990,7 @@ def _project_payload(
     contract.validate(metadata)
     if not _is_deeply_immutable(metadata):
         raise TypeError("metadata contract must return a deeply immutable snapshot")
-    digest = (
-        _sha256_digest(contract.digest(metadata), "metadata digest")
-        if include_metadata_digest
-        else None
-    )
-    return value, metadata, digest
+    return value, metadata
 
 
 def _write_cell(
@@ -1437,8 +1023,6 @@ class DatasetBuilder(Generic[PayloadT]):
             raise TypeError("edge must be FrozenDatasetEdge")
         if edge.cell_schedule is None:
             raise DatasetError("DatasetBuilder requires a frozen exact cell schedule")
-        if edge.schedule_digest is None or edge.consumer_contract_digest is None:
-            raise DatasetError("exact dataset edge is missing its formal digests")
         self.block_id = block_id
         self._reservation = source
         self._source: AcquisitionStream[PayloadT] = source._stream
@@ -1448,15 +1032,10 @@ class DatasetBuilder(Generic[PayloadT]):
         self.edge = edge
         self.schema = edge.schema
         self._cell_schedule = edge.cell_schedule
-        self._join_plan_digest = edge.schedule_digest
-        self._metadata_contract_fingerprint = edge.metadata_contract_fingerprint
         total_cells = self.schema.repeat_axis.size * self.schema.point_table.row_count
         reserved_events = source.end_sequence - source.start_sequence
         if reserved_events != total_cells:
             raise DatasetError("exact reservation length must equal DatasetSchema cell count")
-        self._ordered_metadata_hasher = OrderedDatasetMetadataHasher(
-            self._metadata_contract_fingerprint
-        )
         self._lock = threading.RLock()
         self._preview_reader_minted = False
         self._values = np.zeros(
@@ -1475,10 +1054,6 @@ class DatasetBuilder(Generic[PayloadT]):
         self._exact_readiness = self._source._claim_consumer(
             source,
             self,
-            source_contract_digest=edge.consumer_contract_digest,
-            source_schedule_digest=edge.schedule_digest,
-            source_key_sequence_digest=edge.exact_key_sequence_digest,
-            chain_contract_digest=edge.consumer_contract_digest,
             terminal=True,
         )
 
@@ -1496,11 +1071,7 @@ class DatasetBuilder(Generic[PayloadT]):
             raise TypeError("DatasetBuilder requires an exact Delivery capability")
         if delivery.acknowledged:
             raise DatasetError("delivery was already acknowledged")
-        projected = _project_payload(
-            self.edge,
-            delivery.envelope.payload,
-            include_metadata_digest=True,
-        )
+        projected = _project_payload(self.edge, delivery.envelope.payload)
         self._source._consume_exact(
             self._reservation,
             delivery,
@@ -1511,13 +1082,12 @@ class DatasetBuilder(Generic[PayloadT]):
     def _ingest(
         self,
         envelope: Envelope[PayloadT],
-        projected: tuple[Value, object | None, str | None],
+        projected: tuple[Value, object | None],
     ) -> None:
         address = envelope.join_key
         if not isinstance(address, DatasetCellAddress):
             raise DatasetError("dataset event is missing its typed DatasetCellAddress")
-        value, metadata, metadata_digest = projected
-        assert metadata_digest is not None
+        value, metadata = projected
         validity_mask = _value_validity_mask(self.schema, value.validity)
         with self._lock:
             self._ensure_writable_locked()
@@ -1547,7 +1117,6 @@ class DatasetBuilder(Generic[PayloadT]):
             self._written_count += 1
             self._expected_sequence += 1
             self._ordered_event_metadata[schedule_index] = metadata
-            self._ordered_metadata_hasher.update(metadata_digest)
             flat_cell = (
                 address.repeat_index * self.schema.point_table.row_count
                 + address.point_ordinal
@@ -1640,14 +1209,13 @@ class DatasetBuilder(Generic[PayloadT]):
             _SEALED_TOKEN,
             snapshot=preview.snapshot,
             coverage=preview.coverage,
-            stream_id=self.stream_id,
-            generation=self.generation,
-            start_sequence=self._reservation.start_sequence,
-            end_sequence=self._reservation.end_sequence,
-            join_plan_digest=self._join_plan_digest,
-            ordered_metadata_digest=self._ordered_metadata_hasher.digest(),
-            metadata_contract_fingerprint=self._metadata_contract_fingerprint,
-            trace_binding=self._reservation.trace_binding,
+            output_span=EventSpanRef(
+                self.stream_id,
+                self.generation,
+                self._reservation.start_sequence,
+                self._reservation.end_sequence,
+            ),
+            cell_schedule=self._cell_schedule,
             event_metadata=tuple(self._ordered_event_metadata),
             terminal_reservation=self._reservation,
         )
@@ -1828,7 +1396,6 @@ class _AppendWindowReplacement(Generic[PayloadT]):
     """Fully written append-window shadow awaiting one authoritative envelope."""
 
     payload: PayloadT
-    payload_digest: str
     base_revision: int
     expected_sequence: int
     values: np.ndarray
@@ -2030,15 +1597,7 @@ class MonitorDataset(Generic[PayloadT]):
                 contract = self.edge.payload_contract
                 owned_payload = contract.snapshot(payload)
                 contract.validate(owned_payload)
-                payload_digest = _sha256_digest(
-                    contract.digest(owned_payload),
-                    "append replacement payload digest",
-                )
-                value, metadata, _digest = _project_payload(
-                    self.edge,
-                    owned_payload,
-                    include_metadata_digest=False,
-                )
+                value, metadata = _project_payload(self.edge, owned_payload)
                 validity_mask = _value_validity_mask(self.schema, value.validity)
                 total_cells = (
                     self.schema.repeat_axis.size
@@ -2063,7 +1622,6 @@ class MonitorDataset(Generic[PayloadT]):
                 cell_metadata[0] = metadata
                 replacement = _AppendWindowReplacement(
                     owned_payload,
-                    payload_digest,
                     self._revision,
                     0 if self._last_sequence is None else self._last_sequence + 1,
                     values,
@@ -2121,9 +1679,9 @@ class MonitorDataset(Generic[PayloadT]):
                             "append replacement consumed another stream envelope"
                         )
                     self._validate_envelope_identity_locked(envelope)
-                    if envelope.payload_digest != replacement.payload_digest:
+                    if envelope.payload is not replacement.payload:
                         raise DatasetError(
-                            "append replacement payload digest changed at publication"
+                            "append replacement published another owned payload"
                         )
                     if envelope.sequence != replacement.expected_sequence:
                         raise DatasetError(
@@ -2165,11 +1723,7 @@ class MonitorDataset(Generic[PayloadT]):
         account_skipped_events: bool = True,
     ) -> DatasetRevisionRef:
         envelope = update.envelope
-        value, metadata, _digest = _project_payload(
-            self.edge,
-            envelope.payload,
-            include_metadata_digest=False,
-        )
+        value, metadata = _project_payload(self.edge, envelope.payload)
         validity_mask = _value_validity_mask(self.schema, value.validity)
         with self._lock:
             self._ensure_writable_locked()
@@ -2468,7 +2022,6 @@ __all__ = [
     "DatasetCellSchedule",
     "DatasetCellKeyContract",
     "DatasetCoverage",
-    "DatasetDerivationProvenance",
     "DatasetEventAdapter",
     "DatasetMetadataContract",
     "DatasetError",
@@ -2482,12 +2035,8 @@ __all__ = [
     "MonitorCoverage",
     "MonitorDataset",
     "MonitorDatasetSnapshot",
-    "OrderedDatasetMetadataHasher",
     "SnapshotExpired",
     "SealedDatasetArtifact",
-    "dataset_cell_permutation_digest",
-    "dataset_derivation_provenance_from_tree",
-    "dataset_derivation_provenance_to_tree",
     "dataset_seal_provenance_from_tree",
     "dataset_seal_provenance_to_tree",
     "raw_dataset_seal_provenance_from_tree",

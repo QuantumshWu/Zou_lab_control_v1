@@ -8,7 +8,6 @@ from zlc_neutral_atom.node_input import BoundNodeInputs
 from zlc_neutral_atom.input_spec import DatasetInputSpec
 from zlc_neutral_atom.processing.hosted_processor import (
     HostedProcessor,
-    ProcessorPublication,
 )
 from zlc_neutral_atom.processing.signal_plane import SignalPublication
 from zlc_neutral_atom.runtime.hosted_run import HostedRun
@@ -28,7 +27,8 @@ def run_attachment(
     start_prepared: Callable[[object, object, object], object]
     | None = None,
     project_signal_presentation: Callable[
-        [object, str, SignalPublication], object | None
+        [object, str, SignalPublication, tuple[SignalPublication, ...]],
+        object | None,
     ]
     | None = None,
     resolve_artifact_reference: Callable[[object], object] | None = None,
@@ -72,7 +72,6 @@ def run_attachment(
         event_generation = None
         event_signal = None
         event_output = None
-        event_transform = None
         event_producer = None
         if association_specs:
             association = inputs.resolved[association_specs[0].key]
@@ -88,7 +87,6 @@ def run_attachment(
                 event_generation,
                 event_source,
                 event_output,
-                event_transform,
             ) = (
                 host.data_plane.signal_event_binding(
                     event_signal,
@@ -96,13 +94,10 @@ def run_attachment(
             )
             if event_output != event_producer.output.name:
                 raise RuntimeError("event route exposes another Dataset output")
-            if event_transform != association.transform_spec:
-                raise RuntimeError("event route exposes another Dataset transform")
 
         def prepare_owned(current):
             if current != request:
                 raise RuntimeError("hosted request changed after request freeze")
-            parents = ()
             if event_signal is None:
                 command = prepare(current, None)
             else:
@@ -116,7 +111,6 @@ def run_attachment(
                     generation,
                     source,
                     output_name,
-                    transform,
                 ) = host.data_plane.signal_event_binding(
                     event_signal,
                     expected_generation=event_generation,
@@ -125,25 +119,14 @@ def run_attachment(
                     generation != event_generation
                     or source is not event_source
                     or output_name != event_output
-                    or transform != event_transform
                 ):
                     raise RuntimeError("event-associated Dataset route changed")
                 command = prepare(current, event_source)
-                parent = getattr(
-                    event_producer.run_node,
-                    "prepared_command",
-                    None,
+                host.data_plane.bind_generation_source(
+                    node,
+                    source_name=event_signal,
+                    expected_generation=event_generation,
                 )
-                if parent is None:
-                    raise RuntimeError(
-                        "event-associated producer has no admitted command"
-                    )
-                parents = (parent,)
-            host.data_plane.bind_lifecycle_owner(
-                node,
-                command,
-                parent_owners=parents,
-            )
             return command
 
         node = HostedRun(
@@ -179,7 +162,7 @@ def run_attachment(
             starter = getattr(command, "start", None)
             if not callable(starter):
                 raise TypeError("prepared command exposes no start()")
-            return starter()
+            return starter(lifecycle_owner=node.command_context)
 
         node.bind_starter(start_prepared)
         return node
@@ -198,7 +181,8 @@ def processor_attachment(
     bind_request: Callable[[object, BoundNodeInputs], object],
     prepare: Callable[[object], object],
     project_signal_presentation: Callable[
-        [object, str, SignalPublication], object | None
+        [object, str, SignalPublication, tuple[SignalPublication, ...]],
+        object | None,
     ]
     | None = None,
     resolve_artifact_reference: Callable[[object], object] | None = None,
@@ -218,7 +202,7 @@ def processor_attachment(
         outputs = getattr(result, "outputs", None)
         if not isinstance(outputs, Mapping):
             raise TypeError("Processor evaluation exposes no typed output mapping")
-        return ProcessorPublication(outputs)
+        return outputs
 
     def create_node(
         host: ConsoleNodeHost,
@@ -236,8 +220,6 @@ def processor_attachment(
         authored = spec.build_request(values)
         request = bind_request(authored, inputs.bound)
         source_input = inputs.only_dataset()
-        if source_input.transform_spec is not None:
-            raise ValueError("latest-only Processor input must be a direct output")
         initial_publication = host.current_publication(source_input)
 
         return HostedProcessor(

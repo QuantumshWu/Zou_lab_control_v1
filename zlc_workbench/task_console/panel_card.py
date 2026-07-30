@@ -1578,9 +1578,9 @@ class PanelCard(FluentGroupBox):
         candidate = self._candidate_publication
         advances = (
             candidate is None
-            or candidate.owner_id != publication.owner_id
-            or candidate.generation != publication.generation
-            or candidate.sequence <= publication.sequence
+            or candidate.event_ref.stream_id != publication.event_ref.stream_id
+            or candidate.event_ref.generation != publication.event_ref.generation
+            or candidate.event_ref.sequence <= publication.event_ref.sequence
         )
         if advances:
             self._candidate_value = value
@@ -1839,7 +1839,6 @@ class PanelCard(FluentGroupBox):
     ) -> _PanelRenderRequest:
         """Freeze one frontend-owned presentation for either Qt surface."""
 
-        from zlc_frontend import PanelProvenance
         source_key = (
             str(value.name),
             contract.session_identity,
@@ -1861,7 +1860,6 @@ class PanelCard(FluentGroupBox):
             contract,
             source,
             display,
-            PanelProvenance(value.run_id, value.epoch_id, value.join_digest),
             focus,
             surface_id=surface_id,
         )
@@ -2209,9 +2207,9 @@ class PanelCard(FluentGroupBox):
         """Whether ``origin`` is a newer front of this host's same gesture.
 
         An intermediate worker answer advances the held front's sequence and
-        presentation revision.  Exact origin equality would therefore reject
+        painted display revision.  Exact origin equality would therefore reject
         the next motion of the same drag.  Host identity plus monotonic exact
-        presentation lineage admits that advance while preventing the Edit
+        exact front lineage admits that advance while preventing the Edit
         tab's second host from taking over another host's pending command.
         """
 
@@ -2225,16 +2223,7 @@ class PanelCard(FluentGroupBox):
             and origin.source_identity == pending.source_identity
             and origin.input_identity == pending.input_identity
             and origin.sequence >= pending.sequence
-            and origin.presentation.panel_id
-            == pending.presentation.panel_id
-            and origin.presentation.document_id
-            == pending.presentation.document_id
-            and origin.presentation.document_revision
-            >= pending.presentation.document_revision
-            and origin.presentation.selection_revision
-            == pending.presentation.selection_revision
-            and origin.presentation.panel_revision
-            >= pending.presentation.panel_revision
+            and origin.painted_revision >= pending.painted_revision
         )
 
     def view_intent(self):
@@ -3197,7 +3186,7 @@ class PanelCard(FluentGroupBox):
             revision = int(candidate.display_revision)
         pending_origin = self._pending_interaction_origin
         if pending_origin is None:
-            if self._display_revision != commit.origin.presentation.panel_revision:
+            if self._display_revision != commit.origin.painted_revision:
                 host.discard_pending_interaction(commit.origin)
                 return
         elif not self._continues_pending_interaction(host, commit.origin):
@@ -3262,7 +3251,7 @@ class PanelCard(FluentGroupBox):
             (
                 self._pending_interaction_origin is None
                 and self._display_revision
-                != commit.origin.presentation.panel_revision
+                != commit.origin.painted_revision
             )
             or (
                 self._pending_interaction_origin is not None
@@ -3311,7 +3300,7 @@ class PanelCard(FluentGroupBox):
             (
                 self._pending_interaction_origin is None
                 and self._display_revision
-                != commit.origin.presentation.panel_revision
+                != commit.origin.painted_revision
             )
             or (
                 self._pending_interaction_origin is not None

@@ -20,7 +20,6 @@ from zlc_frontend import (
     FigureCrossCommit,
     FigureSource,
     PlotPanelContract,
-    PanelProvenance,
     PlotPanelSession,
 )
 from zlc_frontend.figure_outputs import (
@@ -50,7 +49,6 @@ class FigureSurfaceRenderRequest:
     contract: PlotPanelContract
     source: FigureSource
     display: object
-    provenance: PanelProvenance
     focus: FacetedPanelFocus | None
     # One Figure may be presented by the live card and by an Edit tab frozen
     # at an older accepted input.  They share this lane and the same renderer
@@ -300,7 +298,6 @@ class FigureSurfaceLane:
                     PlotPanelComposeRequest(
                         request.source,
                         request.display,
-                        request.provenance,
                         focus=request.focus,
                     )
                 )

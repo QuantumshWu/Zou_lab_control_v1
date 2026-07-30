@@ -228,8 +228,8 @@ def build_temperature_release_recapture_program(
 
     if not isinstance(request, TemperatureReleaseRecaptureRequest):
         raise TypeError("request must be TemperatureReleaseRecaptureRequest")
-    if type(calibration) is not ResolvedCalibration:
-        raise TypeError("calibration must be an admitted ResolvedCalibration")
+    if not isinstance(calibration, ResolvedCalibration):
+        raise TypeError("calibration must be a loaded ResolvedCalibration")
     if calibration.reference != request.calibration_ref:
         raise ValueError("resolved calibration differs from the request")
     document = freeze_release_recapture_rows(

@@ -1,18 +1,15 @@
 """Crash-safe storage primitives shared by ZLC bounded contexts.
 
 Domain artifact schemas and typed references deliberately do not live here.
-Repository backends are exposed lazily so importing ``zlc_storage.canonical``
-does not initialize filesystem or lease machinery.
+Filesystem operations are exposed lazily so importing ``zlc_storage.canonical``
+does not initialize the durability backend.
 """
 
 from importlib import import_module
 
 from .canonical import (
     CanonicalArrayEvent,
-    CanonicalEncodingError,
     CanonicalListEvent,
-    CanonicalStructureAdmission,
-    CanonicalStructureEvent,
     canonical_text,
     canonical_digest,
     decode,
@@ -30,20 +27,14 @@ from .canonical import (
 )
 
 _LAZY_EXPORTS = {
+    "atomic_write_bytes": ("durability", "atomic_write_bytes"),
+    "atomic_write_file": ("durability", "atomic_write_file"),
+    "atomic_write_text": ("durability", "atomic_write_text"),
     "DirectoryDurabilityError": ("durability", "DirectoryDurabilityError"),
     "durable_makedirs": ("durability", "durable_makedirs"),
     "durable_mkdir": ("durability", "durable_mkdir"),
     "flush_directory": ("durability", "flush_directory"),
-    "RepositoryRootBusy": ("repository_lease", "RepositoryRootBusy"),
-    "RepositoryRootLease": ("repository_lease", "RepositoryRootLease"),
-    "RepositoryRootLeaseBorrow": ("repository_lease", "RepositoryRootLeaseBorrow"),
-    "ContentAddressedStore": ("content_store", "ContentAddressedStore"),
-    "ContentStoreAuthority": ("content_store", "ContentStoreAuthority"),
-    "ContentCorruptionError": ("content_store", "ContentCorruptionError"),
-    "ContentRef": ("content_store", "ContentRef"),
-    "StoredManifest": ("content_store", "StoredManifest"),
-    "content_ref_from_tree": ("content_store", "content_ref_from_tree"),
-    "content_ref_to_tree": ("content_store", "content_ref_to_tree"),
+    "resolve_under": ("paths", "resolve_under"),
 }
 
 
@@ -61,24 +52,14 @@ def __dir__() -> list[str]:
     return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
 __all__ = [
-    "CanonicalEncodingError",
     "CanonicalArrayEvent",
     "CanonicalListEvent",
-    "CanonicalStructureAdmission",
-    "CanonicalStructureEvent",
     "DirectoryDurabilityError",
-    "ContentAddressedStore",
-    "ContentStoreAuthority",
-    "ContentCorruptionError",
-    "ContentRef",
-    "content_ref_from_tree",
-    "content_ref_to_tree",
+    "atomic_write_bytes",
+    "atomic_write_file",
+    "atomic_write_text",
     "canonical_text",
     "canonical_digest",
-    "RepositoryRootBusy",
-    "RepositoryRootLease",
-    "RepositoryRootLeaseBorrow",
-    "StoredManifest",
     "decode",
     "durable_makedirs",
     "durable_mkdir",
@@ -92,6 +73,7 @@ __all__ = [
     "normalized_text",
     "positive_integer",
     "positive_real",
+    "resolve_under",
     "sha256_digest",
     "sha256_text",
 ]

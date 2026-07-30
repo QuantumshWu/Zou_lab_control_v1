@@ -1,196 +1,126 @@
 # Maintainer checkpoint
 
-This file is a current hand-off note, not an architecture authority. Normative design and acceptance gates live only in `docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md`; execution/recovery rules live only in `AGENTS.md`.
+This file is only the current hand-off checkpoint. Normative architecture lives in
+`docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md`; execution and recovery rules live in
+`AGENTS.md`. Do not preserve superseded slice narratives here.
 
 ## Repository state
 
-- Branch: `codex/system-architecture-migration`
-- M0 normative design baseline: `aaaa063ca5a8535c4f316df95e62574edce46cd3`; canonical observation-address clarification: `0af9354`.
-- Last code checkpoint before the normative freeze: `09fad53 Fix live Figure transactions and restore plot fits`
-- Completed architecture cuts in this checkpoint: **M1 — minimal PointTable/GridTopology/source-binding replacement**, **M2 — exact Signal transaction**, **M3 — Figure/View/Fit convergence**, **M4 — Run, pulse and storage boundary**, and **M5 — leaf packages, composition and public API**.
-- Active next cut: **M6 — domain vertical slices and performance closure**.
-- Active worktree state after the M5 checkpoint: M1–M5 each have one mutable truth owner and no production compatibility model. The only expected worktree exception is the untracked user file below; resume from M6 and do not replay M1–M5.
-- Expected worktree exception: untracked user file `pulses/scan_test.json`; never read, modify, stage or commit it.
-- External temporary audit ledger: `../ARCHITECTURE_AUDIT_CURRENT.md`; it is not a product/design authority and is deleted only after M0–M7 evidence is fully merged and all implementation cuts finish.
+- Branch: `codex/system-architecture-migration`.
+- Closure base HEAD: `41f39da29b644f637dd2c9f413eaae3a388300cc`.
+- Current checkpoint: the commit containing this file closes the reopened M1–M6
+  semantic boundary. The next dependency cut is M7 only.
+- External audit ledger: `../ARCHITECTURE_AUDIT_CURRENT.md`. It remains a temporary
+  implementation checklist until every M7 gate is closed, then must be deleted.
+- Expected worktree exception: untracked user file `pulses/scan_test.json`. Never
+  read, modify, move, delete, stage, or commit it.
+- RTL, Tcl, XDC, bitstream, wire protocol, and deployed hardware assets are frozen
+  and unchanged.
 
 ## Resume protocol
 
-1. Read the complete active `/goal`.
-2. Check `git status --short --branch`, `git log -5 --oneline`, current tree and this checkpoint.
-3. Read `../ARCHITECTURE_AUDIT_CURRENT.md` §1.1–§1.6, the active M cut, its matrix rows and §9; read only the System Architecture sections for the active cut.
-4. Derive completion from Git/current code; do not replay closed audits or fixed historical slice numbers.
-5. Recheck active-diff owners, deletion contract, public concepts and fixed-scope LOC/module deltas before editing.
-6. Keep `pulses/scan_test.json` untouched.
+1. Read the complete active `/goal`, then `AGENTS.md` and this file.
+2. Derive state from branch, HEAD/tree, status, recent log, and diff. Do not replay
+   M1–M6 or re-explain already closed work.
+3. Read audit §1.0–§1.6, M7, §9, and only the System Architecture sections needed
+   for the failing M7 gate.
+4. Recheck production owner/deletion/public-concept/LOC deltas, frozen hardware,
+   and user-file isolation before editing.
+5. A broad-test failure may repair only a still-valid physical/public contract.
+   Rewrite or delete stale tests; never restore a retired owner or compatibility
+   surface.
 
-## M0 closure evidence
+## Reopened M1–M6 closure
 
-The refreshed M0 authority closes all of the following together:
+The implementation now follows the System Architecture's smaller terminal model:
 
-- System Architecture is the sole normative design and contains the converged Point, View/Fit, Signal transaction, Run admission, hardware, storage, form and product-flow contracts.
-- The adversarial audit corrections are merged into System Architecture §4, §5, §8, §9 and §10; this checkpoint does not restate those contracts.
-- System Architecture §3.3–§3.5 no longer turns point semantics into a public type family: PointColumn/GridTopology reuse AxisId, one discriminated AxisSourceRef replaces five ref classes, `point_ordinals` is the row-filter payload, grouping is a plain source tuple, and the sole resolved value is data-owned ResolvedPointRows. A point ordinal itself is the observation address, so the result has no mirrored address field. Frontend validation delegates privately from the existing Figure contract and does not own a second resolved DTO/module.
-- The stale per-revision Presented*, horizontal M1 and public session/lane/admission type implications are absent from the target design except where named as deletion evidence.
-- `AGENTS.md` contains execution protocol only.
-- this file contains checkpoint/operations only.
-- the duplicate design charter and every reference to it are deleted.
-- no contradictory old architecture remains in tracked docs.
-- Markdown/link checks, dead-reference search and `git diff --check` pass.
+- Runtime identity uses typed stream/generation/sequence/event/parent facts. Ordinary
+  live values, Camera payloads, signal joins, Figure derivations, spans, and ordinary
+  artifacts no longer compute payload SHA or mirror the same lineage through digest
+  lattices.
+- Experiment application is the only Run/admission lifecycle owner. SignalPlane owns
+  generations, routes, publications, exact parents, dependency closure, and atomic
+  withdrawal; its duplicate Run lifecycle API/state is gone.
+- Project `_output` is the only experimental output root. Capture, PulseScan,
+  Calibration, Occupancy, Fit, and Figure persistence use typed relative path refs,
+  original-dtype direct files, and domain-record-last atomic publication. Generic CAS,
+  repository leases, prepared commit/pending inspection, and hidden repository roots
+  are gone. Hardware interprocess leases remain unchanged.
+- Calibration owns physical readout facts and raw per-site samples. The generic
+  frontend Distribution/Histogram owner alone performs bins, bimodal analysis,
+  threshold validation, overlay, and style. Synthetic population axes, centered-zero
+  thresholds, pooled pseudo-pages, and leaf-local plotting truth are gone. Explicit
+  frame saving and saved-frame recalibration write below
+  `_output/calibrations/<run-name>/`.
+- Camera finite/live products preserve source dtype and fixed `R×P×data_shape`.
+  Occupancy, MOT, duration fidelity, release-recapture, selectors, and Fit retain exact
+  parent/event semantics without duplicate repository, presentation, or result owners.
+- PulseScan remains autonomous streamed and consumes an arbitrary associated `y`
+  signal. `exp.nodes.pulse_scan` now provides public scan-slot/API-slot authoring,
+  bind, prepare, start, run, load, and materialize operations. TaskConsole stores a
+  portable relative pulse path; the PulseScan package resolves it through the same
+  application-injected pulse loader used by the public API before program binding.
+- Tutorial PulseScan code imports no neutral internals. Direct artifact/archive modules
+  are named for what they do rather than pretending to be generic repositories.
 
-## Operational entry points
+## Deleted owner closure
 
-- Desktop composition: DeviceManager creates the shared Experiment and opens TaskConsole/PulseGUI.
-- Real-hardware qualification: `docs/REAL_HARDWARE_BRINGUP_zh.md`
-- FPGA server operations: `fpga/README.md`
-- Verification entry: `tests/README.md`
+Ten production modules are deleted from the base tree:
 
-Use the narrowest current test or product flow for the active boundary. Broad verification belongs to M7.
-Test-source migration does not belong to M7: every cut must rewrite its directly affected tests to the current public/physical contract or delete them with the retired behavior. M3 includes the one-time catch-up for M1/M2 test debt before it may close.
+- `zlc_data/bimodal_distribution.py`
+- `zlc_neutral_atom/logic_nodes/mot_field/ui/__init__.py`
+- `zlc_neutral_atom/logic_nodes/mot_field/ui/view_projection.py`
+- `zlc_neutral_atom/logic_nodes/pulse_scan/repository.py`
+- `zlc_neutral_atom/logic_nodes/readout/calibration/task_output.py`
+- `zlc_neutral_atom/logic_nodes/readout/occupancy/repository.py`
+- `zlc_neutral_atom/runtime/commit.py`
+- `zlc_storage/content_store.py`
+- `zlc_storage/repository_lease.py`
+- `zlc_workbench/data_figure/archive_repository.py`
 
-## M1 closure evidence
+The three replacement files are direct domain operations, not new layers:
 
-- `zlc_data/schema.py` owns the sole `PointColumn`/`PointTable`/`GridTopology`/`ResolvedPointRows` model; `axis.py` owns canonical scalar/source normalization and `codec.py` owns its wire form. `SourceViewBinding` is the only frontend binding. No point manager, registry, second resolver result or new module was added.
-- Production references to Dataset `PointLayout`, `point_axes`, `point_layout`, `cell_layout`, `TransformedSchema`, `FitCoordinateSource`, `RowComponentValidity`, `AxisViewBinding`, `RepeatViewMode`, `display_selections`, `AxisViewRole.SLIDER`, `fit_axis_ids` and FitGrid are zero. The six obsolete FitGrid owner files are deleted.
-- A real non-grid PulseScan with correlated authored rows A/B/A preserves ordinals `0,1,2`, exact rows and `grid_topology=None` through Dataset, artifact, Figure and Fit without Cartesian expansion.
-- The M1 topology invariant was first proved with a 2×2×2 MOT producer. The current M6 product witness exercises the same point-table/topology split at 7×7×7: scalar physical shape `(1,343,1)`, explicit topology `(7,7,7)`, and no frontend topology inference.
-- Saved Curve and Histogram Fit results reopen through the canonical DataFigure/Figure renderer for overview, focus and export. Focus remains display-only and never rewrites the committed Fit authority.
-- Fixed-scope production Python changed from 174,687 to 172,061 physical lines: 421 to 415 modules, 1,025 to 1,016 classes, 602 to 598 dataclasses and 35 to 33 enums. The complete cut is `+8,464/-11,090`, net `-2,626`, with zero new production modules and six deletions.
-- Production compileall and `git diff --check` passed at the M1 code checkpoint. Forty-nine tests still named the replaced model; the later test-source ruling makes that deferral invalid. They must be rewritten to current contracts or deleted during the M3 catch-up and the owning downstream cuts, never used to restore M1 compatibility.
-- Next action is M2 only. Recover its owner/deletion/public-concept contract from the Goal, audit M2/C rows and System Architecture §5/§8 M2 before touching product code.
+- `zlc_neutral_atom/logic_nodes/pulse_scan/artifact.py`
+- `zlc_neutral_atom/logic_nodes/readout/occupancy/artifact.py`
+- `zlc_workbench/data_figure/archive_io.py`
 
-## M2 frozen preflight
+Production imports of every retired module and of CAS/commit/presentation mirror
+symbols are zero.
 
-- Fixed-scope baseline before M2 product edits is 415 production Python modules and 172,061 physical lines. The worktree has no product diff; `pulses/scan_test.json` remains the sole untracked user file and is outside the cut.
-- The only mutable Signal generation/frontier authority will be `SignalDataPlane`. The existing acquisition `EventRef`/reservation owner, `MonitorDataset` materialization owner, Camera association adapter, PulseScan exact collector and frozen RTL remain unchanged.
-- The sole allowed new public concept is one immutable `SignalPublication`, earned by atomic siblings, exact parent references and monotonic transaction sequence and consumed by Processor routing, Figure-derived publication and Workbench operations. M2 adds zero public presentation types and no public Prepared/Presented/Route/Manager/borrow/lease framework.
-- Delete, do not wrap: `_CausalEdge`/`_CausalComponent` retrospective reconstruction, source-component capture/plumbing, per-revision `source_transform` association guesses, `ConsolePresentationIndex`, Window presentation reconciliation/topology repair and `_card_output_presentations`, dynamic mixed `FigureOutputRequest`/`FigureOutputFront`/`FigureOutputSession`, raster-lane output sessions, and TaskConsole recursive association heuristics.
-- Keep and reassign: `SignalValue` and `SignalFront`; pure `FigureAreaCommit`/`FigureCrossCommit` and materializers; generation-static `FigureOutputPresentation`; the existing Fit solver lane until M3; frontend SiteMap rendering rebuilt from exact signal/artifact facts; exact hardware association and reservation contracts.
-- Area and Cross are separate continuous routes driven from exact source publications independently of paint cadence. Fit parameters are a separate event-result publication and never withdraw or block selector routes. Workbench constructs and presents connected panel fronts from one exact `SignalFront`; a failed attachment/render keeps the prior complete group and is nonfatal.
-- Formal association is a frozen neutral route fact backed directly by the existing `SignalEventAssociationSource`; TaskConsole never infers it from panel names or display transforms. No EmissionSlot/PointEmissionMap framework is introduced because the current FormalPulseScan product has no fixed-K publication consumer.
-- Required M2 evidence is: raw→ROI dual panels; raw→ROI→ROI→Fit under at least three interleaved retained revisions; an independent producer advancing concurrently; atomic Camera frame siblings; and FormalPulseScan over Camera/Area/Occupancy with Fit/Histogram rejected before FIRE. Retirement with active/pending work must not revive a generation.
+## Fixed-scope complexity
 
-## M2 closure evidence
+- Package Python (`Zou_lab_control`, `zlc_data`, `zlc_frontend`, `zlc_neutral_atom`,
+  `zlc_pulse`, `zlc_storage`, `zlc_workbench`): 381 modules, 161,601 physical lines,
+  918 top-level classes, 552 dataclass declarations, and 32 enum declarations.
+- Root launchers: 4 modules / 396 lines.
+- Formal FPGA Python outside verification/tests: 8 modules / 2,825 lines.
+- Complete production diff from the closure base, including the three newly named
+  direct files: `+5,823/-15,233`, net `-9,410`, added/deleted ratio `0.382`.
+- The cut adds no manager, registry, public session/lane, compatibility model, memory
+  budget, or hardware capability. Its three new filenames replace three deleted
+  repository-named owners.
 
-- `SignalDataPlane` is the sole mutable generation/publication/frontier owner. Its one new public value, immutable `SignalPublication`, freezes the sibling bundle, owner generation, monotonic sequence and exact parent publications; only the plane constructs `SignalPublication` and `SignalFront`.
-- Retrospective `_Causal*` reconstruction, source-component plumbing, per-revision presentation data, `ConsolePresentationIndex`, mixed `FigureOutputRequest`/`FigureOutputFront`/`FigureOutputSession`, raster output sessions and Window topology repair are deleted. Area and Cross now have independent continuous routes; Fit parameters use an exact-parent event route; SiteMap presentation is projected from exact signal/artifact facts.
-- Product witnesses passed for raw→ROI, three-revision raw→ROI→ROI→Fit with an independently advancing producer, atomic Camera frame siblings, exact Fit completion tokens, complete render groups and restarted-owner generation isolation. Retirement and terminal counterexamples proved that stale, fake, duplicate or late publications cannot revive a generation.
-- FormalPulseScan preflight accepted Camera, Area and Occupancy event sources and rejected Fit and Histogram before cursor/FIRE. Formal association is validated against the frozen route and value schema; TaskConsole performs no name-, panel- or display-based reconstruction.
-- Fixed-scope production Python changed from 415 modules / 172,061 lines / 1,016 classes / 598 dataclasses / 33 enums to 414 / 171,987 / 1,004 / 589 / 33. Production diff is `+3,062/-3,136`, net `-74`, with zero new modules and one deleted owner module.
-- Production compileall, changed-module import smoke, `git diff --check`, forbidden-symbol search and constructor-owner search passed at the M2 code checkpoint. Its directly affected stale tests are part of the same M3 catch-up; `pulses/scan_test.json` remains untouched and untracked.
-- Next action is M3 only. Recover its Fit-surface, regular-raster, canonical Figure/Form and deletion contracts before changing product code.
+## Current evidence
 
-## M3 frozen preflight
+- Direct artifact/Calibration/Camera/runtime group: 88 passed, followed by all three
+  corrected stale-contract cases passing.
+- Core hardware-installation, endpoint, operator, runtime, data/Fit/transform,
+  Calibration-result, and main-oracle group: 197 passed.
+- Architecture/product/GUI group: 87 passed before four stale test contracts were
+  identified; all four now pass individually. The DeviceManager→Camera→2-D/Area flow,
+  finite Camera progress→FINAL flow, Grid Setting/Edit/Fit flow, and running
+  Camera→PulseScan flow all use formal offscreen composition and real Qt controls.
+- PulseScan public API plus executable tutorial: 18 passed.
+- Final production compileall plus import-DAG/first-party-import/discovery ratchets:
+  39 passed.
+- `git diff --check`, retired-symbol/module scans, zero frozen-hardware diff, and user
+  file isolation pass.
 
-- Fixed-scope baseline is 414 production Python modules / 171,987 physical lines / 1,004 classes / 589 dataclasses / 33 enums. M3 must add no production module and should be materially net-negative; a net increase or another Manager/Session/Lane owner stops the cut for compression review.
-- Existing `PlotPanelContract/PlotPanelSession`, `PanelFrame/BoardFrame`, `EvaluatedProjectionIdentity`, `ViewSpec/SourceViewBinding`, serial Matplotlib render owner, `FitResultBatch` and the six data-owned Fit responsibility files are retained and extended in place. B14–B16, B21 and B25 are already closed and will not be replayed.
-- The only allowed new public concept is frontend-owned `FigureIntent`, consumed by TaskConsole, Calibration, DataFigure/FigureViewer and API projection. Typed `PlotKind` replaces the current string vocabulary in place and may not coexist with a second registry. No public Front/Session/Lane/Manager/problem type is allowed.
-- Delete rather than wrap: repeat-mode mappings/UI and stale alternatives; parallel Figure/Fit translators and DataFigure front/runtime; `FigureFitLane`; card-global Fit source/result/pin state; DataFigure's second Fit executor/draft state; Workbench display-limit/form authority; Histogram scale enum; numeric text sentinels; Calibration's duplicate live/report presentation defaults; leaf-local font overrides/workarounds; leaf UI reverse Workbench imports; unstable root-barrel implementation exports. Main's canonical Helvetica Light asset remains packaged and is registered only by the frontend style owner.
-- `zlc_data.fit_problem/fit_solver` remains the sole representation/solve owner. A private regular 1D/2D path retains readonly original-dtype views, axis vectors, ROI slices and compact validity; irregular inputs retain the packed fallback. Workbench composition owns one private compute submit/cancel/completion seam; frontend owns only authoring, projection and vector overlays.
-- Product evidence must prove: ambiguous defaults need input; repeat and facet remain orthogonal with exact FixedIndex; one exact Figure front/geometry drives selector and Fit; Monitor Fit never pins base; Edit Fit is isolated; Fit completion performs no base compose; 2304² uint8 packing loses the current full-grid/full-float64 cost; Calibration live/report and all Figure hosts share canonical pixels/forms; no reverse leaf→Workbench edge or stale public owner remains.
+## Next action: M7 only
 
-## M3 closure evidence
-
-- `PlotKind`, `FigureIntent`, display forms, view evaluation and Fit authoring now have one frontend owner. TaskConsole, DataFigure/FigureViewer, API projection and Calibration consume that owner instead of maintaining parallel vocabularies, forms or Fit runtimes. Calibration core remains headless; its optional UI adapter delegates report rendering to the same frontend report owner.
-- Monitor Fit consumes successive live fronts without pinning the base raster; Edit Fit owns an isolated snapshot. Fit parameters publish through their exact source publication, while overlays remain presentation state. The existing data Fit problem/solver owns regular-raster handling with readonly original-dtype data and axis vectors; no public Fit lane/session/problem framework was added.
-- Area, Cross and Fit use the same `SinglePanelHost` interaction/publication path and exact frontend geometry. Product witnesses cover Camera→Area, retained ROI→ROI→Fit revisions with an independent producer, visible signal-picker reconciliation, live orange Fit overlay plus parameter publication and Clear, PulseScan schema gating, MOT current presentation, and curve/pulse/image/histogram interaction through real Qt input.
-- M1/M2 test debt was closed in the same cut: tests naming retired Point/Figure/private-board contracts were migrated to current public product surfaces or deleted with the retired behavior. No compatibility production model was restored. Test sources changed by `+5,193/-19,809`, net `-14,616`; cross-test imports and references to retired M1/M2/M3 symbols are zero.
-- Fixed-scope production Python changed from 414 modules / 171,987 physical lines / 1,004 classes / 589 dataclasses / 33 enums to 408 / 171,900 / 993 / 583 / 33. Production diff is `+7,909/-7,996`, net `-87`, with zero new production modules and six deleted owner modules: `panel_policy`, `axis_navigator`, `figure_fit_lane`, `fit_draft`, `form_projection` and `frozen_raster`.
-- Narrow current-contract evidence passed: 197 data/runtime/operator tests, 88 frontend/readout tests, 55 product/plane tests, 46 architecture/calibration tests, 35 unified interaction tests, 9 curve tests, 7 pulse tests, 6 PulseScan consumer tests, 2 exact modified Experiment facade tests, and the MOT current witness. Production compileall, `git diff --check`, forbidden/deleted-symbol scans, debug-code scan and the frozen-hardware diff gate pass at closure.
-- The full Experiment-facade run still exposes two valid lifecycle failures (`close-retry` validation ordering and `close-race-capture` lookup timing): 11 tests pass and 2 fail. Those two case bodies and their close/admission production paths were not changed by M3; keep the tests and repair the single Experiment lifecycle/admission owner in M4/M5. Do not delete them and do not add M3 compatibility.
-- Next action is M4 only. Its production edits must migrate or delete directly affected tests in the same cut; only broad cross-cut execution remains deferred to M7.
-
-## M4 frozen preflight
-
-- The fixed-scope baseline is the M3 checkpoint: 408 production Python modules, 171,900 physical lines, 993 classes, 583 dataclasses and 33 enums. M4 replaces duplicated authority and is expected to be materially net-negative. A net increase, a second commit/SAFE/path owner, or a compatibility reader stops the cut for compression review.
-- Artifact visibility has exactly one durable authority: the canonical CAS manifest. Replace `CommitTarget`, `CommitIntent`, `PublishedManifest`, `FinalCommit`, `RepositoryCommitCoordinator`, `PersistentCommitJournal` and the Run commit-resolution modes with one process-local, single-use `PreparedArtifactCommit` in the existing `runtime/commit.py`. It carries the expected typed ref, publish-once and exact-target inspection callbacks, and one repository-root borrow. No new commit manager, state enum or module is allowed.
-- Publication is attempted once. On an exception, exact inspection returns visible-and-durable, confirmed absent, corrupt, or temporarily unreadable. Only the last case remains nonterminal as `commit-inspection-pending`; the same Run owner repeats inspection only, never publication. The hardware lease is already released and cancellation is too late. Admission and cold reopen validate manifest, blobs, schema and canonical run/source lineage directly.
-- Delete `zlc_storage/framed_journal.py`, its exports/tests and every repository `.journal`/coordinator/recovery path. Delete `AdmittedCapture.commit_id`. Calibration's canonical manifest and Occupancy's canonical metadata carry the run provenance required to replace `CommitIntent.run_id`; Capture and Scan reuse their existing canonical provenance. FitResultRepository remains its existing direct manifest-only owner.
-- `ResourceLease` has one exact-once `release()` independent of terminal publication. Cleanup/SAFE/session stop-drain-join is attempted, device capability is revoked, and the claim is released before validation, staging, report generation or manifest publication. Cleanup failure fails only this Run and does not create quarantine. M5 still owns full application admission/retirement policy.
-- Reuse the existing Pulse values instead of introducing the design document's illustrative type family: strengthen `PulseServerSnapshot` into a strict typed observation with explicit backend progress and SAFE readback facts; remove its public raw `backend` map and all neutral parsing of private backend keys. The deployed streamer session remains the only physical SAFE/readback owner; service/client only bind that fact to the current connection generation. Close must not perform a second physical SAFE after an already verified one.
-- `zlc_pulse.deployment` becomes the only strict loader for the checked deployment geometry. Compiler, validator, packer, server and simulation composition consume that value; neutral imports no `fpga.pulse_streamer.host.*` and receives only narrow clock/fingerprint facts. Missing, corrupt or incomplete geometry fails instead of falling back. No RTL, Tcl, XDC, bitstream, wire bytes, host-stepped scan or new hardware fact is in scope.
-- Extend the existing finite-camera `CaptureStartedAck` and existing signal-association owner in place; do not add an arm manager or parallel receipt hierarchy. New physical capture freezes the exact spec/cardinality/buffer/counter baseline. FormalPulseScan over an already-running signal freezes the existing arm/session plus produced/drained/published baseline without rearming or resizing; the producer keeps draining its finite driver ring into the lossless raw stream, and any overrun/publication/count/order/quiet-window failure invalidates the whole Run. This is fail-closed correctness, not a promise that an arbitrarily long Run fits the current ring. Existing autonomous streamed hardware timing remains the only normal scan mode.
-- Composition owns one immutable `WorkspacePaths` value and injects only narrow roots. `zlc_storage.paths` becomes the stateless `resolve_under(root, path)` owner. Delete `PROJECT_ROOT`, `project_path`, `user_output_path` and `resolve_under_project`; leaves and Workbenches may not infer roots from package location, CWD or environment. Deployed immutable assets remain package/deployment owned, outside WorkspacePaths.
-- Same-cut test contract: delete pure journal/history tests; rewrite manifest lost-ack/absent/corrupt/unreadable and exact-once tests against the current operation; reverse the lease witness so a second Run starts while finalize is blocked; migrate repository cold-reopen/provenance tests; replace package-root tests with explicit WorkspacePaths tests; migrate pulse snapshot/SAFE/geometry and camera-association tests. M4 cannot close while any production or test source imports a retired M4 symbol. Broad cross-cut execution alone remains for M7.
-
-## M4 closure evidence
-
-- The canonical CAS manifest is the sole durable artifact authority. `PreparedArtifactCommit` is the single process-local publication capability; the Run owner publishes once, inspects only the exact target after an error, exposes pending visibility without holding hardware, and abandons an indeterminate handle once during shutdown. The persistent commit journal, coordinator, intent/history types, framed side journal and their tests are deleted.
-- Hardware cleanup, SAFE/buffer sealing, capability revocation and exact-once lease release now precede validation, report generation and manifest publication on success, failure and cancellation. Capture, Scan, Calibration and Occupancy carry and cold-validate their own canonical run/source provenance; no transport intent supplies domain truth.
-- `PulseServerSnapshot` is the sole typed execution observation and `DeployedStreamerSession` is the sole physical SAFE/readback owner. Compiler, artifact compiler, wire packer, validator, server and simulation now consume the same strict checked deployment geometry owner; neutral has no FPGA-host or raw-backend dependency. RTL, Tcl, XDC, bitstream and deployed assets are unchanged.
-- Finite Camera capture freezes its physical arm/cardinality/buffer baseline. FormalPulseScan over a running signal freezes the existing generation plus constant-size schedule/count/timing facts, waits through the exact raw-publication watermark, validates hardware stamps/count/order/quiet-window and fails the whole Run on gaps, extras, overrun or publication failure without rearming, resizing or host-stepped timing.
-- Composition owns immutable `WorkspacePaths`; storage only resolves beneath injected roots. Root launchers, public API, tutorial and directly affected tests use that contract. M1/M2 and every later cut are now explicitly covered by the same-cut test rule: stale private/retired-contract tests are rewritten or deleted before advancing, never deferred to M7 or used to restore compatibility.
-- Fixed-scope production Python changed from 408 modules / 171,900 lines / 993 classes / 583 dataclasses / 33 enums to 406 / 171,541 / 981 / 579 / 32. Production diff is `+2,637/-2,996`, net `-359`; two owner modules (`framed_journal.py`, `timing/clock.py`) are deleted and no production module is added.
-- M4's consolidated current-contract run reached 52 upstream passes before exposing one stale private test call; after migrating that test, the complete downstream/remainder set passed 194 tests. Focused final lifecycle/hardware/facade evidence passed 40 tests and strict geometry/Pulse evidence passed 24 tests. Compileall, import/retired-symbol scans, `git diff --check`, the frozen-hardware diff gate and user-file isolation pass at closure.
-- Next action is M5 only. Recover its fixed-namespace discovery, narrow composition/API binder, unified admission and optional leaf-UI deletion contract before changing product code.
-
-## M5 frozen preflight
-
-- The fixed-scope baseline is the M4 checkpoint: 406 production Python modules, 171,541 physical lines, 981 classes, 579 dataclasses and 32 enums. M5 replaces composition and admission owners and is expected to be materially net-negative; it may add no production module except an earned optional-UI descriptor owner if that value cannot remain in the existing package module.
-- `zlc_neutral_atom.logic_node_package` remains the sole fixed-namespace discovery owner. Discovery must be cached, deterministic and skip optional `ui` namespaces without importing their package roots. Before constructing any public API it validates package namespace/Definition/API identity, dependencies and cycles, declared application facts, device-role/domain availability and lazy UI descriptor ownership. A pure Logic-node addition changes only its leaf package; there is no mutable registry, service locator or central concrete switch.
-- `LogicNodePackage` is narrowed to a frozen leaf declaration and explicit application requirements. Binders receive only the declared immutable fact tuple and dependency APIs for the duration of composition; they never receive or retain `ReadoutFacade`, `ExperimentServices`, a catalog or a queryable operation graph. Ordinary TaskConsole projection is mechanical from `LogicNodeDeclaration` plus the leaf's narrow prepare/bind facts. Delete `TaskConsoleProjection`, `bind_task_console`, `task_console_order`, per-leaf TaskConsole binders and one-function Workbench adapters instead of renaming them.
-- The only allowed new public value is a tiny frozen `UiContributionDescriptor` containing a contribution purpose and lazy owner module/symbol. It has no registry, callbacks, runtime state or Workbench type. Headless discovery validates its namespace without importing it. The baseline optional UI closure is PulseScan's structured table/slot editor, Calibration's creation/report surface and Occupancy's exact-cell navigator; ordinary fields, Figure/SiteMap/style and lifecycle remain generic owners.
-- One Experiment-owned private admission method becomes the sole start coordination path for API, TaskConsole, PulseGUI and leaf coordinators. Existing `ResourceArbiter` returns a deterministic non-empty tuple of all blockers from one locked scan and exposes a narrow release wait; existing `RunPlan` carries explicit frozen preemptibility/owner facts without an Admission/Policy/Receipt class chain. The application uses the existing exact SignalDataPlane generation graph to prove an all-preemptible retirement closure, retires all or none, waits for M4's early lease release, then makes one final admission of the same plan. A new racer fails once; cancellation during retirement never starts the new Run.
-- `SignalDataPlane` is application-owned and injected into TaskConsole; the window neither constructs nor closes another plane. Exact lifecycle parents and admitted Run identity live on its existing generation state, and closure query/retirement mutation are generation-exact. TaskConsole's conflict scanner/retry, board-wide `_task_locked`/single-task mode, `HostedRun.resource_conflict`, PulseGUI replacement admission and the Pulse application second gate are deleted. Row-local edit/start/stop state and non-owning diagnostics remain.
-- Delete the central `zlc_neutral_atom/pulse_catalog.py`; defaults return to their owning leaf or the named release-recapture family. Delete fake `DeviceInfo.availability/health` and `DeviceCatalogView.revision`; live connection/init state remains with the runtime/admin owner. Use the selected installation package's `pulse_editor_mode` instead of a backend switch.
-- Public `Zou_lab_control` remains the sole application API. Figure/Fit Qt composition and leaf GUI opening move, not copy, to `Zou_lab_control.workbench`; the facade retains only validation and narrow lazy opener delegation. Calibration/Occupancy APIs receive application-owned lazy UI openers and never import optional UI modules directly.
-- Directly affected M5 tests are part of this same cut. Each is rewritten to the current physical/public contract or deleted with its retired owner; none may remain as a known historical contract or justify production compatibility. Required evidence covers headless discovery with no leaf UI/Qt/Matplotlib imports, full graph failure before any API bind, unavailable-leaf filtering, ordinary declaration projection, exact complete blockers/all-or-none retirement/cancel/new-racer behavior, application-owned plane reopen, public Workbench delegation and absence of every retired M5 symbol/module. Broad cross-cut execution alone remains for M7.
-
-## M5 closure evidence
-
-- Fixed-namespace discovery is deterministic and validates the complete dependency/application/device/UI graph before public API binding. Binders receive only declared immutable facts and dependency APIs; ordinary TaskConsole projection is declaration-driven, while the three earned optional UIs are lazy and headless discovery imports neither leaf UI nor Qt/Matplotlib.
-- Experiment application now owns the single SignalDataPlane and the single start-admission path. The arbiter reports every blocker from one scan; exact generation closure is retired all-or-none, cleanup/SAFE/lease release is awaited, and the same frozen plan is admitted once. TaskConsole conflict arbitration, board-wide task lock, HostedRun conflict shadow state and the Pulse second gate are gone.
-- Public Figure/Fit and leaf-window composition moved from the facade to `Zou_lab_control.workbench`; transient Figure windows share Experiment ownership. `SerialWorkerWindow` owns one sealed close/drain cycle, and HostedRun cannot report idle or shut down its mailbox until the RunHandle owner is reaped.
-- Eleven duplicate owner modules were deleted and no production module was added: the Camera/MOT/Calibration/Occupancy Workbench adapters, PulseScan TaskConsole wrappers, Calibration report/view/workbench wrappers, Occupancy workbench wrapper and the central pulse catalog. `UiContributionDescriptor` is the only new public value; no registry, service locator, compatibility model or second mutable owner remains.
-- Fixed-scope production Python changed from 406 modules / 171,541 lines / 981 classes / 579 dataclasses / 32 enums to 395 / 171,789 / 978 / 580 / 32. Production diff is `+3,607/-3,359`, net `+248`, ratio 1.074. The positive cut passed the mandatory owner/LOC review: it provides the previously missing graph validation, complete-blocker admission and exact lifecycle closure while deleting eleven owners, adding no module and only one earned value. The cumulative M0-to-M5 baseline remains down 2,898 lines and 26 modules.
-- Directly affected M1/M2/M5 tests were migrated to current physical/public behavior or deleted with their retired owner in this cut; historical filename/private-call assertions were removed rather than preserved. Current-contract groups passed 110 and 48 tests; the final admission/lifecycle group passed 9 tests and the post-guard Calibration lifecycle file passed 8 tests. Production compileall, changed-import smoke, `git diff --check`, reverse-edge/retired-symbol scans, frozen-hardware gate and user-file isolation passed.
-- Next action is M6 only. Recover the Camera/PulseScan, Calibration/Occupancy, MOT/release-recapture and performance slice contract; every production contract change must migrate or delete its affected tests in the same slice.
-
-## M6 PulseScan and event-association subcut closure
-
-- PulseScan now has one unambiguous cardinality contract: `R = scan_sweep_count`, `P = authored scan-table rows`. Pulse-timeline `RepeatRegion` remains inside every point and is never expanded, cleared or interpreted as Dataset R. Autonomous execution materializes sweep-major rows once; API-slot execution reuses the same P compiled point programs in sweep-major order. The dead `scan_shape` pseudo-topology and the old repeat-expansion helper/export are deleted.
-- Release-recapture writes its authored shot sweep into the existing `PulseDocument.scan_sweep_count`; duration fidelity deliberately keeps one host sweep and retains shots as its one-FIRE hardware `RepeatRegion`. Neither path uses the deleted PulseScan repeat helper.
-- An externally triggered Camera event route is now bindable before its first frame exists. `SignalDataPlane` freezes the active generation with the event source/output/authoritative transform, while latest-only Processors still require an actual current publication. The formal product witness starts PulseScan while Camera correctly shows no pre-FIRE value, completes `R=2`, and leaves Camera running.
-- Exact preemption is two-phase in the existing SignalPlane/application owners: the complete preemptible closure is first withdrawn from routing, its Runs are cancelled and allowed to reach cleanup/SAFE/buffer seal/lease release, and only then are live slots closed. This fixes the real Camera→Calibration failure where early slot closure converted expected cancellation into `FAILED`; no admission manager, receipt or second state map was added.
-- Directly affected tests changed with the production contract in this same subcut, including the M4 workspace-root test that still privately constructed a stale Pulse window. It now uses the formal Pulse editor composition; no production compatibility was restored. Focused evidence passed 67 PulseScan/admission/SignalPlane tests plus the Camera→PulseScan and Camera-retirement→Calibration product flows. Compileall, `git diff --check`, retired-symbol scans, zero frozen-hardware diff and user-file isolation pass.
-- Production diff for this subcut is `+280/-186`, net `+94`, across 17 existing files. It adds zero production modules, classes, dataclasses or enums. The positive delta is the pre-publication association invariant and safe two-phase retirement in the existing owners; no second mutable owner or compatibility path remains. The fixed-scope total is therefore 395 modules / 171,883 physical lines / 978 classes / 580 dataclasses / 32 enums.
-- Next action remains M6: replace finite Camera's rolling/single-frame preview and MOT's private exact watcher with one internal exact-delta live seam in the existing runtime owner, then delete the private watcher. Public concept/module increment must remain zero; all affected Camera/MOT tests migrate in the same subcut.
-
-## M6 Camera/MOT exact-live subcut closure
-
-- Runtime now owns one internal exact-delta live seam shared by finite Camera and MOT. `DatasetBuilder` exposes at most one committed cell per freeze, captures watermark/views under its lock and performs the immutable `Value` copy outside it; the worker checks close/failure/generation between cells. This is a fairness and cancellation boundary, not a memory budget or byte quota.
-- SignalPlane wakeup carries the exact attached slot. Non-FINAL detach removes the complete exact generation closure before slow close/join and cleans captured retired state rather than a reusable textual owner id, so an old wake or cleanup cannot dirty or withdraw a replacement generation.
-- Finite Camera preserves every installed camera role and source dtype. K cycles with N frames per cycle publish N atomic siblings, each fixed at `(K,1,*frame_shape)` from first complete-cycle progress through FINAL; incomplete cycles exist only in validity. The old rolling/single-frame finite preview contract is gone.
-- MOT uses the same fixed output-schema object and fingerprint for live and FINAL, performs O(1) in-place accumulation per exact cell, and materializes immutable output only on SignalPlane demand. The private 284-line MOT watcher is deleted. Its ordinary package remains headless; one lazy `logic_nodes/mot_field/ui/**` leaf owns the frontend FigureIntent, so no Workbench presentation owner or per-revision sidecar was added.
-- PulseScan's unused exact-preview/provisional-output surface and the one-consumer `PreparedExactCapture` wrapper module were deleted. Directly affected M1/M2 tests were migrated in this same subcut: forged publications and old one-facet Grid assumptions were replaced with the real SignalDataPlane and complete typed source vocabulary; stale APIs were not restored.
-- Current-contract evidence passes 87 data/runtime/SignalPlane/Figure/Capture/operator tests, 3 headless-import tests, the finite Camera K=3/N=3 formal panel flow, the Grid Setting/Edit/Fit flow and the full MOT 7×7×7 live-to-FINAL flow: 93 distinct tests. Production compileall and the headless ordinary-package/lazy-UI import proof pass.
-- Fixed-scope production Python remains 395 modules / 978 classes / 580 dataclasses / 32 enums and grows from 171,883 to 172,261 physical lines. The subcut is `+1,387/-1,009`, net `+378`, ratio 1.375: two modules are added and two single-owner residue modules are deleted; the class count is unchanged. The positive delta earns finite Camera's previously missing atomic progress contract, one reusable exact-live lifecycle and the generation-race fix, while adding no public value, manager, registry, DTO or compatibility path.
-- Next action remains M6: close Calibration/Occupancy and the remaining domain/performance slices against the same exact owner, same-cut test and no-growth rules; do not replay M1/M2 or defer their affected tests to M7.
-
-## M6 Calibration/Occupancy subcut closure
-
-- Calibration now executes exactly two linked flat Runs: capture then calibration. The generic HostedRun command context sequences the real child handles without inventing a third Run/composite identity, does not hold its start gate across admission, retains the first capture ref if the second Run fails, and preserves the exact failing/cancelled Run snapshot. FINAL remains authoritative; report/output work after FINAL is a visible non-fatal warning.
-- The Task no longer contains saved-capture mode, raw-frame export policy or a duplicate frame tree; recalibration from an existing Capture remains the public Calibration API. The report owns one physical histogram Dataset whose group/site/population axes serve both per-site and pooled frontend views; the pooled pseudo Dataset and duplicate snapshot truth are deleted.
-- The single Experiment-owned Calibration API owns the visible `current_calibration_ref`. Every successful synchronous, asynchronous or Task commit records it immediately after manifest commit; explicit assignment admits the exact ref first, cancellation/failure leaves the previous ref unchanged, and the existing application-operation guard rejects public access during closing. One leaf lock serializes lazy repository creation, current-ref mutation and close; Occupancy receives that exact API dependency, reads the default once, and freezes an explicit ref in every authoritative request. Saved Occupancy input has no hidden path default.
-- The real Camera→Occupancy→PulseScan product flow now proves that counts/occupied/rate siblings share one event/trace and calibration causation, while the formal associated cursor preserves expandable processor/artifact lineage through cold reopen. The hand-forged private Occupancy stream fixture was deleted after its only unique invariant moved into this product flow. Four M1 tests were migrated in the same cut from F-order/source-string assumptions to arbitrary authored `PointTable` rows, optional `GridTopology` and exact nonadjacent ordinals; no historical layout compatibility was restored.
-- Production changes are `+504/-933`, net `-429`, ratio 0.540, with zero module/dataclass/enum additions and one class removed. Fixed-scope production is therefore 395 modules / 171,832 physical lines / 977 classes / 580 dataclasses / 32 enums. Tests are also net `-210`; the complete cut is net `-639`.
-- Focused current-contract evidence passes 30 Calibration/Occupancy/HostedRun/report/catalog/PulseScan/M1 tests, plus the formal TaskConsole Calibration→MOT product flow and cancellation-before-FINAL workbench flow (32 total). Changed production files compile, diff/retired-symbol/frozen-hardware gates pass, and `pulses/scan_test.json` remains untouched and untracked.
-- Next action remains M6: close the remaining release-recapture/domain and measured Figure/Fit performance slices; do not enter M7 broad execution or replay closed M1/M2 work.
-
-## M6 release-recapture and duration-fidelity subcut closure
-
-- Temperature, Grey Molasses and Readout Duration now use their public leaf API's single Prepared owner directly. Two leaf `application.py` wrapper modules, three application Port/Command pairs, three calibrated-intent mirrors, the triggered-spec/result/private-stage DTO chain, a duplicate duration point resolver and two public final-output forwarding functions are deleted. The retained release-recapture path is one `ReleaseRecapturePipelineSpec -> PreparedReleaseRecapture -> RunPlan -> TriggeredReleaseRecaptureResult` chain; Duration has the analogous single Prepared owner.
-- A Logic Node request binder has exactly one owner. Pure `BoundNodeInputs` binding remains on the declaration; binding that requires installed API/device facts lives only on the leaf package. `LogicNodePackage` rejects missing and double binders before composition, and TaskConsole receives that one resolved binder for both Run and Processor declarations. Camera, Temperature, Grey and Duration no longer expose fake declaration binders that require hidden extra arguments.
-- Final Dataset derivation now includes the existing exact evidence instead of only the result Dataset ref: Duration encodes every ordered Camera/Pulse terminal pair; release-recapture encodes Pulse lineage and the RF terminal when present. The owning device modules provide the canonical terminal trees; no evidence DTO or second codec owner was added.
-- Directly affected tests changed with this cut. Temperature admission moved into the current Camera-retirement product witness; Duration uses the public `prepare -> start -> final outputs` path; Grey proves RF/per-site validity and terminal-sensitive final identity; the remaining Calibration→Camera→Occupancy Qt flow uses the leaf-declared automatic SiteMap rather than creating a duplicate manual panel. That flow exposed and removed the sole stale eight-argument `RunSnapshot` construction in `HostedProcessor`; no retired field or compatibility constructor was restored.
-- Production changes are `+452/-837`, net `-385`, ratio 0.540. Fixed-scope production is now 393 modules / 171,447 physical lines / 962 classes / 570 dataclasses / 32 enums: two modules, fifteen classes and ten dataclasses were removed, with no new module/class/dataclass/enum. Tests are `+150/-127`, net `+23`, because the retained product witnesses now assert the current public Prepared/provenance/default-view contracts rather than private wrappers.
-- Five formal product flows pass: discovery, Camera→Calibration→Temperature admission, Grey+RF, Readout Duration Fidelity and Calibration→Camera→Occupancy. Fourteen focused discovery/import-DAG ratchets also pass; production compile, retired-symbol scan, `git diff --check`, zero frozen-hardware diff and user-file isolation pass.
-- Next action remains M6: repair and profile the remaining Figure/Fit regular-raster and fairness gaps in the existing data/frontend owners. Do not add a Fit framework, process backend, lane type or public problem value; directly affected tests must migrate in the same subcut.
-
-## M6 Figure/Fit performance subcut closure
-
-- The existing data-owned Fit representation owner now admits a regular one- or two-axis view backed by the immutable transformed carrier, not only by original Camera storage. This is required for authoritative transforms such as repeat `MEAN`, where a `uint8` source correctly becomes one compact `float64` raster. Rectangular ROI coordinates remain absolute, transformed component validity remains authoritative, and non-contiguous point groups still fall back to the irregular packed path.
-- The repeat-reduction owner avoids a full integer count plane and redundant safe/result float planes when validity is uniform; `MEAN` divides its canonical result in place and invalid output cells are zeroed in place. The original Camera snapshot stays readonly and retains its source dtype. A 2304², R=3 `uint8` repeat-mean radial problem now dispatches as the private regular problem in about 0.121 s with about 81.0 MiB traced peak, down from about 0.181 s/182.3 MiB before the reduction cleanup and from the audited generic path's roughly 0.57 s/608 MiB. The retained authoritative transformed raster is about 40.5 MiB; no H×W x/y grids or selected-index arrays remain.
-- Workbench keeps the one existing `submit_compute` seam. Two bulk Fit workers provide cross-surface progress, while one private latency-sensitive executor prevents selector materialization and DataFigure Fit preparation from waiting behind both active Fits. Qt accepts one completed Fit per owner turn; result summary, overlay materialization and parameter output preparation occur on the worker. Cancelling or retiring a surface also cancels a queued Future, and any node/render/selector/Fit owner completion can advance the same pending window-close transition. No public lane, manager, process backend, DTO, module or caller-visible budget was added.
-- The zero-production-consumer `build_fit_problem` inspection API is deleted. Its directly affected tests were migrated in this same cut from private packed arrays to current `BoundFit.run()` behavior: sparse authored rows, named multidimensional batch mapping, component validity, repeat-mean ROI absolute coordinates, non-finite handling, integer exactness and cancellation remain covered. This applies the same-cut test rule to M1/M2-era fixtures rather than retaining a historical contract. Compute fairness was added to the existing Qt/application-owner contract test instead of creating a one-test module. Tests change by `+221/-112`, net `+109`; every added assertion covers current public/physical behavior, with zero compatibility fixture or private problem representation.
-- Current-contract evidence passes 69 Fit/data/Workbench/DataFigure tests, 26 transform/repeat-mean tests, and the formal DeviceManager→Camera→live 2-D→Fit→Area→Edit product flow. The latter exposed and fixed one wrong root-barrel import before acceptance; live Fit renders its overlay, publishes parameters and leaves the Camera base advancing.
-- Production changes are `+172/-137`, net `+35`, ratio 1.255, across nine existing modules. The ratio triggers the mandatory review but not rollback: the positive delta is the predeclared B38/B39 regular-raster and fairness capability, the obsolete public inspection helper is deleted, and the newly shared Fit summary moved from the DataFigure-specific module into the existing generic Fit projection owner. No module/class/dataclass/enum/public concept or second mutable owner is added. Fixed-scope production is 393 modules / 171,482 physical lines / 962 classes / 570 dataclasses / 32 enums.
-- Next action is M7 only: execute the final current-contract evidence matrix, remove any remaining dead test/doc/tutorial residue in the same owning boundary, run broad verification last, and do not restore a retired production contract for a stale test.
+Run the final current-contract evidence matrix and broad suite last. Close failures by
+their owning physical/public boundary, delete stale tests/docs/tutorial residue in the
+same cut, and do not restore retired private APIs. Recompute the fixed-scope metrics,
+all System Architecture §9 gates, import/dead-symbol scans, formal product flows,
+frozen-hardware diff, and exact staged-file list. Only after every gate passes may the
+temporary audit ledger be deleted and the Goal be marked complete.

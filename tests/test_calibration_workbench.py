@@ -1,4 +1,4 @@
-"""W6 formal calibration creation/edit, commit receipt, and report oracles."""
+"""Formal calibration creation, editing, direct save, and report behavior."""
 
 from __future__ import annotations
 
@@ -42,9 +42,11 @@ def calibration_product(tmp_path_factory):
     workspace = tmp_path_factory.mktemp("w6-calibration-workspace")
     with zlc.connect(
         "virtual",
-        workspace=zlc.WorkspacePaths.for_workspace(
+        workspace=zlc.WorkspacePaths(
             ROOT,
-            repository_root=workspace.resolve(),
+            ROOT / "pulses",
+            ROOT / "tasks",
+            workspace.resolve() / "_output",
         ),
     ) as experiment:
         reference = experiment.nodes.calibration.sitemap(frames=12)
@@ -70,9 +72,9 @@ def _close(application, window) -> None:
     assert window not in getattr(application, "_zlc_retained_windows", ())
 
 
-def _manifest_count(workspace: Path) -> int:
-    root = workspace / "calibrations" / "content" / "manifests" / "calibration"
-    return 0 if not root.exists() else len(tuple(root.glob("*.manifest")))
+def _calibration_record_count(workspace: Path) -> int:
+    root = workspace / "_output" / "calibrations"
+    return 0 if not root.exists() else len(tuple(root.glob("*/calibration.json")))
 
 
 def test_calibration_owner_presenter_and_public_imports_remain_headless() -> None:
@@ -150,7 +152,7 @@ def test_calibration_form_round_trip_preserves_spatial_authority(
         build_calibration_analysis_request_from_authoring(request, values)
 
 
-def test_formal_calibration_commit_wins_close_and_render_failure_keeps_receipt(
+def test_formal_calibration_save_wins_close_and_render_failure_keeps_reference(
     application,
     calibration_product,
 ) -> None:
@@ -160,9 +162,9 @@ def test_formal_calibration_commit_wins_close_and_render_failure_keeps_receipt(
         computation.artifact.source_binding.source_capture_ref,
         replace(original, split_seed=original.split_seed + 1),
     )
-    before = _manifest_count(workspace)
+    before = _calibration_record_count(workspace)
     owner_thread = threading.get_ident()
-    committed = threading.Event()
+    saved = threading.Event()
     release_receipt = threading.Event()
     run_threads: list[int] = []
     window = experiment.nodes.calibration.calibration_gui(request)
@@ -175,7 +177,7 @@ def test_formal_calibration_commit_wins_close_and_render_failure_keeps_receipt(
         window._calibrate_button.click()
         assert window.worker_idle
         assert window._status.text() == "CALIBRATION REQUEST INVALID"
-        assert _manifest_count(workspace) == before
+        assert _calibration_record_count(workspace) == before
         form.widget_for("train_fraction").setValue(0.8)
 
         original_starter = window._run_starter
@@ -188,22 +190,20 @@ def test_formal_calibration_commit_wins_close_and_render_failure_keeps_receipt(
 
             def delayed_result(timeout=None):
                 reference = original_result(timeout)
-                committed.set()
+                saved.set()
                 if not release_receipt.wait(15.0):
-                    raise TimeoutError("test did not release committed receipt")
+                    raise TimeoutError("test did not release saved reference")
                 return reference
 
             def warning_snapshot():
                 snapshot = original_snapshot()
-                if snapshot.final_committed:
-                    return replace(
-                        snapshot,
-                        cleanup_errors=(
-                            *snapshot.cleanup_errors,
-                            "deterministic post-commit cleanup warning",
-                        ),
-                    )
-                return snapshot
+                return replace(
+                    snapshot,
+                    cleanup_errors=(
+                        *snapshot.cleanup_errors,
+                        "deterministic post-FINAL cleanup warning",
+                    ),
+                )
 
             handle.result = delayed_result
             handle.snapshot = warning_snapshot
@@ -211,7 +211,7 @@ def test_formal_calibration_commit_wins_close_and_render_failure_keeps_receipt(
 
         window._run_starter = delayed_receipt_starter
         window._calibrate_button.click()
-        _until(application, committed.is_set)
+        _until(application, saved.is_set)
         assert run_threads and run_threads[0] != owner_thread
 
         # A disabled form can still be changed programmatically.  The formal
@@ -224,7 +224,7 @@ def test_formal_calibration_commit_wins_close_and_render_failure_keeps_receipt(
         assert window._status.text() == "CANCELLING CALIBRATION · CLOSE DEFERRED"
 
         def fail_report(_reference, **_options):
-            raise RuntimeError("deterministic post-commit report failure")
+            raise RuntimeError("deterministic post-FINAL report failure")
 
         window._computation_loader = fail_report
         release_receipt.set()
@@ -239,13 +239,13 @@ def test_formal_calibration_commit_wins_close_and_render_failure_keeps_receipt(
             "CALIBRATION SAVED · RUN WARNING · REPORT DISPLAY FAILED · "
             "EDITOR CHANGED · CLOSE AGAIN"
         )
-        assert "post-commit cleanup warning" in window._diagnostic.text()
-        assert "post-commit report failure" in window._diagnostic.text()
-        assert _manifest_count(workspace) == before + 1
-        admitted = experiment.nodes.calibration.load_calibration_computation(saved)
-        assert admitted.report.request.train_fraction == 0.8
-        assert admitted.report.request.split_seed == original.split_seed + 1
-        assert admitted.artifact.source_binding.source_capture_ref == (
+        assert "post-FINAL cleanup warning" in window._diagnostic.text()
+        assert "post-FINAL report failure" in window._diagnostic.text()
+        assert _calibration_record_count(workspace) == before + 1
+        loaded = experiment.nodes.calibration.load_calibration_computation(saved)
+        assert loaded.report.request.train_fraction == 0.8
+        assert loaded.report.request.split_seed == original.split_seed + 1
+        assert loaded.artifact.source_binding.source_capture_ref == (
             request.source_capture_ref
         )
     finally:
@@ -258,7 +258,7 @@ def test_exact_saved_calibration_reopens_for_new_revision_without_mutation(
     calibration_product,
 ) -> None:
     experiment, reference, _computation, workspace = calibration_product
-    before = _manifest_count(workspace)
+    before = _calibration_record_count(workspace)
     window = experiment.nodes.calibration.calibration_edit_gui(reference)
     try:
         _until(
@@ -268,7 +268,7 @@ def test_exact_saved_calibration_reopens_for_new_revision_without_mutation(
         assert window.saved_reference == reference
         assert reference.target_ref in window._authority.text()
         assert "editing" in window._authority.text()
-        assert _manifest_count(workspace) == before
+        assert _calibration_record_count(workspace) == before
         previous_boards = window._boards
         previous_bundle = window._bundle
         assert previous_boards and previous_bundle is not None
@@ -280,12 +280,12 @@ def test_exact_saved_calibration_reopens_for_new_revision_without_mutation(
         assert window._status.text() == "FINAL CALIBRATION · EDITOR CHANGED"
         window._reset_button.click()
         assert window._form.widget_for("split_seed").value() == 0
-        assert _manifest_count(workspace) == before
+        assert _calibration_record_count(workspace) == before
     finally:
         _close(application, window)
 
 
-def test_committed_invalid_receipt_never_claims_failure_or_auto_closes(
+def test_non_calibration_success_result_is_a_protocol_failure(
     application,
     calibration_product,
 ) -> None:
@@ -294,8 +294,8 @@ def test_committed_invalid_receipt_never_claims_failure_or_auto_closes(
         computation.artifact.source_binding.source_capture_ref,
         replace(computation.report.request, split_seed=23),
     )
-    before = _manifest_count(workspace)
-    committed = threading.Event()
+    before = _calibration_record_count(workspace)
+    saved = threading.Event()
     release = threading.Event()
     actual_references: list[CalibrationArtifactRef] = []
     window = experiment.nodes.calibration.calibration_gui(request)
@@ -309,9 +309,9 @@ def test_committed_invalid_receipt_never_claims_failure_or_auto_closes(
             def invalid_result(timeout=None):
                 reference = original_result(timeout)
                 actual_references.append(reference)
-                committed.set()
+                saved.set()
                 if not release.wait(15.0):
-                    raise TimeoutError("test did not release invalid receipt")
+                    raise TimeoutError("test did not release invalid result")
                 return object()
 
             handle.result = invalid_result
@@ -319,20 +319,18 @@ def test_committed_invalid_receipt_never_claims_failure_or_auto_closes(
 
         window._run_starter = invalid_receipt_starter
         window._calibrate_button.click()
-        _until(application, committed.is_set)
-        window.close()
-        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
-        assert window.isVisible()
+        _until(application, saved.is_set)
         release.set()
         _until(
             application,
             lambda: window.worker_idle
-            and window._status.text() == "COMMIT RECEIPT INVALID · CLOSE AGAIN",
+            and window._status.text() == "CALIBRATION FAILED",
         )
         assert window.isVisible()
         assert window.saved_reference is None
-        assert "Run reports FINAL commit" in window._summary.text()
-        assert _manifest_count(workspace) == before + 1
+        assert "returned no CalibrationArtifactRef" in window._summary.text()
+        assert "invalid reference" in window._diagnostic.text()
+        assert _calibration_record_count(workspace) == before + 1
         assert len(actual_references) == 1
         experiment.nodes.calibration.load_calibration_computation(actual_references[0])
     finally:
@@ -340,7 +338,7 @@ def test_committed_invalid_receipt_never_claims_failure_or_auto_closes(
         _close(application, window)
 
 
-def test_typed_reference_without_commit_evidence_is_not_admitted_as_final(
+def test_typed_success_reference_is_final_without_second_commit_evidence(
     application,
     calibration_product,
 ) -> None:
@@ -355,11 +353,9 @@ def test_typed_reference_without_commit_evidence_is_not_admitted_as_final(
         window._run_active = True
         window._run_revision = window._editor_revision
         snapshot = RunSnapshot(
-            run_id=RunId("synthetic-uncommitted-calibration"),
+            run_id=RunId("synthetic-final-calibration"),
             state=RunState.SUCCEEDED,
             phase="terminal",
-            final_committed=False,
-            commit_publication_warning=None,
             primary_error=None,
             cleanup_errors=(),
         )
@@ -367,11 +363,10 @@ def test_typed_reference_without_commit_evidence_is_not_admitted_as_final(
         future = Future()
         future.set_result(reference)
         window._accept_terminal_completion(generation, future)
-        assert window.worker_idle
-        assert window.saved_reference is None
-        assert window._status.text() == "COMMIT EVIDENCE MISSING"
-        assert "not being admitted as SAVED or FINAL" in window._summary.text()
-        assert "final_committed is false" in window._diagnostic.text()
+        assert window.saved_reference == reference
+        assert window._status.text() == "CALIBRATION SAVED"
+        assert reference.record_path in window._summary.text()
+        assert window._diagnostic.text() == ""
     finally:
         _close(application, window)
 
@@ -388,7 +383,7 @@ def test_stop_before_finalize_publishes_no_calibration(
         computation.artifact.source_binding.source_capture_ref,
         replace(computation.report.request, split_seed=19),
     )
-    before = _manifest_count(workspace)
+    before = _calibration_record_count(workspace)
     import zlc_neutral_atom.logic_nodes.readout.calibration.analysis as analysis_module
 
     original_analyze = analysis_module._analyze_calibration_resolved
@@ -420,7 +415,7 @@ def test_stop_before_finalize_publishes_no_calibration(
             and window._status.text() == "CALIBRATION CANCELLED",
         )
         assert window.saved_reference is None
-        assert _manifest_count(workspace) == before
+        assert _calibration_record_count(workspace) == before
         assert experiment.nodes.calibration.current_calibration_ref == current_before
         experiment.readout.load_capture(request.source_capture_ref)
     finally:
@@ -436,20 +431,20 @@ def test_experiment_close_retires_lazy_calibration_and_occupancy_windows(
 
     experiment = zlc.connect(
         "virtual",
-        workspace=zlc.WorkspacePaths.for_workspace(
+        workspace=zlc.WorkspacePaths(
             ROOT,
-            repository_root=tmp_path.resolve(),
+            ROOT / "pulses",
+            ROOT / "tasks",
+            tmp_path.resolve() / "_output",
         ),
     )
     closed = False
     try:
         calibration = CalibrationArtifactRef(
-            "lazy-ui-lifecycle",
-            "a" * 64,
+            "lazy-ui-lifecycle/calibration.json",
         )
         occupancy = OccupancyArtifactRef(
-            "lazy-ui-lifecycle",
-            "b" * 64,
+            "lazy-ui-lifecycle/occupancy.json",
         )
 
         calibration_window = (

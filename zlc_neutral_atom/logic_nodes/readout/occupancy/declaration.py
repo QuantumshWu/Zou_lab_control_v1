@@ -51,7 +51,7 @@ OCCUPANCY_LOGIC_NODE = LogicNodeDeclaration(
         PathPresentationHint(
             "calibration",
             file_filter=(
-                "Calibration pointer (calibration_ref.json);;JSON files (*.json)"
+                "Calibration record (calibration.json);;JSON files (*.json)"
             ),
             base_dir="output/calibrations",
         ),

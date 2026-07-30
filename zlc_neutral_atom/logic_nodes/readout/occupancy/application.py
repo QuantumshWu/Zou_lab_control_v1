@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from zlc_data import READOUT_EVENT, AxisId
 from zlc_neutral_atom.capture.artifact import (
-    AdmittedCapture,
-    CaptureRepository,
+    CaptureArtifact,
 )
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
-from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
-    ResolvedCalibration,
-)
+from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import ResolvedCalibration
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
 )
@@ -28,34 +25,7 @@ __all__ = [
     "build_detection_request",
     "DetectionRequest",
     "prepare_detection_plan",
-    "resolve_occupancy_calibration_input",
 ]
-
-
-def resolve_occupancy_calibration_input(
-    binding,
-    *,
-    resolve_final_or_saved: Callable[..., object],
-    load_saved_calibration: Callable[[object], object],
-) -> CalibrationArtifactRef:
-    """Resolve one saved-or-FINAL Calibration reference exactly once."""
-
-    if not callable(resolve_final_or_saved) or not callable(load_saved_calibration):
-        raise TypeError("Occupancy artifact resolvers must be callable")
-
-    def extract_reference(loaded: object) -> CalibrationArtifactRef:
-        if type(loaded) is not ResolvedCalibration:
-            raise TypeError("saved Calibration loader returned another value type")
-        return loaded.reference
-
-    reference = resolve_final_or_saved(
-        binding,
-        load_saved=load_saved_calibration,
-        extract_reference=extract_reference,
-    )
-    if not isinstance(reference, CalibrationArtifactRef):
-        raise TypeError("Occupancy Calibration input resolved another artifact type")
-    return reference
 
 
 @dataclass(frozen=True)
@@ -82,20 +52,18 @@ class DetectionRequest:
 
 
 def build_detection_request(
-    source: AdmittedCapture,
+    source: CaptureArtifact,
     calibration: ResolvedCalibration,
     *,
     model_kind: ReadoutModelKind | None = None,
 ) -> DetectionRequest:
     """Bind committed capture and calibration through their declared axes."""
 
-    if type(source) is not AdmittedCapture:
-        raise TypeError("source must be an admitted capture")
+    if not isinstance(source, CaptureArtifact):
+        raise TypeError("source must be CaptureArtifact")
     if type(calibration) is not ResolvedCalibration:
-        raise TypeError("calibration must be an admitted ResolvedCalibration")
-    source._require_authority()
-    calibration._require_authority()
-    artifact = source.artifact
+        raise TypeError("calibration must be ResolvedCalibration")
+    artifact = source
     calibration_artifact = calibration.artifact
     binding = artifact.camera_provenance.binding
     if calibration_artifact.frame_contract.binding != binding:
@@ -113,7 +81,7 @@ def build_detection_request(
         )
     selected_model = calibration_artifact.select_model(model_kind)
     return DetectionRequest(
-        source.reference,
+        source.ref,
         calibration.reference,
         binding,
         event_columns[0].coordinate_id,
@@ -124,34 +92,29 @@ def build_detection_request(
 def prepare_detection_plan(
     request: DetectionRequest,
     *,
-    capture_repository: CaptureRepository,
-    calibration_repository,
-    occupancy_repository,
+    captures_root: Path,
+    calibrations_root: Path,
+    occupancy_root: Path,
 ) -> RunPlan:
     """Compile committed-capture Occupancy from one complete request."""
 
     if not isinstance(request, DetectionRequest):
         raise TypeError("request must be DetectionRequest")
-    from zlc_neutral_atom.logic_nodes.readout.calibration.repository import (
-        CalibrationRepository,
-    )
-    from .repository import (
-        OccupancyRepository,
-        compile_occupancy_artifact_plan,
-    )
+    from .artifact import compile_occupancy_artifact_plan
 
-    if type(capture_repository) is not CaptureRepository:
-        raise TypeError("capture_repository must be CaptureRepository")
-    if type(calibration_repository) is not CalibrationRepository:
-        raise TypeError("calibration_repository must be CalibrationRepository")
-    if type(occupancy_repository) is not OccupancyRepository:
-        raise TypeError("occupancy_repository must be OccupancyRepository")
+    for field, value in (
+        ("captures_root", captures_root),
+        ("calibrations_root", calibrations_root),
+        ("occupancy_root", occupancy_root),
+    ):
+        if not isinstance(value, Path) or not value.is_absolute():
+            raise TypeError(f"{field} must be an absolute Path")
     return compile_occupancy_artifact_plan(
         request.source_capture_ref,
-        capture_repository,
         request.calibration_ref,
-        calibration_repository,
-        occupancy_repository,
+        captures_root=captures_root,
+        calibrations_root=calibrations_root,
+        occupancy_root=occupancy_root,
         expected_readout_binding=request.readout_binding,
         readout_event_axis_id=request.readout_event_axis_id,
         model_kind=request.model_kind,

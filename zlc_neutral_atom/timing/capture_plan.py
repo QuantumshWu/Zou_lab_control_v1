@@ -16,7 +16,6 @@ from zlc_storage import (
 from zlc_neutral_atom.runtime.dataset import (
     DatasetCellAddress,
     DatasetCellSchedule,
-    dataset_cell_permutation_digest,
 )
 
 
@@ -52,12 +51,12 @@ class CaptureCellJoinContract:
             raise ValueError("within_point_grouping entries must be unique")
         object.__setattr__(self, "within_point_grouping", grouping)
 
-    def expected_cell_schedule_digest(
+    def expected_cell_schedule(
         self,
         schedule: DigitalTriggerSchedule,
         schema: DatasetSchema,
-    ) -> str:
-        return dataset_cell_permutation_digest(
+    ) -> DatasetCellSchedule:
+        return DatasetCellSchedule.from_cells(
             schema,
             self.iter_cell_schedule(schedule, schema),
         )

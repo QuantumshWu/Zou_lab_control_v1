@@ -15,7 +15,6 @@ from zlc_frontend.site_map_view import SiteMapView, build_site_map_cell_view
 from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
 from zlc_neutral_atom.logic_nodes.readout.occupancy.cell import (
     ExactOccupancyCellSource,
-    _occupancy_cell_coherence_identity,
 )
 from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
     OCCUPANCY_SITE_MAP_OUTPUT_DECLARATION,
@@ -61,15 +60,14 @@ def _build_exact_occupancy_cell_view(
         f"calibration={domain.calibration_identity}\n"
         f"model={domain.model_kind.value} | "
         f"revision={domain.occupancy_ref.revision.value} | "
-        f"source generation={domain.source_generation.value} | "
-        f"occupancy generation={domain.occupancy_generation.value} | "
+        f"source generation={domain.source_ref.stream_generation.value} | "
+        f"occupancy generation={domain.occupancy_ref.stream_generation.value} | "
         f"address=({address.repeat_index}, {address.point_ordinal}) | "
         f"logical_point={source.logical_point}\n"
         f"frame ordinal={metadata.source_ordinal} | "
         f"frame_stamp={metadata.frame_stamp} | "
         f"camera_stamp={metadata.camera_stamp} | "
-        f"captured_at={metadata.captured_at:.9f}s | "
-        f"correlation={metadata.correlation_id}"
+        f"captured_at={metadata.captured_at:.9f}s"
     )
     return build_site_map_cell_view(
         source.image,
@@ -80,13 +78,6 @@ def _build_exact_occupancy_cell_view(
         site_axis=site_map.site_axis,
         coordinate_frame=site_map.coordinate_frame,
         centers_xy=site_map.coordinates_xy,
-        site_geometry_identity=domain.calibration_identity,
-        coherence_identity=_occupancy_cell_coherence_identity(
-            domain.artifact_identity,
-            address,
-        ),
-        run_id=domain.run_id,
-        provenance_epoch_id=domain.provenance_epoch_id,
         summary=summary,
         presentation_kind="occupancy-cell",
     )
@@ -145,13 +136,9 @@ def project_occupancy_site_map(
         site_axis=site_map.site_axis,
         coordinate_frame=site_map.coordinate_frame,
         centers_xy=site_map.coordinates_xy,
-        site_geometry_identity=calibration_identity,
-        coherence_identity=occupied.join_digest,
-        run_id=occupied.run_id,
-        provenance_epoch_id=occupied.epoch_id,
         summary=(
-            f"source run={occupied.run_id} | "
             f"calibration={calibration_identity} | "
+            f"generation={occupied.snapshot.ref.stream_generation.value} | "
             f"revision={background.snapshot.ref.revision.value} | "
             f"logical point={logical_point}"
         ),
@@ -164,6 +151,7 @@ def project_occupancy_signal_presentation(
     node: object,
     output_name: str,
     publication: SignalPublication,
+    direct_parents: tuple[SignalPublication, ...],
 ):
     """Project one same-shot Occupancy SiteMap from its exact signal front."""
 
@@ -171,7 +159,7 @@ def project_occupancy_signal_presentation(
         return None
     if not isinstance(node, HostedProcessor):
         raise TypeError("Occupancy presentation requires HostedProcessor")
-    parent = publication.parents[0] if len(publication.parents) == 1 else None
+    parent = direct_parents[0] if len(direct_parents) == 1 else None
     background = None if parent is None else parent.value(node.source_signal)
     occupied = publication.value(node.signal_key(output_name))
     if background is None or occupied is None:

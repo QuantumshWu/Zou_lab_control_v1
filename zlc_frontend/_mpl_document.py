@@ -776,7 +776,8 @@ class FacetedPanelAggRenderer:
                     panel_counts,
                     edges,
                 )
-                automatic_analysis = state.histogram_analysis_cache[1]
+                if state.histogram_analysis_cache is not None:
+                    automatic_analysis = state.histogram_analysis_cache[1]
             (
                 state.histogram_fit,
                 thresholds,

@@ -11,19 +11,19 @@ publishes the data value selected on the displayed IMAGE, CURVE, or HISTOGRAM;
 its coordinates remain derivation metadata and never masquerade as separate
 signals.  Fit publishes one typed ``fit.<parameter>`` dataset per parameter
 while preserving its named batch layout and failed-cell validity.  Derived
-values retain the source join digest while receiving stable Figure/output
-dataset identities; a composition root may attach its own run/epoch routing
-metadata afterwards.
+values retain their exact source revision.  Their published Dataset identity
+belongs to the signal route generation; this materializer uses only an opaque
+operation-local identity until composition publishes it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Mapping
+import uuid
 
 import numpy as np
-from zlc_storage import canonical_digest, canonical_text, sha256_text
+from zlc_storage import canonical_text
 
 from zlc_data import (
     AxisSourceRef,
@@ -40,20 +40,17 @@ from zlc_data import (
     Selection,
     StreamGenerationId,
 )
-from zlc_data.codec import dataset_revision_ref_to_tree
-from zlc_data.fit import fit_spec_to_tree
 from zlc_data.output_contract import (
     AUTHORITATIVE_AREA_SELECTION_PROJECTION_ID,
     projected_dataset_output_contract_id,
 )
-from zlc_data.selection import resolve_selection_indices, selection_to_tree
+from zlc_data.selection import resolve_selection_indices
 from zlc_data.snapshot_projection import (
     materialize_dataset_acceptance_mask,
     materialize_fit_parameter_snapshots,
     materialize_scalar_dataset,
 )
 from zlc_data.transform import apply_transform, commit_transform
-from zlc_data.transform_codec import committed_transform_to_tree
 from zlc_data.value import expand_dataset_validity
 from .curve_display import numeric_curve_coordinates
 from .data_figure import DataFigure
@@ -118,11 +115,8 @@ __all__ = [
     "cross_data_output_presentation",
     "fit_parameter_output_presentation",
     "figure_event_transform",
-    "figure_selector_identity",
     "figure_derived_signal",
-    "figure_derivation_digest",
     "figure_output_contract_id",
-    "figure_output_revision_ref",
     "materialize_area_outputs",
     "materialize_cross_outputs",
     "materialize_fit_outputs",
@@ -232,7 +226,7 @@ class FigureCrossCommit:
 
 @dataclass(frozen=True, slots=True)
 class FigureDerivedSignal:
-    """One headless Figure-derived dataset plus derivation identity.
+    """One headless Figure-derived dataset and its exact source revision.
 
     Run identity and routing names intentionally do not appear here.  Those are
     application-shell concerns; the Figure owns only the immutable snapshot,
@@ -243,7 +237,6 @@ class FigureDerivedSignal:
 
     snapshot: OwnedSnapshot
     source_ref: DatasetRevisionRef
-    derivation_digest: str
     preserve_source_coverage: bool = False
 
     def __post_init__(self) -> None:
@@ -253,7 +246,6 @@ class FigureDerivedSignal:
             raise TypeError("Figure signal source_ref must be DatasetRevisionRef")
         if self.snapshot.ref.revision != self.source_ref.revision:
             raise ValueError("Figure signal revision differs from its source")
-        sha256_text(self.derivation_digest, "Figure signal derivation_digest")
         if type(self.preserve_source_coverage) is not bool:
             raise TypeError("preserve_source_coverage must be bool")
 
@@ -914,53 +906,6 @@ def figure_event_transform(
     return _event_local_data_transform(source, transform)
 
 
-def figure_selector_identity(
-    commit: FigureAreaCommit | FigureCrossCommit,
-) -> str:
-    """Canonical generation identity for one committed selector route."""
-
-    if isinstance(commit, FigureAreaCommit):
-        authority = commit.authority
-        if isinstance(authority, CommittedTransform):
-            payload = {"committed_transform": committed_transform_to_tree(authority)}
-        elif isinstance(authority, Selection):
-            payload = {"selection": selection_to_tree(authority)}
-        elif isinstance(authority, HistogramValueRangeSelection):
-            payload = {
-                "histogram_value_range": [authority.lower, authority.upper],
-                "source_transform": committed_transform_to_tree(
-                    authority.source_transform
-                ),
-            }
-        else:  # FigureAreaCommit closes this boundary.
-            raise TypeError("Area commit has another authority type")
-        kind = "area"
-        source_identity = commit.source_identity
-    elif isinstance(commit, FigureCrossCommit):
-        kind = "cross"
-        source_identity = commit.source_identity
-        payload = {
-            "transform": committed_transform_to_tree(commit.transform),
-            "intent": commit.intent.value,
-            "point": commit.point,
-            "histogram_bin": commit.histogram_bin,
-        }
-    else:
-        raise TypeError("selector commit must be FigureAreaCommit or FigureCrossCommit")
-    return canonical_digest(
-        {
-            "owner": "zlc_frontend.figure-selector-generation",
-            "kind": kind,
-            "source": {
-                "block_id": source_identity.block_id.value,
-                "stream_generation": source_identity.stream_generation.value,
-                "schema_fingerprint": source_identity.schema_fingerprint,
-            },
-            "authority": payload,
-        }
-    )
-
-
 def cross_data_output_presentation(
     commit: FigureCrossCommit,
 ) -> FigureOutputPresentation:
@@ -1004,43 +949,27 @@ def fit_parameter_output_presentation(
     )
 
 
-def figure_output_revision_ref(
+def _figure_output_revision_ref(
     output_name: str,
     source_ref: DatasetRevisionRef,
     output_schema,
-    semantic_identity: Mapping[str, object],
 ) -> DatasetRevisionRef:
+    """Create a transient ref before SignalPlane assigns route identity.
+
+    A live derived Dataset is identified by its signal route generation, not
+    by hashing its selection, transform, source payload, or Fit specification.
+    The data materializers nevertheless require a distinct BlockId, so this
+    private value uses an opaque operation nonce and serialises no scientific
+    data.  SignalPlane replaces it at the publication boundary.
+    """
+
     output = _output_name(output_name)
-    generation = canonical_digest(
-        {
-            "owner": "zlc_frontend.figure-output-generation",
-            "output_name": output,
-            "source_block_id": source_ref.block_id.value,
-            "source_generation": source_ref.stream_generation.value,
-            "output_schema": output_schema.fingerprint,
-            "semantic_identity": dict(semantic_identity),
-        }
-    )
+    nonce = uuid.uuid4().hex
     return DatasetRevisionRef(
-        BlockId(f"figure-output-{generation[:32]}"),
-        StreamGenerationId(f"figure-output-{generation}"),
+        BlockId(f"figure-output/{output}/{nonce}"),
+        StreamGenerationId(f"figure-output/materialized/{nonce}"),
         output_schema.fingerprint,
         source_ref.revision,
-    )
-
-
-def figure_derivation_digest(
-    output_name: str,
-    snapshot: OwnedSnapshot,
-    semantic_identity: Mapping[str, object],
-) -> str:
-    return canonical_digest(
-        {
-            "owner": "zlc_frontend.figure-output-derivation",
-            "output_name": _output_name(output_name),
-            "output_ref": dataset_revision_ref_to_tree(snapshot.ref),
-            "semantic_identity": dict(semantic_identity),
-        }
     )
 
 
@@ -1049,14 +978,12 @@ def _materialize_committed_snapshot(
     transform: CommittedTransform,
     *,
     output_name: str,
-    semantic_identity: Mapping[str, object],
 ) -> OwnedSnapshot:
     transformed = apply_transform(source, transform)
-    output_ref = figure_output_revision_ref(
+    output_ref = _figure_output_revision_ref(
         output_name,
         source.ref,
         transformed.schema,
-        semantic_identity,
     )
     return OwnedSnapshot(
         output_ref,
@@ -1076,22 +1003,12 @@ def figure_derived_signal(
     source: FigureSource,
     *,
     preserve_source_coverage: bool,
-    derivation_digest: str | None = None,
 ) -> FigureDerivedSignal:
     if not isinstance(source, FigureSource):
         raise TypeError("Figure output source must be FigureSource")
     return FigureDerivedSignal(
         snapshot=snapshot,
         source_ref=source.snapshot.ref,
-        derivation_digest=(
-            figure_derivation_digest(
-                output_name,
-                snapshot,
-                {"kind": "materialized-figure-output"},
-            )
-            if derivation_digest is None
-            else derivation_digest
-        ),
         preserve_source_coverage=preserve_source_coverage,
     )
 
@@ -1114,17 +1031,10 @@ def materialize_area_outputs(
         snapshot = source.snapshot
         if not isinstance(snapshot, OwnedSnapshot):
             raise TypeError("Histogram Area source does not own a dataset snapshot")
-        context_identity = {
-            "kind": "histogram-area-context",
-            "source_transform": committed_transform_to_tree(
-                authority.source_transform
-            ),
-        }
         working = _materialize_committed_snapshot(
             snapshot,
             authority.source_transform,
             output_name=AREA_DATA_OUTPUT,
-            semantic_identity=context_identity,
         )
         values = working.block.values
         if values.dtype.kind not in "biuf":
@@ -1134,20 +1044,13 @@ def materialize_area_outputs(
             & (values >= authority.lower)
             & (values <= authority.upper)
         )
-        semantic_identity = {
-            "histogram_value_range": [authority.lower, authority.upper],
-            "source_transform": committed_transform_to_tree(
-                authority.source_transform
-            ),
-        }
         selected = materialize_dataset_acceptance_mask(
             working,
             accepted,
-            reference_for=lambda output_schema: figure_output_revision_ref(
+            reference_for=lambda output_schema: _figure_output_revision_ref(
                 AREA_DATA_OUTPUT,
                 snapshot.ref,
                 output_schema,
-                semantic_identity,
             ),
         )
         return {
@@ -1168,15 +1071,10 @@ def materialize_area_outputs(
         raise TypeError("Area source signal does not own a dataset snapshot")
     if not isinstance(authority, CommittedTransform):
         raise TypeError("Dataset Area requires a committed transform")
-    semantic_identity = {
-        "kind": "area-data",
-        "source_transform": committed_transform_to_tree(authority),
-    }
     selected = _materialize_committed_snapshot(
         snapshot,
         authority,
         output_name=AREA_DATA_OUTPUT,
-        semantic_identity=semantic_identity,
     )
     return {
         AREA_DATA_OUTPUT: figure_derived_signal(
@@ -1233,23 +1131,15 @@ def materialize_cross_outputs(
     else:  # FigureCrossCommit closes this; retain the materializer boundary.
         raise RuntimeError("Cross commit has no data-value semantics")
 
-    semantic_identity = {
-        "kind": "cross-data",
-        "source_transform": committed_transform_to_tree(commit.transform),
-        "intent": commit.intent.value,
-        "point": commit.point,
-        "histogram_bin": commit.histogram_bin,
-    }
     output_snapshot = materialize_scalar_dataset(
         snapshot.ref,
         scalar_values,
         valid=bool(scalar_validity[0]),
         unit=unit,
-        reference_for=lambda schema: figure_output_revision_ref(
+        reference_for=lambda schema: _figure_output_revision_ref(
             CROSS_DATA_OUTPUT,
             snapshot.ref,
             schema,
-            semantic_identity,
         ),
     )
     return {
@@ -1258,11 +1148,6 @@ def materialize_cross_outputs(
             output_snapshot,
             source,
             preserve_source_coverage=False,
-            derivation_digest=figure_derivation_digest(
-                CROSS_DATA_OUTPUT,
-                output_snapshot,
-                semantic_identity,
-            ),
         )
     }
 
@@ -1291,18 +1176,12 @@ def materialize_fit_outputs(
     if result.source_ref != snapshot.ref:
         raise ValueError("Fit result belongs to another visible source revision")
 
-    spec_tree = fit_spec_to_tree(result.spec)
     snapshots = materialize_fit_parameter_snapshots(
         result,
-        reference_for=lambda parameter_name, schema: figure_output_revision_ref(
+        reference_for=lambda parameter_name, schema: _figure_output_revision_ref(
             f"{FIT_OUTPUT_PREFIX}{parameter_name}",
             result.source_ref,
             schema,
-            {
-                "kind": "figure-fit-parameter",
-                "fit_spec": spec_tree,
-                "parameter_name": parameter_name,
-            },
         ),
     )
     output: dict[str, FigureDerivedSignal] = {}
@@ -1316,13 +1195,5 @@ def materialize_fit_outputs(
             snapshot=fit_snapshot,
             source_ref=result.source_ref,
             preserve_source_coverage=False,
-            derivation_digest=canonical_digest(
-                {
-                    "owner": "zlc_frontend.figure-fit-output",
-                    "source_ref": dataset_revision_ref_to_tree(result.source_ref),
-                    "fit_spec": spec_tree,
-                    "parameter_name": parameter_name,
-                }
-            ),
         )
     return output

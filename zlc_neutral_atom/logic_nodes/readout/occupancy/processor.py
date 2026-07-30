@@ -1,6 +1,6 @@
 """Camera-frame to neutral-atom occupancy product.
 
-The physical operation is deliberately small: bind one admitted calibration,
+The physical operation is deliberately small: bind one loaded calibration,
 apply its selected readout model to every ``(R, P)`` camera cell, and preserve
 the model's SITE axis and component validity.  Finite artifact evaluation and
 live signal publication share these classification primitives without a
@@ -12,7 +12,6 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -36,7 +35,6 @@ from zlc_data import (
     Value,
     ValueSchema,
 )
-from zlc_data.codec import dataset_revision_ref_to_tree
 from zlc_data.value import dataset_cell_value, expand_dataset_validity
 from zlc_neutral_atom.catalog import DefinitionKey, ProcessorDefinition
 from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
@@ -55,8 +53,8 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CALIBRATION_ARTIFACT_REF_FORMAT,
     CalibrationArtifactRef,
-    calibration_artifact_ref_to_tree,
 )
+from zlc_neutral_atom.capture.artifact import CaptureArtifact
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
     CAMERA_FRAME_OUTPUT_CONTRACT_ID,
@@ -71,13 +69,9 @@ from zlc_neutral_atom.logic_nodes.readout.model_contract import (
     readout_model_kind_from_authoring,
 )
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
-from zlc_storage import canonical_digest, canonical_text, sha256_text
+from zlc_storage import canonical_text
 
 from .reference import OccupancyArtifactRef
-
-if TYPE_CHECKING:
-    from zlc_neutral_atom.capture.artifact import AdmittedCapture
-
 
 OCCUPANCY_PROCESSOR_KEY = DefinitionKey(
     "zlc_neutral_atom.logic_nodes.readout.occupancy",
@@ -148,8 +142,8 @@ OCCUPANCY_CALIBRATION_INPUT_SPEC = ArtifactInputSpec(
     "Calibration",
     CALIBRATION_ARTIFACT_REF_FORMAT,
     description=(
-        "Exact FINAL CalibrationArtifactRef or an explicitly selected saved "
-        "calibration_ref.json pointer"
+        "Exact FINAL CalibrationArtifactRef or an explicitly selected "
+        "calibration.json record from the current project"
     ),
     allow_saved_reference=True,
 )
@@ -331,7 +325,6 @@ def _resolve_occupancy_processor_schema_parts(
 ) -> ResolvedOccupancyProcessorSchema:
     if type(calibration) is not ResolvedCalibration:
         raise TypeError("calibration must be an exact ResolvedCalibration")
-    calibration._require_authority()
     if not isinstance(source_schema, DatasetSchema):
         raise TypeError("source_schema must be DatasetSchema")
     if not isinstance(model_kind, ReadoutModelKind):
@@ -367,7 +360,7 @@ def _resolve_occupancy_processor_schema_parts(
 
 @dataclass(frozen=True, slots=True)
 class _CommittedOccupancyBinding:
-    """Named schema authority shared by analysis and repository admission."""
+    """Named schema facts shared by analysis and cold-open validation."""
 
     readout_event_axis_id: AxisId
     resolved_schema: ResolvedOccupancyProcessorSchema
@@ -384,23 +377,19 @@ class _CommittedOccupancyBinding:
 
 @dataclass(frozen=True, slots=True)
 class _ResolvedCommittedOccupancy:
-    """Admitted source, calibration, and schema carried across one flat Run."""
+    """Loaded source, calibration, and schema carried across one flat Run."""
 
-    source: AdmittedCapture
+    source: CaptureArtifact
     calibration: ResolvedCalibration
     binding: _CommittedOccupancyBinding
 
     def __post_init__(self) -> None:
-        from zlc_neutral_atom.capture.artifact import AdmittedCapture
-
-        if type(self.source) is not AdmittedCapture:
-            raise PermissionError("occupancy source lacks repository admission")
-        self.source._require_authority()  # type: ignore[attr-defined]
+        if not isinstance(self.source, CaptureArtifact):
+            raise TypeError("source must be CaptureArtifact")
         if type(self.calibration) is not ResolvedCalibration:
-            raise PermissionError("occupancy calibration lacks repository admission")
-        self.calibration._require_authority()
+            raise TypeError("calibration must be ResolvedCalibration")
         if not isinstance(self.binding, _CommittedOccupancyBinding):
-            raise PermissionError("occupancy binding authority is invalid")
+            raise TypeError("binding must be committed occupancy binding")
 
 
 def _resolve_committed_occupancy_structure(
@@ -414,7 +403,6 @@ def _resolve_committed_occupancy_structure(
 
     if type(calibration) is not ResolvedCalibration:
         raise TypeError("calibration must be an exact ResolvedCalibration")
-    calibration._require_authority()
     if not isinstance(readout_event_axis_id, AxisId):
         raise TypeError("readout_event_axis_id must be AxisId")
     if not isinstance(model_kind, ReadoutModelKind):
@@ -467,19 +455,15 @@ def _require_committed_occupancy_context(
 ) -> _ResolvedCommittedOccupancy:
     """Compare every selected pulse window before authoritative analysis."""
 
-    from zlc_neutral_atom.capture.artifact import AdmittedCapture
-
-    if type(source) is not AdmittedCapture:
-        raise TypeError("source must be an exact AdmittedCapture")
-    source._require_authority()
+    if not isinstance(source, CaptureArtifact):
+        raise TypeError("source must be an exact CaptureArtifact")
     if type(calibration) is not ResolvedCalibration:
         raise TypeError("calibration must be an exact ResolvedCalibration")
-    calibration._require_authority()
     if not isinstance(binding, _CommittedOccupancyBinding):
         raise TypeError("binding must be resolved committed occupancy")
     event_axis_id = binding.readout_event_axis_id
     resolved_schema = binding.resolved_schema
-    capture = source.artifact
+    capture = source
     if capture.pulse_evidence is None:
         raise ValueError("authoritative occupancy requires persisted pulse lineage")
     context = _derive_readout_physical_context_from_evidence(
@@ -500,15 +484,9 @@ def _require_committed_occupancy_context(
 
 
 def _occupancy_generation_for_run(run_id: str) -> StreamGenerationId:
-    run = canonical_text(run_id, "run_id")
-    return StreamGenerationId(
-        canonical_digest(
-            {
-                "owner": "zlc_neutral_atom.logic_nodes.readout.occupancy.committed-run",
-                "run_id": run,
-            }
-        )
-    )
+    """Use the exact Run identity as the persisted Dataset generation."""
+
+    return StreamGenerationId(canonical_text(run_id, "run_id"))
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -519,7 +497,7 @@ class OccupancyArtifact:
     calibration_reference: CalibrationArtifactRef
     readout_event_axis_id: AxisId
     model_kind: ReadoutModelKind
-    generation: StreamGenerationId
+    run_id: str
     counts: DataBlock
     occupied: DataBlock
 
@@ -534,8 +512,7 @@ class OccupancyArtifact:
             raise TypeError("readout_event_axis_id must be AxisId")
         if not isinstance(self.model_kind, ReadoutModelKind):
             raise TypeError("model_kind must be ReadoutModelKind")
-        if not isinstance(self.generation, StreamGenerationId):
-            raise TypeError("generation must be StreamGenerationId")
+        canonical_text(self.run_id, "run_id")
         if not isinstance(self.counts, DataBlock) or not isinstance(
             self.occupied,
             DataBlock,
@@ -566,83 +543,38 @@ class OccupancyArtifact:
 
     @property
     def counts_snapshot(self) -> OwnedSnapshot:
-        return OwnedSnapshot(self.counts.ref(self.generation), self.counts)
+        return OwnedSnapshot(
+            self.counts.ref(_occupancy_generation_for_run(self.run_id)),
+            self.counts,
+        )
 
     @property
     def occupied_snapshot(self) -> OwnedSnapshot:
-        return OwnedSnapshot(self.occupied.ref(self.generation), self.occupied)
+        return OwnedSnapshot(
+            self.occupied.ref(_occupancy_generation_for_run(self.run_id)),
+            self.occupied,
+        )
 
 
-_RESOLVED_OCCUPANCY_TOKEN = object()
-
-
+@dataclass(frozen=True, slots=True)
 class ResolvedOccupancy:
-    """Process-local proof that one exact occupancy target was committed."""
+    """One cold-opened Occupancy value and its persisted Run provenance."""
 
-    __slots__ = (
-        "_token",
-        "_repository_token",
-        "_reference",
-        "_artifact",
-        "_readout_binding",
-    )
+    reference: OccupancyArtifactRef
+    artifact: OccupancyArtifact
+    readout_binding: ReadoutBindingKey
+    run_id: str
 
-    def __init_subclass__(cls, **_kwargs) -> None:
-        raise TypeError("ResolvedOccupancy is final")
-
-    def __init__(self, *_args, **_kwargs) -> None:
-        raise TypeError("ResolvedOccupancy is returned by OccupancyRepository.admit")
-
-    def __setattr__(self, _name: str, _value: object) -> None:
-        raise AttributeError("ResolvedOccupancy is immutable")
-
-    def __reduce__(self):
-        raise TypeError("ResolvedOccupancy is process-local")
-
-    @classmethod
-    def _from_admission(
-        cls,
-        token: object,
-        *,
-        repository_token: object,
-        reference: OccupancyArtifactRef,
-        artifact: OccupancyArtifact,
-        readout_binding: ReadoutBindingKey,
-    ) -> "ResolvedOccupancy":
-        if token is not _RESOLVED_OCCUPANCY_TOKEN:
-            raise PermissionError("occupancy admission token is invalid")
-        if repository_token is None:
-            raise ValueError("occupancy repository authority is absent")
-        if not isinstance(reference, OccupancyArtifactRef):
+    def __post_init__(self) -> None:
+        if not isinstance(self.reference, OccupancyArtifactRef):
             raise TypeError("reference must be OccupancyArtifactRef")
-        if not isinstance(artifact, OccupancyArtifact):
+        if not isinstance(self.artifact, OccupancyArtifact):
             raise TypeError("artifact must be OccupancyArtifact")
-        if not isinstance(readout_binding, ReadoutBindingKey):
+        if not isinstance(self.readout_binding, ReadoutBindingKey):
             raise TypeError("readout_binding must be ReadoutBindingKey")
-        resolved = object.__new__(cls)
-        object.__setattr__(resolved, "_token", token)
-        object.__setattr__(resolved, "_repository_token", repository_token)
-        object.__setattr__(resolved, "_reference", reference)
-        object.__setattr__(resolved, "_artifact", artifact)
-        object.__setattr__(resolved, "_readout_binding", readout_binding)
-        return resolved
-
-    def _require_authority(self) -> None:
-        if type(self) is not ResolvedOccupancy or (
-            self._token is not _RESOLVED_OCCUPANCY_TOKEN
-            or self._repository_token is None
-        ):
-            raise PermissionError("ResolvedOccupancy authority is invalid")
-
-    @property
-    def reference(self) -> OccupancyArtifactRef:
-        self._require_authority()
-        return self._reference
-
-    @property
-    def artifact(self) -> OccupancyArtifact:
-        self._require_authority()
-        return self._artifact
+        canonical_text(self.run_id, "run_id")
+        if self.artifact.run_id != self.run_id:
+            raise ValueError("resolved run_id differs from the Occupancy artifact")
 
     def project_dataset_source(
         self,
@@ -652,11 +584,10 @@ class ResolvedOccupancy:
     ) -> ArtifactDatasetSource:
         """Project one persisted output without exposing Occupancy block fields."""
 
-        self._require_authority()
         if type(materialize) is not bool:
             raise TypeError("materialize must be bool")
         selected = occupancy_artifact_output_name(output)
-        artifact = self._artifact
+        artifact = self.artifact
         if selected == _OCCUPIED_OUTPUT_DECLARATION.name:
             block = artifact.occupied
             snapshot = artifact.occupied_snapshot if materialize else None
@@ -665,14 +596,9 @@ class ResolvedOccupancy:
             snapshot = artifact.counts_snapshot if materialize else None
         return ArtifactDatasetSource(
             block.schema,
-            block.ref(artifact.generation),
+            block.ref(_occupancy_generation_for_run(artifact.run_id)),
             snapshot,
         )
-
-    @property
-    def readout_binding(self) -> ReadoutBindingKey:
-        self._require_authority()
-        return self._readout_binding
 
 
 def _classify_cells(
@@ -735,14 +661,14 @@ def _analyze_committed_occupancy_resolved(
     """Stream raw frames once while preserving the complete R/P/SITE domain."""
 
     if not isinstance(resolved, _ResolvedCommittedOccupancy):
-        raise TypeError("resolved must be admitted committed occupancy")
+        raise TypeError("resolved must be loaded committed occupancy")
     source = resolved.source
     calibration = resolved.calibration
     event_axis_id = resolved.binding.readout_event_axis_id
     schema = resolved.binding.resolved_schema
     if not callable(checkpoint):
         raise TypeError("checkpoint must be callable")
-    frame_source = source.artifact.frame_source  # type: ignore[attr-defined]
+    frame_source = source.frame_source
     counts, occupied = _classify_cells(
         schema,
         frame_source.revision,
@@ -754,11 +680,11 @@ def _analyze_committed_occupancy_resolved(
     )
     run = canonical_text(run_id, "run_id")
     return OccupancyArtifact(
-        source.reference,  # type: ignore[attr-defined]
+        source.ref,
         calibration.reference,
         event_axis_id,
         schema.model_kind,
-        _occupancy_generation_for_run(run),
+        run,
         counts,
         occupied,
     )
@@ -775,8 +701,7 @@ def _apply_occupancy_snapshot(
     if not isinstance(source, OwnedSnapshot):
         raise TypeError("source must be OwnedSnapshot")
     if type(calibration) is not ResolvedCalibration:
-        raise TypeError("calibration must be an admitted ResolvedCalibration")
-    calibration._require_authority()
+        raise TypeError("calibration must be ResolvedCalibration")
     model = calibration.artifact.select_model(model_kind)
     resolved = _resolve_occupancy_processor_schema_parts(
         calibration,
@@ -797,20 +722,7 @@ def _apply_occupancy_snapshot(
             for point_index in range(schema.point_table.row_count)
         ),
     )
-    reference = calibration.reference
-    generation = StreamGenerationId(
-        "occupancy-processor-"
-        + canonical_digest(
-            {
-                "owner": "zlc_neutral_atom.logic_nodes.readout.occupancy.snapshot-application",
-                "source_generation": source.ref.stream_generation.value,
-                "source_schema": source.ref.schema_fingerprint,
-                "calibration_repository": reference.repository_id,
-                "calibration_manifest": reference.manifest_digest,
-                "model_kind": model.kind.value,
-            }
-        )
-    )
+    generation = source.ref.stream_generation
     return (
         OwnedSnapshot(counts.ref(generation), counts),
         OwnedSnapshot(occupied.ref(generation), occupied),
@@ -870,11 +782,6 @@ class OccupancyProcessorEvaluation:
     site_map: SiteMap
     calibration_ref: CalibrationArtifactRef
     model_kind: ReadoutModelKind
-    source_event_digest: str
-
-    @property
-    def source_ref(self) -> DatasetRevisionRef:
-        return self.background_ref
 
     def __post_init__(self) -> None:
         if not isinstance(self.outputs, Mapping):
@@ -919,11 +826,6 @@ class OccupancyProcessorEvaluation:
             ReadoutModelKind,
         ):
             raise TypeError("calibration_ref/model_kind have another type")
-        source_event_digest = sha256_text(
-            self.source_event_digest,
-            "source_event_digest",
-        )
-        assert source_event_digest is not None
         snapshots = tuple(output.snapshot for output in outputs.values())
         if len(
             {
@@ -942,25 +844,8 @@ class OccupancyProcessorEvaluation:
         # frozen calibration below is that proof.  The three derived sibling
         # outputs do, however, form one generation-owned transaction (checked
         # above).
-        expected_join = canonical_digest(
-            {
-                "owner": "zlc_neutral_atom.logic_nodes.readout.occupancy.processor-evaluation",
-                "source_revision": dataset_revision_ref_to_tree(self.background_ref),
-                "source_event": source_event_digest,
-                "calibration": calibration_artifact_ref_to_tree(
-                    self.calibration_ref
-                ),
-                "model_kind": self.model_kind.value,
-            }
-        )
-        if (
-            len({output.join_digest for output in outputs.values()}) != 1
-            or outputs["occupied"].join_digest != expected_join
-        ):
-            raise ValueError("Occupancy outputs do not share one join")
         object.__setattr__(self, "outputs", MappingProxyType(outputs))
         object.__setattr__(self, "logical_point", logical)
-        object.__setattr__(self, "source_event_digest", source_event_digest)
 
 
 def _evaluate_occupancy_processor(
@@ -969,18 +854,15 @@ def _evaluate_occupancy_processor(
     coverage: MonitorCoverage,
     *,
     model_kind: ReadoutModelKind | None = None,
-    source_event_digest: str,
 ) -> OccupancyProcessorEvaluation:
     """Classify one current Camera revision and select its current display cell."""
 
     if not isinstance(source, OwnedSnapshot):
         raise TypeError("source must be OwnedSnapshot")
     if type(calibration) is not ResolvedCalibration:
-        raise TypeError("calibration must be an admitted ResolvedCalibration")
+        raise TypeError("calibration must be ResolvedCalibration")
     if not isinstance(coverage, MonitorCoverage):
         raise TypeError("coverage must be MonitorCoverage")
-    source_digest = sha256_text(source_event_digest, "source_event_digest")
-    assert source_digest is not None
     model = calibration.artifact.select_model(model_kind)
     counts, occupied = _apply_occupancy_snapshot(
         source,
@@ -1005,21 +887,11 @@ def _evaluate_occupancy_processor(
         (IndexSelection(source_schema.repeat_axis.axis_id, 0),)
     )
     reference = calibration.reference
-    join_digest = canonical_digest(
-        {
-            "owner": "zlc_neutral_atom.logic_nodes.readout.occupancy.processor-evaluation",
-            "source_revision": dataset_revision_ref_to_tree(source.ref),
-            "source_event": source_digest,
-            "calibration": calibration_artifact_ref_to_tree(reference),
-            "model_kind": model.kind.value,
-        }
-    )
     outputs = {
         declaration.name: LiveDatasetOutput(
             declaration,
             snapshot,
             coverage,
-            join_digest,
         )
         for declaration, snapshot in zip(
             OCCUPANCY_LIVE_OUTPUT_DECLARATIONS,
@@ -1038,7 +910,6 @@ def _evaluate_occupancy_processor(
         calibration.artifact.site_map,
         reference,
         model.kind,
-        source_digest,
     )
 
 

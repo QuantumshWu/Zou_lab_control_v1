@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any
 
-from zlc_storage import (
-    canonical_text as _canonical_text,
-    encode,
-    sha256_text as _sha256,
-)
+from zlc_storage import canonical_text, encode
 
 
 CALIBRATION_ARTIFACT_REF_FORMAT = (
@@ -18,43 +15,50 @@ CALIBRATION_ARTIFACT_REF_FORMAT = (
 CALIBRATION_ARTIFACT_NAMESPACE = "calibration"
 
 
-@dataclass(frozen=True, order=True)
+@dataclass(frozen=True, order=True, slots=True)
 class CalibrationArtifactRef:
-    repository_id: str
-    manifest_digest: str
+    """Path to ``calibration.json`` relative to the Calibration output root."""
+
+    record_path: str
 
     def __post_init__(self) -> None:
-        _canonical_text(self.repository_id, "repository_id")
-        _sha256(self.manifest_digest, "manifest_digest")
+        value = canonical_text(self.record_path, "record_path")
+        if "\\" in value:
+            raise ValueError("record_path must use POSIX separators")
+        path = PurePosixPath(value)
+        if (
+            path.is_absolute()
+            or path.as_posix() != value
+            or any(part in {"", ".", ".."} for part in path.parts)
+        ):
+            raise ValueError("record_path must stay beneath the Calibration output root")
+        if path.name != "calibration.json" or len(path.parts) != 2:
+            raise ValueError(
+                "record_path must be '<run-name>/calibration.json'"
+            )
+        object.__setattr__(self, "record_path", path.as_posix())
 
     @property
     def target_ref(self) -> str:
-        return f"{CALIBRATION_ARTIFACT_NAMESPACE}/{self.manifest_digest}"
+        return f"{CALIBRATION_ARTIFACT_NAMESPACE}/{self.record_path}"
 
 
 def calibration_artifact_ref_to_tree(value: CalibrationArtifactRef) -> dict[str, Any]:
     if not isinstance(value, CalibrationArtifactRef):
         raise TypeError("value must be CalibrationArtifactRef")
     return {
-        # ArtifactInputRef owns this generic cross-domain seam and names its
-        # discriminator ``schema``.  The value is still one unversioned current
-        # format name; this does not introduce a schema-version mechanism.
         "schema": CALIBRATION_ARTIFACT_REF_FORMAT,
-        "repository_id": value.repository_id,
-        "manifest_digest": value.manifest_digest,
+        "record_path": value.record_path,
     }
 
 
 def calibration_artifact_ref_from_tree(tree: Any) -> CalibrationArtifactRef:
-    fields = {"schema", "repository_id", "manifest_digest"}
+    fields = {"schema", "record_path"}
     if not isinstance(tree, dict) or set(tree) != fields:
         raise ValueError("CalibrationArtifactRef has an unknown field set")
     if tree["schema"] != CALIBRATION_ARTIFACT_REF_FORMAT:
         raise ValueError("CalibrationArtifactRef format is not current")
-    value = CalibrationArtifactRef(
-        _canonical_text(tree["repository_id"], "repository_id"),
-        _sha256(tree["manifest_digest"], "manifest_digest"),
-    )
+    value = CalibrationArtifactRef(canonical_text(tree["record_path"], "record_path"))
     if calibration_artifact_ref_to_tree(value) != tree:
         raise ValueError("CalibrationArtifactRef tree is typed but non-canonical")
     return value
@@ -64,26 +68,11 @@ def encode_calibration_artifact_ref(value: CalibrationArtifactRef) -> bytes:
     return encode(calibration_artifact_ref_to_tree(value))
 
 
-def calibration_artifact_input_ref(value: CalibrationArtifactRef):
-    """Mint the runtime dependency edge through this reference owner's codec."""
-
-    from zlc_neutral_atom.runtime.streams import ArtifactInputRef
-
-    if not isinstance(value, CalibrationArtifactRef):
-        raise TypeError("value must be CalibrationArtifactRef")
-    return ArtifactInputRef(
-        CALIBRATION_ARTIFACT_REF_FORMAT,
-        encode_calibration_artifact_ref(value),
-        value.manifest_digest,
-    )
-
-
 __all__ = [
     "CALIBRATION_ARTIFACT_NAMESPACE",
     "CALIBRATION_ARTIFACT_REF_FORMAT",
     "CalibrationArtifactRef",
     "calibration_artifact_ref_from_tree",
-    "calibration_artifact_input_ref",
     "calibration_artifact_ref_to_tree",
     "encode_calibration_artifact_ref",
 ]

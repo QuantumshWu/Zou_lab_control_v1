@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from pathlib import Path
 import time
 
 import pytest
@@ -26,9 +25,6 @@ from zlc_pulse import (
     RepeatRegion,
     ScanParameter,
 )
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def _authored_scan_document(experiment) -> tuple[PulseDocument, PulseFieldRef]:
@@ -102,8 +98,7 @@ def experiment(tmp_path_factory):
     with connect(
         "virtual",
         workspace=WorkspacePaths.for_workspace(
-            ROOT,
-            repository_root=tmp_path_factory.mktemp("pulse-application-state"),
+            tmp_path_factory.mktemp("pulse-application-state").resolve()
         ),
     ) as value:
         yield value
@@ -154,7 +149,7 @@ def test_applied_snapshot_preserves_source_api_intent_and_outer_scan_sweeps(
     assert applied.source_document_digest == document.fingerprint
 
 
-def test_two_facades_share_run_observation_applied_identity_and_safe_cancel(
+def test_two_facades_share_unified_preemption_observation_and_safe_cancel(
     experiment,
 ):
     document, _api_field = _authored_scan_document(experiment)
@@ -181,8 +176,18 @@ def test_two_facades_share_run_observation_applied_identity_and_safe_cancel(
     assert holding.request is request
     assert peer.snapshot() == experiment.pulse.snapshot() == holding.applied
 
-    with pytest.raises(RuntimeError, match="already active"):
-        peer.start(request)
+    replacement = peer.start(request)
+    assert replacement.run_id != handle.run_id
+    retired = handle.wait(5.0)
+    assert retired.state is RunState.CANCELLED
+    holding = _wait_for_observation(
+        peer,
+        lambda observation: observation.run.run_id == replacement.run_id
+        and observation.applied is not None
+        and observation.run.phase == "holding-pulse",
+    )
+    assert holding.request is request
+    assert peer.snapshot() == experiment.pulse.snapshot() == holding.applied
 
     assert peer.cancel_active("state owner cancellation proof") is CancelOutcome.REQUESTED
     terminal = _wait_for_observation(
@@ -190,7 +195,7 @@ def test_two_facades_share_run_observation_applied_identity_and_safe_cancel(
         lambda observation: observation.run.state.terminal,
     )
     assert terminal.run.state is RunState.CANCELLED
-    assert terminal.run.final_committed is False
+    assert terminal.run.run_id == replacement.run_id
     assert peer.observe_active() == terminal
     assert peer.cancel_active() is CancelOutcome.ALREADY_TERMINAL
 
@@ -297,4 +302,3 @@ def test_continuous_backend_failure_terminates_run_without_user_cancel(
         time.sleep(0.005)
     terminal = handle.snapshot()
     assert terminal.state is RunState.FAILED
-    assert terminal.final_committed is False

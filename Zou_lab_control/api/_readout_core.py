@@ -10,13 +10,14 @@ from __future__ import annotations
 from pathlib import Path
 
 from zlc_data import OwnedSnapshot
+from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
 from zlc_neutral_atom.artifact_dispatch import ArtifactCapability
 from zlc_neutral_atom.capture.application import (
     CaptureRequest,
     PreparedFiniteCapture,
     prepare_finite_capture,
 )
-from zlc_neutral_atom.capture.artifact import CaptureArtifact
+from zlc_neutral_atom.capture.artifact import CaptureArtifact, load_capture_artifact
 from zlc_neutral_atom.capture.reference import (
     CAPTURE_ARTIFACT_REF_SCHEMA,
     CaptureArtifactRef,
@@ -91,7 +92,7 @@ class ReadoutFacade:
                 request,
                 pulse_port=services.runtime.pulse_port(request.sequencer_ref),
                 camera_port=services.runtime.camera_port(request.camera_ref),
-                repository=services.capture_repository,
+                captures_root=services.captures_root,
                 start_run=self._start_run,
             )
 
@@ -135,13 +136,17 @@ class ReadoutFacade:
         with service_guard(self._services) as services:
             if not isinstance(reference, CaptureArtifactRef):
                 raise TypeError("reference must be CaptureArtifactRef")
-            return services.capture_repository.load(reference)
+            return load_capture_artifact(services.captures_root, reference)
 
     def materialize_capture(self, reference: CaptureArtifactRef) -> OwnedSnapshot:
         with service_guard(self._services) as services:
             if not isinstance(reference, CaptureArtifactRef):
                 raise TypeError("reference must be CaptureArtifactRef")
-            return services.capture_repository.materialize_final(reference)
+            return load_capture_artifact(
+                services.captures_root,
+                reference,
+                materialize=True,
+            ).materialize_snapshot()
 
     def _project_capture_dataset(
         self,
@@ -151,10 +156,23 @@ class ReadoutFacade:
         abort_check=None,
     ):
         with service_guard(self._services) as services:
-            return services.capture_repository.project_dataset_source(
+            artifact = load_capture_artifact(
+                services.captures_root,
                 reference,
                 materialize=materialize,
-                abort_check=abort_check,
+            )
+            if abort_check is not None:
+                abort_check()
+            source = artifact.frame_source
+            snapshot = (
+                artifact.materialize_snapshot(abort_check=abort_check)
+                if materialize
+                else None
+            )
+            return ArtifactDatasetSource(
+                source.schema,
+                source.ref(artifact.provenance.generation),
+                snapshot,
             )
 
     def _artifact_capabilities(self) -> tuple[ArtifactCapability, ...]:

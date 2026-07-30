@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -13,27 +14,26 @@ from Zou_lab_control.workbench import open_pulse_editor
 from zlc_storage.paths import resolve_under
 
 
-def test_workspace_paths_are_composed_from_explicit_absolute_roots(tmp_path) -> None:
-    authored = (tmp_path / "authored").resolve()
-    repository = (tmp_path / "repository").resolve()
+def test_workspace_paths_are_composed_from_one_explicit_project_root(tmp_path) -> None:
+    project = (tmp_path / "project").resolve()
 
-    paths = WorkspacePaths.for_workspace(
-        authored,
-        repository_root=repository,
+    paths = WorkspacePaths.for_workspace(project)
+
+    assert tuple(field.name for field in fields(paths)) == (
+        "project_root",
+        "pulses_root",
+        "tasks_root",
+        "output_root",
     )
-
-    assert paths.pulses_root == authored / "pulses"
-    assert paths.tasks_root == authored / "tasks"
-    assert paths.output_root == repository / "output"
-    assert paths.repository_root == repository
+    assert paths.project_root == project
+    assert paths.pulses_root == project / "pulses"
+    assert paths.tasks_root == project / "tasks"
+    assert paths.output_root == project / "_output"
 
 
 def test_workspace_paths_reject_relative_authorities() -> None:
     with pytest.raises(ValueError, match="absolute"):
-        WorkspacePaths.for_workspace(
-            Path("relative"),
-            repository_root=Path("repository"),
-        )
+        WorkspacePaths.for_workspace(Path("relative"))
 
 
 def test_resolve_under_never_uses_process_cwd(tmp_path, monkeypatch) -> None:
@@ -45,31 +45,22 @@ def test_resolve_under_never_uses_process_cwd(tmp_path, monkeypatch) -> None:
     assert resolve_under(root, "nested/value.json") == (
         root / "nested" / "value.json"
     ).resolve()
-    absolute = (tmp_path / "external.json").resolve()
-    assert resolve_under(root, absolute) == absolute
+    with pytest.raises(ValueError, match="relative"):
+        resolve_under(root, (tmp_path / "external.json").resolve())
+    with pytest.raises(ValueError, match="escapes"):
+        resolve_under(root, "../external.json")
 
 
-def test_storage_path_module_exposes_no_workspace_policy() -> None:
-    import zlc_storage.paths as paths
-
-    for retired in (
-        "PROJECT_ROOT",
-        "project_path",
-        "user_output_path",
-        "resolve_under_project",
-        "display_path",
-    ):
-        assert not hasattr(paths, retired)
+def test_resolve_under_rejects_relative_roots() -> None:
+    with pytest.raises(ValueError, match="root must be absolute"):
+        resolve_under(Path("relative"), "value.json")
 
 
 def test_public_workbench_composition_forwards_workspace_roots(
     tmp_path,
     monkeypatch,
 ) -> None:
-    workspace = WorkspacePaths.for_workspace(
-        (tmp_path / "authored").resolve(),
-        repository_root=(tmp_path / "repository").resolve(),
-    )
+    workspace = WorkspacePaths.for_workspace((tmp_path / "project").resolve())
     observed = {}
     fake_app = ModuleType("zlc_workbench.pulse_editor.app")
 

@@ -10,6 +10,7 @@ from zlc_neutral_atom.logic_node_package import (
 
 from .api import PulseScanApi
 from .application import prepare_exact_scan
+from .authoring import _build_pulse_scan_program
 from .declaration import PULSE_SCAN_LOGIC_NODE
 from .reference import (
     SCAN_ARTIFACT_REF_SCHEMA,
@@ -17,7 +18,7 @@ from .reference import (
     scan_artifact_ref_from_tree,
     scan_artifact_ref_to_tree,
 )
-from .repository import ScanRepository
+from .source_binding import bind_pulse_scan_request
 
 
 def _bind_api(
@@ -25,12 +26,14 @@ def _bind_api(
     _dependencies: tuple[object, ...],
 ) -> PulseScanApi:
     (
-        repository_root,
+        output_root,
         resolve_sequencer_ref,
+        load_pulse,
         pulse_port,
         start_run,
+        wait_run,
     ) = facts
-    repository = ScanRepository(repository_root / "scans")
+    scans_root = output_root / "scans"
 
     def prepare(request, source, sequencer_role):
         sequencer_ref = resolve_sequencer_ref(sequencer_role)
@@ -38,24 +41,30 @@ def _bind_api(
             request,
             source,
             pulse_port=pulse_port(sequencer_ref),
-            repository=repository,
+            scans_root=scans_root,
             start_run=start_run,
         )
 
     return PulseScanApi(
-        repository,
+        scans_root,
+        load_pulse=load_pulse,
         prepare=prepare,
+        wait_run=wait_run,
     )
-
-
-def _close_api(api: PulseScanApi) -> tuple[Exception, ...]:
-    return api.close()
 
 
 def _prepare_hosted(api, request, event_source):
     if event_source is None:
         raise ValueError("PulseScan requires one exact event-associated source")
-    return api.prepare_scan_source(request, event_source)
+    return api.prepare_scan(request, event_source)
+
+
+def _bind_hosted_request(api, authored, inputs):
+    program = _build_pulse_scan_program(
+        authored,
+        load_pulse=api._load_pulse,
+    )
+    return bind_pulse_scan_request(program, inputs)
 
 
 def _availability(catalog, _apparatus):
@@ -76,7 +85,6 @@ def _bind_artifact_capabilities(
             project_dataset=api._project_dataset_source,
             reference_to_tree=scan_artifact_ref_to_tree,
             reference_from_tree=scan_artifact_ref_from_tree,
-            admit_dataset_content=True,
         ),
     )
 
@@ -85,13 +93,16 @@ LOGIC_NODE_PACKAGE = LogicNodePackage(
     api_name="pulse_scan",
     declaration=PULSE_SCAN_LOGIC_NODE,
     api_requirements=(
-        "repository_root",
+        "output_root",
         "resolve_sequencer_ref",
+        "load_pulse",
         "pulse_port",
         "start_run",
+        "wait_run",
     ),
     bind_api=_bind_api,
     prepare_hosted=_prepare_hosted,
+    bind_hosted_request=_bind_hosted_request,
     availability=_availability,
     ui_contributions=(
         UiContributionDescriptor(
@@ -101,7 +112,6 @@ LOGIC_NODE_PACKAGE = LogicNodePackage(
             "task_console_editor",
         ),
     ),
-    close_api=_close_api,
     bind_artifact_capabilities=_bind_artifact_capabilities,
 )
 

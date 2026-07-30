@@ -44,14 +44,11 @@ def _bind_api(
             raise TypeError("temperature binder returned another domain value")
         return prepare_release_recapture(
             name=f"Temperature release-recapture {bound.program.document.name}",
-            owner="zlc_neutral_atom.release-recapture",
-            program_fingerprint=bound.program.fingerprint,
             camera_binding=bound.camera_binding,
             calibration=resolved,
             model_kind=bound.request.model_kind,
             per_site=bound.request.per_site,
             declaration=TEMPERATURE_RELEASE_RECAPTURE_OUTPUT_DECLARATIONS[0],
-            final_owner="temperature-release-recapture",
             start_run=start_run,
         )
 

@@ -306,7 +306,7 @@ def project_input_fields(
                 file_filter="All files (*)" if path is None else path.file_filter,
                 base_dir="" if path is None else path.base_dir,
                 description=(
-                    f"Exact saved {spec.label.lower()} pointer; used when "
+                    f"Exact saved {spec.label.lower()} record; used when "
                     f"{spec.label} source is Saved {spec.label.lower()}"
                 ),
             )

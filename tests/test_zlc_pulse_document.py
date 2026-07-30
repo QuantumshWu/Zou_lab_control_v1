@@ -11,7 +11,6 @@ import pytest
 from conftest import tracked_repo_files
 
 from zlc_pulse import (
-    PULSE_DOCUMENT_SCHEMA,
     FrozenScanTable,
     OutputDelay,
     PulseDocument,
@@ -19,6 +18,7 @@ from zlc_pulse import (
     pulse_document_from_tree,
     pulse_document_to_tree,
 )
+from zlc_pulse.document import PULSE_DOCUMENT_SCHEMA
 
 
 ROOT = Path(__file__).parents[1]

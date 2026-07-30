@@ -7,15 +7,11 @@ from zlc_neutral_atom.logic_node_package import (
     LogicNodePackage,
     UiContributionDescriptor,
 )
+from zlc_storage.paths import resolve_under
 
 from .api import OccupancyApi
-from .application import (
-    prepare_detection_plan,
-    resolve_occupancy_calibration_input,
-)
-from .cell import (
-    inspect_occupancy_cell_domain,
-    load_exact_occupancy_cell_source,
+from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
+    CalibrationArtifactRef,
 )
 from .declaration import OCCUPANCY_LOGIC_NODE
 from .reference import OCCUPANCY_ARTIFACT_NAMESPACE, OccupancyArtifactRef
@@ -27,65 +23,19 @@ def _bind_api(
 ) -> OccupancyApi:
     (calibration,) = dependencies
     (
-        repository_root,
-        capture_repository,
+        output_root,
         start_run,
         wait_run,
         open_ui,
     ) = facts
 
-    def calibration_repository():
-        return calibration._repository_for_readout_family()
-
-    def start_detection(request, occupancy_repository):
-        plan = prepare_detection_plan(
-            request,
-            capture_repository=capture_repository,
-            calibration_repository=calibration_repository(),
-            occupancy_repository=occupancy_repository,
-        )
-        return start_run(plan)
-
-    def load_occupancy(reference, occupancy_repository):
-        return occupancy_repository.admit(
-            reference,
-            capture_repository,
-            calibration_repository(),
-        )
-
-    def inspect_cell(reference, occupancy_repository):
-        return inspect_occupancy_cell_domain(
-            reference,
-            occupancy_repository,
-            capture_repository,
-            calibration_repository(),
-        )
-
-    def load_cell(
-        reference,
-        occupancy_repository,
-        address,
-        *,
-        expected_domain_identity,
-    ):
-        return load_exact_occupancy_cell_source(
-            reference,
-            occupancy_repository,
-            capture_repository,
-            calibration_repository(),
-            address,
-            expected_domain_identity=expected_domain_identity,
-        )
-
     return OccupancyApi(
         calibration,
-        repository_path=repository_root / "occupancy",
+        captures_root=resolve_under(output_root, "captures"),
+        calibrations_root=resolve_under(output_root, "calibrations"),
+        occupancy_root=resolve_under(output_root, "occupancy"),
+        start_run=start_run,
         wait_run=wait_run,
-        admit_capture=capture_repository.admit,
-        start_detection=start_detection,
-        load_occupancy=load_occupancy,
-        inspect_cell=inspect_cell,
-        load_cell=load_cell,
         open_ui=open_ui,
     )
 
@@ -99,21 +49,32 @@ def _prepare_hosted(api, request, event_source):
 
 
 def _resolve_artifact_reference(api, binding, resolve_final_or_saved):
-    return resolve_occupancy_calibration_input(
+    def require_reference(value: object) -> CalibrationArtifactRef:
+        if not isinstance(value, CalibrationArtifactRef):
+            raise TypeError("Occupancy Calibration input is not a typed reference")
+        return value
+
+    reference = resolve_final_or_saved(
         binding,
-        resolve_final_or_saved=resolve_final_or_saved,
-        load_saved_calibration=api.load_saved_calibration,
+        load_saved=api._reference_from_record_path,
+        extract_reference=require_reference,
     )
+    return require_reference(reference)
 
 
 def _close_api(api: OccupancyApi) -> tuple[Exception, ...]:
     return api.close()
 
 
-def _project_signal_presentation(node, output_name, publication):
+def _project_signal_presentation(node, output_name, publication, parents):
     from .ui.view_projection import project_occupancy_signal_presentation
 
-    return project_occupancy_signal_presentation(node, output_name, publication)
+    return project_occupancy_signal_presentation(
+        node,
+        output_name,
+        publication,
+        parents,
+    )
 
 
 def _bind_artifact_capabilities(
@@ -136,8 +97,7 @@ LOGIC_NODE_PACKAGE = LogicNodePackage(
     api_name="occupancy",
     declaration=OCCUPANCY_LOGIC_NODE,
     api_requirements=(
-        "repository_root",
-        "capture_repository",
+        "output_root",
         "start_run",
         "wait_run",
         "open_ui",

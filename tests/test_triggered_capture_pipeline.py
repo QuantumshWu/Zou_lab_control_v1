@@ -338,10 +338,7 @@ def test_public_current_capture_is_one_autonomous_fire_with_exact_reconciliation
         )
         experiment = connect(
             "virtual",
-            workspace=WorkspacePaths.for_workspace(
-                Path.cwd(),
-                repository_root=workspace,
-            ),
+                workspace=WorkspacePaths.for_workspace(workspace),
             seed=7,
         )
         try:
@@ -373,7 +370,6 @@ def test_public_current_capture_is_one_autonomous_fire_with_exact_reconciliation
                 "pulse_trigger_count": dict(
                     pulse.terminal.receipt.expected_trigger_counts_from_completed_schedule
                 )["ch11"],
-                "final_committed": handle.snapshot().final_committed,
                 "execution_form": pulse.compiled_artifact.execution_form.value,
             }
             print("RESULT_JSON=" + json.dumps(result, sort_keys=True))
@@ -389,7 +385,6 @@ def test_public_current_capture_is_one_autonomous_fire_with_exact_reconciliation
         "drained": 3,
         "execution_form": "STATIC_ONCE",
         "expected_frames": 3,
-        "final_committed": True,
         "physical_shape": [1, 3, 96, 128],
         "produced": 3,
         "pulse_trigger_count": 3,
@@ -411,8 +406,7 @@ def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest
             self.missed_events = []
             self.dataset = None
 
-        def bind(self, dataset, *, run_id: str, causation_domain_id: str) -> None:
-            assert run_id and causation_domain_id
+        def bind(self, dataset) -> None:
             self.dataset = dataset
 
         def updated(self) -> None:
@@ -436,11 +430,14 @@ def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest
             if dataset is not None:
                 dataset.close()
 
+    project = (tmp_path / "preview-selection").resolve()
     experiment = connect(
         "virtual",
-        workspace=WorkspacePaths.for_workspace(
-            ROOT,
-            repository_root=tmp_path / "preview-selection",
+        workspace=WorkspacePaths(
+            project_root=project,
+            pulses_root=(ROOT / "pulses").resolve(),
+            tasks_root=(ROOT / "tasks").resolve(),
+            output_root=project / "_output",
         ),
         seed=7,
     )

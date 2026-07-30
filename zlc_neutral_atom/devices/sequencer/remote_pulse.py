@@ -190,40 +190,14 @@ class RemotePulseExecutionEndpoint(_OwnedSequencerEndpoint):
     def _backend_set_safe_state(self, timeout_seconds: float) -> object:
         return self._client.safe_state(timeout=timeout_seconds)
 
-    def _backend_close_evidence(
+    def _backend_safe_state_confirmed(
         self,
-        session_id: str,
         snapshot: PulseServerSnapshot,
-    ) -> tuple[bool, str]:
-        safe = (
+    ) -> bool:
+        return (
             snapshot.state == "SAFE"
             and snapshot.prepared_ref is None
             and snapshot.safe_readback_confirmed
-        )
-        return safe, canonical_digest(
-            {
-                "session_id": session_id,
-                "server_connection_generation": self._server_connection_generation,
-                "state": snapshot.state,
-                "prepared_ref": (
-                    None if snapshot.prepared_ref is None else "present"
-                ),
-                "physical_state": snapshot.physical_state,
-                "physical_prepared_artifact_digest": (
-                    snapshot.physical_prepared_artifact_digest
-                ),
-                "safe_status_word": snapshot.safe_status_word,
-                "safe_clock_enable_words": snapshot.safe_clock_enable_words,
-            }
-        )
-
-    def _backend_interrupt_digest(self, snapshot: PulseServerSnapshot) -> str:
-        return canonical_digest(
-            {
-                "operation": "SAFE_STATE",
-                "server_connection_generation": self._server_connection_generation,
-                "state": snapshot.state,
-            }
         )
 
     def _validate_server_connection_generation(self):

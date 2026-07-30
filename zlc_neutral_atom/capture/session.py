@@ -17,7 +17,6 @@ from zlc_storage import (
 
 from zlc_data import DatasetSchema, StreamGenerationId
 from zlc_neutral_atom.devices.camera.contract import (
-    CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
     CameraCapabilityEvidence,
     CameraCaptureDescriptor,
     CameraDatasetEventAdapter,
@@ -50,7 +49,6 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetCellSchedule,
     DatasetEventAdapter,
     FrozenDatasetEdge,
-    OrderedDatasetMetadataHasher,
     SealedDatasetArtifact,
 )
 from zlc_neutral_atom.runtime.resources import (
@@ -66,14 +64,10 @@ from zlc_neutral_atom.runtime.streams import (
     EventSpanRef,
     ExactConsumerReadiness,
     ExactReservation,
-    OrderedEventSpanHasher,
-    ProcessorStageProvenance,
     ReservationState,
     SourceFailed,
     StreamError,
     StreamId,
-    TraceBinding,
-    TraceContext,
 )
 
 
@@ -197,14 +191,12 @@ class CameraCaptureContract:
             raise ValueError(
                 "capture capability and dataset edge must share the payload owner"
             )
-        for member in ("source_ordinal", "captured_at", "correlation_id"):
+        for member in ("source_ordinal", "captured_at"):
             if not callable(getattr(edge.payload_contract, member, None)):
                 raise TypeError(f"payload_contract.{member} must be callable")
         # A raw camera CaptureArtifact is defined by the acquisition owner, not
         # by schema equality.  Require the exact identity adapter implementation.
-        if type(edge.event_adapter) is not CameraDatasetEventAdapter or (
-            edge.operator_fingerprint != CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT
-        ):
+        if type(edge.event_adapter) is not CameraDatasetEventAdapter:
             raise ValueError(
                 "raw camera provenance requires the owner identity event adapter"
             )
@@ -271,16 +263,13 @@ class CaptureCompletion:
         "_session",
         "_eos",
         "_terminal",
-        "_trace_binding",
+        "_run_id",
         "_source_dataset_schema",
         "_source_cell_schedule",
         "_camera_provenance",
         "_camera_capability_evidence",
         "_camera_arm_spec",
-        "_source_event_adapter_operator_fingerprint",
-        "_chain_contract_digest",
         "_source_event_span",
-        "_processor_stages",
         "_terminal_reservation",
         "_direct_terminal_consumer",
     )
@@ -300,7 +289,9 @@ class CaptureCompletion:
         object.__setattr__(self, "_session", session)
         object.__setattr__(self, "_eos", None)
         object.__setattr__(self, "_terminal", terminal)
-        object.__setattr__(self, "_trace_binding", session._trace_binding)
+        if session._run_id is None:
+            raise RuntimeError("capture completion has no owning Run identity")
+        object.__setattr__(self, "_run_id", session._run_id)
         object.__setattr__(
             self,
             "_source_dataset_schema",
@@ -322,26 +313,18 @@ class CaptureCompletion:
             session._contract.capability.camera_capability_evidence,
         )
         object.__setattr__(self, "_camera_arm_spec", session._capture_spec)
-        object.__setattr__(
-            self,
-            "_source_event_adapter_operator_fingerprint",
-            session._contract.dataset_edge.operator_fingerprint,
-        )
-        object.__setattr__(
-            self,
-            "_chain_contract_digest",
-            readiness.chain_contract_digest,
-        )
         source_reservation = readiness._source_reservation
         if source_reservation._stream is not session._stream:
             raise RuntimeError(
                 "capture completion readiness belongs to another source stream"
             )
-        source_event_span_hasher = session._source_event_span_hasher
-        if source_event_span_hasher is None:
-            raise RuntimeError("capture completion has no source event span owner")
-        source_event_span = source_event_span_hasher.seal(
-            source_reservation.end_sequence
+        if session._next_source_sequence != source_reservation.end_sequence:
+            raise RuntimeError("capture source event span is incomplete")
+        source_event_span = EventSpanRef(
+            session._stream.stream_id,
+            session._stream.generation,
+            source_reservation.start_sequence,
+            source_reservation.end_sequence,
         )
         if (
             source_event_span.stream_id != session._stream.stream_id
@@ -351,7 +334,6 @@ class CaptureCompletion:
         ):
             raise RuntimeError("capture source event span differs from its reservation")
         object.__setattr__(self, "_source_event_span", source_event_span)
-        object.__setattr__(self, "_processor_stages", readiness.processor_stages)
         # Process-local identity capability.  PipelineResult uses it to prove
         # that its SealedDatasetArtifact came from this readiness chain's live
         # terminal DatasetBuilder, including through processor chains.
@@ -363,10 +345,6 @@ class CaptureCompletion:
         direct_terminal = (
             readiness._source_reservation is readiness._terminal_reservation
         )
-        if direct_terminal != (not readiness.processor_stages):
-            raise RuntimeError(
-                "capture readiness terminal identity differs from its stage chain"
-            )
         object.__setattr__(self, "_direct_terminal_consumer", direct_terminal)
 
     def __setattr__(self, _name: str, _value: object) -> None:
@@ -383,8 +361,8 @@ class CaptureCompletion:
         return self._terminal
 
     @property
-    def trace_binding(self) -> TraceBinding:
-        return self._trace_binding
+    def run_id(self) -> str:
+        return self._run_id
 
     @property
     def source_dataset_schema(self) -> DatasetSchema:
@@ -405,14 +383,6 @@ class CaptureCompletion:
     @property
     def camera_arm_spec(self) -> FrozenCaptureSpec:
         return self._camera_arm_spec
-
-    @property
-    def source_event_adapter_operator_fingerprint(self) -> str:
-        return self._source_event_adapter_operator_fingerprint
-
-    @property
-    def chain_contract_digest(self) -> str:
-        return self._chain_contract_digest
 
     @property
     def direct_terminal_consumer(self) -> bool:
@@ -437,10 +407,6 @@ class CaptureCompletion:
     @property
     def source_event_span(self) -> EventSpanRef:
         return self._source_event_span
-
-    @property
-    def processor_stages(self) -> tuple[ProcessorStageProvenance, ...]:
-        return self._processor_stages
 
     def _commit_pipeline_result(self, dataset: SealedDatasetArtifact) -> None:
         """Atomically consume dataset and completion live authority."""
@@ -474,20 +440,15 @@ class CaptureSession:
         self,
         port: BoundCapturePort,
         contract: CameraCaptureContract,
-        trace_binding: TraceBinding,
         capture_spec: FrozenCaptureSpec,
     ) -> None:
-        if not isinstance(trace_binding, TraceBinding):
-            raise TypeError("trace_binding must be TraceBinding")
-        if trace_binding.source_id != contract.source_id:
-            raise ValueError("TraceBinding source differs from CameraCaptureContract")
         if not isinstance(capture_spec, FrozenCaptureSpec):
             raise TypeError("capture_spec must be FrozenCaptureSpec")
         if capture_spec.owner_fingerprint != contract.capture_spec_owner_fingerprint:
             raise ValueError("capture spec owner differs from CameraCaptureContract")
         self._port = port
         self._contract = contract
-        self._trace_binding = trace_binding
+        self._run_id: str | None = None
         self._capture_spec = capture_spec
         self._capture_spec_digest = capture_spec.digest
         self._session_id = uuid.uuid4().hex
@@ -502,12 +463,9 @@ class CaptureSession:
         self._producer: AcquisitionProducer = producer
         self._state = CaptureSessionState.NEW
         self._delivered = 0
-        self._metadata_hasher = OrderedDatasetMetadataHasher(
-            contract.dataset_edge.metadata_contract_fingerprint
-        )
         self._completion: CaptureCompletion | None = None
         self._reservation: ExactReservation | None = None
-        self._source_event_span_hasher: OrderedEventSpanHasher | None = None
+        self._next_source_sequence: int | None = None
         self._exact_consumer_readiness: ExactConsumerReadiness | None = None
         self._lock = threading.RLock()
         self._operation_lock = threading.Lock()
@@ -539,16 +497,10 @@ class CaptureSession:
                     raise RuntimeError("capture session already has an exact reservation")
             reservation = self._stream.reserve(
                 total_events=self._contract.total_events,
-                trace_binding=self._trace_binding,
-            )
-            source_event_span_hasher = OrderedEventSpanHasher(
-                self._stream.stream_id,
-                self._stream.generation,
-                reservation.start_sequence,
             )
             with self._lock:
                 self._reservation = reservation
-                self._source_event_span_hasher = source_event_span_hasher
+                self._next_source_sequence = reservation.start_sequence
             return reservation
 
     def bind_exact_consumer(self, readiness: ExactConsumerReadiness) -> None:
@@ -574,11 +526,10 @@ class CaptureSession:
     def prepare(self, context: RunContext) -> None:
         with self._operation_lock:
             self._assert_owner_thread()
-            if context.run_id.value != self._trace_binding.run_id:
-                raise ValueError("RunContext differs from the frozen TraceBinding")
             with self._lock:
                 if self._state is not CaptureSessionState.NEW:
                     raise RuntimeError("capture session can only be prepared once")
+                self._run_id = context.run_id.value
                 reservation = self._reservation
                 readiness = self._exact_consumer_readiness
             if reservation is None:
@@ -676,18 +627,6 @@ class CaptureSession:
     ) -> None:
         readiness.validate_source(
             reservation=reservation,
-            trace_binding=self._trace_binding,
-            payload_contract_fingerprint=(
-                self._contract.dataset_edge.payload_contract_fingerprint
-            ),
-            join_key_contract_fingerprint=DatasetCellKeyContract.from_schema(
-                self._contract.dataset_schema
-            ).fingerprint,
-            source_contract_digest=self._contract.dataset_edge.consumer_contract_digest,
-            source_schedule_digest=self._contract.dataset_edge.schedule_digest,
-            source_key_sequence_digest=(
-                self._contract.dataset_edge.exact_key_sequence_digest
-            ),
             total_events=self._contract.total_events,
         )
 
@@ -726,22 +665,14 @@ class CaptureSession:
                 captured_at = payload_contract.captured_at(payload)
                 if not math.isfinite(float(captured_at)):
                     raise ValueError("payload captured_at must be finite")
-                correlation_id = payload_contract.correlation_id(payload)
-                _canonical_text(correlation_id, "payload correlation_id")
                 envelope = self._producer.emit(
                     payload,
                     captured_at=float(captured_at),
-                    trace=TraceContext(
-                        run_id=self._trace_binding.run_id,
-                        source_id=self._trace_binding.source_id,
-                        correlation_id=correlation_id,
-                    ),
                     join_key=join_key,
                 )
-                source_event_span_hasher = self._source_event_span_hasher
-                if source_event_span_hasher is None:
-                    raise RuntimeError("capture has no source event span owner")
-                source_event_span_hasher.update(envelope.ref)
+                if envelope.sequence != self._next_source_sequence:
+                    raise StreamError("captured event sequence is not contiguous")
+                self._next_source_sequence += 1
                 stored = envelope.payload
                 if _nonnegative_int(
                     payload_contract.source_ordinal(stored),
@@ -750,15 +681,9 @@ class CaptureSession:
                     raise StreamError("payload snapshot changed the physical source ordinal")
                 if float(payload_contract.captured_at(stored)) != float(captured_at):
                     raise StreamError("payload snapshot changed captured_at")
-                if payload_contract.correlation_id(stored) != correlation_id:
-                    raise StreamError("payload snapshot changed correlation_id")
                 metadata_contract = self._contract.dataset_edge.metadata_contract
                 metadata = metadata_contract.snapshot(stored)
                 metadata_contract.validate(metadata)
-                metadata_digest = _sha256(
-                    metadata_contract.digest(metadata),
-                    "payload metadata digest",
-                )
             except BaseException as error:
                 self._poison(
                     SourceFailed(
@@ -768,7 +693,6 @@ class CaptureSession:
                 )
                 raise
             with self._lock:
-                self._metadata_hasher.update(metadata_digest)
                 self._delivered += 1
 
     def complete(self, context: RunContext) -> CaptureCompletion:
@@ -800,9 +724,6 @@ class CaptureSession:
                     raise StreamError(
                         "capture terminal counters/stop/drain/join proof failed"
                     )
-                expected_digest = self._metadata_hasher.digest()
-                if ack.ordered_metadata_digest != expected_digest:
-                    raise StreamError("capture terminal metadata digest differs")
                 if (
                     ack.settings_fingerprint
                     != self._port.capability.settings_fingerprint
@@ -890,7 +811,7 @@ class CaptureSession:
                 with self._lock:
                     self._reservation = None
                     self._exact_consumer_readiness = None
-                    self._source_event_span_hasher = None
+                    self._next_source_sequence = None
             if port_error is not None:
                 for error in release_errors:
                     record_secondary_failure(
@@ -935,7 +856,7 @@ class CaptureSession:
                 raise RuntimeError("capture completion authority is absent or differs")
             self._completion = None
             self._exact_consumer_readiness = None
-            self._source_event_span_hasher = None
+            self._next_source_sequence = None
             object.__setattr__(completion, "_session", None)
             object.__setattr__(completion, "_terminal_reservation", None)
 
@@ -964,7 +885,7 @@ class CaptureSession:
             object.__setattr__(dataset, "_terminal_reservation", None)
             self._completion = None
             self._exact_consumer_readiness = None
-            self._source_event_span_hasher = None
+            self._next_source_sequence = None
             object.__setattr__(completion, "_session", None)
             object.__setattr__(completion, "_terminal_reservation", None)
 
@@ -992,7 +913,6 @@ class CaptureSession:
 def open_capture_session(
     port: BoundCapturePort,
     contract: CameraCaptureContract,
-    trace_binding: TraceBinding,
     capture_spec: FrozenCaptureSpec,
 ) -> CaptureSession:
     """Bind physical camera authority to one exact application session."""
@@ -1001,7 +921,7 @@ def open_capture_session(
         raise TypeError("port must be BoundCapturePort")
     if contract.capability is not port.capability:
         raise ValueError("CameraCaptureContract must share BoundCapturePort capability")
-    return CaptureSession(port, contract, trace_binding, capture_spec)
+    return CaptureSession(port, contract, capture_spec)
 
 
 __all__ = [

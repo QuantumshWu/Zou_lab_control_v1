@@ -40,7 +40,6 @@ from zlc_frontend import (
     FigureSource,
     FigureIntent,
     FixedIndex,
-    PanelProvenance,
     PlotKind,
     PlotReportDocument,
     SourceViewBinding,
@@ -101,7 +100,6 @@ def _document() -> PlotReportDocument:
         "meter",
         figure=FigureIntent(PlotKind.IMAGE, "Image", "Counts"),
         source=FigureSource(snapshot),
-        provenance=PanelProvenance("run", "epoch", "a" * 64),
     )
     return PlotReportDocument("immutable report", (page,))
 
@@ -197,7 +195,6 @@ def _grid_report_page(cell_count: int):
         "grid",
         figure=FigureIntent(PlotKind.GRID, "Grid", "Counts", view=view),
         source=FigureSource(snapshot),
-        provenance=PanelProvenance("run", "epoch", "b" * 64),
     )
 
 
@@ -279,7 +276,7 @@ def test_calibration_report_dpr_reuses_document_and_retires_old_front(monkeypatc
     monkeypatch.setattr(module, "_render_calibration_report", render_document)
     window = module.CalibrationReportWindow(
         lambda _reference: None,
-        CalibrationArtifactRef("test", "b" * 64),
+        CalibrationArtifactRef("test/calibration.json"),
     )
     window.show()
     try:

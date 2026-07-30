@@ -86,11 +86,14 @@ def test_current_sitemap_preserves_repeat_event_image_and_site_axes(tmp_path):
         from Zou_lab_control.api import WorkspacePaths, connect
 
         workspace = Path(sys.argv[1])
+        project = Path.cwd().resolve()
         experiment = connect(
             "virtual",
-            workspace=WorkspacePaths.for_workspace(
-                Path.cwd(),
-                repository_root=workspace,
+            workspace=WorkspacePaths(
+                project,
+                project / "pulses",
+                project / "tasks",
+                workspace / "_output",
             ),
             seed=7,
         )

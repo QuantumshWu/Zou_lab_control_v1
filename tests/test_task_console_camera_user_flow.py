@@ -7,8 +7,8 @@ inspect the resulting typed fronts, but never bypass a button to create them.
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
+import shutil
 import threading
 import time
 from types import SimpleNamespace
@@ -48,6 +48,19 @@ from zlc_workbench.task_console.console_records import (
 )
 from zlc_frontend import PlotKind
 from zlc_frontend.qt_widgets import ensure_qt_app
+from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
+    CalibrationArtifactRef,
+)
+
+
+def _workspace_with_pulses(tmp_path: Path, *names: str) -> Path:
+    workspace = tmp_path / "workspace"
+    pulses = workspace / "pulses"
+    pulses.mkdir(parents=True)
+    source_root = Path(__file__).resolve().parents[1] / "pulses"
+    for name in names:
+        shutil.copy2(source_root / name, pulses / name)
+    return workspace
 
 
 def _choose_signal_leaf(combo, signal, application) -> None:
@@ -358,7 +371,7 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
     )
     args = _build_parser().parse_args(
         [
-            "--repository",
+            "--workspace",
             str(tmp_path / "workspace"),
             "--name",
             "grid-setting-edit-fit",
@@ -392,21 +405,14 @@ def test_grid_setting_edit_and_fit_remain_one_bounded_formal_window(
             declaration,
             snapshot,
             MonitorCoverage(12, 12, 0, False),
-            "0" * 64,
         )
         slot = SimpleNamespace(
-            freeze_live_outputs=lambda: (
-                "formal-run",
-                "formal-epoch",
-                {"grid": live_output},
-            ),
+            freeze_live_outputs=lambda: {"grid": live_output},
             close=lambda: None,
             notification_failure=None,
         )
         plane = console._data
         plane.reserve(grid_node)
-        lifecycle = plane.begin_run_lifecycle(grid_node)
-        plane.bind_run_lifecycle(lifecycle, "formal-run", preemptible=True)
         plane.attach(grid_node, slot)
         plane.mark_changed(grid_node, slot)
         plane.freeze()
@@ -736,7 +742,7 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
 
     args = _build_parser().parse_args(
         [
-            "--repository",
+            "--workspace",
             str(tmp_path / "workspace"),
             "--name",
             "camera-user-flow",
@@ -1057,11 +1063,21 @@ def test_device_manager_camera_signal_drives_a_changing_2d_front(tmp_path) -> No
             timeout=15.0,
         )
         area_publication = area_card.frozen_render_publication()
-        assert len(area_publication.parents) == 1
-        area_parent = area_publication.parents[0]
-        assert area_parent.owner_id == area_pressed_publication.owner_id
-        assert area_parent.generation == area_pressed_publication.generation
-        assert area_parent.sequence >= area_pressed_publication.sequence
+        area_parents = console._data.direct_parent_publications(area_publication)
+        assert len(area_parents) == 1
+        area_parent = area_parents[0]
+        assert (
+            area_parent.event_ref.stream_id
+            == area_pressed_publication.event_ref.stream_id
+        )
+        assert (
+            area_parent.event_ref.generation
+            == area_pressed_publication.event_ref.generation
+        )
+        assert (
+            area_parent.event_ref.sequence
+            >= area_pressed_publication.event_ref.sequence
+        )
         area_value = area_card.frozen_render_value()
         assert area_publication.value(area_signal) is area_value
         area_source = area_parent.value(signal)
@@ -1198,7 +1214,7 @@ def test_finite_camera_progress_and_final_reach_one_formal_plot_panel(
 
     args = _build_parser().parse_args(
         [
-            "--repository",
+            "--workspace",
             str(tmp_path / "workspace"),
             "--name",
             "finite-camera-user-flow",
@@ -1296,7 +1312,7 @@ def test_finite_camera_progress_and_final_reach_one_formal_plot_panel(
             except RuntimeError:
                 publication = None
             if publication is not None:
-                observed.setdefault(publication.sequence, publication)
+                observed.setdefault(publication.event_ref.sequence, publication)
             if (
                 row.status_label.text().startswith("done")
                 and publication is not None
@@ -1358,7 +1374,10 @@ def test_finite_camera_progress_and_final_reach_one_formal_plot_panel(
 
         final_publication = terminal[-1]
         assert tuple(final_publication.signals) == qualified
-        assert final_publication.sequence > transient[-1].sequence
+        assert (
+            final_publication.event_ref.sequence
+            > transient[-1].event_ref.sequence
+        )
         for name in qualified:
             value = final_publication.value(name)
             assert value is not None and not value.transient
@@ -1397,10 +1416,15 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
     application = ensure_qt_app()
     from task_console import _StandaloneTaskConsoleFlow, _build_parser
 
+    workspace = _workspace_with_pulses(
+        tmp_path,
+        "imaging_template.json",
+        "mot_field_template.json",
+    )
     args = _build_parser().parse_args(
         [
-            "--repository",
-            str(tmp_path / "workspace"),
+            "--workspace",
+            str(workspace),
             "--name",
             "task-user-flow",
             "--seed",
@@ -1432,7 +1456,7 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
         calibration_editor = _current_logic_editor(console, application)
         calibration_widgets = _visible_form_widgets(calibration_editor)
         assert set(calibration_widgets) == {
-            "folder",
+            "save_frames",
             "pulse",
             "threshold_method",
             "reference_exposure_s",
@@ -1441,11 +1465,6 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             "roi_radius",
             "camera_role",
         }
-        calibration_output = tmp_path / "calibration-output"
-        _replace_path_value(
-            calibration_widgets["folder"],
-            str(calibration_output),
-        )
         _replace_spin_value(calibration_widgets["threshold_frames"], "10")
         QtTest.QTest.mouseClick(
             calibration_editor.form.start_button,
@@ -1471,7 +1490,7 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
         assert calibration_row.status_label.text().startswith(
             "calibration artifact committed"
         )
-        assert str(calibration_output) in calibration_row.status_label.text()
+        assert "calibration.json" in calibration_row.status_label.text()
         site_map_signal = console_signal_key(
             calibration_row.node.node_id,
             "site_map",
@@ -1512,8 +1531,26 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
         # The saved report uses denser export pixels for the same ordinary
         # logical 2x2 surface.  It does not obtain resolution by authoring a
         # larger panel.
-        overview_png = (calibration_output / "report" / "overview.png").read_bytes()
+        calibration_final = console_signal_key(
+            calibration_row.node.node_id,
+            "calibration",
+        )
+        calibration_reference = _resolved_artifact(console, calibration_final)
+        assert (
+            calibration_reference is not None
+        ), calibration_row.status_label.text()
+        calibration_run = (
+            tmp_path
+            / "workspace"
+            / "_output"
+            / "calibrations"
+            / calibration_reference.record_path
+        ).parent
+        overview_png = (calibration_run / "report" / "overview.png").read_bytes()
         assert overview_png.startswith(b"\x89PNG\r\n\x1a\n")
+        report_pages = tuple((calibration_run / "report").glob("*.png"))
+        assert any(path.name.startswith("hist-") for path in report_pages)
+        assert all(not path.name.startswith("pooled-") for path in report_pages)
         import struct
 
         overview_pixels = struct.unpack(">II", overview_png[16:24])
@@ -1524,13 +1561,6 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
         assert overview_pixels == export_geometry.raster_size
         assert export_geometry.logical_size == contract.logical_size
 
-        calibration_final = console_signal_key(
-            calibration_row.node.node_id,
-            "calibration",
-        )
-        assert _resolved_artifact(console, calibration_final) is not None, (
-            calibration_row.status_label.text()
-        )
         fidelity_site = console_signal_key(
             calibration_row.node.node_id,
             "fidelity_site",
@@ -1591,14 +1621,9 @@ def test_calibration_and_mot_tasks_open_their_declared_live_panels(tmp_path) -> 
             "roi_cx",
             "roi_cy",
             "roi_radius",
-            "folder",
             "camera_role",
         }
         _replace_spin_value(mot_widgets["points"], "2")
-        _replace_path_value(
-            mot_widgets["folder"],
-            str(tmp_path / "mot-output"),
-        )
         QtTest.QTest.mouseClick(
             mot_editor.form.start_button,
             QtCore.Qt.LeftButton,
@@ -1672,10 +1697,15 @@ def test_calibration_retires_the_exact_conflicting_camera_row_and_retries(
     application = ensure_qt_app()
     from task_console import _StandaloneTaskConsoleFlow, _build_parser
 
+    workspace = _workspace_with_pulses(
+        tmp_path,
+        "imaging_template.json",
+        "release_recapture.json",
+    )
     args = _build_parser().parse_args(
         [
-            "--repository",
-            str(tmp_path / "workspace"),
+            "--workspace",
+            str(workspace),
             "--name",
             "calibration-conflict-handoff",
             "--seed",
@@ -1723,10 +1753,7 @@ def test_calibration_retires_the_exact_conflicting_camera_row_and_retries(
         calibration_row = console.logic_nodes[-1]
         calibration_editor = _current_logic_editor(console, application)
         calibration_widgets = _visible_form_widgets(calibration_editor)
-        _replace_path_value(
-            calibration_widgets["folder"],
-            str(tmp_path / "calibration-output"),
-        )
+        assert "save_frames" in calibration_widgets
         _replace_spin_value(calibration_widgets["threshold_frames"], "10")
         _choose_combo_data(
             calibration_widgets["camera_role"],
@@ -1790,9 +1817,17 @@ def test_calibration_retires_the_exact_conflicting_camera_row_and_retries(
         )
         until(
             application,
-            lambda: temperature_row.status_label.text().startswith("done"),
+            lambda: (
+                temperature_row.status_label.text().startswith("done")
+                or temperature_row.status_label.text().startswith("error:")
+                or temperature_row.status_label.text().startswith("build failed:")
+                or temperature_row.status_label.text().startswith("start failed:")
+            ),
             timeout=25.0,
         )
+        assert temperature_row.status_label.text().startswith(
+            "done"
+        ), temperature_row.status_label.text()
         assert camera_row.status_label.text() == "stopped"
     finally:
         if not widget_gone(console_wrapper):
@@ -1802,7 +1837,7 @@ def test_calibration_retires_the_exact_conflicting_camera_row_and_retries(
         application.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
 
-def test_live_occupancy_consumes_camera_and_saved_calibration_in_console(
+def test_live_occupancy_consumes_camera_and_direct_calibration_record_in_console(
     tmp_path,
 ) -> None:
     """The live Camera -> Occupancy product chain uses formal Qt controls."""
@@ -1811,10 +1846,11 @@ def test_live_occupancy_consumes_camera_and_saved_calibration_in_console(
     application = ensure_qt_app()
     from task_console import _StandaloneTaskConsoleFlow, _build_parser
 
+    workspace = _workspace_with_pulses(tmp_path, "imaging_template.json")
     args = _build_parser().parse_args(
         [
-            "--repository",
-            str(tmp_path / "workspace"),
+            "--workspace",
+            str(workspace),
             "--name",
             "readout-user-flow",
             "--seed",
@@ -1850,10 +1886,7 @@ def test_live_occupancy_consumes_camera_and_saved_calibration_in_console(
         calibration_row = console.logic_nodes[-1]
         calibration_editor = _current_logic_editor(console, application)
         calibration_widgets = _visible_form_widgets(calibration_editor)
-        _replace_path_value(
-            calibration_widgets["folder"],
-            str(tmp_path / "calibration-output"),
-        )
+        assert "save_frames" in calibration_widgets
         _replace_spin_value(calibration_widgets["threshold_frames"], "10")
         QtTest.QTest.mouseClick(
             calibration_editor.form.start_button,
@@ -1973,12 +2006,17 @@ def test_live_occupancy_consumes_camera_and_saved_calibration_in_console(
             application,
         )
         # Coupled Measurements above already exercise the Task-output branch.
-        # Occupancy takes the other authoritative branch: one exact saved
-        # calibration pointer, never a latest-directory lookup.
-        calibration_pointer = (
-            tmp_path / "calibration-output" / "calibration_ref.json"
+        # Occupancy takes the other authoritative branch: the exact direct
+        # calibration.json record, never a pointer or latest-directory lookup.
+        calibration_reference = _resolved_artifact(console, calibration_signal)
+        assert isinstance(calibration_reference, CalibrationArtifactRef)
+        calibration_record = (
+            workspace
+            / "_output"
+            / "calibrations"
+            / calibration_reference.record_path
         )
-        assert calibration_pointer.is_file()
+        assert calibration_record.is_file()
         _choose_combo_data(
             occupancy_widgets["calibration_source"],
             "saved",
@@ -1986,7 +2024,7 @@ def test_live_occupancy_consumes_camera_and_saved_calibration_in_console(
         )
         _replace_path_value(
             occupancy_widgets["calibration_path"],
-            str(calibration_pointer),
+            str(calibration_record),
         )
         _choose_combo_text(
             occupancy_widgets["model_kind"],
@@ -2085,10 +2123,15 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
     configure_offscreen_fast_path()
     application = ensure_qt_app()
     from task_console import _StandaloneTaskConsoleFlow, _build_parser
+    workspace = _workspace_with_pulses(
+        tmp_path,
+        "imaging_template.json",
+        "release_recapture.json",
+    )
     args = _build_parser().parse_args(
         [
-            "--repository",
-            str(tmp_path / "workspace"),
+            "--workspace",
+            str(workspace),
             "--name",
             "grey-molasses-user-flow",
             "--seed",
@@ -2121,10 +2164,7 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
         calibration_row = console.logic_nodes[-1]
         calibration_editor = _current_logic_editor(console, application)
         calibration_widgets = _visible_form_widgets(calibration_editor)
-        _replace_path_value(
-            calibration_widgets["folder"],
-            str(tmp_path / "calibration-output"),
-        )
+        assert "save_frames" in calibration_widgets
         _replace_spin_value(calibration_widgets["threshold_frames"], "10")
         QtTest.QTest.mouseClick(
             calibration_editor.form.start_button,
@@ -2239,31 +2279,8 @@ def test_grey_molasses_uses_virtual_rf_and_requires_manual_plot_binding(
         assert per_site.schema.physical_shape[:2] == (1, 1)
         assert per_site.schema.cell_schema.data_shape[0] > 1
         assert isinstance(per_site.validity, DatasetComponentValidity)
-        assert result.rf_terminal is not None
-        assert result.rf_terminal.advanced_points == 1
         final = prepared.final_dataset_outputs(result)["recapture"]
-        changed_pulse = replace(
-            result,
-            lineage=replace(
-                result.lineage,
-                terminal=replace(
-                    result.lineage.terminal,
-                    session_id=result.lineage.terminal.session_id + "-other",
-                ),
-            ),
-        )
-        changed_rf = replace(
-            result,
-            rf_terminal=replace(
-                result.rf_terminal,
-                session_id=result.rf_terminal.session_id + "-other",
-            ),
-        )
-        assert all(
-            prepared.final_dataset_outputs(changed)["recapture"].join_digest
-            != final.join_digest
-            for changed in (changed_pulse, changed_rf)
-        )
+        assert final.snapshot is result.survival
     finally:
         if not widget_gone(console_wrapper):
             console_wrapper.close()
@@ -2281,10 +2298,11 @@ def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
     application = ensure_qt_app()
     from task_console import _StandaloneTaskConsoleFlow, _build_parser
 
+    workspace = _workspace_with_pulses(tmp_path, "probe_template.json")
     args = _build_parser().parse_args(
         [
-            "--repository",
-            str(tmp_path / "workspace"),
+            "--workspace",
+            str(workspace),
             "--name",
             "pulse-scan-user-flow",
             "--seed",
@@ -2339,7 +2357,7 @@ def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
         camera_producer = _dataset_producer_or_none(console, camera_signal)
         assert camera_producer is not None
         assert camera_producer.running
-        camera_binding_identity = camera_producer.output_binding.identity
+        camera_binding = camera_producer.output_binding
 
         _choose_combo_text(console.kind_combo, "Measurement: Pulse scan", application)
         QtTest.QTest.mouseClick(add, QtCore.Qt.LeftButton)
@@ -2356,16 +2374,22 @@ def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
 
         slots = widgets["pulse_slots"]
         assert slots.isVisible()
-        assert slots._program_code.isVisible()
-        program_source = slots._program_code.toPlainText()
+        from zlc_frontend.qt_widgets import FluentCodeEdit
+
+        program_editor = slots.findChild(FluentCodeEdit)
+        assert program_editor is not None and program_editor.isVisible()
+        program_source = program_editor.toPlainText()
         assert "scan_table" in program_source and "N = 21" in program_source
-        slots._program_code.setPlainText(
-            program_source.replace("N = 21", "N = 2")
-        )
-        assert slots._sweep_combo.currentText() in {
-            "Scan slots (hardware table)",
-            "API slots (one pulse per point)",
-        }
+        edited_program = program_source.replace("N = 21", "N = 2")
+        program_editor.setFocus()
+        count_cursor = program_editor.document().find("N = 21")
+        assert not count_cursor.isNull()
+        program_editor.setTextCursor(count_cursor)
+        QtTest.QTest.keyClicks(program_editor, "N = 2")
+        application.processEvents(QtCore.QEventLoop.AllEvents, 20)
+        slot_values = slots.values_dict()
+        assert slot_values["sweep_kind"]
+        assert slot_values["program"] == edited_program
         scan_spec = scan_editor.form.current_spec()
         y_parameter = next(
             parameter for parameter in scan_spec.editor_fields
@@ -2394,7 +2418,7 @@ def test_running_camera_signal_drives_pulse_scan_without_stopping_camera(
         )
         current_camera = console.resolve_console_producer(camera_signal)
         assert current_camera.running
-        assert current_camera.output_binding.identity == camera_binding_identity
+        assert current_camera.output_binding is camera_binding
         assert camera_row.status_label.text() == "running"
         assert camera_row.stop_button.isEnabled()
         assert not any(card.config.signal == scan_signal for card in console.cards)

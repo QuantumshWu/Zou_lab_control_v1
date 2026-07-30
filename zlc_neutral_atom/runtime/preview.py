@@ -42,9 +42,6 @@ class ExactDatasetPreviewPort(Protocol):
     def bind(
         self,
         reader: ExactDatasetPreviewReader,
-        *,
-        run_id: str,
-        causation_domain_id: str,
     ) -> None: ...
 
     def updated(self) -> None: ...

@@ -1,37 +1,47 @@
-"""Leaf-owned identity and strict codec for durable camera captures.
-
-This module intentionally imports neither ``artifacts`` nor ``readout`` so
-calibration/result domains can name a source capture without creating a
-repository import cycle or inventing a second reference type.
-"""
+"""Stable relative reference to one directly written camera capture."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any
 
-from zlc_storage import (
-    canonical_text as _canonical_text,
-    sha256_text as _sha256,
-)
+from zlc_storage import canonical_text
 
 
 CAPTURE_ARTIFACT_REF_SCHEMA = "zlc_neutral_atom.capture-artifact-ref"
 CAPTURE_ARTIFACT_NAMESPACE = "capture"
 
 
+def _capture_record_path(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("record_path must be str")
+    canonical_text(value, "record_path")
+    if "\\" in value:
+        raise ValueError("record_path must use POSIX separators")
+    path = PurePosixPath(value)
+    if path.is_absolute() or path.as_posix() != value:
+        raise ValueError("record_path must be a canonical relative path")
+    if len(path.parts) != 2 or path.parts[1] != "capture.json":
+        raise ValueError("record_path must be '<run-name>/capture.json'")
+    if path.parts[0] in {"", ".", ".."}:
+        raise ValueError("record_path requires one concrete run-name")
+    canonical_text(path.parts[0], "capture run-name")
+    return value
+
+
 @dataclass(frozen=True, order=True)
 class CaptureArtifactRef:
-    repository_id: str
-    manifest_digest: str
+    """Location of one Capture record relative to its explicit captures root."""
+
+    record_path: str
 
     def __post_init__(self) -> None:
-        _canonical_text(self.repository_id, "repository_id")
-        _sha256(self.manifest_digest, "manifest_digest")
+        object.__setattr__(self, "record_path", _capture_record_path(self.record_path))
 
     @property
     def target_ref(self) -> str:
-        return f"{CAPTURE_ARTIFACT_NAMESPACE}/{self.manifest_digest}"
+        return f"{CAPTURE_ARTIFACT_NAMESPACE}/{self.record_path}"
 
 
 def capture_artifact_ref_to_tree(value: CaptureArtifactRef) -> dict[str, object]:
@@ -39,29 +49,24 @@ def capture_artifact_ref_to_tree(value: CaptureArtifactRef) -> dict[str, object]
         raise TypeError("value must be CaptureArtifactRef")
     return {
         "schema": CAPTURE_ARTIFACT_REF_SCHEMA,
-        "repository_id": value.repository_id,
-        "manifest_digest": value.manifest_digest,
+        "record_path": value.record_path,
     }
 
 
 def capture_artifact_ref_from_tree(tree: Any) -> CaptureArtifactRef:
-    fields = {"schema", "repository_id", "manifest_digest"}
-    if not isinstance(tree, dict) or set(tree) != fields:
+    if not isinstance(tree, dict) or set(tree) != {"schema", "record_path"}:
         raise ValueError("CaptureArtifactRef has an unknown field set")
     if tree["schema"] != CAPTURE_ARTIFACT_REF_SCHEMA:
         raise ValueError("CaptureArtifactRef schema is not current")
-    value = CaptureArtifactRef(
-        _canonical_text(tree["repository_id"], "repository_id"),
-        _sha256(tree["manifest_digest"], "manifest_digest"),
-    )
+    value = CaptureArtifactRef(tree["record_path"])
     if capture_artifact_ref_to_tree(value) != tree:
         raise ValueError("CaptureArtifactRef tree is typed but non-canonical")
     return value
 
 
 __all__ = [
-    "CAPTURE_ARTIFACT_REF_SCHEMA",
     "CAPTURE_ARTIFACT_NAMESPACE",
+    "CAPTURE_ARTIFACT_REF_SCHEMA",
     "CaptureArtifactRef",
     "capture_artifact_ref_from_tree",
     "capture_artifact_ref_to_tree",

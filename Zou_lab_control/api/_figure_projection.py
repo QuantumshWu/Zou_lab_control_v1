@@ -8,9 +8,9 @@ from zlc_data import FitResultBatch
 from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
 from zlc_neutral_atom.artifact_dispatch import ArtifactDispatch
 from zlc_neutral_atom.artifacts import (
-    AdmittedFitResult,
-    FitExecution,
     FitResultArtifactRef,
+    SavedFitResult,
+    load_fit_result,
 )
 
 from ._dataset_sources import project_final_dataset_source
@@ -98,25 +98,20 @@ def project_figure(
             raise ValueError("a Fit source does not accept artifact_output")
         source_ref = source
         source_label = artifacts.source_label(source)
-    elif isinstance(source, FitExecution):
-        if artifact_output is not None:
-            raise ValueError("a Fit source does not accept artifact_output")
-        source_ref = source.source_artifact_ref
-        fit_result = source.result
-        source_label = artifacts.source_label(source_ref)
     elif isinstance(source, FitResultArtifactRef):
         if artifact_output is not None:
             raise ValueError("a saved Fit source does not accept artifact_output")
-        admitted_fit = services.fit_repository.load(
+        saved_fit = load_fit_result(
+            services.workspace_paths.output_root / "fits",
             source,
             artifacts=artifacts,
         )
-        source_ref = admitted_fit.source_artifact_ref
-        fit_result = admitted_fit.result
+        source_ref = saved_fit.source_artifact_ref
+        fit_result = saved_fit.result
         source_label = artifacts.source_label(source_ref)
-    elif isinstance(source, AdmittedFitResult):
+    elif isinstance(source, SavedFitResult):
         if artifact_output is not None:
-            raise ValueError("an admitted Fit source does not accept artifact_output")
+            raise ValueError("a saved Fit source does not accept artifact_output")
         source_ref = source.source_artifact_ref
         fit_result = source.result
         source_label = artifacts.source_label(source_ref)

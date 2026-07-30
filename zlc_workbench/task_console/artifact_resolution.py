@@ -31,7 +31,7 @@ def resolve_final_or_saved_artifact(
     load_saved: Callable[[object], object],
     extract_reference: Callable[[object], object],
 ) -> object:
-    """Resolve either the exact producer result or one explicit saved pointer."""
+    """Resolve either the exact producer result or one explicit saved record."""
 
     if not isinstance(binding, ResolvedArtifactInput):
         raise TypeError("binding must be ResolvedArtifactInput")

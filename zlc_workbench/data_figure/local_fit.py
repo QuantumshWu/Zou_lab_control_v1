@@ -26,7 +26,7 @@ from zlc_frontend import (
 from zlc_frontend.fit_editor import _fit_selection_from_result
 from zlc_frontend.plot_panel import FigureIntent
 
-from .archive_repository import (
+from .archive_io import (
     LoadedFigureArchive,
     load_figure_archive,
     save_figure_archive,
@@ -152,7 +152,7 @@ def local_fit_bindings(
             raise RuntimeError("saved Figure archive did not reopen the exact Fit result")
         return FitSaveReceipt(
             reopened,
-            f"figure-archive:{reopened.archive.payload_digest}",
+            f"figure-archive:{reopened.path}",
             str(reopened.path),
             reopened_result,
         )

@@ -44,7 +44,6 @@ from zlc_pulse import (
     freeze_scan_table,
     load_pulse_document,
     pulse_server_snapshot_from_tree,
-    pulse_server_snapshot_to_tree,
     pulse_target_manifest_from_lanes,
 )
 from zlc_pulse.server import (
@@ -53,6 +52,7 @@ from zlc_pulse.server import (
     encode_completion_message,
     encode_continuous_failure_message,
     encode_prepared_ref_message,
+    pulse_server_snapshot_to_tree,
 )
 from zlc_storage import decode, encode
 
@@ -198,10 +198,9 @@ def _bound_remote(client, endpoint, *, suffix="main"):
     broker = DeviceBroker()
     identity = broker.verify_identity(
         lambda: PhysicalDeviceIdentity(
-            f"installation-endpoint:test-fpga-{suffix}",
-            DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-            f"installation-assertion:test-fpga-{suffix}",
-            "test-assets-v1",
+            stable_device_identity=f"installation-endpoint:test-fpga-{suffix}",
+            evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+            asset_map_revision="test-assets-v1",
         )
     )
     binding = None

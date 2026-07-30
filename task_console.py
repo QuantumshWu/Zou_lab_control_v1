@@ -33,16 +33,10 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--repository",
-        type=Path,
-        default=Path.home() / ".zlc" / "task_console",
-        help="Experiment workspace used after DeviceManager initializes devices.",
-    )
-    parser.add_argument(
         "--workspace",
         type=Path,
         default=Path(__file__).resolve().parent,
-        help="Authored workspace containing pulses/ and tasks/.",
+        help="Project root containing pulses/, tasks/, and user-visible _output/.",
     )
     parser.add_argument(
         "--name",
@@ -100,7 +94,6 @@ class _StandaloneTaskConsoleFlow:
         kwargs = {
             "workspace": WorkspacePaths.for_workspace(
                 self.args.workspace.expanduser().resolve(),
-                repository_root=self.args.repository.expanduser().resolve(),
             ),
             "name": self.args.name,
         }

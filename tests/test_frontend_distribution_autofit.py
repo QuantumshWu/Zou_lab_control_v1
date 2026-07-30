@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+import zlc_frontend._mpl_histogram as histogram_module
 from zlc_data.axis import (
     REPEAT,
     SCALAR_AXIS,
@@ -127,6 +128,44 @@ def test_distribution_failure_leaves_no_invented_fit_or_threshold() -> None:
         )
     )
 
+    assert all(np.asarray(artist.get_xdata()).size == 0 for artist in fit_artists)
+    assert threshold_artists == ()
+    assert thresholds == ()
+    assert stats is not None and stats.get_text() == ""
+    figure.clear()
+
+
+def test_multi_series_distribution_is_draw_only_and_never_autofits(monkeypatch) -> None:
+    figure, axis = _axes()
+    edges, counts = _separated_counts()
+
+    def reject_arbitrary_series(*_args, **_kwargs):
+        raise AssertionError("multi-series histogram selected one series to fit")
+
+    monkeypatch.setattr(
+        histogram_module,
+        "analyze_bimodal_distribution",
+        reject_arbitrary_series,
+    )
+    assert (
+        histogram_module._histogram_analysis_cache(
+            None,
+            (counts, counts * 0.5),
+            edges,
+        )
+        is None
+    )
+
+    fit_artists, threshold_artists, stats, thresholds = _present(
+        axis,
+        HistogramDisplayState(bin_count=len(counts)),
+        (counts, counts * 0.5),
+        edges,
+        show_stats=True,
+        threshold_linewidth=1.9,
+    )
+
+    assert len(fit_artists) == 6
     assert all(np.asarray(artist.get_xdata()).size == 0 for artist in fit_artists)
     assert threshold_artists == ()
     assert thresholds == ()

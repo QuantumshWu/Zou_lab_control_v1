@@ -40,8 +40,6 @@ from zlc_storage import (
     decode,
     encode,
     exact_mapping,
-    sha256_digest,
-    sha256_text,
 )
 
 from .curve_display import CurveDisplayState
@@ -585,14 +583,13 @@ def _freeze_metadata_value(value: Any) -> Any:
 
 @dataclass(frozen=True, slots=True)
 class FigureArchive:
-    """Decoded current archive value, independent of any repository path."""
+    """Decoded current archive value, independent of its filesystem path."""
 
     figure: DataFigure
     figure_intent: FigureIntent
     size_name: str
     display: FigureDisplayState
     metadata: Mapping[str, object]
-    payload_digest: str
 
     def __post_init__(self) -> None:
         size_name = _validate_archive_figure(
@@ -613,11 +610,6 @@ class FigureArchive:
             self,
             "metadata",
             _freeze_metadata_value(normalized_metadata),
-        )
-        object.__setattr__(
-            self,
-            "payload_digest",
-            sha256_text(self.payload_digest, "figure archive payload digest"),
         )
 
 
@@ -656,7 +648,6 @@ def decode_figure_archive_payload(payload: bytes) -> FigureArchive:
         size_name=size_name,
         display=display,
         metadata=metadata,
-        payload_digest=sha256_digest(payload),
     )
 
 

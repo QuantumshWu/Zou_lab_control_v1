@@ -30,9 +30,7 @@ def _pulse_panel(*, digest: str = "e" * 64):
     from zlc_frontend.matplotlib_render import render_pulse_timeline_panel
     from zlc_frontend.render import (
         DocumentInputIdentity,
-        DocumentPresentationStamp,
         PanelFrame,
-        PanelPresentationIdentity,
     )
 
     document_input = DocumentInputIdentity("pulse-document", 1, digest)
@@ -46,12 +44,8 @@ def _pulse_panel(*, digest: str = "e" * 64):
         size="2x2",
         document_input=document_input,
     )
-    presentation = PanelPresentationIdentity(
-        "pulse", "pulse-document", 1, 0, payload.viewport.display_revision
-    )
-    stamp = DocumentPresentationStamp(document_input, (presentation,))
     return PanelFrame(
-        "pulse", "pulse", document_input, stamp, raster, payload
+        "pulse", "pulse", document_input, None, raster, payload
     )
 
 
@@ -263,9 +257,7 @@ def test_pulse_panel_is_strictly_document_backed_and_rejects_mixed_identity() ->
         BoardFrame,
         CoherenceStamp,
         DocumentInputIdentity,
-        DocumentPresentationStamp,
         PanelFrame,
-        PanelPresentationIdentity,
         PulsePanelPayload,
         SourceIdentity,
     )
@@ -274,14 +266,13 @@ def test_pulse_panel_is_strictly_document_backed_and_rejects_mixed_identity() ->
     panel = _pulse_panel()
     document = panel.source_identity
     assert isinstance(document, DocumentInputIdentity)
-    assert isinstance(panel.coherence_stamp, DocumentPresentationStamp)
+    assert panel.coherence_stamp is None
     assert isinstance(panel.display_payload, PulsePanelPayload)
     for forbidden in (
         "dataset_id", "block_id", "stream_generation", "run_id",
         "join_key_digest", "inputs",
     ):
         assert not hasattr(document, forbidden)
-        assert not hasattr(panel.coherence_stamp, forbidden)
     assert not hasattr(panel.display_payload.viewport.x_axis, "axis_id")
 
     changed = DocumentInputIdentity(
@@ -292,43 +283,9 @@ def test_pulse_panel_is_strictly_document_backed_and_rejects_mixed_identity() ->
             panel.panel_id,
             panel.coherence_group,
             document,
-            panel.coherence_stamp,
+            None,
             panel.raster,
             replace(panel.display_payload, document_input=changed),
-        )
-    changed_stamp = DocumentPresentationStamp(
-        changed,
-        (
-            PanelPresentationIdentity(
-                panel.panel_id,
-                changed.document_id,
-                changed.document_revision,
-                0,
-                panel.display_payload.viewport.display_revision,
-            ),
-        ),
-    )
-    with pytest.raises(ValueError, match="stamp differs"):
-        PanelFrame(
-            panel.panel_id,
-            panel.coherence_group,
-            document,
-            changed_stamp,
-            panel.raster,
-            panel.display_payload,
-        )
-    with pytest.raises(ValueError, match="document presentation identity"):
-        DocumentPresentationStamp(
-            document,
-            (
-                PanelPresentationIdentity(
-                    panel.panel_id,
-                    document.document_id,
-                    document.document_revision + 1,
-                    0,
-                    panel.display_payload.viewport.display_revision,
-                ),
-            ),
         )
     dataset_source = SourceIdentity(
         DatasetId("not-a-pulse-document"),
@@ -336,16 +293,6 @@ def test_pulse_panel_is_strictly_document_backed_and_rejects_mixed_identity() ->
         StreamGenerationId("generation"),
         "b" * 64,
     )
-    with pytest.raises(TypeError, match="families differ"):
-        PanelFrame(
-            panel.panel_id,
-            panel.coherence_group,
-            dataset_source,
-            panel.coherence_stamp,
-            panel.raster,
-            panel.display_payload,
-        )
-
     dataset_ref = DatasetRevisionRef(
         dataset_source.block_id,
         dataset_source.stream_generation,
@@ -353,27 +300,28 @@ def test_pulse_panel_is_strictly_document_backed_and_rejects_mixed_identity() ->
         DatasetRevision(1),
     )
     dataset_input = EvaluatedInput(dataset_source.dataset_id, dataset_ref)
+    dataset_stamp = CoherenceStamp((dataset_input,))
+    with pytest.raises(TypeError, match="PulsePanelPayload requires"):
+        PanelFrame(
+            panel.panel_id,
+            panel.coherence_group,
+            dataset_source,
+            dataset_stamp,
+            panel.raster,
+            panel.display_payload,
+        )
+    document_board = BoardFrame("document-board", 0, 0, (panel,))
     with pytest.raises(TypeError, match="document interaction"):
         PanelInteractionOrigin(
-            panel.panel_id,
-            "board",
-            0,
-            0,
-            document,
-            panel.coherence_stamp.presentations[0],
+            document_board,
+            panel,
             dataset_input,
+            panel.display_payload.viewport.display_revision,
         )
-    dataset_presentation = PanelPresentationIdentity(
-        "dataset", "figure-document", 1, 0, 0
-    )
-    dataset_stamp = CoherenceStamp(
-        "run", "epoch", "join", "c" * 64, "d" * 64,
-        (dataset_input,), (dataset_presentation,),
-    )
     dataset_panel = PanelFrame(
         "dataset", "mixed", dataset_source, dataset_stamp, panel.raster
     )
-    with pytest.raises(ValueError, match="one exact"):
+    with pytest.raises(ValueError, match="one exact CoherenceStamp"):
         BoardFrame(
             "board",
             0,
@@ -388,7 +336,7 @@ def test_same_document_revision_with_changed_digest_makes_old_gesture_stale() ->
     from dataclasses import replace
 
     from zlc_frontend.qt_widgets import SinglePanelHost, ensure_qt_app
-    from zlc_frontend.render import DocumentInputIdentity, DocumentPresentationStamp
+    from zlc_frontend.render import DocumentInputIdentity
     from zlc_frontend.selector import CurveViewportCommit
 
     application = ensure_qt_app()
@@ -397,10 +345,7 @@ def test_same_document_revision_with_changed_digest_makes_old_gesture_stale() ->
     host.present_panel(first.raster, first.display_payload)
     stale = host.visible_interaction_origin()
     assert stale is not None
-    assert isinstance(
-        host.front_frame.panels[0].coherence_stamp,
-        DocumentPresentationStamp,
-    )
+    assert host.front_frame.panels[0].coherence_stamp is None
 
     current_document = DocumentInputIdentity(
         first.source_identity.document_id,

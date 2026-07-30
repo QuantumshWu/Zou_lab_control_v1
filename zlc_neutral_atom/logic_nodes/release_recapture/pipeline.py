@@ -39,7 +39,6 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     apply_readout_model,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
-    calibration_artifact_input_ref,
     calibration_artifact_ref_to_tree,
 )
 from zlc_neutral_atom.runtime._failure import (
@@ -74,18 +73,15 @@ from zlc_neutral_atom.runtime.streams import (
     Delivery,
     EndOfStream,
     Envelope,
+    EventSpanRef,
     ExactConsumerReadiness,
     ExactReservation,
-    OrderedEventSpanHasher,
-    ProcessorStageProvenance,
     ReservationState,
     SourceFailed,
     StreamEndedEarly,
     StreamId,
-    TraceBinding,
-    TraceContext,
 )
-from zlc_storage import canonical_digest, canonical_text
+from zlc_storage import canonical_text
 
 
 _CAMERA_FRAME_METADATA_CONTRACT = CameraFrameMetadataContract()
@@ -123,15 +119,6 @@ class ReleaseRecaptureMetadataContract:
     def source(self) -> CameraFrameMetadataContract:
         return _CAMERA_FRAME_METADATA_CONTRACT
 
-    @property
-    def fingerprint(self) -> str:
-        return canonical_digest(
-            {
-                "contract": "zlc_neutral_atom.ReleaseRecapturePairMetadata",
-                "source": self.source.fingerprint,
-            }
-        )
-
     def snapshot(
         self,
         payload: ReleaseRecaptureSample,
@@ -146,18 +133,6 @@ class ReleaseRecaptureMetadataContract:
             raise TypeError("metadata must be ReleaseRecapturePairMetadata")
         self.source.validate(metadata.initial)
         self.source.validate(metadata.recaptured)
-
-    def digest(self, metadata: object | None) -> str:
-        self.validate(metadata)
-        assert isinstance(metadata, ReleaseRecapturePairMetadata)
-        return canonical_digest(
-            {
-                "contract": "zlc_neutral_atom.ReleaseRecapturePairMetadataContent",
-                "initial": self.source.digest(metadata.initial),
-                "recaptured": self.source.digest(metadata.recaptured),
-            }
-        )
-
 
 _RELEASE_RECAPTURE_METADATA_CONTRACT = ReleaseRecaptureMetadataContract()
 
@@ -180,16 +155,6 @@ class ReleaseRecaptureSampleContract:
     def metadata_contract(self) -> ReleaseRecaptureMetadataContract:
         return _RELEASE_RECAPTURE_METADATA_CONTRACT
 
-    @property
-    def fingerprint(self) -> str:
-        return canonical_digest(
-            {
-                "contract": "zlc_neutral_atom.ReleaseRecaptureSample",
-                "value": self.value_contract.fingerprint,
-                "metadata": self.metadata_contract.fingerprint,
-            }
-        )
-
     def snapshot(self, payload: ReleaseRecaptureSample) -> ReleaseRecaptureSample:
         self.validate(payload)
         return payload
@@ -199,17 +164,6 @@ class ReleaseRecaptureSampleContract:
             raise TypeError("payload must be ReleaseRecaptureSample")
         self.value_contract.validate(payload.survival)
         self.metadata_contract.validate(payload.metadata)
-
-    def digest(self, payload: ReleaseRecaptureSample) -> str:
-        self.validate(payload)
-        return canonical_digest(
-            {
-                "contract": "zlc_neutral_atom.ReleaseRecaptureSampleContent",
-                "survival": self.value_contract.digest(payload.survival),
-                "metadata": self.metadata_contract.digest(payload.metadata),
-            }
-        )
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,18 +185,6 @@ class ReleaseRecaptureDatasetEventAdapter:
     @property
     def metadata_contract(self) -> ReleaseRecaptureMetadataContract:
         return self.payload_contract.metadata_contract
-
-    @property
-    def operator_fingerprint(self) -> str:
-        return canonical_digest(
-            {
-                "owner": (
-                    "zlc_neutral_atom.logic_nodes.release_recapture."
-                    "ReleaseRecaptureDatasetEventAdapter"
-                ),
-                "payload": self.payload_contract.fingerprint,
-            }
-        )
 
     @staticmethod
     def value(payload: ReleaseRecaptureSample) -> Value:
@@ -266,16 +208,15 @@ class ReleaseRecapturePipelineSpec:
         canonical_text(self.name, "name")
         if not isinstance(self.camera_binding, TriggeredCameraBinding):
             raise TypeError("camera_binding must be TriggeredCameraBinding")
-        if type(self.calibration) is not ResolvedCalibration:
-            raise TypeError("calibration must be an admitted ResolvedCalibration")
-        self.calibration._require_authority()
+        if not isinstance(self.calibration, ResolvedCalibration):
+            raise TypeError("calibration must be a loaded ResolvedCalibration")
         if not isinstance(self.model, ReadoutModel):
             raise TypeError("model must be ReadoutModel")
         if not any(
             model is self.model
             for model in self.calibration.artifact.models
         ):
-            raise ValueError("model must belong to the admitted calibration")
+            raise ValueError("model must belong to the loaded calibration")
         if type(self.per_site) is not bool:
             raise TypeError("per_site must be bool")
         if not isinstance(self.output_stream_id, StreamId):
@@ -496,7 +437,7 @@ class ExactReleaseRecaptureTransaction:
     output_builder: DatasetBuilder
     pair_plan: tuple[_PairPlan, ...]
     readiness: ExactConsumerReadiness | None
-    ordered_inputs: OrderedEventSpanHasher
+    next_input_sequence: int
     _next_source_index: int = 0
     _first: Envelope[CameraSample] | None = None
     _result: PipelineResult | None = None
@@ -538,7 +479,9 @@ class ExactReleaseRecaptureTransaction:
             )
         if not isinstance(envelope.payload, CameraSample):
             raise TypeError("release-recapture input must be CameraSample")
-        self.ordered_inputs.update(envelope.ref)
+        if envelope.sequence != self.next_input_sequence:
+            raise RuntimeError("release-recapture input sequence is not contiguous")
+        self.next_input_sequence += 1
         if index % 2 == 0:
             self._first = envelope
             self.source_reservation.acknowledge_delivery(
@@ -550,41 +493,17 @@ class ExactReleaseRecaptureTransaction:
             if first is None:
                 raise RuntimeError("release-recapture event 1 has no event 0")
             sample = self._reduce_pair(first, envelope)
-            if (
-                first.trace.config_revision != envelope.trace.config_revision
-                or first.trace.control_revision
-                != envelope.trace.control_revision
-            ):
-                raise ValueError(
-                    "release-recapture pair crosses config/control revisions"
-                )
             emitted = self.output_producer.emit(
                 sample,
                 captured_at=max(first.captured_at, envelope.captured_at),
-                trace=TraceContext(
-                    run_id=envelope.trace.run_id,
-                    source_id=self.spec.output_source_id,
-                    correlation_id=canonical_digest(
-                        {
-                            "owner": "zlc.release-recapture-pair",
-                            "first": first.trace.correlation_id,
-                            "second": envelope.trace.correlation_id,
-                        }
-                    ),
-                    causation_refs=(
-                        first.ref,
-                        envelope.ref,
-                        calibration_artifact_input_ref(
-                            self.spec.calibration.reference
-                        ),
-                    ),
-                    config_revision=envelope.trace.config_revision,
-                    control_revision=envelope.trace.control_revision,
+                direct_parent_refs=(
+                    first.ref,
+                    envelope.ref,
                 ),
                 join_key=group.output_key,
             )
             output = self.output_cursor.next(timeout=call_bound)
-            if output.envelope.event_id != emitted.event_id:
+            if output.envelope.ref != emitted.ref:
                 raise RuntimeError(
                     "release-recapture output cursor lost the emitted sample"
                 )
@@ -671,9 +590,14 @@ class ExactReleaseRecaptureTransaction:
             raise RuntimeError(
                 "release-recapture exact consumer was never bound"
             )
-        sealed = sealed._with_derivation(
+        sealed = sealed._with_direct_parent_span(
             readiness,
-            self.ordered_inputs.seal(self.source_reservation.end_sequence),
+            EventSpanRef(
+                self.source_reservation.stream_id,
+                self.source_reservation.stream_generation,
+                self.source_reservation.start_sequence,
+                self.source_reservation.end_sequence,
+            ),
         )
         self.source_reservation.complete_consumer(
             completion.eos,
@@ -787,7 +711,6 @@ def open_exact_release_recapture(
     session = open_capture_session(
         camera_capture.capture_port,
         contract,
-        TraceBinding(context.run_id.value, contract.source_id),
         camera_capture.capture_spec,
     )
     source_reservation = output_reservation = None
@@ -808,10 +731,6 @@ def open_exact_release_recapture(
         )
         output_reservation = output_stream.reserve(
             total_events=len(plans),
-            trace_binding=TraceBinding(
-                context.run_id.value,
-                spec.output_source_id,
-            ),
         )
         output_cursor = output_reservation.activate()
         output_edge = FrozenDatasetEdge(
@@ -827,38 +746,7 @@ def open_exact_release_recapture(
         downstream = output_builder.exact_readiness()
         downstream._validate_emitter(
             stream=output_stream,
-            trace_binding=TraceBinding(
-                context.run_id.value,
-                spec.output_source_id,
-            ),
-            payload_contract_fingerprint=payload_contract.fingerprint,
-            join_key_contract_fingerprint=output_key_contract.fingerprint,
-            source_key_sequence_digest=output_edge.exact_key_sequence_digest,
             total_events=len(plans),
-        )
-        stage_fingerprint = canonical_digest(
-            {
-                "owner": "zlc_neutral_atom.release-recapture-reducer",
-                "group_size": 2,
-                "source_schema": contract.dataset_schema.fingerprint,
-                "output_schema": output_schema.fingerprint,
-                "calibration": calibration_artifact_ref_to_tree(
-                    spec.calibration.reference
-                ),
-                "model_kind": spec.model.kind.value,
-                "per_site": spec.per_site,
-            }
-        )
-        chain_digest = canonical_digest(
-            {
-                "contract": "zlc_neutral_atom.ExactReleaseRecaptureChain",
-                "reducer": stage_fingerprint,
-                "source_contract": input_edge.consumer_contract_digest,
-                "source_schedule": input_edge.schedule_digest,
-                "downstream": downstream.chain_contract_digest,
-                "input_events": contract.total_events,
-                "output_events": len(plans),
-            }
         )
         # Initialize the callback owner before the final source-consumer claim.
         reducer = ExactReleaseRecaptureTransaction(
@@ -871,34 +759,14 @@ def open_exact_release_recapture(
             output_builder,
             plans,
             readiness=None,
-            ordered_inputs=OrderedEventSpanHasher(
-                source_reservation.stream_id,
-                source_reservation.stream_generation,
-                source_reservation.start_sequence,
-            ),
+            next_input_sequence=source_reservation.start_sequence,
         )
         readiness = source_reservation.bind_consumer(
             reducer,
-            source_contract_digest=(
-                input_edge.consumer_contract_digest
-            ),
-            source_schedule_digest=input_edge.schedule_digest,
-            source_key_sequence_digest=(
-                input_edge.exact_key_sequence_digest
-            ),
-            chain_contract_digest=chain_digest,
             downstream=downstream,
             owner_liveness=reducer._validate_liveness,
             owner_completion=reducer._await_completion,
             owner_cancel=reducer.cancel,
-            processor_stage=ProcessorStageProvenance(
-                stage_fingerprint,
-                (
-                    calibration_artifact_input_ref(
-                        spec.calibration.reference
-                    ),
-                ),
-            ),
         )
         reducer.readiness = readiness
         session.bind_exact_consumer(readiness)

@@ -30,7 +30,7 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraSample,
 )
 from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
-    CameraMeasurementDescriptor,
+    CAMERA_MEASUREMENT_KEY,
     CameraMeasurementRequest,
     project_camera_monitor_outputs,
 )
@@ -78,7 +78,6 @@ from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
     StreamError,
     StreamId,
-    TraceContext,
 )
 
 
@@ -115,9 +114,6 @@ class CameraMonitorViewPort(Protocol):
     def bind(
         self,
         dataset: "CameraMonitorLiveDataset",
-        *,
-        run_id: str,
-        causation_domain_id: str,
     ) -> None: ...
 
     def updated(self) -> None: ...
@@ -264,11 +260,6 @@ class _CameraMonitorTransaction:
             self.producer.emit(
                 payload,
                 captured_at=metadata.captured_at,
-                trace=TraceContext(
-                    context.run_id.value,
-                    capability.camera_capability_evidence.source_id,
-                    metadata.correlation_id,
-                ),
             )
             if self.dataset.ingest_next(context.checkpoint):
                 self._notify_view_updated()
@@ -362,7 +353,6 @@ class PreparedLiveCameraMeasurement:
     """One-shot application command that never exposes a Port or raw device."""
 
     __slots__ = (
-        "_descriptor",
         "_edge",
         "_lock",
         "_active_output_bindings",
@@ -441,12 +431,6 @@ class PreparedLiveCameraMeasurement:
             schema,
             CameraDatasetEventAdapter(capability.payload_contract),
         )
-        self._descriptor = CameraMeasurementDescriptor(
-            "Camera",
-            request.camera_ref.role,
-            schema,
-            str(port.resource_claim.key),
-        )
         self._request = request
         self._port = port
         self._stream, self._producer = AcquisitionStream.create(
@@ -463,16 +447,6 @@ class PreparedLiveCameraMeasurement:
                 if association_authority is None
                 else _association_trigger_channel(capability)
             ),
-            capability_fingerprint=(
-                None
-                if association_authority is None
-                else capability.capability_fingerprint
-            ),
-            binding_instance_id=(
-                None
-                if association_authority is None
-                else port.device.binding_instance_id
-            ),
             operation_deadline_seconds=(
                 None
                 if association_authority is None
@@ -485,16 +459,20 @@ class PreparedLiveCameraMeasurement:
         self._started = False
 
     @property
-    def descriptor(self) -> CameraMeasurementDescriptor:
-        return self._descriptor
-
-    @property
     def view_schema(self) -> DatasetSchema:
         return self._edge.schema
 
     @property
     def request(self) -> CameraMeasurementRequest:
         return self._request
+
+    @property
+    def definition_key(self):
+        return CAMERA_MEASUREMENT_KEY
+
+    @property
+    def dataset_output_declarations(self):
+        return self._request.output_declarations
 
     def live_dataset_outputs(
         self,
@@ -535,6 +513,7 @@ class PreparedLiveCameraMeasurement:
         self,
         *,
         factory: Callable[[CameraMonitorViewSpec], CameraMonitorViewPort],
+        lifecycle_owner: object | None = None,
     ) -> RunHandle:
         if not callable(factory):
             raise TypeError("factory must be callable")
@@ -571,7 +550,10 @@ class PreparedLiveCameraMeasurement:
             activate_output_bindings=self._activate_output_bindings,
             deactivate_output_bindings=self._deactivate_output_bindings,
         )
-        plan = plan.with_lifecycle(owner=self, preemptible=True)
+        plan = plan.with_lifecycle(
+            owner=self if lifecycle_owner is None else lifecycle_owner,
+            preemptible=True,
+        )
         try:
             return self._start_run(plan)
         except BaseException as error:
@@ -710,10 +692,6 @@ def _compile_camera_monitor_plan(
                     exposure_session_id,
                     exposure,
                 )
-            if association_source is not None:
-                association_source.bind_capability_fingerprint(
-                    active_port.capability.capability_fingerprint
-                )
             activate_output_bindings(active_port)
             tap = stream.monitor()
             raw_dataset = MonitorDataset.append_window(
@@ -722,11 +700,7 @@ def _compile_camera_monitor_plan(
                 spec.dataset_edge,
             )
             dataset = CameraMonitorLiveDataset(raw_dataset)
-            view.bind(
-                dataset,
-                run_id=context.run_id.value,
-                causation_domain_id=stream.generation.value,
-            )
+            view.bind(dataset)
             return _CameraMonitorTransaction(
                 active_port,
                 view,
@@ -823,7 +797,6 @@ def _compile_camera_monitor_plan(
         cleanup=cleanup,
         finalize=lambda _context, result: result,
         interrupt_operations=port.interrupt_operations,
-        requires_final_commit=False,
     )
 
 

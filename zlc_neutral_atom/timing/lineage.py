@@ -10,6 +10,7 @@ from zlc_pulse import (
     DigitalTriggerSchedule,
 )
 from zlc_storage import canonical_text, exact_mapping
+from zlc_neutral_atom.runtime.dataset import DatasetCellSchedule
 
 from .capture_plan import (
     CaptureCellJoinContract,
@@ -180,8 +181,8 @@ class PulseCaptureEvidence:
     def expected_trigger_count(self) -> int:
         return self._trigger_schedule.total
 
-    def expected_cell_schedule_digest(self, schema: DatasetSchema) -> str:
-        return self.join_contract.expected_cell_schedule_digest(
+    def expected_cell_schedule(self, schema: DatasetSchema) -> DatasetCellSchedule:
+        return self.join_contract.expected_cell_schedule(
             self._trigger_schedule,
             schema,
         )

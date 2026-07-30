@@ -10,7 +10,7 @@ bytes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
 
 import numpy as np
@@ -24,12 +24,9 @@ from zlc_data import (
     SITE,
     StreamGenerationId,
 )
-from zlc_data.codec import axis_to_tree, dataset_revision_ref_to_tree
 from zlc_storage import (
-    canonical_digest,
     canonical_text as _text,
     nonnegative_integer as _nonnegative,
-    sha256_digest,
     sha256_text,
 )
 
@@ -48,23 +45,7 @@ from .figure import (
     EvaluatedSeries,
 )
 from .image_view import ImageViewportTransform
-from .site_map import immutable_site_state, site_ring_radius
-
-
-SITE_MAP_JOIN_SCHEMA_DIGEST = canonical_digest(
-    {
-        "schema": "zlc_frontend.SiteMapJoinSchema",
-        "value_schema": "zlc_frontend.SiteMapJoin",
-        "fields": (
-            "view_identity",
-            "site_state.dataset_id",
-            "site_state.ref[zlc_data.DatasetRevisionRef]",
-            "background.dataset_id",
-            "background.ref[zlc_data.DatasetRevisionRef]",
-            "geometry_identity",
-        ),
-    }
-)
+from .site_map import immutable_site_state
 
 
 def detached_render_fault(error: BaseException) -> RuntimeError:
@@ -134,46 +115,11 @@ class DocumentInputIdentity:
 
 @dataclass(frozen=True)
 class CoherenceStamp:
-    """Frozen evaluation identity shared by panels from one causation point.
+    """Exact evaluated inputs shared by one coherent dataset panel group."""
 
-    The evaluator mints this value only after freezing the typed join key, every
-    input dataset revision, and the presentation intent.  Equality therefore
-    means more than matching two bare counters from unrelated producers.
-    """
-
-    run_id: str
-    provenance_epoch_id: str
-    join_key_type: str
-    join_key_schema_fingerprint: str
-    join_key_digest: str
     inputs: tuple[EvaluatedInput, ...]
-    presentations: tuple["PanelPresentationIdentity", ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "run_id", _text(self.run_id, "run_id"))
-        object.__setattr__(
-            self,
-            "provenance_epoch_id",
-            _text(self.provenance_epoch_id, "provenance_epoch_id"),
-        )
-        object.__setattr__(
-            self,
-            "join_key_type",
-            _text(self.join_key_type, "join_key_type"),
-        )
-        object.__setattr__(
-            self,
-            "join_key_schema_fingerprint",
-            sha256_text(
-                self.join_key_schema_fingerprint,
-                "join_key_schema_fingerprint",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "join_key_digest",
-            sha256_text(self.join_key_digest, "join_key_digest"),
-        )
         inputs = tuple(self.inputs)
         if not inputs or any(not isinstance(value, EvaluatedInput) for value in inputs):
             raise ValueError("inputs must contain at least one EvaluatedInput")
@@ -184,88 +130,6 @@ class CoherenceStamp:
             self,
             "inputs",
             tuple(sorted(inputs, key=lambda value: value.dataset_id.value)),
-        )
-        presentations = tuple(self.presentations)
-        if not presentations or any(
-            not isinstance(value, PanelPresentationIdentity)
-            for value in presentations
-        ):
-            raise ValueError(
-                "presentations must contain at least one PanelPresentationIdentity"
-            )
-        panel_ids = tuple(value.panel_id for value in presentations)
-        if len(set(panel_ids)) != len(panel_ids):
-            raise ValueError("presentation panel ids must be unique")
-        object.__setattr__(
-            self,
-            "presentations",
-            tuple(sorted(presentations, key=lambda value: value.panel_id)),
-        )
-
-
-@dataclass(frozen=True)
-class PanelPresentationIdentity:
-    """Exact per-panel view intent frozen before raster work is admitted."""
-
-    panel_id: str
-    document_id: str
-    document_revision: int
-    selection_revision: int
-    panel_revision: int
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "panel_id", _text(self.panel_id, "panel_id"))
-        object.__setattr__(
-            self,
-            "document_id",
-            _text(self.document_id, "document_id"),
-        )
-        for field in (
-            "document_revision",
-            "selection_revision",
-            "panel_revision",
-        ):
-            object.__setattr__(
-                self,
-                field,
-                _nonnegative(getattr(self, field), field),
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class DocumentPresentationStamp:
-    """One document input plus the exact panel presentations derived from it."""
-
-    document_input: DocumentInputIdentity
-    presentations: tuple[PanelPresentationIdentity, ...]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.document_input, DocumentInputIdentity):
-            raise TypeError("document_input must be DocumentInputIdentity")
-        presentations = tuple(self.presentations)
-        if not presentations or any(
-            not isinstance(value, PanelPresentationIdentity)
-            for value in presentations
-        ):
-            raise ValueError(
-                "presentations must contain at least one PanelPresentationIdentity"
-            )
-        panel_ids = tuple(value.panel_id for value in presentations)
-        if len(set(panel_ids)) != len(panel_ids):
-            raise ValueError("presentation panel ids must be unique")
-        if any(
-            value.document_id != self.document_input.document_id
-            or value.document_revision
-            != self.document_input.document_revision
-            for value in presentations
-        ):
-            raise ValueError(
-                "document presentation identity differs from its document input"
-            )
-        object.__setattr__(
-            self,
-            "presentations",
-            tuple(sorted(presentations, key=lambda value: value.panel_id)),
         )
 
 
@@ -1033,11 +897,6 @@ class SiteMapPanelPayload:
     centers_xy: np.ndarray
     site_state: np.ndarray | None
     site_validity: np.ndarray
-    site_geometry_identity: str
-    view_identity: str
-    coherence_identity: str
-    _geometry_identity: str = field(init=False, repr=False)
-    _join_key_digest: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.background, ImagePanelPayload):
@@ -1072,7 +931,6 @@ class SiteMapPanelPayload:
             self.site_validity,
             site_count=site_count,
         )
-        radius = site_ring_radius(centers)
         try:
             self.background.viewport.full_points_for_coordinates(
                 centers,
@@ -1089,72 +947,6 @@ class SiteMapPanelPayload:
             site_state if state_present else None,
         )
         object.__setattr__(self, "site_validity", validity)
-        geometry_source_identity = _text(
-            self.site_geometry_identity,
-            "site-map site_geometry_identity",
-        )
-        view_identity = _text(self.view_identity, "site-map view_identity")
-        coherence_identity = _text(
-            self.coherence_identity,
-            "site-map coherence_identity",
-        )
-        object.__setattr__(
-            self,
-            "site_geometry_identity",
-            geometry_source_identity,
-        )
-        object.__setattr__(self, "view_identity", view_identity)
-        object.__setattr__(self, "coherence_identity", coherence_identity)
-        axis = self.site_axis
-        geometry_identity = canonical_digest(
-            {
-                "schema": "zlc_frontend.SiteMapGeometry",
-                "geometry_source_identity": geometry_source_identity,
-                "coordinate_frame": self.coordinate_frame.value,
-                "site_axis": axis_to_tree(axis),
-                "centers_sha256": sha256_digest(memoryview(centers).cast("B")),
-                "ring_radius": radius,
-            }
-        )
-
-        input_trees = {}
-        for name, value in (
-            ("site_state", self.site_state_input),
-            ("background", self.background.evaluated_input),
-        ):
-            ref = value.ref
-            input_trees[name] = {
-                "dataset_id": value.dataset_id.value,
-                "ref": dataset_revision_ref_to_tree(ref),
-            }
-
-        object.__setattr__(self, "_geometry_identity", geometry_identity)
-        object.__setattr__(
-            self,
-            "_join_key_digest",
-            canonical_digest(
-                {
-                    "schema": "zlc_frontend.SiteMapJoin",
-                    "view_identity": view_identity,
-                    "coherence_identity": coherence_identity,
-                    "site_state": input_trees["site_state"],
-                    "background": input_trees["background"],
-                    "geometry_identity": geometry_identity,
-                }
-            ),
-        )
-
-    @property
-    def geometry_identity(self) -> str:
-        """Digest presentation-owned geometry used for hold/topology checks."""
-
-        return self._geometry_identity
-
-    @property
-    def join_key_digest(self) -> str:
-        """Digest the typed view, both data revisions, and site geometry."""
-
-        return self._join_key_digest
 
 
 DisplayPayload = (
@@ -1172,7 +964,7 @@ class PanelFrame:
     panel_id: str
     coherence_group: str
     source_identity: SourceIdentity | DocumentInputIdentity
-    coherence_stamp: CoherenceStamp | DocumentPresentationStamp
+    coherence_stamp: CoherenceStamp | None
     raster: RasterBuffer
     display_payload: DisplayPayload | None = None
 
@@ -1186,28 +978,20 @@ class PanelFrame:
         source_is_document = isinstance(
             self.source_identity, DocumentInputIdentity
         )
-        stamp_is_document = isinstance(
-            self.coherence_stamp, DocumentPresentationStamp
-        )
         if not isinstance(
             self.source_identity, (SourceIdentity, DocumentInputIdentity)
         ):
             raise TypeError(
                 "source_identity must be SourceIdentity or DocumentInputIdentity"
             )
-        if not isinstance(
-            self.coherence_stamp, (CoherenceStamp, DocumentPresentationStamp)
-        ):
-            raise TypeError(
-                "coherence_stamp must be CoherenceStamp or "
-                "DocumentPresentationStamp"
-            )
-        if source_is_document != stamp_is_document:
-            raise TypeError("panel source and presentation stamp families differ")
         if not isinstance(self.raster, RasterBuffer):
             raise TypeError("raster must be RasterBuffer")
         payload = self.display_payload
         if source_is_document:
+            if self.coherence_stamp is not None:
+                raise TypeError(
+                    "document-backed panels do not carry a dataset coherence stamp"
+                )
             if not isinstance(payload, PulsePanelPayload):
                 raise TypeError(
                     "document-backed panels require PulsePanelPayload"
@@ -1216,29 +1000,12 @@ class PanelFrame:
                 raise ValueError(
                     "pulse payload differs from its document source identity"
                 )
-            stamp = self.coherence_stamp
-            assert isinstance(stamp, DocumentPresentationStamp)
-            if stamp.document_input != self.source_identity:
-                raise ValueError(
-                    "document stamp differs from its panel source identity"
-                )
-            presentations = tuple(
-                presentation
-                for presentation in stamp.presentations
-                if presentation.panel_id == self.panel_id
-            )
-            if len(presentations) != 1:
-                raise ValueError(
-                    "payload panel has no unique presentation identity"
-                )
-            if presentations[0].panel_revision != payload.viewport.display_revision:
-                raise ValueError(
-                    "display payload revision differs from panel presentation"
-                )
             return
+        if not isinstance(self.coherence_stamp, CoherenceStamp):
+            raise TypeError("dataset-backed panels require CoherenceStamp")
         if isinstance(payload, PulsePanelPayload):
             raise TypeError(
-                "PulsePanelPayload requires the document presentation family"
+                "PulsePanelPayload requires a document source identity"
             )
         if payload is not None:
             if not isinstance(
@@ -1257,28 +1024,16 @@ class PanelFrame:
                     "CurvePanelPayload, HistogramPanelPayload, MeterPanelPayload, "
                     "PulsePanelPayload, SiteMapPanelPayload, or None"
                 )
-            presentations = tuple(
-                presentation
-                for presentation in self.coherence_stamp.presentations
-                if presentation.panel_id == self.panel_id
-            )
-            if len(presentations) != 1:
-                raise ValueError("payload panel has no unique presentation identity")
             if isinstance(payload, ImagePanelPayload):
-                payload_revision = payload.viewport.viewport_revision
                 source_input = payload.evaluated_input
             elif isinstance(payload, CurvePanelPayload):
-                payload_revision = payload.viewport.display_revision
                 source_input = payload.evaluated_input
             elif isinstance(payload, HistogramPanelPayload):
-                payload_revision = payload.viewport.display_revision
                 source_input = payload.evaluated_input
             elif isinstance(payload, MeterPanelPayload):
-                payload_revision = payload.display_revision
                 source_input = payload.evaluated_input
             else:
                 background = payload.background
-                payload_revision = background.viewport.viewport_revision
                 source_input = payload.site_state_input
                 try:
                     background_ref = next(
@@ -1295,15 +1050,6 @@ class PanelFrame:
                     raise ValueError(
                         "site-map background differs from its frozen coherence input"
                     )
-                if self.coherence_stamp.join_key_digest != payload.join_key_digest:
-                    raise ValueError(
-                        "site-map coherence digest omits or changes its typed view, "
-                        "inputs, or site geometry"
-                    )
-            if presentations[0].panel_revision != payload_revision:
-                raise ValueError(
-                    "display payload revision differs from panel presentation"
-                )
             try:
                 expected_ref = next(
                     value.ref
@@ -1367,34 +1113,30 @@ class BoardFrame:
         for panel in panels:
             panels_by_group.setdefault(panel.coherence_group, []).append(panel)
         for group_panels in panels_by_group.values():
-            stamp = group_panels[0].coherence_stamp
-            if any(panel.coherence_stamp != stamp for panel in group_panels[1:]):
-                raise ValueError(
-                    "panels in one coherence group must carry one exact "
-                    "CoherenceStamp or DocumentPresentationStamp"
-                )
-            expected_panel_ids = tuple(sorted(panel.panel_id for panel in group_panels))
-            if (
-                tuple(value.panel_id for value in stamp.presentations)
-                != expected_panel_ids
-            ):
-                raise ValueError(
-                    "presentation stamp must cover its coherence group exactly"
-                )
-            if isinstance(stamp, DocumentPresentationStamp):
+            first = group_panels[0]
+            if isinstance(first.source_identity, DocumentInputIdentity):
                 for panel in group_panels:
                     if (
                         not isinstance(panel.source_identity, DocumentInputIdentity)
-                        or panel.source_identity != stamp.document_input
+                        or panel.source_identity != first.source_identity
+                        or panel.coherence_stamp is not None
                         or not isinstance(panel.display_payload, PulsePanelPayload)
                     ):
                         raise ValueError(
                             "document presentation group mixes dataset and document "
                             "panel families"
-                        )
+                    )
                 continue
+            stamp = first.coherence_stamp
             if not isinstance(stamp, CoherenceStamp):
-                raise TypeError("unsupported panel presentation stamp")
+                raise TypeError("dataset coherence group requires CoherenceStamp")
+            if any(
+                panel.coherence_stamp != stamp
+                for panel in group_panels[1:]
+            ):
+                raise ValueError(
+                    "panels in one coherence group must carry one exact CoherenceStamp"
+                )
             inputs = {value.dataset_id: value.ref for value in stamp.inputs}
             for panel in group_panels:
                 if not isinstance(panel.source_identity, SourceIdentity):
@@ -1426,13 +1168,11 @@ __all__ = [
     "CurveFitOverlay",
     "CurvePanelPayload",
     "DocumentInputIdentity",
-    "DocumentPresentationStamp",
     "HistogramPanelPayload",
     "HistogramFitOverlay",
     "MeterPanelPayload",
     "detached_render_fault",
     "DisplayPayload",
-    "PanelPresentationIdentity",
     "SourceIdentity",
     "PanelFrame",
     "ImagePanelPayload",
@@ -1441,5 +1181,4 @@ __all__ = [
     "SiteMapPanelPayload",
     "PulsePanelPayload",
     "RasterBuffer",
-    "SITE_MAP_JOIN_SCHEMA_DIGEST",
 ]

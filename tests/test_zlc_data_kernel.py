@@ -334,7 +334,7 @@ def test_schema_fingerprint_covers_point_rows_topology_and_component_validity():
     assert value_only.fingerprint != sparse.fingerprint
 
 
-def test_value_payload_digest_binds_valid_content_and_normalizes_invalid_fillers():
+def test_canonical_value_array_normalizes_invalid_component_fillers():
     schema = image_schema(component_validity=True)
     x = schema.data_axes[1]
     validity = ComponentValidity(
@@ -345,23 +345,22 @@ def test_value_payload_digest_binds_valid_content_and_normalizes_invalid_fillers
     right_values = np.array(left_values, copy=True)
     right_values[:, 1] = 500
     right_values[:, 3] = 700
-    contract = ValuePayloadContract(schema)
     canonical_valid = canonical_value_array(left_values, VALID, schema)
     assert canonical_valid is not None
     assert np.shares_memory(canonical_valid, left_values)
-    left = Value(left_values, validity, schema)
-    right = Value(right_values, validity, schema)
-
-    assert contract.digest(left) == contract.digest(right)
-    assert contract.digest(left) == contract.digest_content(left.values, validity)
+    canonical_left = canonical_value_array(left_values, validity, schema)
+    canonical_right = canonical_value_array(right_values, validity, schema)
+    assert canonical_left is not None and canonical_right is not None
+    assert np.array_equal(canonical_left, canonical_right)
+    assert np.all(canonical_left[:, (1, 3)] == 0)
     canonical_mask = expand_component_validity(validity, schema)
     canonical_validity = ComponentValidity(
         schema.validity_contract.component_axis_ids,
         canonical_mask,
     )
-    assert contract.digest(left) == contract.digest_content(
-        left_values,
-        canonical_validity,
+    assert np.array_equal(
+        canonical_left,
+        canonical_value_array(left_values, canonical_validity, schema),
     )
 
     changed_valid = np.array(right_values, copy=True)

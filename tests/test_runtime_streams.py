@@ -38,94 +38,20 @@ from zlc_neutral_atom.runtime.streams import (
     StreamError,
     AcquisitionCursor,
     EndOfStream,
-    EventId,
-    EventRef,
-    OrderedEventSpanHasher,
     SourceFailed,
     StreamId,
-    TraceContext,
-    TraceBinding,
 )
 
 
-PAYLOAD_FINGERPRINT = "1" * 64
-JOIN_FINGERPRINT = "2" * 64
 SCALAR_SCHEMA = ValueSchema.scalar(np.dtype("<f8"))
-TRACE_BINDING = TraceBinding("run-one", "camera-one")
-
-
-def test_ordered_event_span_hasher_matches_frozen_golden_and_rejects_drift():
-    stream_id = StreamId("camera.exact")
-    generation = StreamGenerationId("generation-one")
-    references = tuple(
-        EventRef(
-            stream_id,
-            generation,
-            sequence,
-            EventId(f"event-{sequence}"),
-            f"{sequence + 1:064x}",
-        )
-        for sequence in range(3)
-    )
-
-    producer_owner = OrderedEventSpanHasher(stream_id, generation, 0)
-    changed_owner = OrderedEventSpanHasher(stream_id, generation, 0)
-    for reference in references:
-        producer_owner.update(reference)
-        changed_owner.update(
-            EventRef(
-                stream_id,
-                generation,
-                reference.sequence,
-                EventId("changed-event")
-                if reference.sequence == 1
-                else reference.event_id,
-                reference.payload_digest,
-            )
-        )
-
-    producer_span = producer_owner.seal(3)
-    assert producer_span.ordered_digest == (
-        "d49a43d8dd78705137efee489fe682478ef97bcd80307bbe2eb40be0ac844d42"
-    )
-    assert changed_owner.seal(3).ordered_digest != producer_span.ordered_digest
-
-    changed_payload_owner = OrderedEventSpanHasher(stream_id, generation, 0)
-    for reference in references:
-        changed_payload_owner.update(
-            EventRef(
-                reference.stream_id,
-                reference.generation,
-                reference.sequence,
-                reference.event_id,
-                "f" * 64 if reference.sequence == 1 else reference.payload_digest,
-            )
-        )
-    assert changed_payload_owner.seal(3).ordered_digest != producer_span.ordered_digest
-
-    discontinuous = OrderedEventSpanHasher(stream_id, generation, 0)
-    with pytest.raises(ValueError, match="stream/generation/sequence"):
-        discontinuous.update(references[1])
-    with pytest.raises(RuntimeError, match="already sealed"):
-        producer_owner.update(references[-1])
 
 
 class TupleJoinContract:
-    fingerprint = JOIN_FINGERPRINT
-
     @staticmethod
     def snapshot(key):
         if not isinstance(key, tuple):
             raise TypeError("join key must be tuple")
         return tuple(key)
-
-
-def trace() -> TraceContext:
-    return TraceContext(
-        run_id="run-one",
-        source_id="camera-one",
-        correlation_id="capture-one",
-    )
 
 
 def scalar_value(value: float) -> Value:
@@ -149,7 +75,6 @@ def emit(producer, value: float):
     return producer.emit(
         scalar_value(value),
         captured_at=float(value),
-        trace=trace(),
         join_key=(0, int(value)),
     )
 
@@ -159,10 +84,6 @@ def bind_terminal_consumer(source, reservation):
     source._claim_consumer(
         reservation,
         owner,
-        source_contract_digest="3" * 64,
-        source_schedule_digest="4" * 64,
-        source_key_sequence_digest="5" * 64,
-        chain_contract_digest="6" * 64,
         terminal=True,
     )
     return owner
@@ -180,13 +101,12 @@ def test_exact_reservation_retains_every_event_until_ordered_ack():
     source, producer = stream()
     reservation = source.reserve(
         total_events=4,
-        trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     owner = bind_terminal_consumer(source, reservation)
     emitted = [emit(producer, float(index)) for index in range(4)]
 
-    assert cursor.next().envelope.event_id == emitted[0].event_id
+    assert cursor.next().envelope.event_ref is emitted[0].event_ref
     for expected in emitted:
         delivery = cursor.next(timeout=0.1)
         assert delivery.envelope is expected
@@ -199,31 +119,19 @@ def test_exact_reservation_retains_every_event_until_ordered_ack():
     reservation.release()
 
 
-def test_exact_consumer_reuses_the_publication_event_ref_without_rehash(monkeypatch):
-    digest_calls = 0
-    original_digest = ValuePayloadContract.digest
-
-    def counted_digest(contract, payload):
-        nonlocal digest_calls
-        digest_calls += 1
-        return original_digest(contract, payload)
-
-    monkeypatch.setattr(ValuePayloadContract, "digest", counted_digest)
+def test_exact_consumer_reuses_the_publication_event_ref() -> None:
     source, producer = stream()
     reservation = source.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     owner = bind_terminal_consumer(source, reservation)
     emitted = emit(producer, 1.0)
     delivery = cursor.next()
     assert emitted.ref is emitted.event_ref
-    assert emitted.payload_digest == emitted.event_ref.payload_digest
-    assert digest_calls == 1
+    assert delivery.envelope.event_ref is emitted.event_ref
     source._validate_consumer_delivery(reservation, delivery, owner)
     acknowledge(source, reservation, delivery, owner)
-    assert digest_calls == 1
     eos = producer.finish()
     source._complete_consumer(reservation, eos, owner, lambda: None)
     reservation.release()
@@ -244,7 +152,6 @@ def test_slow_exact_consumer_retains_all_events_and_display_latest_reports_skips
     source, producer = stream()
     reservation = source.reserve(
         total_events=4,
-        trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     owner = bind_terminal_consumer(source, reservation)
@@ -273,7 +180,6 @@ def test_monitor_next_never_drops_and_display_latest_does_not_change_exact_order
     source, producer = stream()
     reservation = source.reserve(
         total_events=total,
-        trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     owner = bind_terminal_consumer(source, reservation)
@@ -345,12 +251,10 @@ def test_reservation_allows_only_one_formal_exact_consumer():
     source, _producer = stream()
     first = source.reserve(
         total_events=4,
-        trace_binding=TRACE_BINDING,
     )
     with pytest.raises(ReservationStateError, match="one formal exact consumer"):
         source.reserve(
             total_events=2,
-            trace_binding=TRACE_BINDING,
         )
     first.abort()
     first.release()
@@ -360,7 +264,6 @@ def test_unbound_exact_emit_is_side_effect_free_and_zero_event_preflight_is_retr
     source, producer = stream()
     reservation = source.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     reservation.activate()
     with pytest.raises(ReservationStateError, match="formal consumer"):
@@ -373,7 +276,6 @@ def test_unbound_exact_emit_is_side_effect_free_and_zero_event_preflight_is_retr
 
     replacement = source.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     replacement.abort()
     replacement.release()
@@ -383,25 +285,18 @@ def test_failed_preclaim_is_retryable_but_first_data_tombstones_generation():
     source, producer = stream()
     reservation = source.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     reservation.activate()
-    with pytest.raises(ValueError, match="digest"):
+    with pytest.raises(ValueError, match="either a terminal"):
         source._claim_consumer(
             reservation,
             object(),
-            source_contract_digest="not-a-digest",
-            source_schedule_digest="4" * 64,
-            source_key_sequence_digest="5" * 64,
-            chain_contract_digest="6" * 64,
-            terminal=True,
         )
     reservation.abort()
     reservation.release()
 
     claimed = source.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     claimed.activate()
     owner = bind_terminal_consumer(source, claimed)
@@ -414,7 +309,6 @@ def test_failed_preclaim_is_retryable_but_first_data_tombstones_generation():
     ):
         source.reserve(
             total_events=1,
-            trace_binding=TRACE_BINDING,
         )
 
 
@@ -422,7 +316,6 @@ def test_zero_event_rebind_gate_blocks_loose_emit_and_survives_failed_replacemen
     source, producer = stream()
     abandoned = source.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     abandoned.activate()
     owner = bind_terminal_consumer(source, abandoned)
@@ -437,18 +330,12 @@ def test_zero_event_rebind_gate_blocks_loose_emit_and_survives_failed_replacemen
 
     failed = source.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     failed.activate()
-    with pytest.raises(ValueError, match="digest"):
+    with pytest.raises(ValueError, match="either a terminal"):
         source._claim_consumer(
             failed,
             object(),
-            source_contract_digest="not-a-digest",
-            source_schedule_digest="4" * 64,
-            source_key_sequence_digest="5" * 64,
-            chain_contract_digest="6" * 64,
-            terminal=True,
         )
     failed.abort()
     failed.release()
@@ -458,7 +345,6 @@ def test_zero_event_rebind_gate_blocks_loose_emit_and_survives_failed_replacemen
 
     replacement = source.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     replacement.activate()
     replacement_owner = bind_terminal_consumer(source, replacement)
@@ -473,7 +359,6 @@ def test_zero_event_release_and_emit_are_serialized_without_an_authority_gap():
     source, producer = stream()
     reservation = source.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     reservation.activate()
     owner = bind_terminal_consumer(source, reservation)
@@ -517,7 +402,6 @@ def test_formal_interval_rejects_extra_or_post_failure_emit_and_short_finish():
     source, producer = stream()
     reservation = source.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     reservation.activate()
     owner = bind_terminal_consumer(source, reservation)
@@ -533,7 +417,6 @@ def test_formal_interval_rejects_extra_or_post_failure_emit_and_short_finish():
     short_source, short_producer = stream()
     short = short_source.reserve(
         total_events=2,
-        trace_binding=TRACE_BINDING,
     )
     short.activate()
     short_owner = bind_terminal_consumer(short_source, short)
@@ -544,39 +427,8 @@ def test_formal_interval_rejects_extra_or_post_failure_emit_and_short_finish():
     short.release()
 
 
-@pytest.mark.parametrize(
-    "wrong_trace",
-    (
-        TraceContext("wrong-run", "camera-one", "capture"),
-        TraceContext("run-one", "wrong-source", "capture"),
-    ),
-)
-def test_formal_emit_rejects_wrong_trace_without_publication(wrong_trace):
-    source, producer = stream()
-    reservation = source.reserve(
-        total_events=1,
-        trace_binding=TRACE_BINDING,
-    )
-    reservation.activate()
-    owner = bind_terminal_consumer(source, reservation)
-    with pytest.raises(StreamError, match="formal run/source"):
-        producer.emit(
-            scalar_value(0.0),
-            captured_at=0.0,
-            trace=wrong_trace,
-            join_key=(0, 0),
-        )
-    assert source.next_sequence == 0
-    assert source.retained_events == 0
-    assert reservation.acknowledged_sequence == 0
-    abort_consumer(source, reservation, owner)
-    reservation.release()
-
-
 def test_stream_rejects_materialized_dataset_payloads():
     class IllegalContract:
-        fingerprint = PAYLOAD_FINGERPRINT
-
         @staticmethod
         def snapshot(payload):
             return payload
@@ -584,10 +436,6 @@ def test_stream_rejects_materialized_dataset_payloads():
         @staticmethod
         def validate(_payload):
             return None
-
-        @staticmethod
-        def digest(_payload):
-            return "0" * 64
 
     source, producer = AcquisitionStream.create(
         StreamId("illegal.dataset"),
@@ -626,13 +474,11 @@ def test_stream_rejects_materialized_dataset_payloads():
         producer.emit(
             block,
             captured_at=0.0,
-            trace=trace(),
         )
     with pytest.raises(TypeError, match="materialization"):
         producer.emit(
             ("nested", block),
             captured_at=0.0,
-            trace=trace(),
         )
     assert source.next_sequence == 0
     assert source.retained_events == 0
@@ -655,22 +501,16 @@ def test_value_payload_runs_the_materialization_admission_once(monkeypatch):
     assert calls == 1
 
 
-def test_stream_requires_payload_contract_owned_content_digest():
-    class MissingDigestContract:
-        fingerprint = PAYLOAD_FINGERPRINT
-
+def test_stream_requires_payload_contract_validation():
+    class MissingValidateContract:
         @staticmethod
         def snapshot(payload):
             return payload
 
-        @staticmethod
-        def validate(_payload):
-            return None
-
-    with pytest.raises(TypeError, match="payload_contract.digest"):
+    with pytest.raises(TypeError, match="payload_contract.validate"):
         AcquisitionStream.create(
-            StreamId("missing.payload-digest"),
-            MissingDigestContract(),
+            StreamId("missing.payload-validation"),
+            MissingValidateContract(),
         )
 
 
@@ -680,7 +520,6 @@ def test_join_key_is_snapshotted_and_validated_by_one_contract():
         producer.emit(
             scalar_value(1.0),
             captured_at=1.0,
-            trace=trace(),
             join_key=[0, 0],
         )
 
@@ -708,11 +547,14 @@ def test_monitor_drains_retained_event_then_observes_source_eos():
     monitor.close()
 
 
-def test_payload_size_is_measured_by_stream_owner_and_event_ids_do_not_repeat():
+def test_event_refs_advance_with_the_stream_sequence():
     _source, producer = stream()
     first = emit(producer, 1.0)
     second = emit(producer, 2.0)
-    assert first.event_id != second.event_id
+    assert first.event_ref.stream_id == second.event_ref.stream_id
+    assert first.event_ref.generation == second.event_ref.generation
+    assert first.event_ref.sequence == 0
+    assert second.event_ref.sequence == 1
 
 
 def test_cursor_and_terminal_receipt_cannot_be_fabricated():
@@ -748,7 +590,7 @@ def test_schema_change_discards_monitor_queue_immediately():
 
 def test_rejected_emit_has_no_retention_side_effects():
     source, producer = stream()
-    reservation = source.reserve(total_events=2, trace_binding=TRACE_BINDING)
+    reservation = source.reserve(total_events=2)
     cursor = reservation.activate()
     owner = bind_terminal_consumer(source, reservation)
     expected = emit(producer, 1.0)
@@ -756,7 +598,6 @@ def test_rejected_emit_has_no_retention_side_effects():
         producer.emit(
             scalar_value(2.0),
             captured_at=float("nan"),
-            trace=trace(),
             join_key=(0, 2),
         )
     assert source.retained_events == 1
@@ -787,7 +628,6 @@ def test_first_post_marker_failure_terminalizes_without_retryable_hole(monkeypat
         producer.emit(
             scalar_value(3.0),
             captured_at=3.0,
-            trace=trace(),
             join_key=(0, 3),
         )
 

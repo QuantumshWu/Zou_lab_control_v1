@@ -1,6 +1,6 @@
 """Frozen dispatch from durable artifact references to their owning capability.
 
-Artifact leaves own reference types, codecs, repositories, and any special Figure
+Artifact leaves own reference types, codecs, direct files, and any special Figure
 projection.  Application code receives this immutable projection of already-discovered
 owners; it never imports a concrete Logic node, registers a handler, or dispatches by a
 user-supplied string.
@@ -31,7 +31,6 @@ class ArtifactCapability:
     project_figure: Callable[..., object] | None = None
     reference_to_tree: Callable[[object], object] | None = None
     reference_from_tree: Callable[[object], object] | None = None
-    admit_dataset_content: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -63,10 +62,6 @@ class ArtifactCapability:
             raise ValueError(
                 "Dataset artifact capability requires its owner reference codec"
             )
-        if not isinstance(self.admit_dataset_content, bool):
-            raise TypeError("admit_dataset_content must be bool")
-        if self.admit_dataset_content and self.project_dataset is None:
-            raise ValueError("only a Dataset artifact can require content admission")
 
     def owns(self, reference: object) -> bool:
         return isinstance(reference, self.reference_type)
@@ -142,17 +137,6 @@ class ArtifactDispatch:
         if bool(materialize):
             result.require_owned_snapshot()
         return result
-
-    def admit_dataset_reference(self, reference: object) -> ArtifactDatasetSource:
-        """Revalidate a saved derived artifact against its source owner's policy."""
-
-        owner = self._owner(reference)
-        if owner.project_dataset is None:
-            raise TypeError("artifact reference is not a Dataset source")
-        return self.project_dataset(
-            reference,
-            materialize=owner.admit_dataset_content,
-        )
 
     def project_figure(
         self,

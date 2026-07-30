@@ -24,8 +24,9 @@ from .image_view import (
     validate_normalized_rectangle,
 )
 from .render import (
+    BoardFrame,
     DocumentInputIdentity,
-    PanelPresentationIdentity,
+    PanelFrame,
     SourceIdentity,
 )
 
@@ -69,7 +70,7 @@ class RectangleGesture:
             )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class PanelInteractionOrigin:
     """The exact painted front against which one display intent was authored.
 
@@ -78,66 +79,75 @@ class PanelInteractionOrigin:
     leave half-populated.
     """
 
-    panel_id: str
-    board_id: str
-    layout_generation: int
-    sequence: int
-    source_identity: SourceIdentity | DocumentInputIdentity
-    presentation: PanelPresentationIdentity
+    board: BoardFrame
+    panel: PanelFrame
     input_identity: EvaluatedInput | DocumentInputIdentity
+    painted_revision: int
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "panel_id", canonical_text(self.panel_id, "panel_id"))
-        object.__setattr__(self, "board_id", canonical_text(self.board_id, "board_id"))
-        for field in ("layout_generation", "sequence"):
-            object.__setattr__(
-                self,
-                field,
-                nonnegative_integer(getattr(self, field), field),
-            )
-        if not isinstance(
-            self.source_identity, (SourceIdentity, DocumentInputIdentity)
-        ):
-            raise TypeError(
-                "source_identity must be SourceIdentity or DocumentInputIdentity"
-            )
-        if not isinstance(self.presentation, PanelPresentationIdentity):
-            raise TypeError(
-                "presentation must be zlc_frontend.render.PanelPresentationIdentity"
-            )
-        if self.presentation.panel_id != self.panel_id:
-            raise ValueError("interaction presentation belongs to another panel")
-        if isinstance(self.source_identity, DocumentInputIdentity):
+        if not isinstance(self.board, BoardFrame):
+            raise TypeError("board must be BoardFrame")
+        if not isinstance(self.panel, PanelFrame):
+            raise TypeError("panel must be PanelFrame")
+        if not any(value is self.panel for value in self.board.panels):
+            raise ValueError("interaction panel is not owned by its exact BoardFrame")
+        object.__setattr__(
+            self,
+            "painted_revision",
+            nonnegative_integer(self.painted_revision, "painted_revision"),
+        )
+        source_identity = self.panel.source_identity
+        if isinstance(source_identity, DocumentInputIdentity):
             if not isinstance(self.input_identity, DocumentInputIdentity):
                 raise TypeError(
                     "document interaction requires DocumentInputIdentity"
                 )
-            if self.input_identity != self.source_identity:
+            if self.input_identity != source_identity:
                 raise ValueError(
                     "interaction document differs from its source identity"
-                )
-            if (
-                self.presentation.document_id
-                != self.source_identity.document_id
-                or self.presentation.document_revision
-                != self.source_identity.document_revision
-            ):
-                raise ValueError(
-                    "interaction presentation differs from its document identity"
                 )
             return
         if not isinstance(self.input_identity, EvaluatedInput):
             raise TypeError("dataset interaction requires EvaluatedInput")
-        if self.input_identity.dataset_id != self.source_identity.dataset_id:
+        if self.input_identity.dataset_id != source_identity.dataset_id:
             raise ValueError("interaction input belongs to another dataset")
         if (
-            self.input_identity.ref.block_id != self.source_identity.block_id
+            self.input_identity.ref.block_id != source_identity.block_id
             or self.input_identity.ref.stream_generation
-            != self.source_identity.stream_generation
+            != source_identity.stream_generation
             or self.input_identity.ref.schema_fingerprint
-            != self.source_identity.schema_fingerprint
+            != source_identity.schema_fingerprint
         ):
             raise ValueError("interaction input differs from its source identity")
+
+    @property
+    def panel_id(self) -> str:
+        return self.panel.panel_id
+
+    @property
+    def board_id(self) -> str:
+        return self.board.board_id
+
+    @property
+    def layout_generation(self) -> int:
+        return self.board.layout_generation
+
+    @property
+    def sequence(self) -> int:
+        return self.board.sequence
+
+    @property
+    def source_identity(self) -> SourceIdentity | DocumentInputIdentity:
+        return self.panel.source_identity
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, PanelInteractionOrigin)
+            and self.board is other.board
+            and self.panel is other.panel
+            and self.input_identity == other.input_identity
+            and self.painted_revision == other.painted_revision
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,7 +193,7 @@ class ImageViewportCommit:
             raise TypeError("origin must be PanelInteractionOrigin")
         if not isinstance(self.viewport, ImageViewportTransform):
             raise TypeError("viewport must be ImageViewportTransform")
-        if self.viewport.viewport_revision <= self.origin.presentation.panel_revision:
+        if self.viewport.viewport_revision <= self.origin.painted_revision:
             raise ValueError("viewport commit revision must exceed its painted origin")
 
 
@@ -232,7 +242,7 @@ class CurveViewportCommit:
             raise TypeError(
                 "dataset curve viewport commit requires CurveViewportTransform"
             )
-        if self.viewport.display_revision <= self.origin.presentation.panel_revision:
+        if self.viewport.display_revision <= self.origin.painted_revision:
             raise ValueError(
                 "numeric viewport commit revision must exceed its painted origin"
             )
@@ -268,7 +278,7 @@ class HistogramViewportCommit:
             raise TypeError("origin must be PanelInteractionOrigin")
         if not isinstance(self.viewport, HistogramViewportTransform):
             raise TypeError("viewport must be HistogramViewportTransform")
-        if self.viewport.display_revision <= self.origin.presentation.panel_revision:
+        if self.viewport.display_revision <= self.origin.painted_revision:
             raise ValueError(
                 "histogram viewport commit revision must exceed its painted origin"
             )

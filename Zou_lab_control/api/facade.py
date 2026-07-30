@@ -22,18 +22,19 @@ from zlc_data import (
     CommittedTransform,
     FitNumericPolicy,
     FitParameterConstraint,
+    FitResultBatch,
     FitSpec,
     HistogramSpec,
     Selection,
 )
 from zlc_data.fit import fit_spec_for
 from zlc_neutral_atom.artifacts import (
-    AdmittedFitResult,
-    FitExecution,
     FitResultArtifactRef,
-    FitResultRepository,
+    SavedFitResult,
+    execute_fit,
+    load_fit_result,
+    write_fit_result,
 )
-from zlc_neutral_atom.capture.artifact import CaptureRepository
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.capture.application import (
     CaptureRequest,
@@ -407,7 +408,7 @@ class Experiment:
         batch_sources: tuple[AxisSourceRef, ...] | None = None,
         constraints: tuple[FitParameterConstraint, ...] = (),
         numeric_policy: FitNumericPolicy | None = None,
-    ) -> FitExecution:
+    ) -> FitResultBatch:
         """Fit one owner-admitted FINAL Dataset artifact without hidden reduction."""
 
         if not self._artifact_operations.can_project_dataset(source):
@@ -458,19 +459,38 @@ class Experiment:
                 raise ValueError(
                     "spec cannot be combined with model convenience arguments"
                 )
-            return services.fit_repository.execute(
+            return execute_fit(
                 self._artifact_operations,
                 source,
                 spec,
                 cancel_check=closing_cancel_check,
             )
 
+    def save_fit(
+        self,
+        source: object,
+        result: FitResultBatch,
+        *,
+        label: str | None = None,
+    ) -> FitResultArtifactRef:
+        """Persist one already-computed Fit result beneath this project."""
+
+        with _fit_service_guard(self._services) as services:
+            return write_fit_result(
+                services.workspace_paths.output_root / "fits",
+                self._artifact_operations,
+                source,
+                result,
+                label=label,
+            )
+
     def load_fit(
         self,
         reference: FitResultArtifactRef,
-    ) -> AdmittedFitResult:
+    ) -> SavedFitResult:
         with _service_guard(self._services) as services:
-            return services.fit_repository.load(
+            return load_fit_result(
+                services.workspace_paths.output_root / "fits",
                 reference,
                 artifacts=self._artifact_operations,
             )
@@ -660,11 +680,7 @@ class Experiment:
             )
 
         if isinstance(source, FitResultArtifactRef):
-            with _service_guard(self._services) as services:
-                source = services.fit_repository.load(
-                    source,
-                    artifacts=self._artifact_operations,
-                )
+            source = self.load_fit(source)
 
         if self._artifact_operations.can_project_dataset(source):
             return self._open_fit_capable_figure_gui(
@@ -676,22 +692,15 @@ class Experiment:
                 artifact_output=output,
             )
 
-        if isinstance(source, (FitExecution, AdmittedFitResult)):
+        if isinstance(source, SavedFitResult):
             result = source.result
             transform = result.spec.committed_transform
             initial_authority_selection = _fit_selection_authority(
                 transform,
                 context="Fit result analysis",
             )
-            if isinstance(source, AdmittedFitResult):
-                identity = (
-                    f"{source.reference.repository_id}:"
-                    f"{source.reference.manifest_digest}"
-                )
-                fit_source = source.source_artifact_ref
-            else:
-                identity = f"draft-execution:{id(source):x}"
-                fit_source = source.source_artifact_ref
+            identity = source.reference.record_path
+            fit_source = source.source_artifact_ref
             return self._open_fit_capable_figure_gui(
                 source,
                 fit_source,
@@ -812,7 +821,7 @@ class Experiment:
 
             # Runtime shutdown is the terminal authority for active Runs. Give
             # each GUI handle one idempotent post-runtime turn, then wait for
-            # its owner-thread terminal acknowledgement before repositories
+            # its owner-thread terminal acknowledgement before data services
             # can be closed.
             for handle in gui_handles:
                 try:
@@ -831,8 +840,8 @@ class Experiment:
                     gui_close_failures.append(error)
 
             # A GUI that has not acknowledged owner-thread retirement can
-            # still hold a worker borrow into the data plane.  Preserve every
-            # repository and the frozen handle set so a later close attempt
+            # still hold a worker borrow into the data plane.  Preserve the
+            # data plane and frozen handle set so a later close attempt
             # can retry; never turn an acknowledgement failure into use-after-
             # close by continuing down the teardown chain.
             if gui_close_failures:
@@ -843,9 +852,7 @@ class Experiment:
 
             failures = (
                 _cleanup_failures(services.signal_plane.close)
-                + _cleanup_failures(services.fit_repository.close)
                 + list(self.nodes.close())
-                + _cleanup_failures(services.capture_repository.close)
             )
             if failures:
                 raise _ResourceCleanupError(
@@ -962,17 +969,15 @@ def connect(
     if not isinstance(workspace, WorkspacePaths):
         raise TypeError("workspace must be WorkspacePaths")
     canonical_name = _text(name, "experiment name")
-    repository_root = workspace.repository_root
-    # The composition root owns the workspace hierarchy; each repository owns
-    # exactly one child beneath it and never guesses missing ancestors.
-    durable_makedirs(repository_root)
-    capture_repository = None
-    fit_repository = None
+    output_root = workspace.output_root
+    durable_makedirs(output_root)
     runtime = None
     signal_plane = None
     try:
-        capture_repository = CaptureRepository(repository_root / "captures")
-        fit_repository = FitResultRepository(repository_root / "fits")
+        captures_root = output_root / "captures"
+        durable_makedirs(captures_root)
+        calibrations_root = output_root / "calibrations"
+        durable_makedirs(calibrations_root)
         from zlc_neutral_atom.installation_dispatch import create_installation
 
         installation = create_installation(
@@ -988,8 +993,8 @@ def connect(
             workspace_paths=workspace,
             installation=installation,
             runtime=runtime,
-            capture_repository=capture_repository,
-            fit_repository=fit_repository,
+            captures_root=captures_root,
+            calibrations_root=calibrations_root,
             catalog=catalog,
             installation_config=installation_document,
             pulse_application=PulseApplicationOwner(),
@@ -1019,12 +1024,6 @@ def connect(
             )
             + _cleanup_failures(
                 None if signal_plane is None else signal_plane.close,
-            )
-            + _cleanup_failures(
-                None if fit_repository is None else fit_repository.close,
-            )
-            + _cleanup_failures(
-                None if capture_repository is None else capture_repository.close,
             )
         )
         if failures and isinstance(error, Exception):
@@ -1063,7 +1062,6 @@ def device_manager(
 
 
 __all__ = [
-    "AdmittedFitResult",
     "AppliedPulseSnapshot",
     "CaptureArtifactRef",
     "FitResultArtifactRef",
@@ -1071,7 +1069,7 @@ __all__ = [
     "connect",
     "device_manager",
     "Experiment",
-    "FitExecution",
+    "SavedFitResult",
     "InstallationConfigDocument",
     "PlanDescriptor",
     "PreparedPulseExecution",

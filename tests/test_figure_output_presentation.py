@@ -99,7 +99,7 @@ def _area_commit(snapshot, y_axis, x_axis):
     from zlc_frontend import ImageDisplayState
     from zlc_frontend.figure import ViewIntent, suggest_view
     from zlc_frontend.figure_outputs import bind_area_data_commit
-    from zlc_frontend.panel_render import PanelComposer, PanelProvenance
+    from zlc_frontend.panel_render import PanelComposer
 
     suggestion = suggest_view(snapshot.block.schema, ViewIntent.IMAGE)
     assert suggestion.spec is not None
@@ -112,7 +112,6 @@ def _area_commit(snapshot, y_axis, x_axis):
         frame, figure = composer.compose_with_figure(
             snapshot,
             display=ImageDisplayState(),
-            provenance=PanelProvenance("run", "epoch", "0" * 64),
         )
         selection = Selection(
             (
@@ -134,8 +133,6 @@ def _derived(value):
 
     return DerivedSignalOutput(
         snapshot=value.snapshot,
-        source_ref=value.source_ref,
-        derivation_digest=value.derivation_digest,
         preserve_source_coverage=value.preserve_source_coverage,
     )
 
@@ -155,7 +152,6 @@ def _camera_plane(*, revision: int = 3):
             declaration,
             snapshot,
             MonitorCoverage(1, 1, 0, False),
-            "1" * 64,
         )
     }
     node = SimpleNamespace(
@@ -164,11 +160,7 @@ def _camera_plane(*, revision: int = 3):
         signal_key=lambda name: f"camera/{name}",
     )
     slot = SimpleNamespace(
-        freeze_live_outputs=lambda: (
-            "camera-run",
-            "camera-epoch",
-            {"frame": state["output"]},
-        ),
+        freeze_live_outputs=lambda: {"frame": state["output"]},
         close=lambda: None,
         notification_failure=None,
     )
@@ -183,7 +175,6 @@ def test_panel_derived_signal_advances_with_its_exact_parent_publication() -> No
     from zlc_frontend.figure_outputs import (
         AREA_DATA_OUTPUT,
         area_data_output_presentation,
-        figure_selector_identity,
         materialize_area_outputs,
     )
     from zlc_frontend.figure_source import FigureSource
@@ -216,8 +207,8 @@ def test_panel_derived_signal_advances_with_its_exact_parent_publication() -> No
         generation = plane.bind_continuous_derived(
             "figure/area-panel/area",
             source_name="camera/frame",
+            expected_source_generation=publication_3.event_ref.generation,
             output_names=(area_name,),
-            route_identity=figure_selector_identity(commit),
         )
         assert plane.publish_continuous_derived(
             "figure/area-panel/area",
@@ -226,7 +217,9 @@ def test_panel_derived_signal_advances_with_its_exact_parent_publication() -> No
             {area_name: _derived(output_3)},
         )
         coherent_3 = plane.freeze()
-        assert coherent_3.publication(area_name).parents == (publication_3,)
+        assert plane.direct_parent_publications(
+            coherent_3.publication(area_name)
+        ) == (publication_3,)
         assert coherent_3.value("camera/frame").snapshot.ref.revision.value == 3
         assert coherent_3.value(area_name).snapshot.ref.revision.value == 3
 
@@ -235,7 +228,6 @@ def test_panel_derived_signal_advances_with_its_exact_parent_publication() -> No
             declaration,
             snapshot_4,
             MonitorCoverage(1, 1, 0, False),
-            "2" * 64,
         )
         plane.mark_changed(node, slot)
         staged = plane.freeze()
@@ -256,7 +248,9 @@ def test_panel_derived_signal_advances_with_its_exact_parent_publication() -> No
             {area_name: _derived(output_4)},
         )
         coherent_4 = plane.freeze()
-        assert coherent_4.publication(area_name).parents == (publication_4,)
+        assert plane.direct_parent_publications(
+            coherent_4.publication(area_name)
+        ) == (publication_4,)
         assert coherent_4.value("camera/frame").snapshot.ref.revision.value == 4
         assert coherent_4.value(area_name).snapshot.ref.revision.value == 4
 
@@ -289,10 +283,10 @@ def test_derived_sibling_bundle_is_atomic_and_route_replacement_is_explicit() ->
         generation = plane.bind_continuous_derived(
             "figure/atomic",
             source_name="camera/frame",
+            expected_source_generation=parent.event_ref.generation,
             output_names=("@panel/atomic/area.data", "@panel/atomic/cross.data"),
-            route_identity="atomic-selector",
         )
-        value = DerivedSignalOutput(snapshot, source.snapshot.ref, "a" * 64)
+        value = DerivedSignalOutput(snapshot)
         with pytest.raises(ValueError, match="sibling vocabulary"):
             plane.publish_continuous_derived(
                 "figure/atomic",
@@ -319,8 +313,8 @@ def test_derived_sibling_bundle_is_atomic_and_route_replacement_is_explicit() ->
         renamed_generation = plane.bind_continuous_derived(
             "figure/atomic",
             source_name="camera/frame",
+            expected_source_generation=parent.event_ref.generation,
             output_names=("@panel/atomic/roi.data",),
-            route_identity="renamed-selector",
         )
         assert plane.publish_continuous_derived(
             "figure/atomic",
@@ -361,8 +355,8 @@ def test_source_retirement_removes_nested_figure_publications() -> None:
         first_generation = plane.bind_continuous_derived(
             "figure/first",
             source_name="camera/frame",
+            expected_source_generation=source_publication.event_ref.generation,
             output_names=(first_name,),
-            route_identity="first-area",
         )
         assert plane.publish_continuous_derived(
             "figure/first",
@@ -378,8 +372,8 @@ def test_source_retirement_removes_nested_figure_publications() -> None:
         second_generation = plane.bind_continuous_derived(
             "figure/second",
             source_name=first_name,
+            expected_source_generation=first_publication.event_ref.generation,
             output_names=(second_name,),
-            route_identity="second-area",
         )
         assert plane.publish_continuous_derived(
             "figure/second",
@@ -389,8 +383,6 @@ def test_source_retirement_removes_nested_figure_publications() -> None:
                 second_name: _derived(
                     SimpleNamespace(
                         snapshot=first_value.snapshot,
-                        source_ref=first_value.snapshot.ref,
-                        derivation_digest="b" * 64,
                         preserve_source_coverage=True,
                     )
                 )

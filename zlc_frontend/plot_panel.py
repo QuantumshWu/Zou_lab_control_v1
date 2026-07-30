@@ -14,10 +14,18 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeAlias
 
 from zlc_data import MONITOR_HISTORY, DatasetSchema, FitResultBatch, OwnedSnapshot
+from zlc_data.codec import axis_source_ref_from_tree
 from zlc_storage import canonical_text
 
 from .curve_display import CurveDisplayState
-from .figure import AxisViewRole, GRID_INTENTS, ViewIntent, ViewSpec
+from .figure import (
+    AxisViewRole,
+    GRID_INTENTS,
+    ViewIntent,
+    ViewPreferences,
+    ViewSpec,
+    suggest_view,
+)
 from .histogram_display import (
     FacetedHistogramDisplayState,
     HistogramDisplayState,
@@ -30,7 +38,6 @@ from .panel_params import panel_display_state_from_params
 from .panel_size import DEFAULT_PANEL_SIZE
 from .plot_kind import PlotKind
 from .plot_layout import PanelSurfaceGeometry, panel_surface_geometry
-from .panel_render import PanelProvenance
 from .site_map import SiteMapPresentation
 
 if TYPE_CHECKING:
@@ -52,6 +59,7 @@ PlotDisplayState: TypeAlias = (
 # Workbench composition owner imports them when committing authored values;
 # a separate policy module would only mirror this vocabulary.
 VIEW_SPEC_PARAM = "view_spec"
+VIEW_PREFERENCES_PARAM = "view_preferences"
 HISTOGRAM_THRESHOLDS_PARAM = "histogram_thresholds"
 HISTOGRAM_CELL_THRESHOLDS_PARAM = "histogram_cell_thresholds"
 
@@ -258,7 +266,6 @@ class PlotPanelComposeRequest:
 
     source: FigureSource
     display: PlotDisplayState
-    provenance: PanelProvenance
     focus: FacetedPanelFocus | None = None
     fit_result: FitResultBatch | None = None
     fit_result_identity: str | None = None
@@ -268,8 +275,6 @@ class PlotPanelComposeRequest:
     def __post_init__(self) -> None:
         if not isinstance(self.source, FigureSource):
             raise TypeError("plot panel source must be FigureSource")
-        if not isinstance(self.provenance, PanelProvenance):
-            raise TypeError("plot panel provenance must be PanelProvenance")
         if not isinstance(
             self.display,
             (
@@ -380,6 +385,54 @@ def plot_panel_view_for_schema(
     view = plot_panel_view_from_params(kind, params)
     if view is not None and view.schema_fingerprint != schema.fingerprint:
         view = None
+    raw_preferences = params.get(VIEW_PREFERENCES_PARAM)
+    if view is None and raw_preferences is not None:
+        if not isinstance(raw_preferences, Mapping):
+            raise TypeError("plot panel view_preferences must be a mapping")
+        allowed = {
+            "intent",
+            "x_source",
+            "image_x_source",
+            "image_y_source",
+            "batch_sources",
+            "facet_sources",
+            "sample_sources",
+        }
+        unknown = set(raw_preferences).difference(allowed)
+        if unknown:
+            raise ValueError(
+                "unknown plot panel view preference fields: "
+                + ", ".join(sorted(str(value) for value in unknown))
+            )
+
+        def optional_source(name: str):
+            raw = raw_preferences.get(name)
+            return None if raw is None else axis_source_ref_from_tree(raw)
+
+        def source_group(name: str):
+            raw = raw_preferences.get(name, ())
+            if not isinstance(raw, (list, tuple)):
+                raise TypeError(f"plot panel {name} must be a sequence")
+            return tuple(axis_source_ref_from_tree(value) for value in raw)
+
+        try:
+            intent = ViewIntent(str(raw_preferences["intent"]))
+        except KeyError as exc:
+            raise ValueError("plot panel view_preferences require intent") from exc
+        preferences = ViewPreferences(
+            x_source=optional_source("x_source"),
+            image_x_source=optional_source("image_x_source"),
+            image_y_source=optional_source("image_y_source"),
+            batch_sources=source_group("batch_sources"),
+            facet_sources=source_group("facet_sources"),
+            sample_sources=source_group("sample_sources"),
+        )
+        suggestion = suggest_view(schema, intent, preferences=preferences)
+        if suggestion.spec is None:
+            detail = "; ".join(reason.message for reason in suggestion.reasons)
+            raise ValueError(f"declared plot panel view is unavailable: {detail}")
+        view = suggestion.spec
+        _validate_figure_view(kind, view)
     if view is None and kind is PlotKind.GRID and bool(default_grid):
         from .figure import suggest_default_grid_view
 
@@ -501,7 +554,6 @@ class PlotPanelSession:
             result = self._composer.compose_faceted(
                 request.source.snapshot,
                 display=request.display,
-                provenance=request.provenance,
                 focus=request.focus,
                 fit_result=request.fit_result,
                 fit_result_identity=request.fit_result_identity,
@@ -511,7 +563,6 @@ class PlotPanelSession:
         frame, figure = self._composer.compose_with_figure(
             request.source.snapshot,
             display=request.display,
-            provenance=request.provenance,
             fit_result=request.fit_result,
             fit_result_identity=request.fit_result_identity,
             histogram_projection_value_range=(
@@ -565,7 +616,6 @@ class PlotPanelSession:
         frame, visible = self._composer.compose_data_figure(
             figure,
             display=request.display,
-            provenance=request.provenance,
             fit_result=request.fit_result,
             fit_result_identity=request.fit_result_identity,
             histogram_projection_value_range=(
@@ -638,6 +688,7 @@ __all__ = [
     "PlotPanelComposeResult",
     "PlotPanelContract",
     "PlotPanelSession",
+    "VIEW_PREFERENCES_PARAM",
     "figure_intent_from_view",
     "plot_panel_display_state",
     "plot_panel_input",

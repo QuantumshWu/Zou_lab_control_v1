@@ -10,7 +10,6 @@ import pytest
 from zlc_pulse import (
     AnalogStep,
     ApiParameter,
-    DestructivePulseEditError,
     FrozenScanTable,
     OutputDelay,
     PulseDocument,
@@ -32,6 +31,7 @@ from zlc_pulse import (
     remove_period,
     resolve_api_parameters,
 )
+from zlc_pulse.authoring import DestructivePulseEditError
 
 
 ROOT = Path(__file__).parents[1]

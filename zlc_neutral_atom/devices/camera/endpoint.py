@@ -46,9 +46,6 @@ from zlc_neutral_atom.devices.camera.capture_port import (
     ReadCaptureCommand,
     StartCaptureCommand,
 )
-from zlc_neutral_atom.runtime.dataset import (
-    OrderedDatasetMetadataHasher,
-)
 from zlc_neutral_atom.devices.camera.monitor import (
     CameraMonitorCapabilitySnapshot,
     CameraMonitorInterrupted,
@@ -166,7 +163,6 @@ class _EndpointSession:
     expected_frames: int | None
     source_group_sizes: tuple[int, ...] | None
     payload_contract: CameraSampleContract
-    metadata_hasher: OrderedDatasetMetadataHasher
     buffer_frame_count: int | None = None
     started: bool = False
     drained_count: int = 0
@@ -185,7 +181,6 @@ class _EndpointSession:
 class _MonitorSignalAssociation:
     """One E0-qualified external-trigger interval over a live camera arm."""
 
-    association_id: str
     cause_digest: str
     trigger_schedule_fingerprint: str
     expected_trigger_count: int
@@ -201,7 +196,6 @@ class _MonitorSignalAssociation:
     previous_frame_stamp: int | None = None
     previous_camera_stamp: int | None = None
     trigger_channel: str | None = None
-    terminal_evidence_digest: str | None = None
     bound: bool = False
     error: RuntimeError | None = None
 
@@ -337,7 +331,6 @@ class CameraCaptureEndpoint:
                 f"{type(self._camera).__qualname__}"
             ),
             source_id=self._source_id,
-            payload_contract_fingerprint=payload_contract.fingerprint,
             capture_spec_owner_fingerprint=(
                 CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT
             ),
@@ -505,9 +498,6 @@ class CameraCaptureEndpoint:
                 spec.expected_frames,
                 spec.source_group_sizes,
                 payload_contract,
-                OrderedDatasetMetadataHasher(
-                    payload_contract.metadata_contract.fingerprint
-                ),
             )
             return CapturePreparedAck(
                 command.session_id,
@@ -637,19 +627,15 @@ class CameraCaptureEndpoint:
                 if len(records) != 1:
                     raise RuntimeError("camera returned a short read for an exact capture")
                 record = records[0]
-                payload = self._sample(record, command.session_id, payload_contract)
+                payload = self._sample(record, payload_contract)
                 if payload.metadata.source_ordinal != expected_ordinal:
                     raise RuntimeError(
                         f"camera ordinal {payload.metadata.source_ordinal} differs from "
                         f"expected {expected_ordinal}"
                     )
                 self._validate_frame_sequence(session, payload.metadata)
-                metadata_digest = payload_contract.metadata_contract.digest(
-                    payload.metadata
-                )
                 if session.drained_count != expected_ordinal:
                     raise RuntimeError("camera session changed during frame read")
-                session.metadata_hasher.update(metadata_digest)
                 session.drained_count += 1
                 return CapturedPayloadAck(
                     command.session_id,
@@ -667,7 +653,6 @@ class CameraCaptureEndpoint:
     @staticmethod
     def _sample(
         record: CameraFrameRecord,
-        session_id: str,
         payload_contract: CameraSampleContract,
     ) -> CameraSample:
         if not isinstance(record, CameraFrameRecord):
@@ -681,7 +666,6 @@ class CameraCaptureEndpoint:
             record.timestamp_microseconds,
             record.host_received_at_ns,
             record.driver_buffer_index,
-            f"{session_id}:{record.source_ordinal}",
         )
         sample = CameraSample(
             Value(record.image, VALID, payload_contract.value_schema),
@@ -734,7 +718,6 @@ class CameraCaptureEndpoint:
                     terminal.source_stopped,
                     terminal.no_more_frames,
                     terminal.joined,
-                    session.metadata_hasher.digest(),
                     capability.settings_fingerprint,
                     capability.capability_fingerprint,
                     session.spec_fingerprint,
@@ -801,15 +784,6 @@ class CameraCaptureEndpoint:
                 terminal.source_stopped,
                 terminal.no_more_frames,
                 terminal.joined,
-                canonical_digest(
-                    {
-                        "session_id": command.session_id,
-                        "produced_count": terminal.produced_count,
-                        "source_stopped": terminal.source_stopped,
-                        "no_more_frames": terminal.no_more_frames,
-                        "joined": terminal.joined,
-                    }
-                ),
             )
 
     def _close_exposure_lease(
@@ -859,16 +833,9 @@ class CameraCaptureEndpoint:
             True,
             True,
             True,
-            canonical_digest(
-                {
-                    "session_id": command.session_id,
-                    "operation": "restore-camera-exposure",
-                    "settings_fingerprint": baseline.settings_fingerprint,
-                }
-            ),
         )
 
-    def interrupt(self) -> str:
+    def interrupt(self) -> None:
         with self._condition:
             self._operation_epoch += 1
             session = self._session
@@ -894,22 +861,6 @@ class CameraCaptureEndpoint:
                     and terminal is not None
                 ):
                     session.terminal = terminal
-            return canonical_digest(
-                {
-                    "operation": "DISARM",
-                    "source_id": self._source_id,
-                    "terminal": (
-                        None
-                        if terminal is None
-                        else {
-                            "produced_count": terminal.produced_count,
-                            "source_stopped": terminal.source_stopped,
-                            "no_more_frames": terminal.no_more_frames,
-                            "joined": terminal.joined,
-                        }
-                    ),
-                }
-            )
         finally:
             with self._condition:
                 self._physical_operations_inflight -= 1
@@ -1191,7 +1142,6 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
 
         if not isinstance(request, SignalAssociationRequest):
             raise TypeError("request must be SignalAssociationRequest")
-        identity = request.association_id
         digest = request.cause_digest
         schedule_fingerprint = request.trigger_schedule_fingerprint
         channel = request.trigger_channel
@@ -1288,7 +1238,6 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                     "camera monitor is not at a complete readout-cycle boundary"
                 )
             association = _MonitorSignalAssociation(
-                identity,
                 digest,
                 schedule_fingerprint,
                 expected_trigger_count,
@@ -1312,16 +1261,11 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
         *,
         artifact_digest: str,
         trigger_counts: tuple[tuple[str, int], ...],
-        terminal_evidence_digest: str,
         terminal_evidence_kind: str,
     ) -> tuple[str, int, int]:
         """Bind the admitted interval to the FPGA hardware-terminal receipt."""
 
         artifact = _sha256(artifact_digest, "artifact_digest")
-        terminal_digest = _sha256(
-            terminal_evidence_digest,
-            "terminal_evidence_digest",
-        )
         if terminal_evidence_kind != "HARDWARE_RAW_REGISTERS":
             raise ValueError(
                 "real camera association requires a hardware pulse terminal"
@@ -1350,7 +1294,6 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                     "hardware pulse-terminal trigger count differs from camera association"
                 )
             association.trigger_channel = channel
-            association.terminal_evidence_digest = terminal_digest
             association.bound = True
             return (
                 channel,
@@ -1362,7 +1305,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
     def finish_signal_event_association(
         self,
         token: object,
-    ) -> tuple[str, int, int, str]:
+    ) -> tuple[str, int, int]:
         """Reconcile one hardware FIRE with exactly its delivered camera frames."""
 
         with self._lock:
@@ -1381,8 +1324,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                     "camera E0 qualification changed during signal association"
                 )
             channel = association.trigger_channel
-            terminal_digest = association.terminal_evidence_digest
-            if channel is None or terminal_digest is None:
+            if channel is None:
                 raise RuntimeError("camera association lost its terminal binding")
             progress = self._camera
             if not isinstance(progress, CameraAssociationProgress):
@@ -1448,7 +1390,6 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 channel,
                 association.physical_start_ordinal,
                 end,
-                terminal_digest,
             )
 
     def cancel_signal_event_association(self, token: object) -> None:
@@ -1588,9 +1529,6 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 None,
                 None,
                 payload_contract,
-                OrderedDatasetMetadataHasher(
-                    payload_contract.metadata_contract.fingerprint
-                ),
                 buffer_frame_count=command.buffer_frame_count,
             )
             return CameraMonitorPreparedAck(
@@ -1700,7 +1638,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                     )
                 if len(records) != 1:
                     raise RuntimeError("camera monitor returned a short read")
-                payload = self._sample(records[0], command.session_id, payload_contract)
+                payload = self._sample(records[0], payload_contract)
                 if payload.metadata.source_ordinal != expected_ordinal:
                     raise RuntimeError(
                         "camera monitor lost or reordered a pre-broker record: "

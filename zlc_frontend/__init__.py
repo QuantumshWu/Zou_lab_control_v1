@@ -50,12 +50,11 @@ from .fit_editor import (
     FitAuthoringDraft,
     FitAuthoringOption,
     fit_spec_from_arguments,
-    figure_fit_transform,
     prepare_fit_authoring_options,
     reconcile_fit_authoring_draft,
     validate_fit_authoring_options,
 )
-from .form import FormChoice, FormFieldKind, FormFieldProps, FormSpec
+from .form import FormChoice, FormFieldProps, FormSpec
 from .histogram_display import (
     FacetedHistogramDisplayState,
     HistogramBinProjection,
@@ -73,9 +72,8 @@ from .image_display import (
     image_display_form_values,
     image_display_from_form,
 )
-from .image_view import ImageViewportTransform, NormalizedPoint, NormalizedRectangle
+from .image_view import ImageViewportTransform, NormalizedRectangle
 from .meter_display import MeterDisplayState
-from .panel_render import PanelProvenance
 from .plot_kind import PlotKind
 from .plot_panel import (
     FigureIntent,
@@ -84,7 +82,7 @@ from .plot_panel import (
     PlotPanelSession,
     plot_panel_display_state,
 )
-from .plot_report import PlotReportDocument, PlotReportPage, plot_report_page
+from .plot_report import PlotReportDocument, plot_report_page
 from .render import BoardFrame
 from .selector import (
     CrossGesture,
@@ -136,7 +134,6 @@ __all__ = [
     "FitAuthoringOption",
     "FixedIndex",
     "FormChoice",
-    "FormFieldKind",
     "FormFieldProps",
     "FormSpec",
     "HistogramBinProjection",
@@ -155,18 +152,15 @@ __all__ = [
     "ImageViewportTransform",
     "LatestNonempty",
     "MeterDisplayState",
-    "NormalizedPoint",
     "NormalizedRectangle",
     "NumericDisplayAxis",
     "NumericViewportTransform",
     "PanelInteractionOrigin",
-    "PanelProvenance",
     "PlotDisplayState",
     "PlotKind",
     "PlotPanelContract",
     "PlotPanelSession",
     "PlotReportDocument",
-    "PlotReportPage",
     "RectangleGesture",
     "RelimMode",
     "SourceViewBinding",
@@ -181,7 +175,6 @@ __all__ = [
     "curve_display_form_values",
     "curve_display_from_form",
     "fit_spec_from_arguments",
-    "figure_fit_transform",
     "histogram_display_form_spec",
     "histogram_display_form_values",
     "histogram_display_from_form",

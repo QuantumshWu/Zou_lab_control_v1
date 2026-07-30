@@ -5,11 +5,9 @@ from __future__ import annotations
 from zlc_neutral_atom.dataset_output import (
     DatasetOutputDeclaration,
     FinalDatasetOutput,
-    final_dataset_join_digest,
 )
 
-from .reference import scan_artifact_ref_to_tree
-from .repository import MaterializedScanData
+from .artifact import MaterializedScanData
 
 
 PULSE_SCAN_FINAL_OUTPUT_DECLARATIONS = (
@@ -29,12 +27,6 @@ def scan_final_outputs(
     output = FinalDatasetOutput(
         declaration,
         snapshot,
-        final_dataset_join_digest(
-            owner="pulse-scan",
-            declaration=declaration,
-            source_identity=scan_artifact_ref_to_tree(materialized.artifact_ref),
-            snapshot=snapshot,
-        ),
     )
     return {output.name: output}
 

@@ -8,15 +8,13 @@ separate public Calibration API path, not a second Task mode.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from pathlib import Path
-import shutil
 import threading
-import uuid
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Mapping, Protocol
 
-from zlc_neutral_atom.capture.artifact import CaptureRepository
+import numpy as np
+
 from zlc_neutral_atom.authoring import (
     AuthoringChoice,
     AuthoringField,
@@ -40,16 +38,9 @@ from zlc_neutral_atom.dataset_output import (
 )
 from .calibration import (
     CalibrationAnalysisRequest,
-    ResolvedCalibration,
     ThresholdMethod,
 )
 from .reference import CalibrationArtifactRef
-from .repository import CalibrationRepository
-from .task_output import (
-    CalibrationTaskOutput,
-    read_calibration_task_output,
-    write_calibration_task_output,
-)
 from .sitemap import DEFAULT_CALIBRATION_PULSE_PATH, SitemapCalibrationRequest
 from zlc_neutral_atom.runtime.dataset import (
     DatasetPreviewSnapshot,
@@ -66,6 +57,8 @@ from zlc_storage import (
     normalized_text,
     positive_real,
 )
+from zlc_storage.durability import atomic_write_file
+from zlc_storage.paths import resolve_under
 from zlc_pulse import PulseExecutionForm
 
 if TYPE_CHECKING:
@@ -79,7 +72,6 @@ CALIBRATION_LIVE_OUTPUT_DECLARATIONS = (
         "zlc_neutral_atom.calibration-task.live-frame",
     ),
 )
-DEFAULT_CALIBRATION_FOLDER = "calibrations"
 DEFAULT_CALIBRATION_THRESHOLD_METHOD = "otsu"
 DEFAULT_CALIBRATION_REFERENCE_EXPOSURE_S = 0.020
 DEFAULT_CALIBRATION_READOUT_EXPOSURE_S = 0.005
@@ -90,60 +82,33 @@ MINIMUM_CALIBRATION_ROI_RADIUS = 1
 DEFAULT_CALIBRATION_CAMERA_ROLE = "camera"
 
 
-def admit_calibration_task_output(
-    path: str | Path,
-    *,
-    capture_repository: CaptureRepository,
-    calibration_repository: CalibrationRepository,
-) -> ResolvedCalibration:
-    """Admit a saved task pointer and its complete capture lineage."""
-
-    if not isinstance(capture_repository, CaptureRepository):
-        raise TypeError("capture_repository must be CaptureRepository")
-    if not isinstance(calibration_repository, CalibrationRepository):
-        raise TypeError("calibration_repository must be CalibrationRepository")
-    output = read_calibration_task_output(path)
-    resolved = calibration_repository.admit(
-        output.calibration_ref,
-        capture_repository,
-    )
-    if (
-        resolved.artifact.source_binding.source_capture_ref
-        != output.source_capture_ref
-    ):
-        raise ValueError("saved calibration pointer names another source capture")
-    return resolved
-
-
-def write_calibration_task_outputs(
+def write_calibration_post_final_exports(
     source: CaptureArtifactRef,
     calibration: CalibrationArtifactRef,
     *,
-    folder: str | Path,
-    capture_repository: CaptureRepository,
-    calibration_repository: CalibrationRepository,
+    captures_root: Path,
+    calibrations_root: Path,
+    save_frames: bool,
     expected_camera_role: str | None = None,
     render_report: Callable | None = None,
 ) -> None:
-    """Write the typed pointer and non-authoritative human result bundle.
+    """Write optional frames and a human report beside the committed record."""
 
-    Capture and calibration repositories remain the only canonical artifact
-    owners.  Existing-capture recalibration consumes the canonical Capture ref;
-    the Task never creates a duplicate raw-frame authority.  Frontend rendering
-    is an explicit composition callback; this module never imports a renderer.
-    """
-
+    from zlc_neutral_atom.capture.artifact import load_capture_artifact
     from .projection import project_calibration_report
     from .result_bundle import write_calibration_result_bundle
+    from .repository import load_calibration_computation
 
     if not isinstance(source, CaptureArtifactRef):
         raise TypeError("source must be CaptureArtifactRef")
     if not isinstance(calibration, CalibrationArtifactRef):
         raise TypeError("calibration must be CalibrationArtifactRef")
-    if not isinstance(capture_repository, CaptureRepository):
-        raise TypeError("capture_repository must be CaptureRepository")
-    if not isinstance(calibration_repository, CalibrationRepository):
-        raise TypeError("calibration_repository must be CalibrationRepository")
+    if not isinstance(captures_root, Path) or not captures_root.is_absolute():
+        raise ValueError("captures_root must be an absolute Path")
+    if not isinstance(calibrations_root, Path) or not calibrations_root.is_absolute():
+        raise ValueError("calibrations_root must be an absolute Path")
+    if type(save_frames) is not bool:
+        raise TypeError("save_frames must be bool")
     if not callable(render_report):
         raise TypeError("render_report must be callable")
     camera_role = (
@@ -151,87 +116,60 @@ def write_calibration_task_outputs(
         if expected_camera_role is None
         else normalized_text(expected_camera_role, "expected_camera_role")
     )
-    computation = calibration_repository.load_computation(calibration)
+    capture_root = captures_root.resolve()
+    calibration_root = calibrations_root.resolve()
+    computation = load_calibration_computation(
+        calibration_root,
+        capture_root,
+        calibration,
+    )
     calibration_artifact = computation.artifact
     if calibration_artifact.source_binding.source_capture_ref != source:
         raise ValueError("calibration task result belongs to another source capture")
-    admitted = capture_repository.admit(source)
+    capture = load_capture_artifact(
+        capture_root,
+        source,
+        materialize=save_frames,
+    )
     if (
         camera_role is not None
-        and admitted.artifact.camera_provenance.binding.value != camera_role
+        and capture.camera_provenance.binding.value != camera_role
     ):
         raise ValueError(
             "calibration task source belongs to camera role "
-            f"{admitted.artifact.camera_provenance.binding.value!r}, not "
+            f"{capture.camera_provenance.binding.value!r}, not "
             f"{camera_role!r}"
         )
-    root = Path(folder).expanduser()
-    if not root.is_absolute():
-        raise ValueError("calibration output folder must be resolved by composition")
-    root = root.resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    nonce = uuid.uuid4().hex
-    pointer_path = root / "calibration_ref.json"
-    pointer_temp = root / f".calibration_ref.{nonce}.tmp"
-    report = root / "report"
-    report_stage = root / f".report.{nonce}.tmp"
-    report_backup = root / f".report.{nonce}.old"
-    installed_report = False
-    committed = False
-    try:
-        write_calibration_task_output(
-            pointer_temp,
-            CalibrationTaskOutput(calibration, source),
-        )
-        write_calibration_result_bundle(
-            report_stage,
-            project_calibration_report(computation, calibration),
-            calibration,
-            source,
-            calibration_repository_root=calibration_repository.root,
-            capture_repository_root=capture_repository.root,
-            render_report=render_report,
-        )
-        if report.exists() and (
-            report.is_symlink()
-            or not report.is_dir()
-            or report.resolve().parent != root
-        ):
-            raise ValueError(
-                "calibration report output is not a task-owned directory"
+    record_path = resolve_under(calibration_root, calibration.record_path)
+    run_directory = record_path.parent
+    if save_frames:
+        snapshot = capture.materialize_snapshot()
+
+        def save(path: Path, array: np.ndarray) -> None:
+            atomic_write_file(
+                path,
+                lambda stream: np.save(stream, array, allow_pickle=False),
             )
 
-        if report.exists():
-            os.replace(report, report_backup)
-        os.replace(report_stage, report)
-        installed_report = True
-
-        # The typed pointer is the task output's final commit record.  The
-        # report is staged and installed before the pointer changes.
-        os.replace(pointer_temp, pointer_path)
-        committed = True
-    finally:
-        if not committed:
-            if installed_report and report.exists():
-                shutil.rmtree(report)
-            if report_backup.exists():
-                os.replace(report_backup, report)
-        if report_stage.exists():
-            shutil.rmtree(report_stage)
-        if committed and report_backup.exists():
-            shutil.rmtree(report_backup)
-        for temporary_path in (pointer_temp,):
-            try:
-                temporary_path.unlink()
-            except FileNotFoundError:
-                pass
+        save(run_directory / "source_frames.npy", snapshot.block.values)
+        save(
+            run_directory / "source_frame_validity.npy",
+            np.asarray(snapshot.block.validity.mask),
+        )
+    write_calibration_result_bundle(
+        run_directory / "report",
+        project_calibration_report(computation, calibration),
+        calibration,
+        source,
+        render_report=render_report,
+    )
 
 
 @dataclass(frozen=True)
 class CalibrationTaskIntent:
     """Complete capture-then-calibrate Task intent before service binding."""
 
-    folder: str
+    save_frames: bool
     pulse: str
     threshold_method: str
     reference_exposure_s: float
@@ -241,7 +179,8 @@ class CalibrationTaskIntent:
     camera_role: str
 
     def __post_init__(self) -> None:
-        folder = normalized_text(self.folder, "folder")
+        if type(self.save_frames) is not bool:
+            raise TypeError("save_frames must be bool")
         pulse = normalized_text(self.pulse, "pulse")
         threshold_method = normalized_text(
             self.threshold_method,
@@ -273,7 +212,6 @@ class CalibrationTaskIntent:
         )
         assert roi_radius is not None
         camera_role = normalized_text(self.camera_role, "camera_role")
-        object.__setattr__(self, "folder", folder)
         object.__setattr__(self, "pulse", pulse)
         object.__setattr__(self, "threshold_method", threshold_method)
         object.__setattr__(
@@ -290,12 +228,15 @@ class CalibrationTaskIntent:
 _CALIBRATION_TASK_AUTHORING_SCHEMA = AuthoringSchema(
     (
         AuthoringField(
-            "folder",
-            "path",
-            "Folder",
-            default=DEFAULT_CALIBRATION_FOLDER,
+            "save_frames",
+            "bool",
+            "Save raw frames",
+            default=False,
             required=True,
-            description="Directory for the typed result pointer and human report.",
+            description=(
+                "Also export source frame and validity arrays beside the "
+                "committed calibration record."
+            ),
         ),
         AuthoringField(
             "pulse",
@@ -441,12 +382,12 @@ class CalibrationTaskApplicationPort(Protocol):
         lifecycle_owner: object | None = None,
     ) -> RunHandle: ...
 
-    def write_calibration_task_outputs(
+    def write_calibration_post_final_exports(
         self,
         source: CaptureArtifactRef,
         calibration: CalibrationArtifactRef,
         *,
-        folder: str,
+        save_frames: bool,
         expected_camera_role: str,
     ) -> None: ...
 
@@ -575,7 +516,7 @@ class PreparedCalibrationTask:
         "_post_final_warning",
         "_source_capture_ref",
         "_started",
-        "_task_outputs_written",
+        "_post_final_exports_attempted",
     )
 
     def __init__(
@@ -600,7 +541,7 @@ class PreparedCalibrationTask:
         self._started = False
         self._analysis_handle: RunHandle | None = None
         self._source_capture_ref: CaptureArtifactRef | None = None
-        self._task_outputs_written = False
+        self._post_final_exports_attempted = False
         self._post_final_warning: str | None = None
 
     @property
@@ -633,16 +574,20 @@ class PreparedCalibrationTask:
             if self._started:
                 raise RuntimeError("PreparedCalibrationTask is one-shot")
             self._started = True
-        source = start_and_wait(lambda: self._start_capture(live_output))
+        source = start_and_wait(
+            lambda: self._start_capture(
+                live_output,
+                lifecycle_owner=command_context,
+            )
+        )
         if not isinstance(source, CaptureArtifactRef):
             raise TypeError("capture Run returned a non-CaptureArtifactRef")
         with self._lock:
             self._source_capture_ref = source
-        # The application/SignalPlane performs the final short admission check
-        # against command_context.cancel_requested.  Returning this handle lets
-        # HostedRun observe the second flat Run directly instead of inventing a
-        # composite lifecycle.
-        handle = self._start_calibration_analysis(source)
+        handle = self._start_calibration_analysis(
+            source,
+            lifecycle_owner=command_context,
+        )
         with self._lock:
             self._analysis_handle = handle
         return handle
@@ -650,6 +595,8 @@ class PreparedCalibrationTask:
     def _start_capture(
         self,
         live_output: CalibrationTaskLiveOutputPort,
+        *,
+        lifecycle_owner: object,
     ) -> RunHandle:
         capture = self._capture
         ordinals = self._preview_ordinals
@@ -668,17 +615,19 @@ class PreparedCalibrationTask:
         return capture.start_with_preview(
             factory=attach,
             source_ordinals=ordinals,
-            lifecycle_owner=self,
+            lifecycle_owner=lifecycle_owner,
         )
 
     def _start_calibration_analysis(
         self,
         source: CaptureArtifactRef,
+        *,
+        lifecycle_owner: object,
     ) -> RunHandle:
         handle = self._dependencies.start_calibration_analysis(
             source,
             self._plan.analysis,
-            lifecycle_owner=self,
+            lifecycle_owner=lifecycle_owner,
         )
         if not isinstance(handle, RunHandle):
             raise TypeError("calibration application port returned a non-RunHandle")
@@ -690,10 +639,10 @@ class PreparedCalibrationTask:
         calibration: CalibrationArtifactRef,
     ) -> None:
         intent = self._plan.intent
-        self._dependencies.write_calibration_task_outputs(
+        self._dependencies.write_calibration_post_final_exports(
             source,
             calibration,
-            folder=intent.folder,
+            save_frames=intent.save_frames,
             expected_camera_role=intent.camera_role,
         )
 
@@ -733,9 +682,9 @@ class PreparedCalibrationTask:
 
         outputs = calibration_final_outputs(computation, reference)
         with self._lock:
-            if self._task_outputs_written:
-                raise RuntimeError("calibration task outputs were already finalized")
-            self._task_outputs_written = True
+            if self._post_final_exports_attempted:
+                raise RuntimeError("calibration post-FINAL exports were already attempted")
+            self._post_final_exports_attempted = True
             source = self._source_capture_ref
         if not isinstance(source, CaptureArtifactRef):
             raise RuntimeError("calibration task lost its exact source capture")
@@ -767,11 +716,10 @@ class PreparedCalibrationTask:
         return calibration_site_map_context(computation, reference)
 
     def completion_summary(self, result: CalibrationArtifactRef) -> str:
-        """Report the committed authority without claiming a report succeeded."""
+        """Report the FINAL record without claiming its optional report succeeded."""
 
         self._require_own_success(result)
-        root = Path(self._plan.intent.folder)
-        return f"calibration artifact committed; requested output: {root}"
+        return f"calibration artifact committed: {result.record_path}"
 
 
 def start_calibration_task_command(
@@ -845,7 +793,6 @@ __all__ = [
     "CALIBRATION_LIVE_OUTPUT_DECLARATIONS",
     "CALIBRATION_THRESHOLD_METHODS",
     "DEFAULT_CALIBRATION_CAMERA_ROLE",
-    "DEFAULT_CALIBRATION_FOLDER",
     "DEFAULT_CALIBRATION_PULSE_PATH",
     "DEFAULT_CALIBRATION_READOUT_EXPOSURE_S",
     "DEFAULT_CALIBRATION_REFERENCE_EXPOSURE_S",
@@ -858,10 +805,9 @@ __all__ = [
     "CalibrationTaskIntent",
     "CalibrationTaskLiveOutputPort",
     "PreparedCalibrationTask",
-    "admit_calibration_task_output",
     "build_calibration_task_intent_from_authoring",
     "calibration_task_authoring_schema",
     "calibration_task_default_camera_role",
     "prepare_calibration_task",
-    "write_calibration_task_outputs",
+    "write_calibration_post_final_exports",
 ]

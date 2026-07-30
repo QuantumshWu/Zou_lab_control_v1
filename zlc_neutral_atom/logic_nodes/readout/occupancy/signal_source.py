@@ -32,7 +32,6 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
 )
 from zlc_neutral_atom.runtime._failure import safe_error_summary
 from zlc_neutral_atom.runtime.signal_source import (
-    SignalAssociationEvidence,
     SignalAssociationRequest,
     SignalAssociationScheduleRequirement,
     SignalEvent,
@@ -41,23 +40,20 @@ from zlc_neutral_atom.runtime.signal_source import (
     SignalEventSource,
     SignalOutputProjection,
     StreamSignalEventSource,
-    signal_association_evidence_to_tree,
 )
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionProducer,
     AcquisitionStream,
-    ArtifactInputRef,
-    ProcessorStageProvenance,
     SourceFailed,
     StreamEndedEarly,
     StreamError,
     StreamId,
-    TraceContext,
-    processor_stage_provenance_to_tree,
 )
-from zlc_storage import canonical_digest, canonical_text, encode
+from zlc_storage import canonical_text
 
 from .processor import (
+    OCCUPANCY_LIVE_OUTPUT_DECLARATIONS,
+    OCCUPANCY_PROCESSOR_KEY,
     _output_schemas,
     _require_output_value_schemas,
     _validate_sample_fields,
@@ -69,9 +65,6 @@ from zlc_neutral_atom.logic_nodes.camera_measurement.output_binding import (
 
 
 _OUTPUT_NAMES = ("counts", "occupied", "rate")
-_ASSOCIATION_EVIDENCE_SCHEMA = (
-    "zlc_neutral_atom.logic_nodes.readout.occupancy.signal-association"
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,20 +113,6 @@ class OccupancySignalValuesContract:
     def _rate(self) -> ValuePayloadContract:
         return ValuePayloadContract(self.rate_schema)
 
-    @property
-    def fingerprint(self) -> str:
-        return canonical_digest(
-            {
-                "owner": (
-                    "zlc_neutral_atom.logic_nodes.readout.occupancy."
-                    "live-signal-values"
-                ),
-                "counts": self.counts_schema.fingerprint,
-                "occupied": self.occupied_schema.fingerprint,
-                "rate": self.rate_schema.fingerprint,
-            }
-        )
-
     def snapshot(self, payload: OccupancySignalValues) -> OccupancySignalValues:
         self.validate(payload)
         return payload
@@ -146,21 +125,6 @@ class OccupancySignalValuesContract:
         self._rate.validate(payload.rate)
         _validate_sample_fields(payload.counts, payload.occupied)
         _validate_rate(payload.occupied, payload.rate)
-
-    def digest(self, payload: OccupancySignalValues) -> str:
-        self.validate(payload)
-        return canonical_digest(
-            {
-                "owner": (
-                    "zlc_neutral_atom.logic_nodes.readout.occupancy."
-                    "live-signal-content"
-                ),
-                "counts": self._counts.digest(payload.counts),
-                "occupied": self._occupied.digest(payload.occupied),
-                "rate": self._rate.digest(payload.rate),
-            }
-        )
-
 
 def _validate_rate(occupied: Value, rate: Value) -> None:
     validity = occupied.validity
@@ -226,19 +190,6 @@ def _occupancy_output_schema(
     raise KeyError(f"Occupancy has no signal output {output_name!r}")
 
 
-def _processor_artifact_inputs(
-    stages: tuple[ProcessorStageProvenance, ...],
-) -> tuple[ArtifactInputRef, ...]:
-    ordered: list[ArtifactInputRef] = []
-    seen: set[str] = set()
-    for stage in stages:
-        for reference in stage.direct_artifact_inputs:
-            if reference.fingerprint not in seen:
-                seen.add(reference.fingerprint)
-                ordered.append(reference)
-    return tuple(ordered)
-
-
 @dataclass(slots=True, eq=False)
 class _OccupancyAssociationToken:
     request: SignalAssociationRequest
@@ -258,7 +209,6 @@ class _OccupancyAssociatedCursor:
         "_contract",
         "_frame_schema",
         "_output_name",
-        "_processor_stage",
         "_producer",
         "_stream",
         "_upstream",
@@ -273,7 +223,6 @@ class _OccupancyAssociatedCursor:
         frame_schema: ValueSchema,
         contract: OccupancySignalValuesContract,
         classify: Callable[[Value], OccupancySignalValues],
-        processor_stage: ProcessorStageProvenance,
     ) -> None:
         if not isinstance(upstream, SignalEventAssociationCursor):
             raise TypeError("Occupancy requires an upstream association cursor")
@@ -291,7 +240,6 @@ class _OccupancyAssociatedCursor:
         self._frame_schema = frame_schema
         self._contract = contract
         self._classify = classify
-        self._processor_stage = processor_stage
         self._stream = stream
         self._producer = producer
         self._active: _OccupancyAssociationToken | None = None
@@ -359,80 +307,30 @@ class _OccupancyAssociatedCursor:
             raise RuntimeError("upstream associated Camera schema changed")
         payload = self._classify(upstream_event.value)
         self._contract.validate(payload)
-        stages = (*upstream_event.processor_stages, self._processor_stage)
-        trace = TraceContext(
-            run_id=upstream_event.trace.run_id,
-            source_id=self.stream_id.value,
-            correlation_id=upstream_event.trace.correlation_id,
-            causation_refs=(
-                upstream_event.event_ref,
-                *_processor_artifact_inputs(stages),
-            ),
-            config_revision=upstream_event.trace.config_revision,
-            control_revision=upstream_event.trace.control_revision,
-        )
         envelope = self._producer.emit(
             payload,
             captured_at=upstream_event.captured_at,
-            trace=trace,
+            direct_parent_refs=(upstream_event.event_ref,),
         )
         state.delivered += 1
         return SignalEvent(
             _occupancy_output_value(payload, self._output_name),
             envelope.event_ref,
-            envelope.trace,
+            envelope.direct_parent_refs,
             envelope.captured_at,
-            stages,
         )
 
     def finish_signal_association(
         self,
         token: object,
-    ) -> SignalAssociationEvidence:
+    ) -> None:
         state = self._require_token(token)
         if not state.terminal_bound:
             raise RuntimeError("Occupancy association is not terminal-bound")
         if state.delivered != state.request.expected_event_count:
             raise RuntimeError("Occupancy association group is incomplete")
-        upstream = self._upstream.finish_signal_association(state.upstream_token)
-        if not isinstance(upstream, SignalAssociationEvidence):
-            raise TypeError("upstream returned another association evidence type")
-        if upstream.request != state.request:
-            raise RuntimeError("upstream association evidence changed its request")
-        upstream_tree = signal_association_evidence_to_tree(upstream)
-        request = state.request
-        evidence = SignalAssociationEvidence(
-            request,
-            upstream.terminal_evidence_digest,
-            _ASSOCIATION_EVIDENCE_SCHEMA,
-            encode(
-                {
-                    "schema": _ASSOCIATION_EVIDENCE_SCHEMA,
-                    "association_id": request.association_id,
-                    "cause_id": request.cause_id,
-                    "cause_digest": request.cause_digest,
-                    "expected_event_count": request.expected_event_count,
-                    "trigger_schedule_fingerprint": (
-                        request.trigger_schedule_fingerprint
-                    ),
-                    "trigger_channel": request.trigger_channel,
-                    "trigger_count": request.trigger_count,
-                    "minimum_trigger_interval_ticks": (
-                        request.minimum_trigger_interval_ticks
-                    ),
-                    "clock_hz": request.clock_hz,
-                    "terminal_evidence_digest": upstream.terminal_evidence_digest,
-                    "upstream_evidence": upstream_tree,
-                    "upstream_evidence_digest": canonical_digest(upstream_tree),
-                    "processor_stage": processor_stage_provenance_to_tree(
-                        self._processor_stage
-                    ),
-                    "source_output": self._output_name,
-                }
-            ),
-        )
+        self._upstream.finish_signal_association(state.upstream_token)
         state.finished = True
-        return evidence
 
     def close(self) -> None:
         if self._closed:
@@ -461,11 +359,9 @@ class OccupancySignalProcessor:
     """Frozen classifier/provenance owner that can start one live derived source."""
 
     __slots__ = (
-        "_artifact_input",
         "_contract",
         "_frame_schema",
         "_model",
-        "_model_kind",
         "_source_binding",
     )
 
@@ -474,15 +370,12 @@ class OccupancySignalProcessor:
         *,
         frame_contract: FrameContract,
         model: ReadoutModel,
-        artifact_input: ArtifactInputRef,
         source_binding: CameraFrameOutputBinding,
     ) -> None:
         if not isinstance(frame_contract, FrameContract):
             raise TypeError("frame_contract must be FrameContract")
         if not isinstance(model, ReadoutModel):
             raise TypeError("model must be ReadoutModel")
-        if not isinstance(artifact_input, ArtifactInputRef):
-            raise TypeError("artifact_input must be ArtifactInputRef")
         if not isinstance(source_binding, CameraFrameOutputBinding):
             raise TypeError("source_binding must be CameraFrameOutputBinding")
         counts_schema, occupied_schema = _output_schemas(
@@ -491,12 +384,6 @@ class OccupancySignalProcessor:
         )
         self._frame_schema = frame_contract.frame_schema
         self._model = model
-        self._model_kind = model.kind
-        self._artifact_input = ArtifactInputRef(
-            artifact_input.reference_schema_id,
-            artifact_input.canonical_reference,
-            artifact_input.content_digest,
-        )
         self._source_binding = source_binding
         self._contract = OccupancySignalValuesContract(
             counts_schema,
@@ -526,23 +413,6 @@ class OccupancySignalProcessor:
         """Open the Camera future cursor before starting the processor worker."""
 
         name = canonical_text(source_output_name, "Camera signal output name")
-        processor_stage = ProcessorStageProvenance(
-            canonical_digest(
-                {
-                    "owner": (
-                        "zlc_neutral_atom.logic_nodes.readout.occupancy."
-                        "live-signal-processor-binding"
-                    ),
-                    "source_output": name,
-                    "frame_schema": self._frame_schema.fingerprint,
-                    "output_contract": self._contract.fingerprint,
-                    "calibration_input": self._artifact_input.fingerprint,
-                    "model_kind": self._model_kind.value,
-                    "source_binding": self._source_binding.identity,
-                }
-            ),
-            (self._artifact_input,),
-        )
         source_type = (
             AssociatedRunningOccupancySignalSource
             if isinstance(source, SignalEventAssociationSource)
@@ -554,8 +424,6 @@ class OccupancySignalProcessor:
             frame_schema=self._frame_schema,
             contract=self._contract,
             classify=self._classify,
-            artifact_input=self._artifact_input,
-            processor_stage=processor_stage,
             expected_source_stream_id=self._source_binding.stream_id,
             expected_source_stream_generation=(
                 self._source_binding.stream_generation
@@ -597,13 +465,11 @@ class RunningOccupancySignalSource:
         "_condition",
         "_contract",
         "_cursor",
-        "_artifact_input",
         "_classify",
         "_done",
         "_error",
         "_frame_schema",
         "_output_source_id",
-        "_processor_stage",
         "_producer",
         "_signal_source",
         "_source",
@@ -619,8 +485,6 @@ class RunningOccupancySignalSource:
         frame_schema: ValueSchema,
         contract: OccupancySignalValuesContract,
         classify: Callable[[Value], OccupancySignalValues],
-        artifact_input: ArtifactInputRef,
-        processor_stage: ProcessorStageProvenance,
         expected_source_stream_id: StreamId,
         expected_source_stream_generation: StreamGenerationId,
     ) -> None:
@@ -634,14 +498,6 @@ class RunningOccupancySignalSource:
             raise TypeError("contract must be OccupancySignalValuesContract")
         if not callable(classify):
             raise TypeError("classify must be callable")
-        if not isinstance(artifact_input, ArtifactInputRef):
-            raise TypeError("artifact_input must be ArtifactInputRef")
-        if not isinstance(processor_stage, ProcessorStageProvenance):
-            raise TypeError("processor_stage must be ProcessorStageProvenance")
-        if processor_stage.direct_artifact_inputs != (artifact_input,):
-            raise ValueError(
-                "Occupancy processor stage must name its calibration input"
-            )
         if not isinstance(expected_source_stream_id, StreamId):
             raise TypeError("expected_source_stream_id must be StreamId")
         if not isinstance(expected_source_stream_generation, StreamGenerationId):
@@ -683,7 +539,6 @@ class RunningOccupancySignalSource:
                         lambda envelope: envelope.payload.rate,
                     ),
                 },
-                processor_stages=(processor_stage,),
             )
         except BaseException:
             cursor.close()
@@ -694,8 +549,6 @@ class RunningOccupancySignalSource:
         self._frame_schema = frame_schema
         self._contract = contract
         self._classify = classify
-        self._artifact_input = artifact_input
-        self._processor_stage = processor_stage
         self._cursor = cursor
         self._output_source_id = stream_id.value
         self._producer: AcquisitionProducer[OccupancySignalValues] = producer
@@ -704,7 +557,7 @@ class RunningOccupancySignalSource:
         self._error: BaseException | None = None
 
         def process() -> None:
-            self._process_events(classify, artifact_input)
+            self._process_events(classify)
 
         thread = threading.Thread(
             target=process,
@@ -730,6 +583,14 @@ class RunningOccupancySignalSource:
     @property
     def output_names(self) -> tuple[str, ...]:
         return _OUTPUT_NAMES
+
+    @property
+    def definition_key(self):
+        return OCCUPANCY_PROCESSOR_KEY
+
+    @property
+    def dataset_output_declarations(self):
+        return OCCUPANCY_LIVE_OUTPUT_DECLARATIONS
 
     @property
     def worker_idle(self) -> bool:
@@ -764,7 +625,6 @@ class RunningOccupancySignalSource:
     def _process_events(
         self,
         classify: Callable[[Value], OccupancySignalValues],
-        artifact_input: ArtifactInputRef,
     ) -> None:
         failure: BaseException | None = None
         try:
@@ -777,14 +637,7 @@ class RunningOccupancySignalSource:
                 self._producer.emit(
                     payload,
                     captured_at=event.captured_at,
-                    trace=TraceContext(
-                        run_id=event.trace.run_id,
-                        source_id=self._output_source_id,
-                        correlation_id=event.trace.correlation_id,
-                        causation_refs=(event.event_ref, artifact_input),
-                        config_revision=event.trace.config_revision,
-                        control_revision=event.trace.control_revision,
-                    ),
+                    direct_parent_refs=(event.event_ref,),
                 )
         except StreamEndedEarly:
             self._producer.finish()
@@ -838,7 +691,6 @@ class AssociatedRunningOccupancySignalSource(RunningOccupancySignalSource):
                 frame_schema=self._frame_schema,
                 contract=self._contract,
                 classify=self._classify,
-                processor_stage=self._processor_stage,
             )
         except BaseException:
             upstream.close()

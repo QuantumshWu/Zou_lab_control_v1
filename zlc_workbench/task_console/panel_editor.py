@@ -855,7 +855,7 @@ class PanelEditor(QtWidgets.QWidget):
             contract = self._snapshot_contract
             if figure is None or display is None or contract is None:
                 raise RuntimeError("the editor has no exact typed figure to save")
-            from zlc_workbench.data_figure.archive_repository import save_figure_archive
+            from zlc_workbench.data_figure.archive_io import save_figure_archive
 
             save_figure_archive(
                 figure,

@@ -3,24 +3,29 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
 
 import numpy as np
 from PyQt5 import QtCore, QtTest, QtWidgets
 
+from zlc_data import AxisSourceRef
 from gui_user_flow import (
     choose_combo_text,
     configure_offscreen_fast_path,
     current_logic_editor,
-    replace_path_value,
     replace_spin_value,
     require_offscreen_platform,
     until,
     visible_form_widgets,
     widget_gone,
 )
-from zlc_frontend import PlotKind
+from zlc_frontend import AxisViewRole, PlotKind, ViewIntent
+from zlc_frontend.figure import grid_facet_source
 from zlc_frontend.qt_widgets import FigureSurfaceHost, ensure_qt_app
 from zlc_workbench.task_console.console_records import console_signal_key
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _faceted_card(console, signal_key: str):
@@ -49,11 +54,16 @@ def test_mot_field_form_runs_live_and_final_named_axis_grids(tmp_path: Path) -> 
     require_offscreen_platform(application)
     from task_console import _StandaloneTaskConsoleFlow, _build_parser
 
+    workspace = tmp_path / "workspace"
+    pulses = workspace / "pulses"
+    pulses.mkdir(parents=True)
+    for name in ("imaging_template.json", "mot_field_template.json"):
+        shutil.copy2(ROOT / "pulses" / name, pulses / name)
     flow = _StandaloneTaskConsoleFlow(
         _build_parser().parse_args(
             [
-                "--repository",
-                str(tmp_path / "workspace"),
+                "--workspace",
+                str(workspace),
                 "--name",
                 "mot-field-current",
                 "--seed",
@@ -89,7 +99,6 @@ def test_mot_field_form_runs_live_and_final_named_axis_grids(tmp_path: Path) -> 
         editor = current_logic_editor(console, application)
         widgets = visible_form_widgets(editor)
         replace_spin_value(widgets["points"], "7")
-        replace_path_value(widgets["folder"], str(tmp_path / "mot-report"))
 
         QtTest.QTest.mouseClick(
             editor.form.start_button,
@@ -114,8 +123,13 @@ def test_mot_field_form_runs_live_and_final_named_axis_grids(tmp_path: Path) -> 
             live_value,
             first_live_publication,
         )
-        prepared = console._logic_nodes[id(row)].prepared_command
-        assert first_live_intent is prepared._bound_figure_intent()
+        assert first_live_intent is None
+        first_live_contract = live_card._presented_contract
+        assert first_live_contract is not None
+        first_live_view = first_live_contract.figure.view
+        assert first_live_contract.figure.kind is PlotKind.GRID
+        assert first_live_view is not None
+        assert first_live_view.intent is ViewIntent.IMAGE
         first_live_revision = live_value.snapshot.ref.revision.value
         first_live_coverage = live_value.coverage
         assert first_live_coverage is not None
@@ -134,29 +148,49 @@ def test_mot_field_form_runs_live_and_final_named_axis_grids(tmp_path: Path) -> 
             ("mot-field.da_y", "scan-point"),
             ("mot-field.da_z", "scan-point"),
         )
+        grid_sources = tuple(
+            AxisSourceRef.grid_dimension(column.coordinate_id)
+            for column in live_schema.point_table.columns
+        )
+        assert first_live_view.binding(grid_sources[0]).role is AxisViewRole.IMAGE_X
+        assert first_live_view.binding(grid_sources[1]).role is AxisViewRole.IMAGE_Y
+        assert grid_facet_source(first_live_view) == grid_sources[2]
         until(
             application,
             lambda: (
                 (card := _faceted_card(console, live_key)) is not None
                 and (value := _presented_value(card)) is not None
                 and value.snapshot.ref.revision.value > first_live_revision
-                and card.frozen_render_publication().sequence
-                > first_live_publication.sequence
+                and card.frozen_render_publication().event_ref.sequence
+                > first_live_publication.event_ref.sequence
             ),
             timeout=30.0,
         )
         second_live_card = _faceted_card(console, live_key)
         second_live_value = second_live_card.frozen_render_value()
         second_live_publication = second_live_card.frozen_render_publication()
-        assert second_live_card._presentation_provider(
+        second_live_intent = second_live_card._presentation_provider(
             second_live_value,
             second_live_publication,
-        ) is first_live_intent
+        )
+        assert second_live_intent is None
+        second_live_contract = second_live_card._presented_contract
+        assert second_live_contract is not None
+        assert second_live_contract.figure.view == first_live_view
         second_live_coverage = second_live_value.coverage
         assert second_live_coverage is not None
-        assert second_live_publication.owner_id == first_live_publication.owner_id
-        assert second_live_publication.generation == first_live_publication.generation
-        assert second_live_publication.sequence > first_live_publication.sequence
+        assert (
+            second_live_publication.event_ref.stream_id
+            == first_live_publication.event_ref.stream_id
+        )
+        assert (
+            second_live_publication.event_ref.generation
+            == first_live_publication.event_ref.generation
+        )
+        assert (
+            second_live_publication.event_ref.sequence
+            > first_live_publication.event_ref.sequence
+        )
         assert second_live_value.snapshot.ref.revision.value > first_live_revision
         assert (
             second_live_coverage.written_cells

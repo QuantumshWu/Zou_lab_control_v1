@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import tempfile
+from typing import BinaryIO, Callable
 
 
 class DirectoryDurabilityError(RuntimeError):
@@ -90,6 +92,65 @@ def flush_directory(directory: str | os.PathLike[str]) -> None:
         ) from exc
 
 
+def atomic_write_file(
+    target: str | os.PathLike[str],
+    writer: Callable[[BinaryIO], None],
+) -> Path:
+    """Write and durably replace one file through a same-directory temporary."""
+
+    if not callable(writer):
+        raise TypeError("writer must be callable")
+    destination = Path(target).expanduser().resolve()
+    parent = destination.parent
+    if not parent.is_dir():
+        raise FileNotFoundError(f"target parent directory does not exist: {parent}")
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            writer(stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        flush_directory(parent)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return destination
+
+
+def atomic_write_bytes(
+    target: str | os.PathLike[str],
+    payload: bytes | bytearray | memoryview,
+) -> Path:
+    """Atomically replace one file with bytes."""
+
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise TypeError("payload must be bytes-like")
+    return atomic_write_file(target, lambda stream: stream.write(payload))
+
+
+def atomic_write_text(
+    target: str | os.PathLike[str],
+    text: str,
+    *,
+    encoding: str = "utf-8",
+) -> Path:
+    """Atomically replace one file with encoded text."""
+
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+    return atomic_write_bytes(target, text.encode(encoding))
+
+
 def durable_mkdir(directory: str | os.PathLike[str]) -> Path:
     """Create or re-acknowledge one directory below an existing parent.
 
@@ -154,6 +215,9 @@ def durable_makedirs(directory: str | os.PathLike[str]) -> Path:
 
 __all__ = [
     "DirectoryDurabilityError",
+    "atomic_write_bytes",
+    "atomic_write_file",
+    "atomic_write_text",
     "durable_makedirs",
     "durable_mkdir",
     "flush_directory",

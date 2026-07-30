@@ -1,4 +1,4 @@
-"""Filesystem repository for current typed Figure archives.
+"""Direct filesystem I/O for current typed Figure archives.
 
 The frontend owns the archive value and canonical payload codec.  This module
 alone owns path normalization, the NPZ envelope, atomic replacement, and the
@@ -34,7 +34,7 @@ _NPZ_FIELDS = ("payload", "schema")
 
 @dataclass(frozen=True, slots=True)
 class LoadedFigureArchive:
-    """One repository path and the exact frontend value decoded from it."""
+    """One archive path and the exact frontend value decoded from it."""
 
     path: Path
     archive: FigureArchive

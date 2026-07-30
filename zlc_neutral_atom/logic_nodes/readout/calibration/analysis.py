@@ -1,4 +1,4 @@
-"""Calibration analysis for the admitted neutral-atom readout model.
+"""Calibration analysis for the loaded neutral-atom readout model.
 
 The module has two layers only: pure image/statistics functions, and one adapter
 that reads a raw CaptureArtifact through ``CalibrationCaptureLayout``.  Training
@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 import math
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 
@@ -60,12 +60,12 @@ from zlc_neutral_atom.logic_nodes.readout.physical_context import (
 )
 import zlc_neutral_atom.logic_nodes.readout.bimodal as _bimodal
 
+if TYPE_CHECKING:
+    from zlc_neutral_atom.capture.artifact import CaptureArtifact
+
 
 class CalibrationAnalysisError(ValueError):
     pass
-
-
-_ADMITTED_ANALYSIS_TOKEN = object()
 
 
 def _validate_site_center_admission(
@@ -76,7 +76,7 @@ def _validate_site_center_admission(
 
     The detector's returned coordinates are never snapped, reordered, or
     replaced here.  A request without spatial intent remains valid for a pure
-    preview computation; only authority minting requires the paired fields.
+    preview computation; durable Calibration writing requires the paired fields.
     """
 
     if not isinstance(request, CalibrationAnalysisRequest):
@@ -237,7 +237,6 @@ class ModelCalibrationReport:
     quick_thresholds: np.ndarray
     short_signals: np.ndarray
     short_validity: np.ndarray
-    bin_edges: np.ndarray
     predictions: np.ndarray
     site_fidelity: tuple[SiteFidelity, ...]
     aggregate_fidelity: float
@@ -268,9 +267,6 @@ class ModelCalibrationReport:
             shape=short.shape,
             field_name="short_validity",
         )
-        edges = _immutable_array(self.bin_edges, dtype="<f8", field_name="bin_edges")
-        if edges.ndim != 1 or edges.size < 3 or not np.all(np.diff(edges) > 0):
-            raise ValueError("bin_edges must be a strictly increasing 1D array")
         predictions = _immutable_array(
             self.predictions,
             dtype="bool",
@@ -294,7 +290,6 @@ class ModelCalibrationReport:
         object.__setattr__(self, "quick_thresholds", quick)
         object.__setattr__(self, "short_signals", short)
         object.__setattr__(self, "short_validity", short_validity)
-        object.__setattr__(self, "bin_edges", edges)
         object.__setattr__(self, "predictions", predictions)
         object.__setattr__(self, "site_fidelity", site_fidelity)
         object.__setattr__(self, "ablation", ablation)
@@ -464,7 +459,7 @@ def _runtime_threshold_source_mask(
 def calibration_runtime_threshold_sources(
     report: CalibrationReport,
 ) -> tuple[tuple[str, ...], ...]:
-    """Describe the exact threshold authority selected for every model/site.
+    """Describe the exact threshold source selected for every model/site.
 
     The nested tuples follow ``report.models`` and each model's canonical site
     axis.  Values are ``"formal"`` or ``"quick-fallback"`` and are derived
@@ -539,7 +534,7 @@ def _validate_calibration_binding(
     artifact: CalibrationArtifact,
     report: CalibrationReport,
 ) -> None:
-    """Validate the pure artifact/report relationship without minting authority."""
+    """Validate the pure artifact/report relationship."""
 
     if not isinstance(artifact, CalibrationArtifact):
         raise TypeError("artifact must be CalibrationArtifact")
@@ -625,7 +620,7 @@ def _validate_calibration_binding(
 
 @dataclass(frozen=True)
 class CalibrationComputation:
-    """Pure, validated calibration output with no durable commit authority."""
+    """Pure, validated calibration output before durable writing."""
 
     artifact: CalibrationArtifact
     report: CalibrationReport
@@ -634,104 +629,38 @@ class CalibrationComputation:
         _validate_calibration_binding(self.artifact, self.report)
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class CalibrationAnalysisResult:
-    """Authority-bearing result produced only from an AdmittedCapture."""
+    """Calibration result retaining its exact immutable CaptureArtifact."""
 
     artifact: CalibrationArtifact
     report: CalibrationReport
-    _token: object = field(repr=False, compare=False)
-    _source_admission: object = field(repr=False, compare=False)
+    source: CaptureArtifact = field(repr=False, compare=False)
     _source_resolution: _ResolvedCalibrationSource = field(
         repr=False,
         compare=False,
     )
 
-    def __init_subclass__(cls, **_kwargs) -> None:
-        raise TypeError("CalibrationAnalysisResult is final and cannot be subclassed")
+    def __post_init__(self) -> None:
+        from zlc_neutral_atom.capture.artifact import CaptureArtifact
 
-    def __init__(self, *_args, **_kwargs) -> None:
-        raise TypeError(
-            "CalibrationAnalysisResult is returned by a committed calibration Run"
-        )
-
-    def __reduce__(self):
-        raise TypeError(
-            "CalibrationAnalysisResult is process-local and cannot be serialized"
-        )
-
-    def __reduce_ex__(self, _protocol: int):
-        raise TypeError(
-            "CalibrationAnalysisResult is process-local and cannot be serialized"
-        )
-
-    @classmethod
-    def _from_admitted_analysis(
-        cls,
-        token: object,
-        computation: CalibrationComputation,
-        source: object,
-        resolved: _ResolvedCalibrationSource,
-    ) -> "CalibrationAnalysisResult":
-        from zlc_neutral_atom.capture.artifact import AdmittedCapture
-
-        if token is not _ADMITTED_ANALYSIS_TOKEN:
-            raise PermissionError(
-                "admitted calibration results are minted by the calibration Run"
-            )
-        if not isinstance(computation, CalibrationComputation):
-            raise TypeError("computation must be CalibrationComputation")
-        if type(source) is not AdmittedCapture:
-            raise TypeError("source must be an exact AdmittedCapture")
-        if not isinstance(resolved, _ResolvedCalibrationSource):
-            raise TypeError("resolved must be _ResolvedCalibrationSource")
-        if computation.artifact.source_binding.source_capture_ref != source.reference:
-            raise ValueError("calibration result names another admitted capture")
-        if computation.artifact.source_binding != resolved.source_binding or (
-            computation.artifact.frame_contract != resolved.frame_contract
-        ) or (
-            computation.artifact.readout_physical_context
-            != resolved.readout_physical_context
-        ):
-            raise ValueError(
-                "calibration result differs from its admitted source resolution"
-            )
-        result = object.__new__(cls)
-        object.__setattr__(result, "artifact", computation.artifact)
-        object.__setattr__(result, "report", computation.report)
-        object.__setattr__(result, "_token", token)
-        object.__setattr__(result, "_source_admission", source)
-        object.__setattr__(result, "_source_resolution", resolved)
-        return result
-
-    def _source_for_commit(
-        self,
-    ) -> tuple[object, _ResolvedCalibrationSource]:
-        """Return the exact retained input after validating result authority."""
-
-        from zlc_neutral_atom.capture.artifact import AdmittedCapture
-
-        if type(self) is not CalibrationAnalysisResult or (
-            self._token is not _ADMITTED_ANALYSIS_TOKEN
-        ):
-            raise PermissionError("calibration result authority is invalid")
-        source = self._source_admission
-        if type(source) is not AdmittedCapture:
-            raise PermissionError("calibration result source authority is invalid")
-        source._require_authority()
-        if self.artifact.source_binding.source_capture_ref != source.reference:
-            raise PermissionError("calibration result source changed after analysis")
+        CalibrationComputation(self.artifact, self.report)
+        if not isinstance(self.source, CaptureArtifact):
+            raise TypeError("source must be CaptureArtifact")
+        if not isinstance(self._source_resolution, _ResolvedCalibrationSource):
+            raise TypeError("source resolution must be _ResolvedCalibrationSource")
+        if self.artifact.source_binding.source_capture_ref != self.source.ref:
+            raise ValueError("calibration result names another CaptureArtifact")
         resolved = self._source_resolution
-        if not isinstance(resolved, _ResolvedCalibrationSource) or (
-            self.artifact.source_binding != resolved.source_binding
-        ) or self.artifact.frame_contract != resolved.frame_contract or (
+        if self.artifact.source_binding != resolved.source_binding or (
+            self.artifact.frame_contract != resolved.frame_contract
+        ) or (
             self.artifact.readout_physical_context
             != resolved.readout_physical_context
         ):
-            raise PermissionError(
-                "calibration result source resolution changed after analysis"
+            raise ValueError(
+                "calibration result differs from its CaptureArtifact resolution"
             )
-        return source, resolved
 
 def _gaussian_2d(coords, offset, amplitude, x0, y0, sigma_x, sigma_y):
     x, y = coords
@@ -1524,7 +1453,6 @@ def characterize_readout(
         quick,
         short,
         short_validity,
-        edges,
         prediction,
         tuple(metrics),
         float(aggregate),
@@ -1914,10 +1842,10 @@ def _analyze_calibration_resolved(
     request: CalibrationAnalysisRequest,
     resolved: _ResolvedCalibrationSource,
 ) -> CalibrationAnalysisResult:
-    from zlc_neutral_atom.capture.artifact import AdmittedCapture
+    from zlc_neutral_atom.capture.artifact import CaptureArtifact
 
-    if type(source) is not AdmittedCapture:
-        raise TypeError("calibration analysis requires an exact AdmittedCapture")
+    if not isinstance(source, CaptureArtifact):
+        raise TypeError("calibration analysis requires a CaptureArtifact")
     if not isinstance(request, CalibrationAnalysisRequest):
         raise TypeError("request must be CalibrationAnalysisRequest")
     if request.expected_centers_xy is None:
@@ -1927,7 +1855,7 @@ def _analyze_calibration_resolved(
         )
     if not isinstance(resolved, _ResolvedCalibrationSource):
         raise TypeError("resolved must be _ResolvedCalibrationSource")
-    frame_source = source.artifact.frame_source
+    frame_source = source.frame_source
     if not isinstance(frame_source, CaptureFrameSource):
         raise TypeError("capture.frame_source must be CaptureFrameSource")
     group_count, reference_frames, short_frames, contexts = _capture_frame_source(
@@ -1945,9 +1873,9 @@ def _analyze_calibration_resolved(
         readout_physical_context=resolved.readout_physical_context,
         request=request,
     )
-    return CalibrationAnalysisResult._from_admitted_analysis(
-        _ADMITTED_ANALYSIS_TOKEN,
-        computation,
+    return CalibrationAnalysisResult(
+        computation.artifact,
+        computation.report,
         source,
         resolved,
     )

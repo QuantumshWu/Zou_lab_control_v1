@@ -7,21 +7,13 @@ catalog VALUES, never raw device objects.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from Zou_lab_control.api import WorkspacePaths, connect
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_public_session_exposes_catalog_values_not_raw_devices(tmp_path):
     exp = connect(
         "virtual",
-        workspace=WorkspacePaths.for_workspace(
-            ROOT,
-            repository_root=tmp_path / "workspace",
-        ),
+        workspace=WorkspacePaths.for_workspace((tmp_path / "workspace").resolve()),
     )
     try:
         assert not hasattr(exp, "devices")

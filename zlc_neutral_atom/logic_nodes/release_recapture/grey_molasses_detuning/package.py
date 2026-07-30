@@ -58,14 +58,11 @@ def _bind_api(
             raise TypeError("Grey-molasses binder returned another domain value")
         return prepare_release_recapture(
             name=f"Grey molasses detuning {bound.program.document.name}",
-            owner="zlc_neutral_atom.grey-molasses-detuning",
-            program_fingerprint=bound.program.fingerprint,
             camera_binding=bound.camera_binding,
             calibration=resolved,
             model_kind=bound.request.model_kind,
             per_site=bound.request.per_site,
             declaration=GREY_MOLASSES_DETUNING_OUTPUT_DECLARATIONS[0],
-            final_owner="grey-molasses-detuning",
             start_run=start_run,
             rf_port=bound.rf_port,
             rf_table=bound.rf_table,

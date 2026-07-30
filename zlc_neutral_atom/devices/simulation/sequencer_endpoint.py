@@ -197,34 +197,14 @@ class VirtualSequencerExecutionEndpoint(_OwnedSequencerEndpoint):
         self._sequencer.set_safe_state()
         return dict(self._sequencer.snapshot())
 
-    def _backend_close_evidence(
-        self,
-        session_id: str,
-        snapshot: object,
-    ) -> tuple[bool, str]:
+    def _backend_safe_state_confirmed(self, snapshot: object) -> bool:
         if not isinstance(snapshot, dict):
             raise TypeError("virtual sequencer safe-state snapshot must be a mapping")
-        safe = (
+        return (
             snapshot.get("state") == "safe"
             and snapshot.get("prepared_program") is None
             and self._sequencer.firing is None
             and self._sequencer.last_fired is None
-        )
-        return safe, canonical_digest(
-            {
-                "session_id": session_id,
-                "state": snapshot.get("state"),
-                "prepared_program": snapshot.get("prepared_program"),
-                "firing": self._sequencer.firing is not None,
-                "last_fired": self._sequencer.last_fired is not None,
-            }
-        )
-
-    def _backend_interrupt_digest(self, snapshot: object) -> str:
-        if not isinstance(snapshot, dict):
-            raise TypeError("virtual sequencer safe-state snapshot must be a mapping")
-        return canonical_digest(
-            {"operation": "SAFE_STATE", "state": snapshot.get("state")}
         )
 
 

@@ -17,8 +17,6 @@ from .render import (
     CoherenceStamp,
     ImagePanelPayload,
     PanelFrame,
-    PanelPresentationIdentity,
-    SITE_MAP_JOIN_SCHEMA_DIGEST,
     SiteMapPanelPayload,
     SourceIdentity,
 )
@@ -32,8 +30,6 @@ def _compose_site_map_front(
     panel_id: str,
     board_id: str,
     sequence: int,
-    surface_revision: int,
-    selection_revision: int,
     data_range: tuple[float, float] | None,
     current_color_limits: tuple[float, float] | None = None,
     previous_relim_mode=None,
@@ -57,19 +53,6 @@ def _compose_site_map_front(
     board_id = canonical_text(board_id, "board_id")
     if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
         raise ValueError("sequence must be a non-negative integer")
-    if (
-        isinstance(surface_revision, bool)
-        or not isinstance(surface_revision, int)
-        or surface_revision < 0
-    ):
-        raise ValueError("surface_revision must be a non-negative integer")
-    if (
-        isinstance(selection_revision, bool)
-        or not isinstance(selection_revision, int)
-        or selection_revision < 0
-    ):
-        raise ValueError("selection_revision must be a non-negative integer")
-
     viewport = image_viewport_for_display_state(display, view.home_viewport)
     data_range, effective_limits = resolve_image_color_limits_from_range(
         data_range,
@@ -120,26 +103,8 @@ def _compose_site_map_front(
         view.centers_xy,
         view.site_state,
         view.site_validity,
-        view.site_geometry_identity,
-        view.view_identity,
-        view.coherence_identity,
     )
-    presentation = PanelPresentationIdentity(
-        panel_id,
-        f"site-map:{view.presentation_kind}:{view.view_identity}",
-        surface_revision,
-        selection_revision,
-        display.revision,
-    )
-    stamp = CoherenceStamp(
-        view.run_id,
-        view.provenance_epoch_id,
-        view.presentation_kind,
-        SITE_MAP_JOIN_SCHEMA_DIGEST,
-        payload.join_key_digest,
-        (view.background_input, view.site_state_input),
-        (presentation,),
-    )
+    stamp = CoherenceStamp((view.background_input, view.site_state_input))
     ref = view.site_state_input.ref
     source = SourceIdentity(
         view.site_state_input.dataset_id,
@@ -212,18 +177,11 @@ class SiteMapComposer:
         view: SiteMapPresentation,
         *,
         display: ImageDisplayState,
-        selection_revision: int = 0,
         surface_geometry: PanelSurfaceGeometry | None = None,
         surface_revision: int = 0,
     ) -> BoardFrame:
         if not isinstance(view, SiteMapPresentation):
             raise TypeError("view must be a typed SiteMap view")
-        if (
-            isinstance(selection_revision, bool)
-            or not isinstance(selection_revision, int)
-            or selection_revision < 0
-        ):
-            raise ValueError("selection_revision must be a non-negative integer")
         if surface_geometry is None:
             surface_geometry = self._surface_geometry
         if not isinstance(surface_geometry, PanelSurfaceGeometry):
@@ -250,7 +208,7 @@ class SiteMapComposer:
         range_identity = (
             background_input,
             state_input,
-            view.view_identity,
+            view.cell_selection,
         )
         lineage = (
             background_input.dataset_id,
@@ -263,8 +221,8 @@ class SiteMapComposer:
             state_input.ref.schema_fingerprint,
             view.presentation_kind,
             view.cell_selection,
-            view.site_geometry_identity,
             view.coordinate_frame,
+            id(view.centers_xy),
             view.home_viewport.x_axis.axis_id,
             view.home_viewport.y_axis.axis_id,
             view.site_axis.axis_id,
@@ -318,8 +276,6 @@ class SiteMapComposer:
                 panel_id=self._panel_id,
                 board_id=self._board_id,
                 sequence=self._sequence,
-                surface_revision=self._surface_revision,
-                selection_revision=selection_revision,
                 data_range=self._range_value,
                 current_color_limits=self._color_limits,
                 previous_relim_mode=self._previous_relim_mode,

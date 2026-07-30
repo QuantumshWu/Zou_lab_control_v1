@@ -162,7 +162,6 @@ def _raw_projection(archive) -> str:
     return pformat(
         {
             "path": str(archive.path),
-            "payload_digest": value.payload_digest,
             "document": figure.document,
             "datasets": tuple(datasets),
             "fit_results": dict(figure.fit_results),
@@ -185,7 +184,6 @@ def project_figure_info(archive) -> FigureInfoProjection:
     plot_rows: list[tuple[str, object]] = [
         ("document", document.document_id),
         ("revision", document.revision),
-        ("payload_digest", value.payload_digest),
     ]
     for layer in document.layers:
         descriptor = document.descriptor(layer.dataset_id)

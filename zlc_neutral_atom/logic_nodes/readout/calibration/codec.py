@@ -1,10 +1,4 @@
-"""Canonical durable formats for readout calibration artifacts and reports.
-
-Only the two repository values cross this boundary.  Nested values remain
-private implementation details and delegate foreign values to their owner
-serializers.  Scientific validation belongs to the domain constructors; this
-module enforces exact field sets, scalar types, and canonical bytes.
-"""
+"""Calibration-owned primitive trees for its artifact and scientific report."""
 
 from __future__ import annotations
 
@@ -20,12 +14,7 @@ from zlc_neutral_atom.capture.reference import (
     capture_artifact_ref_to_tree,
 )
 from zlc_storage import (
-    ContentRef,
     canonical_text as _text,
-    content_ref_from_tree,
-    content_ref_to_tree,
-    decode,
-    encode,
     exact_mapping as _exact_map,
 )
 
@@ -154,21 +143,6 @@ def _component_validity(tree: Any, field: str) -> ComponentValidity:
     value = validity_from_tree(tree)
     if not isinstance(value, ComponentValidity):
         raise ValueError(f"{field} must be ComponentValidity")
-    return value
-
-
-def _decode_typed(
-    payload: bytes | bytearray | memoryview,
-    parser,
-    projector,
-    name: str,
-):
-    if not isinstance(payload, (bytes, bytearray, memoryview)):
-        raise TypeError(f"{name} payload must be bytes-like")
-    raw = bytes(payload)
-    value = parser(decode(raw))
-    if encode(projector(value)) != raw:
-        raise ValueError(f"{name} payload is typed but non-canonical")
     return value
 
 
@@ -653,7 +627,6 @@ def _model_report_to_tree(value: ModelCalibrationReport) -> dict[str, Any]:
         "quick_thresholds": value.quick_thresholds,
         "short_signals": value.short_signals,
         "short_validity": value.short_validity,
-        "bin_edges": value.bin_edges,
         "predictions": value.predictions,
         "site_fidelity": [_site_fidelity_to_tree(item) for item in value.site_fidelity],
         "aggregate_fidelity": _real(value.aggregate_fidelity, "aggregate_fidelity"),
@@ -674,7 +647,6 @@ def _model_report_from_tree(tree: Any) -> ModelCalibrationReport:
         "quick_thresholds",
         "short_signals",
         "short_validity",
-        "bin_edges",
         "predictions",
         "site_fidelity",
         "aggregate_fidelity",
@@ -689,7 +661,6 @@ def _model_report_from_tree(tree: Any) -> ModelCalibrationReport:
         quick_thresholds=_array(data["quick_thresholds"], "quick_thresholds"),
         short_signals=_array(data["short_signals"], "short_signals"),
         short_validity=_array(data["short_validity"], "short_validity"),
-        bin_edges=_array(data["bin_edges"], "bin_edges"),
         predictions=_array(data["predictions"], "predictions"),
         site_fidelity=tuple(
             _site_fidelity_from_tree(item)
@@ -789,8 +760,8 @@ _REPORT_FIELDS = {
     "request",
     "software_lineage",
     "group_contexts",
-    "reference_average_blob",
-    "reference_average_validity_blob",
+    "reference_average",
+    "reference_average_validity",
     "reference_box_signals",
     "labels",
     "split",
@@ -801,31 +772,17 @@ _REPORT_FIELDS = {
 
 def _report_to_tree(
     value: CalibrationReport,
-    reference_average_blob: ContentRef,
-    reference_average_validity_blob: ContentRef,
 ) -> dict[str, Any]:
     analysis = _analysis_types()
     if not isinstance(value, analysis.CalibrationReport):
         raise TypeError("value must be CalibrationReport")
-    if not isinstance(reference_average_blob, ContentRef):
-        raise TypeError("reference_average_blob must be ContentRef")
-    if not isinstance(reference_average_validity_blob, ContentRef):
-        raise TypeError("reference_average_validity_blob must be ContentRef")
-    if reference_average_blob.size != value.reference_average.nbytes:
-        raise ValueError("reference_average_blob size differs from the report image")
-    if reference_average_validity_blob.size != value.reference_average_validity.nbytes:
-        raise ValueError(
-            "reference_average_validity_blob size differs from the report mask"
-        )
     return {
         "format": CALIBRATION_REPORT_FORMAT,
         "request": _request_to_tree(value.request),
         "software_lineage": _lineage_to_tree(value.software_lineage),
         "group_contexts": _group_contexts_to_tree(value.group_contexts),
-        "reference_average_blob": content_ref_to_tree(reference_average_blob),
-        "reference_average_validity_blob": content_ref_to_tree(
-            reference_average_validity_blob
-        ),
+        "reference_average": value.reference_average,
+        "reference_average_validity": value.reference_average_validity,
         "reference_box_signals": value.reference_box_signals,
         "labels": _labels_to_tree(value.labels),
         "split": _split_to_tree(value.split),
@@ -840,20 +797,18 @@ def _report_data(tree: Any) -> dict[str, Any]:
 
 def _report_from_tree(
     tree: Any,
-    *,
-    reference_average: np.ndarray,
-    reference_average_validity: np.ndarray,
 ) -> CalibrationReport:
     analysis = _analysis_types()
     data = _report_data(tree)
-    content_ref_from_tree(data["reference_average_blob"])
-    content_ref_from_tree(data["reference_average_validity_blob"])
     return analysis.CalibrationReport(
         request=_request_from_tree(data["request"]),
         software_lineage=_lineage_from_tree(data["software_lineage"]),
         group_contexts=_group_contexts_from_tree(data["group_contexts"]),
-        reference_average=reference_average,
-        reference_average_validity=reference_average_validity,
+        reference_average=_array(data["reference_average"], "reference_average"),
+        reference_average_validity=_array(
+            data["reference_average_validity"],
+            "reference_average_validity",
+        ),
         reference_box_signals=_array(
             data["reference_box_signals"],
             "reference_box_signals",
@@ -869,151 +824,27 @@ def _report_from_tree(
     )
 
 
-def encode_calibration_artifact(value: CalibrationArtifact) -> bytes:
-    return encode(_artifact_to_tree(value))
+def calibration_artifact_to_tree(value: CalibrationArtifact) -> dict[str, Any]:
+    return _artifact_to_tree(value)
 
 
-def decode_calibration_artifact(
-    payload: bytes | bytearray | memoryview,
-) -> CalibrationArtifact:
-    return _decode_typed(
-        payload,
-        _artifact_from_tree,
-        _artifact_to_tree,
-        CALIBRATION_ARTIFACT_FORMAT,
-    )
+def calibration_artifact_from_tree(tree: Any) -> CalibrationArtifact:
+    return _artifact_from_tree(tree)
 
 
-def encode_calibration_report_metadata(
-    value: CalibrationReport,
-    *,
-    reference_average_blob: ContentRef,
-    reference_average_validity_blob: ContentRef,
-) -> bytes:
-    return encode(
-        _report_to_tree(
-            value,
-            reference_average_blob,
-            reference_average_validity_blob,
-        )
-    )
+def calibration_report_to_tree(value: CalibrationReport) -> dict[str, Any]:
+    return _report_to_tree(value)
 
 
-def calibration_report_blob_refs(
-    payload: bytes | bytearray | memoryview,
-) -> tuple[ContentRef, ContentRef]:
-    if not isinstance(payload, (bytes, bytearray, memoryview)):
-        raise TypeError("calibration report payload must be bytes-like")
-    data = _report_data(decode(payload))
-    return (
-        content_ref_from_tree(data["reference_average_blob"]),
-        content_ref_from_tree(data["reference_average_validity_blob"]),
-    )
-
-
-def _report_image_bytes(
-    value: np.ndarray,
-    dtype: str,
-    field: str,
-    finite: bool,
-) -> bytes:
-    array = np.asarray(value)
-    if (
-        array.dtype != np.dtype(dtype)
-        or array.ndim != 2
-        or not array.flags.c_contiguous
-        or (finite and not np.all(np.isfinite(array)))
-    ):
-        qualifier = "finite " if finite else ""
-        raise ValueError(f"{field} must be a {qualifier}C-contiguous {dtype} image")
-    return array.tobytes(order="C")
-
-
-def encode_calibration_reference_average(value: np.ndarray) -> bytes:
-    return _report_image_bytes(value, "<f8", "reference_average", True)
-
-
-def encode_calibration_reference_average_validity(value: np.ndarray) -> bytes:
-    return _report_image_bytes(value, "bool", "reference_average_validity", False)
-
-
-def decode_calibration_report_arrays(
-    reference_average_payload: bytes | bytearray | memoryview,
-    reference_average_validity_payload: bytes | bytearray | memoryview,
-    *,
-    image_shape: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray]:
-    if (
-        not isinstance(reference_average_payload, (bytes, bytearray, memoryview))
-        or not isinstance(
-            reference_average_validity_payload,
-            (bytes, bytearray, memoryview),
-        )
-    ):
-        raise TypeError("calibration report array payloads must be bytes-like")
-    try:
-        raw_shape = tuple(image_shape)
-    except TypeError as exc:
-        raise ValueError("image_shape must contain two positive integers") from exc
-    if len(raw_shape) != 2 or any(
-        isinstance(size, bool) or not isinstance(size, Integral) or size <= 0
-        for size in raw_shape
-    ):
-        raise ValueError("image_shape must contain two positive integers")
-    shape = tuple(int(size) for size in raw_shape)
-    pixel_count = shape[0] * shape[1]
-    average_payload = bytes(reference_average_payload)
-    validity_payload = bytes(reference_average_validity_payload)
-    if len(average_payload) != pixel_count * np.dtype("<f8").itemsize:
-        raise ValueError("reference_average payload size differs from image_shape")
-    if len(validity_payload) != pixel_count:
-        raise ValueError(
-            "reference_average_validity payload size differs from image_shape"
-        )
-    average = np.frombuffer(average_payload, dtype="<f8").reshape(shape)
-    validity_bytes = np.frombuffer(validity_payload, dtype="uint8")
-    if np.any(validity_bytes > 1):
-        raise ValueError("reference_average_validity payload is not canonical boolean")
-    validity = validity_bytes.view("bool").reshape(shape)
-    if not np.all(np.isfinite(average)):
-        raise ValueError("reference_average payload contains non-finite values")
-    average.setflags(write=False)
-    validity.setflags(write=False)
-    return average, validity
-
-
-def decode_calibration_report(
-    payload: bytes | bytearray | memoryview,
-    *,
-    reference_average: np.ndarray,
-    reference_average_validity: np.ndarray,
-) -> CalibrationReport:
-    if not isinstance(payload, (bytes, bytearray, memoryview)):
-        raise TypeError("calibration report payload must be bytes-like")
-    raw = bytes(payload)
-    tree = decode(raw)
-    data = _report_data(tree)
-    average_blob = content_ref_from_tree(data["reference_average_blob"])
-    validity_blob = content_ref_from_tree(data["reference_average_validity_blob"])
-    report = _report_from_tree(
-        tree,
-        reference_average=reference_average,
-        reference_average_validity=reference_average_validity,
-    )
-    if encode(_report_to_tree(report, average_blob, validity_blob)) != raw:
-        raise ValueError("calibration report payload is typed but non-canonical")
-    return report
+def calibration_report_from_tree(tree: Any) -> CalibrationReport:
+    return _report_from_tree(tree)
 
 
 __all__ = [
     "CALIBRATION_ARTIFACT_FORMAT",
     "CALIBRATION_REPORT_FORMAT",
-    "decode_calibration_artifact",
-    "decode_calibration_report",
-    "decode_calibration_report_arrays",
-    "encode_calibration_artifact",
-    "encode_calibration_reference_average",
-    "encode_calibration_reference_average_validity",
-    "encode_calibration_report_metadata",
-    "calibration_report_blob_refs",
+    "calibration_artifact_from_tree",
+    "calibration_artifact_to_tree",
+    "calibration_report_from_tree",
+    "calibration_report_to_tree",
 ]

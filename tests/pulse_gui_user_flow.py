@@ -146,7 +146,7 @@ def exercise_offline_dac_round_trip(
 def capture_offscreen_pulse_gui_user_flow(
     output_directory: str | Path,
     *,
-    repository: str | Path | None = None,
+    workspace_root: str | Path | None = None,
     settle_ms: int = 1000,
 ) -> tuple[Path, ...]:
     """Run the offscreen fast flow and return its whole-window PNG files."""
@@ -162,17 +162,14 @@ def capture_offscreen_pulse_gui_user_flow(
     output = Path(output_directory).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     temporary = None
-    if repository is None:
+    if workspace_root is None:
         temporary = tempfile.TemporaryDirectory(prefix="zlc-pulse-user-view-")
-        repository_path = Path(temporary.name)
+        project_path = Path(temporary.name)
     else:
-        repository_path = Path(repository).expanduser().resolve()
+        project_path = Path(workspace_root).expanduser().resolve()
 
     body = open_pulse_editor(
-        workspace=WorkspacePaths.for_workspace(
-            (repository_path / "authored").resolve(),
-            repository_root=repository_path.resolve(),
-        )
+        workspace=WorkspacePaths.for_workspace(project_path.resolve())
     )
     captures: list[dict[str, object]] = []
     try:
@@ -294,12 +291,12 @@ def _main() -> int:
         description="Capture the formal PulseGUI through offscreen Qt input events."
     )
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--repository", type=Path)
+    parser.add_argument("--workspace", type=Path)
     parser.add_argument("--settle-ms", type=int, default=1000)
     arguments = parser.parse_args()
     paths = capture_offscreen_pulse_gui_user_flow(
         arguments.out,
-        repository=arguments.repository,
+        workspace_root=arguments.workspace,
         settle_ms=arguments.settle_ms,
     )
     for path in paths:

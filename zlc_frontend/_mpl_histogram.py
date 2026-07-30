@@ -52,22 +52,25 @@ _AUTOMATIC_ANALYSIS_NOT_SUPPLIED = object()
 
 
 def _histogram_analysis_cache(cache, counts_group, edges):
-    """Return the exact observation-keyed automatic bimodal analysis cache."""
+    """Return a sole-series automatic analysis cache, or ``None``."""
 
-    primary_counts = np.asarray(counts_group[0])
+    counts_group = tuple(counts_group)
+    if len(counts_group) != 1:
+        return None
+    counts = np.asarray(counts_group[0])
     edge_values = np.asarray(edges)
     key = (
         edge_values.dtype.str,
         edge_values.tobytes(order="C"),
-        primary_counts.dtype.str,
-        primary_counts.tobytes(order="C"),
+        counts.dtype.str,
+        counts.tobytes(order="C"),
     )
     if cache is not None and cache[0] == key:
         return cache
     bin_centers = (edge_values[:-1] + edge_values[1:]) * 0.5
     return (
         key,
-        analyze_bimodal_distribution(bin_centers, primary_counts),
+        analyze_bimodal_distribution(bin_centers, counts),
     )
 
 def _histogram_left_fraction(
@@ -245,8 +248,10 @@ def _update_histogram_presentation(
     """Draw Distribution's one automatic analysis or a formal Fit projection.
 
     The bounded automatic two-Gaussian analysis is display-only and consumes
-    the already-binned primary series on the render worker.  It never creates
-    a Fit artifact or publishes parameters.  ``fit_overlays`` is the
+    one already-binned series on the render worker.  Multi-series histograms
+    are presentation-only and never select an arbitrary series to fit.  The
+    analysis never creates a Fit artifact or publishes parameters.
+    ``fit_overlays`` is the
     authoritative exact-source Figure Fit projection; its presence suppresses
     the automatic analysis completely.  Authored thresholds always override
     the automatic display cut without mutating ``state``.
@@ -274,14 +279,16 @@ def _update_histogram_presentation(
     ):
         raise ValueError("formal histogram Fit overlays must align with series")
 
-    if fit_overlays:
+    if fit_overlays or len(counts_group) != 1:
         automatic_analysis = None
     elif automatic_analysis is _AUTOMATIC_ANALYSIS_NOT_SUPPLIED:
-        automatic_analysis = _histogram_analysis_cache(
+        analysis_cache = _histogram_analysis_cache(
             None,
             counts_group,
             edges,
-        )[1]
+        )
+        assert analysis_cache is not None
+        automatic_analysis = analysis_cache[1]
 
     fit_artists = tuple(fit_artists)
     required_artist_count = 3 * len(counts_group)
@@ -312,7 +319,10 @@ def _update_histogram_presentation(
                 raise ValueError(
                     "histogram Fit model exposed an unsupported component count"
                 )
-    elif automatic_analysis.status is FitBatchStatus.CONVERGED:
+    elif (
+        automatic_analysis is not None
+        and automatic_analysis.status is FitBatchStatus.CONVERGED
+    ):
         for artist, values in zip(
             fit_artists[:3],
             automatic_analysis.component_predictions,

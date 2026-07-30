@@ -161,7 +161,7 @@ class ConsoleCapabilityAttachment:
     spec: ConsoleNodeSpec
     create_node: ConsoleNodeFactory
     project_signal_presentation: Callable[
-        [object, str, SignalPublication],
+        [object, str, SignalPublication, tuple[SignalPublication, ...]],
         object | None,
     ] | None = None
 

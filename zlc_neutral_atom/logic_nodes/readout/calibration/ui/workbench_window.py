@@ -1,4 +1,4 @@
-"""Calibration creation/editing Workbench with a committed report view."""
+"""Calibration creation/editing Workbench with a direct FINAL report view."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ def _authority_summary(
 
 
 class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
-    """Edit one frozen calibration request and run an atomic FINAL commit."""
+    """Edit one frozen calibration request and write one direct FINAL record."""
 
     def __init__(
         self,
@@ -125,7 +125,7 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
 
         super().__init__(
             window_title="Readout Calibration",
-            mode_text="FORMAL CALIBRATION · ATOMIC FINAL COMMIT",
+            mode_text="FORMAL CALIBRATION · DIRECT FINAL RECORD",
             loading_summary="Resolving immutable calibration authority…",
             object_prefix="calibrationEditor",
             subject="calibration",
@@ -258,7 +258,7 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
         if self._saved_reference is None:
             self._status.setText("CALIBRATION REQUEST CHANGED")
             self._summary.setText(
-                "No artifact has been committed from the current editor state."
+                "No artifact has been saved from the current editor state."
             )
         else:
             self._status.setText("FINAL CALIBRATION · EDITOR CHANGED")
@@ -297,7 +297,7 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
         self._status.setText("STARTING FORMAL CALIBRATION")
         self._summary.setText(
             "The frozen source and this exact editor revision are entering one "
-            "formal Run; success commits immediately."
+            "formal Run; success returns its FINAL record path."
         )
         self._diagnostic.setText("")
         self._set_busy("start")
@@ -352,11 +352,11 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
         if self._cancel_requested or self._close_requested:
             handle.cancel("calibration Workbench cancelled before Run attachment")
         if not self._run_owner.begin_terminal_job("terminal", handle.result):
-            raise RuntimeError("calibration terminal owner was not admitted")
+            raise RuntimeError("calibration terminal owner was not accepted")
         self._status.setText(
             "CANCELLING CALIBRATION"
             if self._cancel_requested or self._close_requested
-            else "CALIBRATING & COMMITTING"
+            else "CALIBRATING & SAVING"
         )
         self._set_busy("run")
 
@@ -382,14 +382,10 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
         if handle is None:
             raise RuntimeError("calibration terminal completion has no RunHandle")
         snapshot = handle.snapshot()
-        warnings = []
-        if snapshot.commit_publication_warning is not None:
-            warnings.append(
-                f"commit publication warning: {snapshot.commit_publication_warning}"
-            )
-        warnings.extend(f"cleanup warning: {item}" for item in snapshot.cleanup_errors)
+        warnings = [
+            f"cleanup warning: {item}" for item in snapshot.cleanup_errors
+        ]
         self._run_warnings = tuple(warnings)
-        return snapshot
 
     def _diagnostic_with_run_warnings(self, extra: str | None = None) -> str:
         messages = list(self._run_warnings)
@@ -403,35 +399,19 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
         except BaseException as error:
             self._run_owner.finish_terminal_job(generation, owner_reaped=True)
             self._run_active = False
-            snapshot = self._record_terminal_warnings()
-            if snapshot.final_committed:
-                self._receipt_close_again = self._close_requested
-                self._close_requested = False
-                self._status.setText(
-                    self._terminal_status("COMMIT RECEIPT UNAVAILABLE")
-                )
-                self._summary.setText(
-                    "The Run reports FINAL commit, but its exact artifact reference "
-                    "could not be accepted.  The window will not claim cancellation "
-                    "or close automatically."
-                )
-                self._diagnostic.setText(
-                    self._diagnostic_with_run_warnings(error_summary(error))
-                )
-                self._set_busy(None)
-                return
+            self._record_terminal_warnings()
             if self._close_requested:
                 self._close_requested = False
                 self._set_busy(None)
                 super().shutdown()
             elif isinstance(error, RunCancelled):
                 self._status.setText("CALIBRATION CANCELLED")
-                self._summary.setText("No new calibration artifact was committed.")
+                self._summary.setText("No new calibration artifact was saved.")
                 self._diagnostic.setText(error_summary(error))
                 self._set_busy(None)
             else:
                 self._status.setText("CALIBRATION FAILED")
-                self._summary.setText("No new calibration artifact was committed.")
+                self._summary.setText("No new calibration artifact was saved.")
                 self._diagnostic.setText(
                     self._diagnostic_with_run_warnings(error_summary(error))
                 )
@@ -440,46 +420,23 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
 
         self._run_owner.finish_terminal_job(generation, owner_reaped=True)
         self._run_active = False
-        snapshot = self._record_terminal_warnings()
+        self._record_terminal_warnings()
         if not isinstance(result, CalibrationArtifactRef):
             error = TypeError("calibration Run returned an invalid reference")
-            if snapshot.final_committed:
-                self._receipt_close_again = self._close_requested
-                self._close_requested = False
-                self._status.setText(self._terminal_status("COMMIT RECEIPT INVALID"))
-                self._summary.setText(
-                    "The Run reports FINAL commit, but returned a non-calibration "
-                    "receipt.  No exact reference is being guessed or hidden."
-                )
-                self._diagnostic.setText(
-                    self._diagnostic_with_run_warnings(error_summary(error))
-                )
-                self._set_busy(None)
-                return
             if self._close_requested:
                 self._close_requested = False
                 self._set_busy(None)
                 super().shutdown()
             else:
                 self._status.setText("CALIBRATION FAILED")
-                self._summary.setText("No calibration artifact was committed.")
-                self._diagnostic.setText(error_summary(error))
-                self._set_busy(None)
-            return
-        if not snapshot.final_committed:
-            self._receipt_close_again = self._close_requested
-            self._close_requested = False
-            self._status.setText(self._terminal_status("COMMIT EVIDENCE MISSING"))
-            self._summary.setText(
-                "A typed calibration reference was returned without terminal "
-                "final-commit evidence.  It is not being admitted as SAVED or FINAL."
-            )
-            self._diagnostic.setText(
-                self._diagnostic_with_run_warnings(
-                    "Run protocol violation: final_committed is false"
+                self._summary.setText(
+                    "The successful Run returned no CalibrationArtifactRef; "
+                    "no reference is being guessed."
                 )
-            )
-            self._set_busy(None)
+                self._diagnostic.setText(
+                    self._diagnostic_with_run_warnings(error_summary(error))
+                )
+                self._set_busy(None)
             return
         reference = result
         self._saved_reference = reference
@@ -487,7 +444,7 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
         self._close_requested = False
         self._status.setText(self._terminal_status())
         self._summary.setText(
-            f"FINAL {reference.repository_id}:{reference.manifest_digest} · "
+            f"FINAL {reference.record_path} · "
             "reopening the paired artifact/report from this exact reference."
         )
         self._diagnostic.setText(self._diagnostic_with_run_warnings())
@@ -564,7 +521,7 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
                 self._status.setText(self._terminal_status(display_failed=True))
                 self._diagnostic.setText(
                     self._diagnostic_with_run_warnings(
-                        "Report projection was cancelled after commit."
+                        "Report projection was cancelled after FINAL save."
                     )
                 )
                 self._set_busy(None)
@@ -655,7 +612,7 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
         reference = self._saved_reference
         if reference is not None:
             self._summary.setText(
-                f"FINAL {reference.repository_id}:{reference.manifest_digest}\n"
+                f"FINAL {reference.record_path}\n"
                 f"{bundle.summary}"
             )
         if displayed:
@@ -686,7 +643,7 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
         self._set_busy(None)
 
     def _start_report_render_if_ready(self) -> None:
-        # The formal Run has priority over re-rasterizing the already-committed
+        # The formal Run has priority over re-rasterizing the already-saved
         # report.  A screen change still clears stale pixels immediately; the
         # newest surface request remains queued until the Run resolves.
         if self._run_active:
@@ -726,7 +683,7 @@ class CalibrationWorkbenchWindow(CalibrationReportSurfaceWindow):
                 handle.cancel("calibration Workbench requested close")
             self._status.setText("CANCELLING CALIBRATION · CLOSE DEFERRED")
             self._diagnostic.setText(
-                "If FINAL commit wins, the exact reference will be shown before "
+                "If the FINAL save wins, the exact reference will be shown before "
                 "this window may close."
             )
             self._set_busy("run")

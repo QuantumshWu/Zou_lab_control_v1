@@ -380,17 +380,13 @@ class _SequencerSessionOwner:
             raise TimeoutError("sequencer close exceeded its bounded deadline")
         if session is not None and not self._wait_until_joined(session, deadline):
             raise TimeoutError("sequencer physical operation did not join before close")
-        safe, digest = self._backend._backend_close_evidence(
-            command.session_id,
-            snapshot,
-        )
+        safe = self._backend._backend_safe_state_confirmed(snapshot)
         acknowledgement = SessionClosedAck(
             command.session_id,
             binding.binding_instance_id,
             safe,
             safe,
             safe,
-            digest,
         )
         with self._condition:
             if session is not None:
@@ -399,13 +395,14 @@ class _SequencerSessionOwner:
                 session.close_acknowledged = True
         return acknowledgement
 
-    def interrupt(self) -> str:
+    def interrupt(self) -> None:
         with self._condition:
             self._operation_epoch += 1
             if self._session is not None:
                 self._session.closed = True
         snapshot = self._set_safe_state()
-        return self._backend._backend_interrupt_digest(snapshot)
+        if not self._backend._backend_safe_state_confirmed(snapshot):
+            raise RuntimeError("sequencer interrupt did not reach verified SAFE state")
 
     def _validate_binding(self, binding: BoundDevice) -> None:
         _require_binding(binding, "sequencer", self._binding_instance_id)
@@ -524,8 +521,8 @@ class _OwnedSequencerEndpoint:
     ) -> SessionClosedAck:
         return self._owner.close_session(binding, command)
 
-    def interrupt(self) -> str:
-        return self._owner.interrupt()
+    def interrupt(self) -> None:
+        self._owner.interrupt()
 
 
 __all__: list[str] = []

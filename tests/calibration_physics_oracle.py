@@ -1,6 +1,6 @@
 """Array-input harness for current calibration physics oracles.
 
-Production calibration accepts an admitted capture.  The deterministic tests
+Production calibration accepts a loaded capture.  The deterministic tests
 below start from frozen arrays, so this module adapts only their input shape to
 the same product science core; it owns no algorithm, artifact authority, or
 public compatibility surface.

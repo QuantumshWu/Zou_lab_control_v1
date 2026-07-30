@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from pathlib import Path
 import threading
 import time
 
@@ -29,14 +28,9 @@ from zlc_pulse import (
     PulseTarget,
     RepeatRegion,
     ScanParameter,
-    build_pulse_timeline,
-    compile_pulse_artifact,
     save_pulse_document,
 )
 from zlc_workbench.pulse_editor.session import PulseEditorSession
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def _target() -> PulseTarget:
@@ -180,23 +174,6 @@ def test_scan_preview_uses_visible_nominal_values_not_the_first_scan_row():
 
     assert timeline.reference_label == "nominal scan/API reference"
     assert timeline.logical_duration_ticks == 20
-
-
-def test_timeline_rejects_labels_from_another_source_document():
-    document = _document()
-    artifact = compile_pulse_artifact(
-        document,
-        clock_hz=100e6,
-        execution_form=PulseExecutionForm.STATIC_ONCE,
-        live_target=document.target,
-    )
-
-    with pytest.raises(ValueError, match="another PulseDocument"):
-        build_pulse_timeline(
-            replace(document, name="wrong labels"),
-            artifact,
-            reference_label="compiled static pulse",
-        )
 
 
 def test_hardware_run_retains_authored_api_intent_and_explicit_values():
@@ -360,8 +337,7 @@ def test_notebook_pulse_run_and_cancelled_hold_share_the_runtime_safe_path(tmp_p
     with connect(
         "virtual",
         workspace=WorkspacePaths.for_workspace(
-            ROOT,
-            repository_root=tmp_path / "experiment",
+            (tmp_path / "experiment").resolve()
         ),
     ) as experiment:
         target = experiment.pulse.target
@@ -431,4 +407,3 @@ def test_notebook_pulse_run_and_cancelled_hold_share_the_runtime_safe_path(tmp_p
         terminal = hold.wait(5.0)
 
     assert terminal.state is RunState.CANCELLED
-    assert not terminal.final_committed

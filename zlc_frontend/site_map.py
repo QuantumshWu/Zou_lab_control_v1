@@ -45,9 +45,6 @@ class SiteMapPresentation(Protocol):
     centers_xy: np.ndarray
     site_radius: float
     site_validity: np.ndarray
-    run_id: str
-    provenance_epoch_id: str
-    coherence_identity: str
     summary: str
 
     @property
@@ -55,12 +52,6 @@ class SiteMapPresentation(Protocol):
 
     @property
     def cell_selection(self) -> "Selection": ...
-
-    @property
-    def site_geometry_identity(self) -> str: ...
-
-    @property
-    def view_identity(self) -> str: ...
 
     @property
     def site_state(self) -> np.ndarray | None: ...
@@ -138,9 +129,20 @@ def immutable_site_state(
     center_source = np.asarray(centers_xy)
     if center_source.dtype.kind not in "iuf":
         raise TypeError("centers_xy must contain real numeric values")
+    target_dtype = np.dtype("<f8")
+    # Preserve an already-owned immutable geometry object. Site geometry is
+    # generation-static, and render/session continuity deliberately follows
+    # that stable owner across changing background/state revisions. An eager
+    # dtype/order conversion creates a fresh ndarray header even when the same
+    # bytes-backed geometry is supplied, falsely starting a new Figure session.
+    normalized_centers = (
+        center_source
+        if center_source.dtype == target_dtype
+        else np.asarray(center_source, dtype=target_dtype)
+    )
     centers = immutable_array(
-        np.asarray(center_source, dtype=np.dtype("<f8"), order="C"),
-        dtype=np.dtype("<f8"),
+        normalized_centers,
+        dtype=target_dtype,
         shape=(count, 2),
     )
     if not np.all(np.isfinite(centers)):

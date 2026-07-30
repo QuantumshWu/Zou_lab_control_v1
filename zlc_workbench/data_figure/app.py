@@ -473,12 +473,12 @@ def open_figure_workbench(
         raise ValueError("all four Figure Fit capabilities must be supplied together")
     fit_bindings = None
     if any(item is not None for item in fit_calls):
-        from zlc_neutral_atom.artifacts import FitExecution, FitResultArtifactRef
+        from zlc_neutral_atom.artifacts import FitResultArtifactRef
 
-        def execution_result(execution) -> FitResultBatch:
-            if not isinstance(execution, FitExecution):
-                raise TypeError("artifact Fit executor must return FitExecution")
-            return execution.result
+        def execution_result(result) -> FitResultBatch:
+            if not isinstance(result, FitResultBatch):
+                raise TypeError("artifact Fit executor must return FitResultBatch")
+            return result
 
         def save_execution(execution, destination, _display) -> FitSaveReceipt:
             if destination is not None:
@@ -486,7 +486,7 @@ def open_figure_workbench(
             reference = fit_saver(execution)
             if not isinstance(reference, FitResultArtifactRef):
                 raise TypeError("artifact Fit saver returned another reference type")
-            identity = f"{reference.repository_id}:{reference.manifest_digest}"
+            identity = reference.record_path
             return FitSaveReceipt(
                 reference,
                 identity,

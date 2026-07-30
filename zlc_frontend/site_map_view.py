@@ -24,39 +24,20 @@ from zlc_data import (
     Value,
     ValueSchema,
 )
-from zlc_data.codec import dataset_revision_ref_to_tree
-from zlc_data.selection import selection_to_tree
 from zlc_data.snapshot_projection import materialize_component_dataset
 from zlc_data.value import dataset_cell_value, expand_value_validity
-from zlc_storage import canonical_digest, canonical_text, positive_real
+from zlc_storage import canonical_text, positive_real
 
 from zlc_frontend.figure import DatasetId, EvaluatedAxis, EvaluatedImage, EvaluatedInput
 from zlc_frontend.figure_outputs import (
     AREA_DATA_OUTPUT,
     FigureDerivedSignal,
+    _figure_output_revision_ref,
     figure_derived_signal,
-    figure_output_revision_ref,
 )
 from zlc_frontend.figure_source import FigureSource
 from zlc_frontend.image_view import ImageViewportTransform
 from zlc_frontend.site_map import immutable_site_state, site_ring_radius
-
-
-def _site_map_input_tree(view) -> dict[str, object]:
-    """Canonical lineage for one source-owned, already coherent SiteMap."""
-
-    def evaluated_input_tree(value: EvaluatedInput) -> dict[str, object]:
-        return {
-            "dataset_id": value.dataset_id.value,
-            "ref": dataset_revision_ref_to_tree(value.ref),
-        }
-
-    return {
-        "background": evaluated_input_tree(view.background_input),
-        "site_state": evaluated_input_tree(view.site_state_input),
-        "site_geometry_identity": view.site_geometry_identity,
-        "view_identity": view.view_identity,
-    }
 
 
 def _site_map_data_snapshot(
@@ -67,7 +48,6 @@ def _site_map_data_snapshot(
     *,
     data_axes: tuple[AxisSpec, ...],
     unit: str | None,
-    semantic_identity: dict[str, object],
 ) -> OwnedSnapshot:
     """Materialise selected site components without reducing SITE validity."""
 
@@ -81,11 +61,10 @@ def _site_map_data_snapshot(
         validity_axis_ids=(site_axis.axis_id,),
         validity=validity,
         unit=unit,
-        reference_for=lambda schema: figure_output_revision_ref(
+        reference_for=lambda schema: _figure_output_revision_ref(
             AREA_DATA_OUTPUT,
             source_ref,
             schema,
-            semantic_identity,
         ),
     )
 
@@ -124,15 +103,6 @@ def _site_map_area_outputs(
         & (centers[:, 1] >= float(y_term.lower))
         & (centers[:, 1] <= float(y_term.upper))
     )
-    lineage = _site_map_input_tree(view)
-    selection_tree = selection_to_tree(selection)
-    derivation_digest = canonical_digest(
-        {
-            "owner": "zlc_frontend.site-map-area",
-            "inputs": lineage,
-            "selection": selection_tree,
-        }
-    )
     # There is no selected data for an empty box.  Geometry is provenance, not
     # a second public signal, and inventing a sentinel site would be false data.
     if not selected.size:
@@ -155,22 +125,14 @@ def _site_map_area_outputs(
         values = np.asarray(site_state, dtype=np.bool_)[selected]
         data_axes = (site_axis,)
         unit = None
-        quantity = "site-state"
     else:
         if x_axis.unit != y_axis.unit:
             raise ValueError(
                 "state-free SiteMap Area cannot combine x/y coordinates with "
                 "different units into one area.data signal"
             )
-        identity = canonical_digest(
-            {
-                "owner": "zlc_frontend.site-map-area-coordinate",
-                "source_block_id": snapshot.ref.block_id.value,
-                "selection": selection_tree,
-            }
-        )
         coordinate_axis = AxisSpec(
-            AxisId(f"figure-output-{identity[:24]}-coordinate"),
+            AxisId("site-map-coordinate"),
             "coordinate",
             COMPONENT,
             2,
@@ -179,7 +141,6 @@ def _site_map_area_outputs(
         values = np.asarray(centers[selected], dtype="<f8")
         data_axes = (site_axis, coordinate_axis)
         unit = x_axis.unit
-        quantity = "calibrated-centers"
 
     result = _site_map_data_snapshot(
         snapshot.ref,
@@ -188,11 +149,6 @@ def _site_map_area_outputs(
         validity,
         data_axes=data_axes,
         unit=unit,
-        semantic_identity={
-            "inputs": lineage,
-            "selection": selection_tree,
-            "quantity": quantity,
-        },
     )
     return {
         AREA_DATA_OUTPUT: figure_derived_signal(
@@ -200,7 +156,6 @@ def _site_map_area_outputs(
             result,
             source,
             preserve_source_coverage=False,
-            derivation_digest=derivation_digest,
         )
     }
 
@@ -283,10 +238,6 @@ def build_site_map_snapshot_view(
     coordinate_frame: CoordinateFrameId,
     centers_xy: np.ndarray,
     site_validity: np.ndarray,
-    site_geometry_identity: str,
-    coherence_identity: str,
-    run_id: str,
-    provenance_epoch_id: str,
     summary: str,
     presentation_kind: str = "site-map",
 ) -> "SiteMapView":
@@ -303,23 +254,15 @@ def build_site_map_snapshot_view(
         raise ValueError(
             "SiteMap background and site geometry use different coordinate frames"
         )
-    identity = canonical_digest(
-        {
-            "owner": "zlc_frontend.site-map-snapshot-view",
-            "source": dataset_revision_ref_to_tree(snapshot.ref),
-            "site_geometry_identity": site_geometry_identity,
-            "coherence_identity": coherence_identity,
-        }
-    )
     selection = Selection((IndexSelection(schema.repeat_axis.axis_id, 0),))
     return SiteMapView(
         background=background,
         background_input=EvaluatedInput(
-            DatasetId(f"site-map-background-{identity}"),
+            DatasetId("site-map-background"),
             snapshot.ref,
         ),
         site_state_input=EvaluatedInput(
-            DatasetId(f"site-map-state-{identity}"),
+            DatasetId("site-map-state"),
             snapshot.ref,
         ),
         cell_selection=selection,
@@ -330,12 +273,7 @@ def build_site_map_snapshot_view(
         site_radius=site_ring_radius(centers_xy),
         site_validity=site_validity,
         site_state=None,
-        site_geometry_identity=site_geometry_identity,
-        view_identity=identity,
-        coherence_identity=coherence_identity,
         presentation_kind=presentation_kind,
-        run_id=run_id,
-        provenance_epoch_id=provenance_epoch_id,
         summary=summary,
     )
 
@@ -350,10 +288,6 @@ def build_site_map_cell_view(
     site_axis: AxisSpec,
     coordinate_frame: CoordinateFrameId,
     centers_xy: np.ndarray,
-    site_geometry_identity: str,
-    coherence_identity: str,
-    run_id: str,
-    provenance_epoch_id: str,
     summary: str,
     presentation_kind: str = "site-map-cell",
 ) -> "SiteMapView":
@@ -390,24 +324,14 @@ def build_site_map_cell_view(
         raise ValueError("SiteMap state validity must name exactly the SITE axis")
     state_values = np.asarray(state_value.values, dtype=np.bool_)
     site_validity = np.asarray(state_value.validity.mask, dtype=np.bool_)
-    identity = canonical_digest(
-        {
-            "owner": "zlc_frontend.site-map-cell-view",
-            "source": dataset_revision_ref_to_tree(background_ref),
-            "state": dataset_revision_ref_to_tree(state_ref),
-            "site_geometry_identity": site_geometry_identity,
-            "coherence_identity": coherence_identity,
-            "selection": selection_to_tree(selection),
-        }
-    )
     return SiteMapView(
         background=background,
         background_input=EvaluatedInput(
-            DatasetId(f"site-map-background-{identity}"),
+            DatasetId("site-map-background"),
             background_ref,
         ),
         site_state_input=EvaluatedInput(
-            DatasetId(f"site-map-state-{identity}"),
+            DatasetId("site-map-state"),
             state_ref,
         ),
         cell_selection=selection,
@@ -418,12 +342,7 @@ def build_site_map_cell_view(
         site_radius=site_ring_radius(centers_xy),
         site_state=state_values,
         site_validity=site_validity,
-        site_geometry_identity=site_geometry_identity,
-        view_identity=identity,
-        coherence_identity=coherence_identity,
         presentation_kind=presentation_kind,
-        run_id=run_id,
-        provenance_epoch_id=provenance_epoch_id,
         summary=summary,
     )
 
@@ -442,12 +361,7 @@ class SiteMapView:
     site_radius: float
     site_validity: np.ndarray
     site_state: np.ndarray | None
-    site_geometry_identity: str
-    view_identity: str
-    coherence_identity: str
     presentation_kind: str
-    run_id: str
-    provenance_epoch_id: str
     summary: str
 
     def __post_init__(self) -> None:
@@ -504,12 +418,7 @@ class SiteMapView:
         )
         radius = positive_real(self.site_radius, "site_radius")
         for value, name in (
-            (self.site_geometry_identity, "site_geometry_identity"),
-            (self.view_identity, "view_identity"),
-            (self.coherence_identity, "coherence_identity"),
             (self.presentation_kind, "presentation_kind"),
-            (self.run_id, "run_id"),
-            (self.provenance_epoch_id, "provenance_epoch_id"),
         ):
             canonical_text(value, name)
         canonical_text(self.summary, "SiteMap summary")

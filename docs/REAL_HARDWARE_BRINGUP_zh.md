@@ -200,7 +200,7 @@ observer 只要在任一采样中看见 `STATUS_UNDERFLOW`，即使该位随后�
 
 | # | 检查 | 通过判据 |
 |---|---|---|
-| S1 | 分别运行只占一个 bank、恰跨 bank、超过两个 bank 的 finite 表 | 每次只有一个 FIRE；point/camera 总数、ordered schedule、cursor terminal、producer-owned SignalAssociationEvidence 与 collector coverage 完全一致 |
+| S1 | 分别运行只占一个 bank、恰跨 bank、超过两个 bank 的 finite 表 | 每次只有一个 FIRE；point/camera 总数、ordered schedule、single-use association finish、ordered EventRef/direct parents 与 collector coverage 完全一致 |
 | S2 | 运行奇数与偶数 chunk 数，并以 9999 点表做 streamed 压力检查 | bank/chunk 顺序与冻结 table digest 一致；无 observed UNDERFLOW、ERROR、错序、重复或遗漏 |
 | S3 | 运行 cyclic 表并在多个 wrap 后取消 | wrap 顺序保持冻结映射；cancel 由同一 observer 收口并进入 SAFE，不遗留第二个 I/O worker |
 | S4 | 在测试环境故意把一次 refill 延迟到 bank 边界附近 | observer 必须由 UNDERFLOW 或 refill 后的 cursor 跨 chunk 证明拒绝该 run，随后 SAFE 成功；不得以稍后的 RUNNING/DONE 判成功 |

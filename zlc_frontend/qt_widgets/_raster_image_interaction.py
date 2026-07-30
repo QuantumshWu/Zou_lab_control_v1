@@ -32,10 +32,8 @@ from ._raster_front import (
     _hold_matches_frame,
     _panel_bounds,
     _panel_image_geometry,
-    _panel_presentation,
     _presentation_answers,
     _panel_semantics_changed,
-    _raster_geometry,
     _site_map_payload,
     _visible_display,
 )
@@ -482,15 +480,11 @@ def _sample_for_target(
     image_target, _frame, panel = target[0], target[1], target[2]
     if hold is not None and hold.panel_id == panel.panel_id:
         payload = _image_payload(hold)
-        presentation = hold.presentation
     else:
         payload = _image_payload(panel)
-        presentation = _panel_presentation(panel)
     if payload is None:
         return None
     viewport = payload.viewport
-    if presentation.panel_revision != viewport.viewport_revision:
-        return None
     normalized = _normalized_point(point, image_target, clamp=False)
     y_index, x_index = viewport.sample_indices_for_visible_point(normalized)
     value = payload.image.values[y_index, x_index]
@@ -517,14 +511,8 @@ def _sample_for_target(
 def _held_panel_from_target(target) -> _HeldPanelFront:
     frame, panel, prepared = target[1], target[2], target[3]
     return _HeldPanelFront(
-        panel_id=panel.panel_id,
-        board_id=frame.board_id,
-        layout_generation=frame.layout_generation,
-        sequence=frame.sequence,
-        coherence_group=panel.coherence_group,
-        source_identity=panel.source_identity,
-        presentation=_panel_presentation(panel),
-        raster_geometry=_raster_geometry(panel),
+        board=frame,
+        panel=panel,
         prepared=prepared,
         display_payload=(
             target[4] if len(target) > 4 else panel.display_payload

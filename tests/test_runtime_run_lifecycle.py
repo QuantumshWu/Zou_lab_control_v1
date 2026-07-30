@@ -1,4 +1,4 @@
-"""Current flat Run lifecycle and FINAL commit contracts."""
+"""Current flat Run lifecycle and post-safety finalization contracts."""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from Zou_lab_control.api._application_services import (
 from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
 from zlc_neutral_atom.runtime._failure import detach_failure, safe_error_summary
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
-from zlc_neutral_atom.runtime.commit import PreparedArtifactCommit
 from zlc_neutral_atom.runtime.cancellation import CancellationRequested
 from zlc_neutral_atom.runtime.ports import (
     BoundDevice,
@@ -38,7 +37,6 @@ from zlc_neutral_atom.runtime.resources import (
 )
 from zlc_neutral_atom.runtime.run import (
     CancelOutcome,
-    CapabilityRevoked,
     PostSafetyContext,
     RunCancelled,
     RunContext,
@@ -49,7 +47,6 @@ from zlc_neutral_atom.runtime.run import (
     RunStartRejected,
     RunState,
 )
-from zlc_storage import RepositoryRootLease
 
 
 def camera_key(name: str = "a") -> ResourceKey:
@@ -60,7 +57,6 @@ def identity(resource: ResourceKey) -> PhysicalDeviceIdentity:
     return PhysicalDeviceIdentity(
         stable_device_identity=str(resource),
         evidence_kind=DeviceIdentityEvidenceKind.HARDWARE_IDENTITY_READBACK,
-        evidence_digest=f"identity-readback:{resource}",
         asset_map_revision="test-assets-v1",
     )
 
@@ -93,7 +89,6 @@ def device_fixture(
             source_stopped=True,
             no_more_work=True,
             joined=True,
-            acknowledgement_digest="test-session-closed",
         )
 
     device = broker.bind(
@@ -126,7 +121,6 @@ def plan(
     cleanup=None,
     finalize=lambda _context, executed: executed,
     interrupt: bool = False,
-    requires_final_commit: bool = False,
     timeout_seconds: float | None = None,
 ) -> RunPlan:
     cleanup = cleanup or (
@@ -145,7 +139,6 @@ def plan(
             if interrupt
             else ()
         ),
-        requires_final_commit=requires_final_commit,
         timeout_seconds=timeout_seconds,
     )
 
@@ -175,51 +168,6 @@ def wait_snapshot(handle, predicate, timeout: float = 2.0) -> RunSnapshot:
         if time.monotonic() >= deadline:
             raise TimeoutError(f"Run did not reach requested state: {snapshot}")
         time.sleep(0.002)
-
-
-def prepare_final_commit(
-    context: PostSafetyContext,
-    lease: RepositoryRootLease,
-    *,
-    artifact_name: str,
-    publish,
-    inspect=lambda _payload: True,
-    run_id: str | None = None,
-) -> PreparedArtifactCommit[str]:
-    if run_id is None:
-        run_id = context.authorize_commit_preparation()
-    operation = PreparedArtifactCommit(
-        run_id=run_id,
-        result=f"artifacts/{artifact_name}",
-        manifest_payload=f"manifest:{artifact_name}".encode("utf-8"),
-        publish=publish,
-        inspect=inspect,
-        repository_borrow=lease.borrow(),
-    )
-    try:
-        context.track_prepared_commit(operation)
-    except BaseException:
-        operation.abandon()
-        raise
-    return operation
-
-
-def commit_final(
-    context: PostSafetyContext,
-    lease: RepositoryRootLease,
-    *,
-    artifact_name: str,
-    publish,
-    inspect=lambda _payload: True,
-):
-    operation = prepare_final_commit(
-        context,
-        lease,
-        artifact_name=artifact_name,
-        publish=publish,
-        inspect=inspect,
-    )
-    return context.commit_final(operation)
 
 
 class _AdmissionRuntime:
@@ -260,12 +208,11 @@ def _admission_environment(tmp_path):
     services = ExperimentServices(
         workspace_paths=WorkspacePaths.for_workspace(
             tmp_path.resolve(),
-            repository_root=tmp_path.resolve(),
         ),
         installation=object(),
         runtime=runtime,
-        capture_repository=object(),
-        fit_repository=object(),
+        captures_root=tmp_path.resolve() / "_output" / "captures",
+        calibrations_root=tmp_path.resolve() / "_output" / "calibrations",
         catalog=object(),
         installation_config=object(),
         pulse_application=object(),
@@ -697,351 +644,95 @@ def test_cleanup_failure_fails_only_the_current_run(tmp_path):
     close_runtime(runtime, arbiter, item)
 
 
-def test_final_commit_is_linearization_point_for_late_cancel(tmp_path):
-    item = device_fixture("commit-gate")
+def test_finalize_start_is_linearization_point_for_late_cancel(tmp_path):
+    item = device_fixture("finalize-gate")
     runtime, arbiter = controller(tmp_path)
-    lease = RepositoryRootLease(tmp_path / "repository")
-    committed = threading.Event()
+    finalize_entered = threading.Event()
     release = threading.Event()
+    observed = []
 
-    def finalize(context, _executed):
-        result = commit_final(
-            context,
-            lease,
-            artifact_name="final-linearization",
-            publish=lambda _payload: None,
-        )
-        committed.set()
+    def finalize(context: PostSafetyContext, executed):
+        observed.append(context.run_id)
+        finalize_entered.set()
         assert release.wait(1.0)
-        return result
+        return f"final:{executed}"
 
-    handle = runtime.start(
-        plan(item, finalize=finalize, requires_final_commit=True)
-    )
-    assert committed.wait(1.0)
-    assert handle.cancel("too late") is CancelOutcome.TOO_LATE_ALREADY_COMMITTED
+    handle = runtime.start(plan(item, finalize=finalize))
+    assert finalize_entered.wait(1.0)
+    assert observed == [handle.run_id]
+    assert handle.cancel("too late") is CancelOutcome.TOO_LATE_FINALIZING
     release.set()
-    assert handle.result(2.0) == "artifacts/final-linearization"
-    lease.close()
+    assert handle.result(2.0) == "final:prepared"
     close_runtime(runtime, arbiter, item)
 
 
-def test_finalize_failure_after_prepare_abandons_repository_borrow(tmp_path):
-    item = device_fixture("abandon-prepared-commit")
+def test_finalize_failure_is_an_ordinary_run_failure_after_release(tmp_path):
+    item = device_fixture("finalize-failure")
     runtime, arbiter = controller(tmp_path)
-    lease = RepositoryRootLease(tmp_path / "abandoned-repository")
-    publish_calls = 0
-
-    def publish(_payload):
-        nonlocal publish_calls
-        publish_calls += 1
 
     def finalize(context, _executed):
-        prepare_final_commit(
-            context,
-            lease,
-            artifact_name="never-published",
-            publish=publish,
-        )
-        raise RuntimeError("finalize failed after commit preparation")
+        assert arbiter.wait_until_released((context.run_id.value,), timeout=0.0)
+        raise RuntimeError("domain finalization failed")
 
-    handle = runtime.start(
-        plan(item, finalize=finalize, requires_final_commit=True)
-    )
-    with pytest.raises(RunFailed, match="failed after commit preparation"):
+    handle = runtime.start(plan(item, finalize=finalize))
+    with pytest.raises(RunFailed, match="domain finalization failed"):
         handle.result(2.0)
-    assert publish_calls == 0
-    lease.close()
+    assert handle.snapshot().state is RunState.FAILED
     close_runtime(runtime, arbiter, item)
 
 
-def test_commit_for_another_run_never_publishes_and_releases_borrow(tmp_path):
-    item = device_fixture("commit-run-id")
+def test_cancel_before_finalize_skips_domain_output(tmp_path):
+    item = device_fixture("cancel-before-finalize")
     runtime, arbiter = controller(tmp_path)
-    lease = RepositoryRootLease(tmp_path / "wrong-run-repository")
-    publish_calls = 0
+    cleanup_entered = threading.Event()
+    cleanup_release = threading.Event()
+    finalized = []
 
-    def publish(_payload):
-        nonlocal publish_calls
-        publish_calls += 1
-
-    def finalize(context, _executed):
-        operation = PreparedArtifactCommit(
-            run_id="another-run",
-            result="artifacts/wrong-run",
-            manifest_payload=b"manifest:wrong-run",
-            publish=publish,
-            inspect=lambda _payload: True,
-            repository_borrow=lease.borrow(),
-        )
-        return context.commit_final(operation)
+    def cleanup(context, _prepared, _primary):
+        cleanup_entered.set()
+        assert cleanup_release.wait(1.0)
+        return safe_cleanup(context, item.key)
 
     handle = runtime.start(
-        plan(item, finalize=finalize, requires_final_commit=True)
+        plan(
+            item,
+            cleanup=cleanup,
+            finalize=lambda _context, _executed: finalized.append(True),
+        )
     )
-    with pytest.raises(RunFailed, match="belongs to another Run"):
+    assert cleanup_entered.wait(1.0)
+    assert handle.cancel("before domain output") is CancelOutcome.REQUESTED
+    cleanup_release.set()
+    with pytest.raises(RunCancelled):
         handle.result(2.0)
-    assert publish_calls == 0
-    lease.close()
+    assert finalized == []
+    assert arbiter.wait_until_released((handle.run_id.value,), timeout=0.0)
     close_runtime(runtime, arbiter, item)
 
 
-def test_same_prepared_commit_and_run_final_gate_are_single_use(tmp_path):
-    item = device_fixture("single-use-commit")
+def test_post_safety_context_only_exposes_run_identity(tmp_path):
+    item = device_fixture("post-safety-context")
     runtime, arbiter = controller(tmp_path)
-    lease = RepositoryRootLease(tmp_path / "single-use-repository")
-    publish_calls = 0
+    observed = []
 
-    def publish(_payload):
-        nonlocal publish_calls
-        publish_calls += 1
-
-    def finalize(context, _executed):
-        operation = prepare_final_commit(
-            context,
-            lease,
-            artifact_name="single-use",
-            publish=publish,
-        )
-        result = context.commit_final(operation)
-        with pytest.raises(RuntimeError, match="only once"):
-            context.commit_final(operation)
-        return result
-
-    handle = runtime.start(
-        plan(item, finalize=finalize, requires_final_commit=True)
-    )
-    assert handle.result(2.0) == "artifacts/single-use"
-    assert publish_calls == 1
-    lease.close()
-    close_runtime(runtime, arbiter, item)
-
-
-def test_visible_manifest_after_lost_ack_succeeds_with_publication_warning(tmp_path):
-    item = device_fixture("lost-ack-visible")
-    runtime, arbiter = controller(tmp_path)
-    lease = RepositoryRootLease(tmp_path / "lost-ack-repository")
-    publish_calls = 0
-    inspect_calls = 0
-
-    def publish(_payload):
-        nonlocal publish_calls
-        publish_calls += 1
-        raise OSError("publication acknowledgement lost")
-
-    def inspect(_payload):
-        nonlocal inspect_calls
-        inspect_calls += 1
-        return True
-
-    def finalize(context, _executed):
-        return commit_final(
-            context,
-            lease,
-            artifact_name="lost-ack-visible",
-            publish=publish,
-            inspect=inspect,
-        )
-
-    handle = runtime.start(
-        plan(item, finalize=finalize, requires_final_commit=True)
-    )
-    assert handle.result(2.0) == "artifacts/lost-ack-visible"
-    snapshot = handle.snapshot()
-    assert snapshot.final_committed
-    assert snapshot.commit_publication_warning is not None
-    assert "publication acknowledgement lost" in snapshot.commit_publication_warning
-    assert publish_calls == inspect_calls == 1
-    lease.close()
-    close_runtime(runtime, arbiter, item)
-
-
-def test_commit_inspection_wait_does_not_hold_device_or_republish(tmp_path):
-    item = device_fixture("inspect-pending")
-    runtime, arbiter = controller(tmp_path)
-    lease = RepositoryRootLease(tmp_path / "pending-repository")
-    inspection_resolved = threading.Event()
-    publish_calls = 0
-    inspect_calls = 0
-
-    def publish(_payload):
-        nonlocal publish_calls
-        publish_calls += 1
-        raise OSError("publication acknowledgement lost")
-
-    def inspect(_payload):
-        nonlocal inspect_calls
-        inspect_calls += 1
-        return True if inspection_resolved.is_set() else None
-
-    def finalize(context, _executed):
-        return commit_final(
-            context,
-            lease,
-            artifact_name="inspection-pending",
-            publish=publish,
-            inspect=inspect,
-        )
-
-    first = runtime.start(
-        plan(item, finalize=finalize, requires_final_commit=True)
-    )
-    wait_snapshot(first, lambda value: value.phase == "commit-inspection-pending")
-    assert publish_calls == 1
-    assert arbiter.wait_until_released((first.run_id.value,), timeout=0.0)
-
-    second = runtime.start(plan(item))
-    assert second.result(2.0) == "prepared"
-    inspection_resolved.set()
-    assert first.result(2.0) == "artifacts/inspection-pending"
-    assert publish_calls == 1
-    assert inspect_calls >= 2
-    lease.close()
-    close_runtime(runtime, arbiter, item)
-
-
-def test_shutdown_performs_one_final_inspection_then_abandons_indeterminate_commit(
-    tmp_path,
-):
-    item = device_fixture("shutdown-inspection")
-    runtime, arbiter = controller(tmp_path)
-    lease = RepositoryRootLease(tmp_path / "shutdown-inspection-repository")
-    final_inspection_entered = threading.Event()
-    allow_final_inspection = threading.Event()
-    publish_calls = 0
-    inspect_calls = 0
-
-    def publish(_payload):
-        nonlocal publish_calls
-        publish_calls += 1
-        raise OSError("publication acknowledgement lost")
-
-    def inspect(_payload):
-        nonlocal inspect_calls
-        inspect_calls += 1
-        if inspect_calls == 1:
-            return None
-        final_inspection_entered.set()
-        assert allow_final_inspection.wait(1.0)
-        return None
-
-    def finalize(context, _executed):
-        return commit_final(
-            context,
-            lease,
-            artifact_name="shutdown-indeterminate",
-            publish=publish,
-            inspect=inspect,
-        )
-
-    handle = runtime.start(
-        plan(item, finalize=finalize, requires_final_commit=True)
-    )
-    wait_snapshot(handle, lambda value: value.phase == "commit-inspection-pending")
-
-    assert not runtime.shutdown(0.0)
-    assert final_inspection_entered.wait(1.0)
-    allow_final_inspection.set()
-    assert runtime.shutdown(2.0)
-
-    snapshot = handle.snapshot()
-    assert snapshot.state is RunState.FAILED
-    assert snapshot.primary_error is not None
-    assert "manifest visibility remained indeterminate" in snapshot.primary_error
-    assert "abandoned without republication" in snapshot.primary_error
-    assert publish_calls == 1
-    assert inspect_calls == 2
-    lease.close()
-    item.broker.shutdown()
-    arbiter.shutdown()
-
-
-def test_confirmed_absent_commit_fails_without_republication(tmp_path):
-    item = device_fixture("inspect-absent")
-    runtime, arbiter = controller(tmp_path)
-    lease = RepositoryRootLease(tmp_path / "absent-repository")
-    publish_calls = 0
-
-    def publish(_payload):
-        nonlocal publish_calls
-        publish_calls += 1
-        raise OSError("publication failed before visibility")
-
-    def finalize(context, _executed):
-        return commit_final(
-            context,
-            lease,
-            artifact_name="inspection-absent",
-            publish=publish,
-            inspect=lambda _payload: False,
-        )
-
-    handle = runtime.start(
-        plan(item, finalize=finalize, requires_final_commit=True)
-    )
-    with pytest.raises(RunFailed, match="publication failed before visibility"):
-        handle.result(2.0)
-    assert publish_calls == 1
-    lease.close()
-    close_runtime(runtime, arbiter, item)
-
-
-def test_commit_inspection_contract_error_is_fatal_without_republication(tmp_path):
-    item = device_fixture("inspect-corrupt")
-    runtime, arbiter = controller(tmp_path)
-    lease = RepositoryRootLease(tmp_path / "corrupt-repository")
-    publish_calls = 0
-
-    def publish(_payload):
-        nonlocal publish_calls
-        publish_calls += 1
-        raise OSError("publication acknowledgement lost")
-
-    def inspect(_payload):
-        raise ValueError("visible manifest belongs to another Run")
-
-    def finalize(context, _executed):
-        return commit_final(
-            context,
-            lease,
-            artifact_name="inspection-corrupt",
-            publish=publish,
-            inspect=inspect,
-        )
-
-    handle = runtime.start(
-        plan(item, finalize=finalize, requires_final_commit=True)
-    )
-    with pytest.raises(RunFailed, match="belongs to another Run"):
-        handle.result(2.0)
-    assert publish_calls == 1
-    lease.close()
-    close_runtime(runtime, arbiter, item)
-
-
-def test_required_final_commit_cannot_succeed_with_return_value_only(tmp_path):
-    item = device_fixture("missing-commit")
-    runtime, arbiter = controller(tmp_path)
-    handle = runtime.start(plan(item, requires_final_commit=True))
-    with pytest.raises(RunFailed, match="requires a final commit"):
-        handle.result(2.0)
-    close_runtime(runtime, arbiter, item)
-
-
-def test_leaked_post_safety_context_is_revoked_after_finalize(tmp_path):
-    item = device_fixture("revoke-post")
-    runtime, arbiter = controller(tmp_path)
-    leaked = []
-
-    def finalize(context, executed):
-        leaked.append(context)
+    def finalize(context: PostSafetyContext, executed):
+        observed.append(context)
+        assert arbiter.wait_until_released((context.run_id.value,), timeout=0.0)
+        for removed_capability in (
+            "cancellation",
+            "deadline",
+            "checkpoint",
+            "device",
+            "cleanup_device",
+        ):
+            assert not hasattr(context, removed_capability)
         return executed
 
-    assert runtime.start(plan(item, finalize=finalize)).result(2.0) == "prepared"
-    with pytest.raises(CapabilityRevoked, match="left finalize"):
-        leaked[0].checkpoint()
-    with pytest.raises(CapabilityRevoked, match="left finalize"):
-        leaked[0].authorize_commit_preparation()
+    handle = runtime.start(plan(item, finalize=finalize))
+    assert handle.result(2.0) == "prepared"
+    assert observed[0].run_id == handle.run_id
+    with pytest.raises(AttributeError, match="immutable"):
+        observed[0].run_id = handle.run_id
     close_runtime(runtime, arbiter, item)
 
 

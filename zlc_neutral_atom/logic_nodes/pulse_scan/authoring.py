@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
-from pathlib import Path
 from typing import Mapping
 
 from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema
@@ -11,10 +11,10 @@ from zlc_neutral_atom.input_spec import (
     DatasetInputSpec,
 )
 from zlc_pulse import (
+    PulseDocument,
     commit_scan_table,
     evaluate_numeric_scan_program,
     freeze_scan_program,
-    load_pulse_document,
 )
 from zlc_pulse.scan_template import SWEEP_API_SLOT, SWEEP_SCAN_SLOT
 from zlc_neutral_atom.timing.pulse_parameter_scan import (
@@ -79,10 +79,10 @@ def pulse_scan_input_specs():
     return _PULSE_SCAN_INPUT_SPECS
 
 
-def build_pulse_scan_program(
+def _freeze_pulse_scan_authoring(
     values: Mapping[str, object],
-) -> AutonomousScanSlotProgram | ApiSlotSegmentedProgram:
-    """Commit one owner-authored PulseScan program with the Pulse evaluator."""
+) -> dict[str, object]:
+    """Validate portable PulseScan authoring before application binding."""
 
     if not isinstance(values, Mapping):
         raise TypeError("PulseScan values must be a mapping")
@@ -98,14 +98,36 @@ def build_pulse_scan_program(
             if key in values
         }
     )
-    source = Path(authored["pulse"]).expanduser()
-    if not source.is_absolute():
-        raise ValueError("PulseScan pulse path must be resolved by composition")
+    slots = values.get("pulse_slots") or {}
+    if not isinstance(slots, Mapping):
+        raise TypeError("PulseScan pulse_slots must be a mapping")
+    slots = dict(slots)
+    api_values = slots.get("api") or {}
+    if not isinstance(api_values, Mapping):
+        raise TypeError("PulseScan API-slot values must be a mapping")
+    slots["api"] = dict(api_values)
+    return {**authored, "pulse_slots": slots}
+
+
+def _build_pulse_scan_program(
+    values: Mapping[str, object],
+    *,
+    load_pulse: Callable[[object], PulseDocument],
+) -> AutonomousScanSlotProgram | ApiSlotSegmentedProgram:
+    """Commit one owner-authored PulseScan program with the Pulse evaluator."""
+
+    if not callable(load_pulse):
+        raise TypeError("load_pulse must be callable")
+    authored = _freeze_pulse_scan_authoring(values)
+    loaded = load_pulse(authored["pulse"])
+    if not isinstance(loaded, PulseDocument):
+        raise TypeError("PulseScan pulse loader returned another value")
     document = replace(
-        load_pulse_document(source.resolve()),
+        loaded,
         scan_sweep_count=authored["scan_sweep_count"],
     )
-    slots = dict(values.get("pulse_slots") or {})
+    slots = authored["pulse_slots"]
+    assert isinstance(slots, dict)
     sweep_kind = str(slots.get("sweep_kind") or "")
     source = str(slots.get("program") or "")
     if sweep_kind == SWEEP_SCAN_SLOT:
@@ -157,7 +179,6 @@ __all__ = [
     "DEFAULT_PULSE_SCAN_PULSE_PATH",
     "DEFAULT_PULSE_SCAN_SWEEP_COUNT",
     "PULSE_SCAN_SOURCE_INPUT_SPEC",
-    "build_pulse_scan_program",
     "pulse_scan_authoring_schema",
     "pulse_scan_input_specs",
 ]

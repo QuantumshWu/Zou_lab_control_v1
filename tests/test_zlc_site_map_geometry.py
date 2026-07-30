@@ -92,6 +92,31 @@ def test_immutable_site_state_owns_exact_dtype_shape_and_validity():
     assert not frozen_validity.flags.writeable
 
 
+def test_immutable_site_state_retains_generation_static_geometry_owner():
+    centers = np.frombuffer(
+        np.asarray(((1.0, 2.0), (3.0, 4.0)), dtype="<f8").tobytes(),
+        dtype="<f8",
+    ).reshape(2, 2)
+    occupied = np.asarray((False, True), dtype=bool)
+    validity = np.asarray((True, True), dtype=bool)
+
+    first = immutable_site_state(
+        centers,
+        occupied,
+        validity,
+        site_count=2,
+    )[0]
+    second = immutable_site_state(
+        centers,
+        occupied,
+        validity,
+        site_count=2,
+    )[0]
+
+    assert first is centers
+    assert second is centers
+
+
 def test_immutable_site_state_rejects_wrong_dtype_or_shape():
     with pytest.raises(TypeError, match="bool dtype"):
         immutable_site_state(
@@ -171,7 +196,13 @@ def _site_map_inputs(revision):
     return one("background", "a" * 64), one("state", "b" * 64)
 
 
-def _site_map_protocol_view(image_projection, identity, inputs, *, cell_index=0):
+def _site_map_protocol_view(
+    image_projection,
+    inputs,
+    *,
+    cell_index=0,
+    centers_xy=None,
+):
     from zlc_data import AxisId, AxisSpec, Selection, SITE
 
     image, viewport, frame = image_projection
@@ -181,17 +212,12 @@ def _site_map_protocol_view(image_projection, identity, inputs, *, cell_index=0)
         home_viewport=viewport,
         site_axis=AxisSpec(AxisId("site"), "site", SITE, 1, ("A",)),
         coordinate_frame=frame,
-        centers_xy=np.zeros((1, 2)),
+        centers_xy=(np.zeros((1, 2)) if centers_xy is None else centers_xy),
         site_radius=1.0,
         site_validity=np.ones(1, dtype=bool),
-        run_id="run",
-        provenance_epoch_id="epoch",
-        coherence_identity="coherence",
         summary="summary",
         site_state_input=inputs[1],
         cell_selection=Selection.index(AxisId("repeat"), cell_index),
-        site_geometry_identity="geometry",
-        view_identity=identity,
         site_state=None,
         presentation_kind="site-map",
         materialize_area_outputs=lambda source, selection: {},
@@ -240,28 +266,29 @@ def test_site_map_composer_persists_named_renderer_and_scans_each_image_once(
     monkeypatch.setattr(site_map_render, "_compose_site_map_front", compose)
 
     revision_one_inputs = _site_map_inputs(1)
+    centers_xy = np.zeros((1, 2))
     first = _site_map_protocol_view(
         _site_map_image(((2, 3), (4, 9))),
-        "first",
         revision_one_inputs,
+        centers_xy=centers_xy,
     )
     second_frozen_cell = _site_map_protocol_view(
         _site_map_image(((11, 12), (13, 14))),
-        "second-frozen-cell",
         revision_one_inputs,
         cell_index=1,
+        centers_xy=centers_xy,
     )
     advanced_revision = _site_map_protocol_view(
         _site_map_image(((21, 22), (23, 24))),
-        "advanced-revision",
         _site_map_inputs(2),
         cell_index=1,
+        centers_xy=centers_xy,
     )
     switched_advancing_revision = _site_map_protocol_view(
         _site_map_image(((31, 32), (33, 34))),
-        "switched-advancing-revision",
         _site_map_inputs(3),
         cell_index=0,
+        centers_xy=centers_xy,
     )
     geometry = panel_surface_geometry("2x2", pixel_ratio=1.25)
     moved_geometry = panel_surface_geometry("2x2", pixel_ratio=1.75)
@@ -272,27 +299,23 @@ def test_site_map_composer_persists_named_renderer_and_scans_each_image_once(
     )
     display = ImageDisplayState(relim_mode=RelimMode.NORMAL)
     try:
-        composer.compose(first, display=display, selection_revision=3)
-        composer.compose(first, display=display, selection_revision=3)
+        composer.compose(first, display=display)
+        composer.compose(first, display=display)
         composer.compose(
             second_frozen_cell,
             display=display,
-            selection_revision=4,
         )
         composer.compose(
             advanced_revision,
             display=display,
-            selection_revision=5,
         )
         composer.compose(
             switched_advancing_revision,
             display=display,
-            selection_revision=6,
         )
         composer.compose(
             switched_advancing_revision,
             display=display,
-            selection_revision=6,
             surface_geometry=moved_geometry,
             surface_revision=1,
         )
@@ -321,21 +344,16 @@ def test_site_map_composer_persists_named_renderer_and_scans_each_image_once(
     ) == moved_geometry.raster_size
     assert moved_renderer.options["dpi"] == moved_geometry.dpi
     assert moved_renderer.closed == 1
-    assert compose_calls[0]["selection_revision"] == 3
     assert compose_calls[0]["current_color_limits"] is None
     assert compose_calls[0]["previous_relim_mode"] is None
     assert compose_calls[1]["current_color_limits"] == (2.0, 9.0)
     assert compose_calls[1]["previous_relim_mode"] is RelimMode.NORMAL
-    assert compose_calls[2]["selection_revision"] == 4
     assert compose_calls[2]["current_color_limits"] is None
     assert compose_calls[2]["previous_relim_mode"] is None
-    assert compose_calls[3]["selection_revision"] == 5
     assert compose_calls[3]["current_color_limits"] == (2.0, 9.0)
     assert compose_calls[3]["previous_relim_mode"] is RelimMode.NORMAL
-    assert compose_calls[4]["selection_revision"] == 6
     assert compose_calls[4]["current_color_limits"] is None
     assert compose_calls[4]["previous_relim_mode"] is None
-    assert compose_calls[5]["surface_revision"] == 1
     assert compose_calls[5]["current_color_limits"] == (2.0, 9.0)
     assert compose_calls[5]["previous_relim_mode"] is RelimMode.NORMAL
 
@@ -359,7 +377,7 @@ def test_occupancy_window_delegates_to_generic_figure_surface_and_closes():
     window = module.OccupancyCellWindow(
         invalid_navigation_loader,
         lambda *_args, **_kwargs: None,
-        OccupancyArtifactRef("test", "a" * 64),
+        OccupancyArtifactRef("test/occupancy.json"),
         address=None,
     )
     try:

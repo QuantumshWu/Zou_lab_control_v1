@@ -261,7 +261,13 @@ def test_deadband_never_clips_and_avoids_normal_or_tight_jitter() -> None:
 def _evaluated_image(values, validity):
     import numpy as np
 
-    from zlc_data import AxisId, CoordinateFrameId, SPATIAL_X, SPATIAL_Y
+    from zlc_data import (
+        AxisId,
+        AxisSourceRef,
+        CoordinateFrameId,
+        SPATIAL_X,
+        SPATIAL_Y,
+    )
     from zlc_frontend.figure import EvaluatedAxis, EvaluatedImage
 
     array = np.asarray(values)
@@ -269,7 +275,7 @@ def _evaluated_image(values, validity):
     frame = CoordinateFrameId("indexed-test.camera")
     return EvaluatedImage(
         EvaluatedAxis(
-            AxisId("indexed-test.x"),
+            AxisSourceRef.tensor(AxisId("indexed-test.x")),
             "x",
             SPATIAL_X,
             "pixel",
@@ -278,7 +284,7 @@ def _evaluated_image(values, validity):
             frame,
         ),
         EvaluatedAxis(
-            AxisId("indexed-test.y"),
+            AxisSourceRef.tensor(AxisId("indexed-test.y")),
             "y",
             SPATIAL_Y,
             "pixel",
@@ -295,7 +301,7 @@ def _evaluated_image(values, validity):
 def test_evaluated_image_viewport_preserves_explicit_numeric_axis_truth() -> None:
     from dataclasses import replace
 
-    from zlc_data import AxisId, CoordinateFrameId, SCAN_POINT
+    from zlc_data import AxisId, AxisSourceRef, CoordinateFrameId, SCAN_POINT
     from zlc_frontend.figure import EvaluatedImage
     from zlc_frontend.image_view import image_viewport_for_evaluated_image
 
@@ -336,7 +342,7 @@ def test_evaluated_image_viewport_preserves_explicit_numeric_axis_truth() -> Non
 
     scan_x = replace(
         image.x_axis,
-        axis_id=AxisId("scan.bx"),
+        source=AxisSourceRef.point_coordinate(AxisId("scan.bx")),
         name="Bx",
         role=SCAN_POINT,
         unit="code",
@@ -345,7 +351,7 @@ def test_evaluated_image_viewport_preserves_explicit_numeric_axis_truth() -> Non
     )
     scan_y = replace(
         image.y_axis,
-        axis_id=AxisId("scan.by"),
+        source=AxisSourceRef.point_coordinate(AxisId("scan.by")),
         name="By",
         role=SCAN_POINT,
         unit="code",

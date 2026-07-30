@@ -166,7 +166,8 @@ def project_run_declaration(
     | None = None,
     path_roots=None,
     project_signal_presentation: Callable[
-        [object, str, SignalPublication], object | None
+        [object, str, SignalPublication, tuple[SignalPublication, ...]],
+        object | None,
     ]
     | None = None,
 ):
@@ -202,7 +203,8 @@ def project_processor_declaration(
     prepare: Callable[[object], object],
     bind_request: Callable[[object, object], object] | None = None,
     project_signal_presentation: Callable[
-        [object, str, SignalPublication], object | None
+        [object, str, SignalPublication, tuple[SignalPublication, ...]],
+        object | None,
     ]
     | None = None,
     dynamic_choices: tuple[DynamicChoicePresentation, ...] = (),

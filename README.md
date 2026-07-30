@@ -72,10 +72,7 @@ installation = InstallationConfigDocument.from_parameters(
 )
 exp = connect(
     installation,
-    workspace=WorkspacePaths.for_workspace(
-        Path.cwd(),
-        repository_root=Path.home() / ".zlc" / "notebooks" / "experiment",
-    ),
+    workspace=WorkspacePaths.for_workspace(Path.cwd()),
 )
 ```
 
@@ -89,25 +86,26 @@ not raw camera, sequencer, registry, or SDK objects.
 
 ## Outputs and saved files
 
-The composition root creates one explicit `WorkspacePaths` value. User-authored
-pulses/tasks live below its authored root; artifacts and operator-facing exports
-live below its explicit repository/output roots. Leaf packages never infer a
-root from their package path, current directory, or environment.
+The composition root creates one explicit `WorkspacePaths` value from the
+selected project root. User-authored pulses and tasks live in that project;
+artifacts and operator-facing exports live under `project/_output`. Leaf
+packages never infer another root from their package path, current directory,
+home directory, or environment.
 
 | Product or action | Default location |
 |---|---|
 | Calibration task result bundle | `workspace.output_root / "calibrations"` |
-| MOT-field task report | `workspace.output_root / "mot_field"` |
+| MOT-field acquisition | `workspace.output_root / "captures"` |
 | TaskConsole figure export | `workspace.output_root / "figures/task-console"` |
 | DataFigure / FigureViewer export | `workspace.output_root / "figures/data-figure"` |
 | Pulse preview export | `workspace.output_root / "figures/pulses"` |
 
-The Calibration folder contains the discoverable `calibration_ref.json`, a
-human-readable `report/` with summaries, tables and PNG pages, and optional
-raw `frames/`.  The canonical machine authority remains in the experiment
-repository selected by `WorkspacePaths.repository_root`; the pointer file names
-that exact committed artifact.  MOT similarly writes a report while publishing
-its typed FINAL outputs.
+Each Calibration run folder publishes `calibration.json` last, after its
+original-dtype arrays. It may also contain a human-readable `report/` and
+explicitly requested raw `frames/`. `CalibrationArtifactRef` names that record
+directly; there is no hidden repository, pointer file, CAS, or second manifest.
+MOT reuses the generic Capture artifact and derives its typed FINAL outputs
+statelessly from that capture.
 
 Measurements and processors publish typed live/FINAL signals to the Logic
 tree; they do not silently create arbitrary files.  Save/Export is an explicit

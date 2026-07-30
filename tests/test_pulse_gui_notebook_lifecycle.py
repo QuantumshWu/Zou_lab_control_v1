@@ -27,10 +27,7 @@ def test_bound_x_hides_and_reopens_same_dirty_editor_then_owner_retires(tmp_path
     application = ensure_qt_app()
     experiment = connect(
         "virtual",
-        workspace=WorkspacePaths.for_workspace(
-            (tmp_path / "authored").resolve(),
-            repository_root=tmp_path.resolve(),
-        ),
+        workspace=WorkspacePaths.for_workspace((tmp_path / "workspace").resolve()),
     )
     body = experiment.pulse_gui()
     wrapper = body.window()

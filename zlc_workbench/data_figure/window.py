@@ -1358,7 +1358,7 @@ class DataFigureWindow(FrozenRasterWindow):
         if (
             origin.panel_id != DATA_FIGURE_PANEL_ID
             or self._visible_typed_origin() != origin
-            or origin.presentation.panel_revision != display.revision
+            or origin.painted_revision != display.revision
         ):
             raise RuntimeError("IMAGE interaction origin is stale")
         if isinstance(command, ImageViewportCommit):
@@ -1406,7 +1406,7 @@ class DataFigureWindow(FrozenRasterWindow):
         if (
             origin.panel_id != DATA_FIGURE_PANEL_ID
             or self._visible_typed_origin() != origin
-            or origin.presentation.panel_revision != display.revision
+            or origin.painted_revision != display.revision
         ):
             raise RuntimeError("numeric interaction origin is stale")
         if isinstance(command, (CurveRangeGesture, HistogramRangeGesture)):

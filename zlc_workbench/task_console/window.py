@@ -77,7 +77,6 @@ from zlc_frontend.figure_outputs import (
     area_data_output_presentation,
     cross_data_output_presentation,
     figure_event_transform,
-    figure_selector_identity,
     fit_parameter_output_presentation,
     materialize_fit_outputs,
     source_identity_matches_snapshot,
@@ -95,6 +94,9 @@ from zlc_neutral_atom.processing.signal_plane import (
     DerivedSignalOutput,
     SignalDataPlane,
     SignalPublication,
+)
+from zlc_neutral_atom.runtime.signal_source import (
+    authoritative_signal_event_source,
 )
 from zlc_neutral_atom.runtime.hosted_run import HostedRun
 from .panel_card import PanelCard
@@ -217,7 +219,8 @@ class TaskConsole(QtWidgets.QWidget):
         run_factory=None,
         data_plane: SignalDataPlane,
         project_signal_presentation: Callable[
-            [object, str, SignalPublication], object | None
+            [object, str, SignalPublication, tuple[SignalPublication, ...]],
+            object | None,
         ]
         | None = None,
         tasks_root: Path,
@@ -254,6 +257,14 @@ class TaskConsole(QtWidgets.QWidget):
         # in each entry makes Clear/Edit retirement withdraw only the surface
         # that actually committed the current parameter bundle.
         self._fit_output_routes: dict[str, tuple[str, object, object, object]] = {}
+        # Figure commits own selector semantics.  This composition-only table
+        # remembers which exact immutable commit/source currently owns each
+        # derived generation so a changed commit retires that generation before
+        # rebinding.  SignalDataPlane never receives a commit hash or transform.
+        self._figure_route_capabilities: dict[
+            str,
+            tuple[str, object, object, object | None, str | None],
+        ] = {}
         self._fit_closing = False
         self._owner_close_lock = threading.Lock()
         self._owner_retiring = False
@@ -277,7 +288,7 @@ class TaskConsole(QtWidgets.QWidget):
         self._data_wake_token = None
         self._tick_data = self._data.freeze()
         self._signal_metadata_front = self._tick_data
-        self._signal_schema_fingerprints = self._front_schema_fingerprints(
+        self._signal_schemas = self._front_schemas(
             self._tick_data
         )
         # EMBEDDED mode (the figure viewer hosts a whole TaskConsole in one pane): a stripped,
@@ -737,7 +748,8 @@ class TaskConsole(QtWidgets.QWidget):
         if output_name is None:
             raise RuntimeError("publication output is absent from its owner declaration")
         try:
-            return projector(node, output_name, publication)
+            parents = self._data.direct_parent_publications(publication)
+            return projector(node, output_name, publication, parents)
         except Exception as error:
             raise ValueError(
                 "signal presentation attachment failed: "
@@ -812,6 +824,7 @@ class TaskConsole(QtWidgets.QWidget):
             if commit is None or not source_name:
                 self._render_lane.forget_selector(owner_id)
                 self._data.withdraw_derived(owner_id)
+                self._figure_route_capabilities.pop(owner_id, None)
                 continue
             # Bind the route from the exact frame that authored the selector.
             # A free-running producer may already have advanced beyond it, so
@@ -846,6 +859,7 @@ class TaskConsole(QtWidgets.QWidget):
                 # context is presented.
                 self._render_lane.forget_selector(owner_id)
                 self._data.withdraw_derived(owner_id)
+                self._figure_route_capabilities.pop(owner_id, None)
                 continue
             from zlc_frontend.plot_panel import plot_panel_input
 
@@ -855,46 +869,62 @@ class TaskConsole(QtWidgets.QWidget):
                     value.snapshot,
                     self._presentation_for(value, publication),
                 )
-                try:
-                    transform = figure_event_transform(painted_source, commit)
-                except ValueError:
-                    transform = None
-                    preserves_association = False
-                else:
-                    # Replayability is necessary but not sufficient for a
-                    # formal hardware-event association.  A plain monitor may
-                    # still publish continuous Area/Cross values, but it must
-                    # not acquire a capability that its upstream source never
-                    # exposed.
-                    preserves_association = self._data.has_event_association(
-                        source_name
-                    )
-                    if not transform.operations:
-                        transform = None
-                route_identity = figure_selector_identity(commit)
-                qualified = panel_signal_key(card.panel_id, output_name)
-                try:
-                    generation = self._data.bind_continuous_derived(
-                        owner_id,
-                        source_name=source_name,
-                        output_names=(qualified,),
-                        route_identity=route_identity,
-                        source_transform=transform,
-                        preserves_event_association=preserves_association,
-                    )
-                except RuntimeError as bind_error:
-                    if "configuration changed" not in str(bind_error):
-                        raise
+                route_key = (
+                    source_name,
+                    commit,
+                    latest_publication.event_ref.generation,
+                )
+                retained_route = self._figure_route_capabilities.get(owner_id)
+                if retained_route is None or retained_route[:3] != route_key:
+                    try:
+                        transform = figure_event_transform(painted_source, commit)
+                    except ValueError:
+                        event_source = None
+                        event_output_name = None
+                    else:
+                        try:
+                            (
+                                _source_generation,
+                                upstream_event_source,
+                                event_output_name,
+                            ) = self._data.signal_event_binding(source_name)
+                        except (
+                            KeyError,
+                            LookupError,
+                            RuntimeError,
+                            TypeError,
+                            ValueError,
+                        ):
+                            event_source = None
+                            event_output_name = None
+                        else:
+                            event_source = authoritative_signal_event_source(
+                                upstream_event_source,
+                                event_output_name,
+                                transform if transform.operations else None,
+                            )
                     self._render_lane.forget_selector(owner_id)
                     self._data.withdraw_derived(owner_id)
-                    generation = self._data.bind_continuous_derived(
-                        owner_id,
-                        source_name=source_name,
-                        output_names=(qualified,),
-                        route_identity=route_identity,
-                        source_transform=transform,
-                        preserves_event_association=preserves_association,
+                    retained_route = (
+                        *route_key,
+                        event_source,
+                        event_output_name,
                     )
+                    self._figure_route_capabilities[owner_id] = retained_route
+                else:
+                    event_source = retained_route[3]
+                    event_output_name = retained_route[4]
+                qualified = panel_signal_key(card.panel_id, output_name)
+                generation = self._data.bind_continuous_derived(
+                    owner_id,
+                    source_name=source_name,
+                    expected_source_generation=(
+                        latest_publication.event_ref.generation
+                    ),
+                    output_names=(qualified,),
+                    event_source=event_source,
+                    event_output_name=event_output_name,
+                )
                 if not self._data.continuous_needs_publication(
                     owner_id,
                     generation,
@@ -1006,8 +1036,6 @@ class TaskConsole(QtWidgets.QWidget):
             {
                 qualified: DerivedSignalOutput(
                     snapshot=derived.snapshot,
-                    source_ref=derived.source_ref,
-                    derivation_digest=derived.derivation_digest,
                     preserve_source_coverage=derived.preserve_source_coverage,
                 )
             },
@@ -1022,6 +1050,7 @@ class TaskConsole(QtWidgets.QWidget):
             owner_id = f"figure/{panel_id}/{output_name}"
             self._render_lane.forget_selector(owner_id)
             self._data.withdraw_derived(owner_id)
+            self._figure_route_capabilities.pop(owner_id, None)
 
     # ----------------------------------------------------------------- control
     def _card_reads(self, card: "PanelCard") -> set:
@@ -1465,25 +1494,21 @@ class TaskConsole(QtWidgets.QWidget):
         return projection.axis_labels, projection.short_names
 
     @staticmethod
-    def _front_schema_fingerprints(front) -> dict[str, str | None]:
-        """Exact present-signal keys and their schema identities for one front."""
+    def _front_schemas(front) -> dict[str, object | None]:
+        """Exact present-signal keys and their typed schemas for one front."""
 
-        fingerprints: dict[str, str | None] = {}
+        schemas: dict[str, object | None] = {}
         for name in front.names():
             key = str(name)
             value = front.value(key)
-            schema = None if value is None else value.schema
-            fingerprint = None if schema is None else schema.fingerprint
-            fingerprints[key] = (
-                None if fingerprint is None else str(fingerprint)
-            )
-        return fingerprints
+            schemas[key] = None if value is None else value.schema
+        return schemas
 
     def _promote_data_front(self, front) -> set[str]:
         """Promote one immutable front and reconcile only metadata transitions.
 
         Ordinary revisions with an unchanged schema do no Qt metadata work.
-        Presence changes and schema-fingerprint changes update the affected
+        Presence changes and typed-schema changes update the affected
         Logic legend plus any Setting picker that is currently visible, without
         invoking the topology owner or rebuilding a picker model.
         """
@@ -1499,10 +1524,10 @@ class TaskConsole(QtWidgets.QWidget):
                 self._sync_card_continuous_routes(card)
         if front is self._signal_metadata_front:
             return set()
-        previous = self._signal_schema_fingerprints
-        current = self._front_schema_fingerprints(front)
+        previous = self._signal_schemas
+        current = self._front_schemas(front)
         self._signal_metadata_front = front
-        self._signal_schema_fingerprints = current
+        self._signal_schemas = current
         changed = {
             key
             for key in set(previous).union(current)
@@ -1804,6 +1829,73 @@ class TaskConsole(QtWidgets.QWidget):
             output_binding=output_binding,
         )
 
+    def _resolve_figure_dataset_route(
+        self,
+        signal_key: str,
+        *,
+        visited: frozenset[str] = frozenset(),
+    ):
+        """Resolve a Figure output from its card-owned committed transform.
+
+        SignalDataPlane owns event order and direct dependencies only.  The
+        composition root that owns cards resolves frontend selector intent back
+        to the declared Dataset producer when a Logic node needs a serializable
+        input binding.  Nested selectors compose their typed operations in
+        source-to-leaf order; no route hash or copied transform lives in the
+        signal plane.
+        """
+
+        from zlc_data import DataTransformSpec
+        from .input_binding import ConsoleDatasetProducerBinding
+        from zlc_frontend.plot_panel import plot_panel_input
+
+        key = str(signal_key).strip()
+        if not key or key in visited:
+            raise ValueError("Figure Dataset routes must be non-empty and acyclic")
+        topology = self._current_signal_projection().topology
+        entry = topology.get(key)
+        card = None if entry is None else entry.node
+        if not isinstance(card, PanelCard):
+            raise LookupError(f"{key!r} is not a committed Figure output")
+        source_key = str(card.config.signal or "").strip()
+        if not source_key:
+            raise ValueError("Figure output has no selected Dataset source")
+
+        try:
+            upstream = self.resolve_console_producer(source_key)
+        except LookupError:
+            upstream, prior = self._resolve_figure_dataset_route(
+                source_key,
+                visited=visited | {key},
+            )
+        else:
+            if not isinstance(upstream, ConsoleDatasetProducerBinding):
+                raise TypeError("Figure source must resolve to a Dataset producer")
+            prior = None
+
+        publication, value, area, cross = card.frozen_figure_output_state()
+        if publication is None or value is None or value.name != source_key:
+            raise RuntimeError("Figure route has no exact current source publication")
+        if key == panel_signal_key(card.panel_id, AREA_DATA_OUTPUT):
+            commit = area
+        elif key == panel_signal_key(card.panel_id, CROSS_DATA_OUTPUT):
+            commit = cross
+        else:
+            raise TypeError("this Figure output has no event-local Dataset transform")
+        if commit is None:
+            raise RuntimeError("Figure output has no committed selector authority")
+        source = plot_panel_input(
+            card.config.kind,
+            value.snapshot,
+            self._presentation_for(value, publication),
+        )
+        local = figure_event_transform(source, commit)
+        operations = (
+            () if prior is None else prior.operations
+        ) + local.operations
+        transform = DataTransformSpec(tuple(operations)) if operations else None
+        return upstream, transform
+
     def _resolve_dataset_input(self, selection):
         """Resolve a contract-admitted Dataset or typed Figure source transform."""
 
@@ -1841,17 +1933,11 @@ class TaskConsole(QtWidgets.QWidget):
         if producer is not None:
             return ResolvedDatasetInput(selection, producer)
         try:
-            source_key, transform = self._data.signal_route_source(current)
-        except (LookupError, TypeError) as error:
+            upstream, transform = self._resolve_figure_dataset_route(current)
+        except (LookupError, TypeError, ValueError, RuntimeError) as error:
             raise ValueError(
                 f"{current!r} is not a contract-admitted Dataset producer or "
                 "event-local Figure source transform"
-            ) from error
-        try:
-            upstream = self.resolve_console_producer(source_key)
-        except LookupError as error:
-            raise RuntimeError(
-                "the frozen Figure route root has no declared producer"
             ) from error
         return ResolvedDatasetInput(selection, upstream, transform)
 
@@ -2044,7 +2130,7 @@ class TaskConsole(QtWidgets.QWidget):
             not self.logic_nodes and not self._passive_publisher_rows
         )
 
-    def _begin_run(self, node: _ConsoleNode) -> None:
+    def _start_node_owner(self, node: _ConsoleNode) -> None:
         """Submit one row-owned node start without creating another registry.
 
         The node already knows HOW it starts -- the composition root bound that
@@ -2059,20 +2145,20 @@ class TaskConsole(QtWidgets.QWidget):
             isinstance(node, HostedRun)
             and node.dataset_output_declarations
         )
-        if reserved:
-            self._data.reserve(node)
         try:
+            if reserved:
+                node.bind_signal_generation(self._data.reserve(node))
             node.start()
         except Exception:
             if reserved:
                 self._data.retire(node)
             raise
 
-    def _stop_run(self, node: _ConsoleNode) -> bool:
-        """Ask a hosted node to stop and report whether it reached terminal.
+    def _stop_node_owner(self, node: _ConsoleNode) -> bool:
+        """Ask a hosted node to stop and report whether its owner is terminal.
 
         Cancellation is a request, not a join: the console never blocks the GUI
-        thread waiting for hardware to let go.  An un-terminated run keeps its
+        thread waiting for hardware to let go.  An unterminated owner keeps its
         registration so the next tick (or the close path) can finish the teardown
         instead of losing track of a run that is still holding a device.
         """
@@ -2081,16 +2167,17 @@ class TaskConsole(QtWidgets.QWidget):
         # The Qt owner performs exactly one observation.  Future timer turns
         # continue the same state transition; no GUI callback sleeps or joins a
         # hardware/worker owner.
-        snapshot = node.poll()
-        ready = (
-            snapshot is None
-            and isinstance(node, HostedRun)
-            and node.cancelled_before_start
-        ) or node.last_error is not None
-        if snapshot is not None and snapshot.state.terminal:
-            ready = snapshot.state.name != "SUCCEEDED" or (
-                node.final_result_resolved and node.final_outputs_resolved
-            )
+        observation = node.poll()
+        if isinstance(node, HostedProcessor):
+            ready = observation is not None and node.terminal
+        else:
+            ready = (
+                observation is None and node.cancelled_before_start
+            ) or node.last_error is not None
+            if observation is not None and observation.state.terminal:
+                ready = observation.state.name != "SUCCEEDED" or (
+                    node.final_result_resolved and node.final_outputs_resolved
+                )
         if not ready:
             return False
         if not node.worker_idle:
@@ -2599,7 +2686,7 @@ class TaskConsole(QtWidgets.QWidget):
             # catalog namespace but publishes a new immutable generation.
             self._retire_logic_node_publications(previous)
         try:
-            self._begin_run(node)
+            self._start_node_owner(node)
         except Exception as exc:
             self._signal_topology_changed()
             row.set_state("error", status=f"start failed: {exc}")
@@ -2613,7 +2700,7 @@ class TaskConsole(QtWidgets.QWidget):
         self._sync_terminal_poll_timer()
         self._signal_topology_changed()
         # Submission is not hardware admission.  Keep the visible lifecycle at
-        # ``starting`` until HostedRun.poll() observes the admitted Run; this
+        # ``starting`` until the hosted owner exposes its admitted lifecycle; this
         # prevents a dependent Task from treating an optimistic GUI label as a
         # physical owner that is already safe to preempt.
         row.set_state("running", status="starting")
@@ -2693,7 +2780,7 @@ class TaskConsole(QtWidgets.QWidget):
             self._remove_panel(panel, _state_change=False)
 
     def _build_logic_node(self, node: LogicNodeConfig, values: dict):
-        """Freeze this row into a HostedRun -- the RUN seam's unit of work.
+        """Freeze this row into its finite-Run or continuous-Processor owner.
 
         The row names a catalog entry; the CATALOG seam's spec turns the form
         values into that definition's own typed request, and the composition
@@ -3094,8 +3181,6 @@ class TaskConsole(QtWidgets.QWidget):
                 {
                     name: DerivedSignalOutput(
                         snapshot=output.snapshot,
-                        source_ref=output.source_ref,
-                        derivation_digest=output.derivation_digest,
                         preserve_source_coverage=output.preserve_source_coverage,
                     )
                     for name, output in qualified.items()
@@ -3193,17 +3278,17 @@ class TaskConsole(QtWidgets.QWidget):
         *,
         _silent: bool = False,
     ) -> bool:
-        """Cancel a logic row's Run and grey its dot."""
+        """Cancel a logic row's hosted owner and grey its dot."""
         node = self._logic_nodes.get(id(row))
         if node is not None:
-            if not self._stop_run(node):
+            if not self._stop_node_owner(node):
                 editor = self._logic_editors.get(id(row))
                 if not _silent:
-                    row.set_state("running", status="stop pending: the run has not gone terminal")
+                    row.set_state("running", status="stop pending: node owner not terminal")
                     if editor is not None:
                         editor.set_running(True)
                         editor.set_status(
-                            "stop pending: the run has not gone terminal", error=True
+                            "stop pending: node owner not terminal", error=True
                         )
                 return False
         self._remove_transient_result_panels(row)
@@ -3261,7 +3346,7 @@ class TaskConsole(QtWidgets.QWidget):
         return True
 
     def _poll_logic_nodes(self) -> None:
-        """Each tick: reflect every running node's Run state on its row + Edit.
+        """Each tick: reflect every hosted node's own status on its row + Edit.
 
         ``poll`` is what turns a submitted start into a live handle, so this is
         also where a start that failed on the worker surfaces -- the GUI thread
@@ -3276,7 +3361,7 @@ class TaskConsole(QtWidgets.QWidget):
             if node is None:
                 continue
             editor = self._logic_editors.get(id(row))
-            snapshot = node.poll()
+            observation = node.poll()
             error = node.last_error
             if error:
                 row.set_state("error", status=f"error: {error}")
@@ -3285,7 +3370,7 @@ class TaskConsole(QtWidgets.QWidget):
                     editor.set_status(f"error: {error}", error=True)
                 self._stop_logic_node(row, _silent=True)
                 continue
-            if snapshot is None:
+            if observation is None:
                 if (
                     isinstance(node, HostedRun)
                     and node.cancelled_before_start
@@ -3296,18 +3381,32 @@ class TaskConsole(QtWidgets.QWidget):
                         editor.set_status("stopped", error=False)
                     self._stop_logic_node(row, _silent=True)
                     continue
-                # Submitted, not yet acknowledged: the run exists as a request only.
+                # Submitted, not yet acknowledged by the hosted owner.
                 row.set_state("running", status="starting")
                 if editor is not None:
                     editor.set_running(True)
                     editor.set_status("starting", error=False)
                 continue
-            state = snapshot.state.name
-            if state == "CANCELLING":
-                row.set_state("running", status="stop pending: run owner not terminal")
+            if isinstance(node, HostedProcessor):
+                if node.terminal:
+                    row.set_state("stopped", status="stopped")
+                    if editor is not None:
+                        editor.set_running(False)
+                        editor.set_status("stopped", error=False)
+                    self._stop_logic_node(row, _silent=True)
+                    continue
+                row.set_state("running", status=node.phase)
                 if editor is not None:
                     editor.set_running(True)
-                    editor.set_status("stop pending: run owner not terminal", error=False)
+                    editor.set_status(node.phase, error=False)
+                continue
+            snapshot = observation
+            state = snapshot.state.name
+            if state == "CANCELLING":
+                row.set_state("running", status="stop pending: node owner not terminal")
+                if editor is not None:
+                    editor.set_running(True)
+                    editor.set_status("stop pending: node owner not terminal", error=False)
                 continue
             if snapshot.state.terminal:
                 if state == "FAILED":
@@ -3317,10 +3416,6 @@ class TaskConsole(QtWidgets.QWidget):
                         editor.set_running(False)
                         editor.set_status(f"error: {message}", error=True)
                 elif state == "SUCCEEDED":
-                    if not isinstance(node, HostedRun):
-                        raise RuntimeError(
-                            "HostedProcessor cannot report SUCCEEDED"
-                        )
                     if (
                         not node.final_result_resolved
                         or not node.final_outputs_resolved
@@ -3368,7 +3463,7 @@ class TaskConsole(QtWidgets.QWidget):
                     if editor is not None:
                         editor.set_running(False)
                         editor.set_status("stopped", error=False)
-                # A run that ended on its own uses the same row-local teardown
+                # A hosted owner that ended on its own uses the same row-local teardown
                 # path as Stop.
                 self._stop_logic_node(row, _silent=True)
                 if state == "SUCCEEDED":
@@ -3601,14 +3696,14 @@ class TaskConsole(QtWidgets.QWidget):
             if snapshot is None:
                 identity.append((signal_name, None))
                 continue
-            ref = snapshot.ref
+            publication = front.publication(signal_name)
+            if publication is None or publication.value(signal_name) is not value:
+                raise RuntimeError("signal front lost its exact publication")
             identity.append(
                 (
                     signal_name,
-                    value.run_id,
-                    value.epoch_id,
-                    ref,
-                    value.join_digest,
+                    publication.event_ref,
+                    snapshot.ref,
                 )
             )
         return tuple(identity)
@@ -3940,6 +4035,20 @@ class TaskConsole(QtWidgets.QWidget):
             if not self.stop_all_nodes():
                 self._shutdown_state = "BLOCKED_NODE_OWNERSHIP"
                 return False
+            # A permanently closed surface must not leave Area/Cross/Fit
+            # generations in the Experiment-owned SignalPlane.  Retire every
+            # card-owned route while the selector/render owner is still alive,
+            # then promote the one resulting neutral front.  Normal panel
+            # removal uses the same route owner path.
+            for card in tuple(self.cards):
+                self._withdraw_panel_outputs(card.panel_id)
+            for panel_id in tuple(self._fit_output_routes):
+                self._withdraw_panel_outputs(panel_id)
+            for owner_id in tuple(self._figure_route_capabilities):
+                self._render_lane.forget_selector(owner_id)
+                self._data.withdraw_derived(owner_id)
+                self._figure_route_capabilities.pop(owner_id, None)
+            self._promote_data_front(self._data.freeze())
             self._timer.stop()
             self._terminal_timer.stop()
             self._shutdown_state = "WAITING_RENDER"
@@ -4029,7 +4138,8 @@ def show_task_console(
     run_factory=None,
     data_plane: SignalDataPlane,
     project_signal_presentation: Callable[
-        [object, str, SignalPublication], object | None
+        [object, str, SignalPublication, tuple[SignalPublication, ...]],
+        object | None,
     ]
     | None = None,
     scale: float | None = None,

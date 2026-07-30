@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from zlc_pulse import (
-    COMPILER_ID,
     FIELD_DURATION,
     OutputDelay,
     PORT_DAC,
@@ -22,6 +21,7 @@ from zlc_pulse import (
     freeze_scan_table,
     load_pulse_document,
 )
+from zlc_pulse.compiler import COMPILER_ID
 
 
 ROOT = Path(__file__).resolve().parents[1]

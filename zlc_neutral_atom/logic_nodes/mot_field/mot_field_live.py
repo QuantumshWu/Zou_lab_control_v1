@@ -129,7 +129,7 @@ class MotFieldLiveProjection:
         if len(set(output_cells)) != len(output_cells) or any(
             self._valid[output_cell] for output_cell in output_cells
         ):
-            raise RuntimeError("MOT delta attempted to rewrite a committed grid cell")
+            raise RuntimeError("MOT delta attempted to rewrite a written grid cell")
 
         expected_written = self._written_count + len(projected)
         if expected_written != delta.coverage.written_cells:
@@ -149,7 +149,7 @@ class MotFieldLiveProjection:
         """Materialize the current scalar front only on consumer demand."""
 
         if self._generation is None or self._revision.value < 1:
-            raise RuntimeError("MOT live projection has no committed cell")
+            raise RuntimeError("MOT live projection has no written cell")
 
         ref = DatasetRevisionRef(
             self._output_block_id,

@@ -56,10 +56,7 @@ def test_operator_observes_holds_steps_and_stops_virtual_scan(tmp_path) -> None:
     )
     experiment = connect(
         "virtual",
-        workspace=WorkspacePaths.for_workspace(
-            (tmp_path / "authored").resolve(),
-            repository_root=tmp_path.resolve(),
-        ),
+        workspace=WorkspacePaths.for_workspace((tmp_path / "workspace").resolve()),
     )
     body = experiment.pulse_gui(document=document)
     try:

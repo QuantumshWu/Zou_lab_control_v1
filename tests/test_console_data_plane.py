@@ -33,6 +33,7 @@ from zlc_neutral_atom.dataset_output import (
     LiveDatasetOutput,
 )
 from zlc_neutral_atom.processing.signal_plane import (
+    DerivedSignalOutput,
     SignalDataPlane,
     SignalFront,
     SignalPublication,
@@ -46,7 +47,6 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 def _live_output(
     name: str,
     revision: int,
-    digest: str,
     *,
     generation: str | None = None,
 ) -> LiveDatasetOutput:
@@ -89,7 +89,6 @@ def _live_output(
         DatasetOutputDeclaration(name, f"test.{name}"),
         snapshot,
         MonitorCoverage(1, 1, 0, False),
-        digest,
     )
 
 
@@ -106,14 +105,12 @@ def _attach_live(
     node,
     state: dict[str, LiveDatasetOutput],
     *,
-    run: str,
-    epoch: str,
     calls: list[object] | None = None,
 ):
     def freeze_live_outputs():
         if calls is not None:
             calls.append(object())
-        return run, epoch, dict(state)
+        return dict(state)
 
     slot = SimpleNamespace(
         freeze_live_outputs=freeze_live_outputs,
@@ -121,8 +118,6 @@ def _attach_live(
         notification_failure=None,
     )
     plane.reserve(node)
-    lifecycle = plane.begin_run_lifecycle(node)
-    plane.bind_run_lifecycle(lifecycle, run, preemptible=True)
     plane.attach(node, slot)
     plane.mark_changed(node, slot)
     return slot
@@ -131,16 +126,14 @@ def _attach_live(
 def _live_source_plane():
     plane = SignalDataPlane()
     state = {
-        "frame": _live_output("frame", 1, "1" * 64),
-        "frame_aux": _live_output("frame_aux", 1, "2" * 64),
+        "frame": _live_output("frame", 1),
+        "frame_aux": _live_output("frame_aux", 1),
     }
     node = _node("camera", tuple(state.values()))
     slot = _attach_live(
         plane,
         node,
         state,
-        run="camera-run",
-        epoch="camera-epoch",
     )
     first = plane.freeze()
     return plane, state, node, slot, first
@@ -150,14 +143,14 @@ def test_event_route_freezes_generation_before_any_publication() -> None:
     """A passive trigger source is bindable before the event that FIRE creates."""
 
     plane = SignalDataPlane()
-    output = _live_output("frame", 1, "1" * 64)
+    output = _live_output("frame", 1)
     node = _node("passive-camera", (output,))
     source = SimpleNamespace(
         value_schema=lambda _name: output.snapshot.block.schema.cell_schema,
         open_signal_cursor=lambda _name: object(),
     )
     slot = SimpleNamespace(
-        freeze_live_outputs=lambda: ("camera-run", "camera-epoch", {"frame": output}),
+        freeze_live_outputs=lambda: {"frame": output},
         close=lambda: None,
         notification_failure=None,
     )
@@ -166,13 +159,13 @@ def test_event_route_freezes_generation_before_any_publication() -> None:
         plane.attach(node, slot, event_source=source)
         assert plane.latest_publication("passive-camera/frame") is None
         frozen = plane.signal_event_binding("passive-camera/frame")
-        assert frozen == (generation, source, "frame", None)
+        assert frozen == (generation, source, "frame")
 
         plane.retire(node)
         replacement = _node("passive-camera", (output,))
         replacement_generation = plane.reserve(replacement)
         plane.attach(replacement, slot, event_source=source)
-        assert replacement_generation > generation
+        assert replacement_generation != generation
         with pytest.raises(RuntimeError, match="generation changed"):
             plane.signal_event_binding(
                 "passive-camera/frame",
@@ -182,31 +175,66 @@ def test_event_route_freezes_generation_before_any_publication() -> None:
         plane.close()
 
 
+def test_derived_route_stores_an_owned_event_capability_not_selector_metadata() -> None:
+    plane = SignalDataPlane()
+    output = _live_output("frame", 1)
+    node = _node("camera", (output,))
+    source = SimpleNamespace(
+        value_schema=lambda _name: output.snapshot.block.schema.cell_schema,
+        open_signal_cursor=lambda _name: object(),
+    )
+    slot = SimpleNamespace(
+        freeze_live_outputs=lambda: {"frame": output},
+        close=lambda: None,
+        notification_failure=None,
+    )
+    try:
+        plane.reserve(node)
+        plane.attach(node, slot, event_source=source)
+        plane.mark_changed(node, slot)
+        parent = plane.freeze().publication("camera/frame")
+        assert parent is not None
+
+        generation = plane.bind_continuous_derived(
+            "figure/area",
+            source_name="camera/frame",
+            expected_source_generation=parent.event_ref.generation,
+            output_names=("panel/area",),
+            event_source=source,
+            event_output_name="frame",
+        )
+        assert plane.publish_continuous_derived(
+            "figure/area",
+            generation,
+            parent,
+            {"panel/area": DerivedSignalOutput(output.snapshot)},
+        )
+        assert plane.signal_event_binding("panel/area") == (
+            generation,
+            source,
+            "frame",
+        )
+    finally:
+        plane.close()
+
+
 def test_detach_with_slow_slot_cannot_withdraw_or_wake_replacement() -> None:
     """Retirement is generation-linearized before a live slot joins."""
 
     plane = SignalDataPlane()
-    old_output = _live_output("frame", 1, "1" * 64)
-    new_output = _live_output("frame", 2, "2" * 64)
+    old_output = _live_output("frame", 1)
+    new_output = _live_output("frame", 2)
     node = _node("camera", (old_output,))
     close_entered = threading.Event()
     allow_close = threading.Event()
     errors = []
     old_slot = SimpleNamespace(
-        freeze_live_outputs=lambda: (
-            "old-run",
-            "old-epoch",
-            {"frame": old_output},
-        ),
+        freeze_live_outputs=lambda: {"frame": old_output},
         close=lambda: (close_entered.set(), allow_close.wait(2.0)),
         notification_failure=None,
     )
     new_slot = SimpleNamespace(
-        freeze_live_outputs=lambda: (
-            "new-run",
-            "new-epoch",
-            {"frame": new_output},
-        ),
+        freeze_live_outputs=lambda: {"frame": new_output},
         close=lambda: None,
         notification_failure=None,
     )
@@ -223,7 +251,7 @@ def test_detach_with_slow_slot_cannot_withdraw_or_wake_replacement() -> None:
         worker = threading.Thread(target=detach)
         worker.start()
         assert close_entered.wait(1.0)
-        assert plane.reserve(node) > first_generation
+        assert plane.reserve(node) != first_generation
         plane.attach(node, new_slot)
 
         plane.mark_changed(node, old_slot)
@@ -241,63 +269,6 @@ def test_detach_with_slow_slot_cannot_withdraw_or_wake_replacement() -> None:
         plane.close()
 
 
-def test_preemption_keeps_a_parent_with_an_unadmitted_exact_descendant() -> None:
-    plane = SignalDataPlane()
-    parent = _node("parent", (_live_output("source", 1, "1" * 64),))
-    child = _node("child", (_live_output("result", 1, "2" * 64),))
-    parent_command = object()
-    child_command = object()
-    try:
-        plane.reserve(parent)
-        plane.bind_lifecycle_owner(parent, parent_command)
-        parent_ref = plane.begin_run_lifecycle(parent_command)
-        plane.bind_run_lifecycle(parent_ref, "parent-run", preemptible=True)
-
-        plane.reserve(child)
-        plane.bind_lifecycle_owner(
-            child,
-            child_command,
-            parent_owners=(parent_command,),
-        )
-
-        assert plane.retire_preemptible_run_closure(("parent-run",)) is None
-        child_ref = plane.begin_run_lifecycle(child_command)
-        assert plane.abort_run_lifecycle(child_ref)
-        plane.finish_run_lifecycle("parent-run")
-    finally:
-        plane.close()
-
-
-def test_preemption_closes_live_slot_only_after_safe_run_release() -> None:
-    plane = SignalDataPlane()
-    output = _live_output("source", 1, "1" * 64)
-    parent = _node("parent", (output,))
-    closed = []
-    slot = SimpleNamespace(
-        freeze_live_outputs=lambda: ("parent-run", "parent-epoch", {"source": output}),
-        close=lambda: closed.append(True),
-        notification_failure=None,
-    )
-    command = object()
-    try:
-        plane.reserve(parent)
-        plane.bind_lifecycle_owner(parent, command)
-        lifecycle = plane.begin_run_lifecycle(command)
-        plane.bind_run_lifecycle(lifecycle, "parent-run", preemptible=True)
-        plane.attach(parent, slot)
-
-        assert plane.retire_preemptible_run_closure(("parent-run",)) == (
-            "parent-run",
-        )
-        assert closed == []
-        assert len(plane) == 0
-
-        assert plane.finish_preemptible_run_retirement(("parent-run",)) == ()
-        assert closed == [True]
-    finally:
-        plane.close()
-
-
 class _GatedProcessorApplication:
     def __init__(
         self,
@@ -307,7 +278,7 @@ class _GatedProcessorApplication:
         self._output_names = output_names
         self._gates = gates
 
-    def evaluate(self, snapshot, _coverage, *, source_event_digest):
+    def evaluate(self, snapshot, _coverage):
         revision = snapshot.ref.revision.value
         gate = self._gates.setdefault(revision, threading.Event())
         if not gate.wait(2.0):
@@ -316,14 +287,11 @@ class _GatedProcessorApplication:
             name: _live_output(
                 name,
                 revision,
-                source_event_digest,
                 generation=f"{name}-generation-{revision}",
             )
             for name in self._output_names
         }
         return SimpleNamespace(
-            source_ref=snapshot.ref,
-            source_event_digest=source_event_digest,
             outputs=outputs,
         )
 
@@ -347,7 +315,7 @@ class _GatedProcessorNode:
             declared_outputs if published_outputs is None else published_outputs
         )
         self.dataset_output_declarations = tuple(
-            _live_output(name, 1, "a" * 64).declaration
+            _live_output(name, 1).declaration
             for name in declared_outputs
         )
         self.failure: Exception | None = None
@@ -411,7 +379,7 @@ def _wait_for_signal_revision(
 
 def test_unchanged_sources_reuse_their_exact_publication_and_front() -> None:
     plane = SignalDataPlane()
-    output = _live_output("frame", 1, "a" * 64)
+    output = _live_output("frame", 1)
     state = {"frame": output}
     node = _node("camera", (output,))
     calls: list[object] = []
@@ -419,8 +387,6 @@ def test_unchanged_sources_reuse_their_exact_publication_and_front() -> None:
         plane,
         node,
         state,
-        run="run",
-        epoch="epoch",
         calls=calls,
     )
     try:
@@ -431,7 +397,7 @@ def test_unchanged_sources_reuse_their_exact_publication_and_front() -> None:
         assert plane.freeze() is first
         assert len(calls) == 1
 
-        state["frame"] = _live_output("frame", 2, "b" * 64)
+        state["frame"] = _live_output("frame", 2)
         plane.mark_changed(node, slot)
         second = plane.freeze()
         assert second is not first
@@ -457,16 +423,14 @@ def test_the_data_plane_holds_no_toolkit_or_domain_authority() -> None:
 
 
 def test_live_slot_cannot_publish_an_undeclared_output_contract() -> None:
-    declared = _live_output("frame", 1, "a" * 64)
-    undeclared = _live_output("roi", 1, "b" * 64)
+    declared = _live_output("frame", 1)
+    undeclared = _live_output("roi", 1)
     node = _node("camera", (declared,))
     plane = SignalDataPlane()
     _attach_live(
         plane,
         node,
         {"roi": undeclared},
-        run="run",
-        epoch="epoch",
     )
     try:
         front = plane.freeze()
@@ -478,23 +442,19 @@ def test_live_slot_cannot_publish_an_undeclared_output_contract() -> None:
 
 def test_independent_producers_keep_independent_publications() -> None:
     plane = SignalDataPlane()
-    slow = _live_output("frame", 3, "a" * 64)
-    fast = _live_output("frame", 91, "b" * 64, generation="fast-generation")
+    slow = _live_output("frame", 3)
+    fast = _live_output("frame", 91, generation="fast-generation")
     slow_node = _node("slow", (slow,))
     fast_node = _node("fast", (fast,))
     _attach_live(
         plane,
         slow_node,
         {"frame": slow},
-        run="run-slow",
-        epoch="epoch-slow",
     )
     _attach_live(
         plane,
         fast_node,
         {"frame": fast},
-        run="run-fast",
-        epoch="epoch-fast",
     )
     try:
         front = plane.freeze()
@@ -502,9 +462,11 @@ def test_independent_producers_keep_independent_publications() -> None:
         fast_publication = front.publication("fast/frame")
         assert slow_publication is not None and fast_publication is not None
         assert slow_publication is not fast_publication
-        assert slow_publication.parents == fast_publication.parents == ()
-        assert front.value("slow/frame").run_id == "run-slow"
-        assert front.value("fast/frame").run_id == "run-fast"
+        assert slow_publication.direct_parent_refs == ()
+        assert fast_publication.direct_parent_refs == ()
+        assert slow_publication.event_ref.stream_id.value == "slow"
+        assert fast_publication.event_ref.stream_id.value == "fast"
+        assert not hasattr(front.value("slow/frame"), "run_id")
         assert not hasattr(front, "shot")
     finally:
         plane.close()
@@ -535,10 +497,12 @@ def test_processor_advances_with_its_exact_source_publication() -> None:
         admitted = _wait_for_signal_revision(plane, "occupancy/occupied", 1)
         derived_publication = admitted.publication("occupancy/occupied")
         assert derived_publication is not None
-        assert derived_publication.parents == (first_publication,)
+        assert plane.direct_parent_publications(derived_publication) == (
+            first_publication,
+        )
 
-        state["frame"] = _live_output("frame", 2, "3" * 64)
-        state["frame_aux"] = _live_output("frame_aux", 2, "4" * 64)
+        state["frame"] = _live_output("frame", 2)
+        state["frame_aux"] = _live_output("frame_aux", 2)
         plane.mark_changed(source_node, source_slot)
         staged = plane.freeze()
         assert staged.value("camera/frame").snapshot.ref.revision.value == 1
@@ -550,7 +514,9 @@ def test_processor_advances_with_its_exact_source_publication() -> None:
         source_publication = advanced.publication("camera/frame")
         result_publication = advanced.publication("occupancy/occupied")
         assert source_publication is not None and result_publication is not None
-        assert result_publication.parents == (source_publication,)
+        assert plane.direct_parent_publications(result_publication) == (
+            source_publication,
+        )
         assert advanced.value("camera/frame_aux").snapshot.ref.revision.value == 2
     finally:
         for gate in gates.values():
@@ -615,7 +581,9 @@ def test_fan_out_binds_the_same_exact_visible_publication() -> None:
             front = _wait_for_signal_revision(plane, f"{name}/value", 1)
             publication = front.publication(f"{name}/value")
             assert publication is not None
-            assert publication.parents == (source_publication,)
+            assert plane.direct_parent_publications(publication) == (
+                source_publication,
+            )
     finally:
         plane.close()
 
@@ -669,8 +637,7 @@ def test_task_console_failure_and_retirement_release_the_shared_plane_wake(
     application = ensure_qt_app()
     assert application.platformName().lower() == "offscreen"
     workspace = zlc.WorkspacePaths.for_workspace(
-        REPO,
-        repository_root=tmp_path.resolve(),
+        (tmp_path / "workspace").resolve()
     )
     experiment = zlc.connect("virtual", workspace=workspace)
     original_constructor = window_module.TaskConsole

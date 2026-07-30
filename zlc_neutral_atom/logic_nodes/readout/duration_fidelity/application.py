@@ -26,7 +26,6 @@ from zlc_data import (
     StreamGenerationId,
     ValueSchema,
 )
-from zlc_data.codec import dataset_revision_ref_to_tree
 from zlc_data.value import dataset_cell_value, expand_value_validity
 from zlc_neutral_atom.capture.binding import (
     TriggeredCameraLayout,
@@ -44,7 +43,6 @@ from zlc_neutral_atom.capture.triggered import (
 )
 from zlc_neutral_atom.dataset_output import (
     FinalDatasetOutput,
-    final_dataset_join_digest,
 )
 from zlc_neutral_atom.logic_nodes.readout.bimodal import fit_bimodal
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
@@ -62,7 +60,6 @@ from zlc_neutral_atom.logic_nodes.readout.duration_fidelity.measurement import (
 from zlc_neutral_atom.devices.camera.capture_port import (
     BoundCapturePort,
     CaptureTerminalAck,
-    capture_terminal_ack_to_tree,
     configure_camera_exposure,
 )
 from zlc_neutral_atom.runtime.cleanup import CleanupReport, run_cleanup_steps
@@ -71,9 +68,7 @@ from zlc_neutral_atom.devices.sequencer.port import (
     BoundPulsePort,
     PulseSession,
     PulseTerminalAck,
-    pulse_terminal_ack_to_tree,
 )
-from zlc_storage import canonical_digest, sha256_text
 from zlc_pulse import PulseExecutionForm
 
 
@@ -86,7 +81,6 @@ class ReadoutDurationFidelityResult:
     calibration_ref: CalibrationArtifactRef
     model_kind: ReadoutModelKind
     site: int | None
-    program_fingerprint: str
     capture_terminals: tuple[CaptureTerminalAck, ...]
     pulse_terminals: tuple[PulseTerminalAck, ...]
 
@@ -99,7 +93,6 @@ class ReadoutDurationFidelityResult:
             raise TypeError("calibration_ref must be CalibrationArtifactRef")
         if not isinstance(self.model_kind, ReadoutModelKind):
             raise TypeError("model_kind must be ReadoutModelKind")
-        sha256_text(self.program_fingerprint, "program_fingerprint")
         point_count = self.snapshot.block.schema.point_table.row_count
         values = (tuple(self.capture_terminals), tuple(self.pulse_terminals))
         if any(len(value) != point_count for value in values):
@@ -110,31 +103,6 @@ class ReadoutDurationFidelityResult:
             raise TypeError("pulse_terminals contain another value type")
         object.__setattr__(self, "capture_terminals", values[0])
         object.__setattr__(self, "pulse_terminals", values[1])
-
-    @property
-    def identity(self) -> str:
-        return canonical_digest(
-            {
-                "owner": "zlc_neutral_atom.logic_nodes.readout-duration-fidelity",
-                "run_id": self.run_id,
-                "dataset_ref": dataset_revision_ref_to_tree(self.snapshot.ref),
-                "calibration": self.calibration_ref.target_ref,
-                "model_kind": self.model_kind.value,
-                "site": self.site,
-                "program": self.program_fingerprint,
-                "point_terminals": tuple(
-                    {
-                        "capture": capture_terminal_ack_to_tree(capture),
-                        "pulse": pulse_terminal_ack_to_tree(pulse),
-                    }
-                    for capture, pulse in zip(
-                        self.capture_terminals,
-                        self.pulse_terminals,
-                        strict=True,
-                    )
-                ),
-            }
-        )
 
 
 @dataclass(slots=True)
@@ -160,14 +128,18 @@ class PreparedReadoutDurationFidelity:
         self._started = False
         self._lock = threading.Lock()
 
-    def start(self) -> RunHandle:
+    def start(
+        self,
+        *,
+        lifecycle_owner: object | None = None,
+    ) -> RunHandle:
         with self._lock:
             if self._started:
                 raise RuntimeError("PreparedReadoutDurationFidelity is one-shot")
             self._started = True
         return self._start_run(
             self._plan.with_lifecycle(
-                owner=self,
+                owner=self if lifecycle_owner is None else lifecycle_owner,
                 preemptible=False,
             )
         )
@@ -182,12 +154,6 @@ class PreparedReadoutDurationFidelity:
         output = FinalDatasetOutput(
             declaration,
             result.snapshot,
-            final_dataset_join_digest(
-                owner="readout-duration-fidelity",
-                declaration=declaration,
-                source_identity=result.identity,
-                snapshot=result.snapshot,
-            ),
         )
         return {output.name: output}
 
@@ -215,7 +181,6 @@ def _point_samples(model, site: int | None, block: DataBlock) -> np.ndarray:
 
 def _result_snapshot(
     run_id: str,
-    program_fingerprint: str,
     durations: tuple[float, ...],
     fidelities: tuple[float, ...],
     validity: tuple[bool, ...],
@@ -234,22 +199,14 @@ def _result_snapshot(
         None,
         ValueSchema.scalar(np.dtype("<f8"), "fidelity"),
     )
-    identity = canonical_digest(
-        {
-            "owner": "zlc_neutral_atom.logic_nodes.readout-duration-fidelity-result",
-            "run_id": run_id,
-            "program": program_fingerprint,
-            "duration_seconds": durations,
-        }
-    )
     block = DataBlock(
-        BlockId(f"readout-duration-{identity[:20]}"),
+        BlockId(f"readout-duration-{run_id}"),
         DatasetRevision(0),
         np.asarray(fidelities, dtype="<f8").reshape((1, len(durations), 1)),
         CellValidity(np.asarray(validity, dtype=bool).reshape((1, len(durations)))),
         schema,
     )
-    generation = StreamGenerationId(f"readout-duration-{identity}")
+    generation = StreamGenerationId(f"readout-duration-{run_id}")
     return OwnedSnapshot(block.ref(generation), block)
 
 
@@ -263,9 +220,8 @@ def prepare_readout_duration_fidelity(
 ) -> PreparedReadoutDurationFidelity:
     if not isinstance(request, ReadoutDurationFidelityRequest):
         raise TypeError("request must be ReadoutDurationFidelityRequest")
-    if type(calibration) is not ResolvedCalibration:
-        raise TypeError("calibration must be an admitted ResolvedCalibration")
-    calibration._require_authority()
+    if not isinstance(calibration, ResolvedCalibration):
+        raise TypeError("calibration must be a loaded ResolvedCalibration")
     bound = bind_readout_duration_fidelity(
         request,
         calibration,
@@ -398,7 +354,6 @@ def prepare_readout_duration_fidelity(
             context.run_id.value,
             _result_snapshot(
                 context.run_id.value,
-                bound.program.fingerprint,
                 tuple(applied_durations),
                 tuple(fidelities),
                 tuple(valid_cells),
@@ -406,7 +361,6 @@ def prepare_readout_duration_fidelity(
             calibration.reference,
             model.kind,
             bound.request.site,
-            bound.program.fingerprint,
             tuple(capture_terminals),
             tuple(pulse_terminals),
         )
@@ -440,7 +394,6 @@ def prepare_readout_duration_fidelity(
             raise TypeError("readout-duration finalize received another result")
         if result.run_id != context.run_id.value:
             raise ValueError("readout-duration result belongs to another Run")
-        context.checkpoint()
         return result
 
     plan = RunPlan(
@@ -455,7 +408,6 @@ def prepare_readout_duration_fidelity(
             *pulse_port.interrupt_operations,
             *camera_port.interrupt_operations,
         ),
-        requires_final_commit=False,
     )
     return PreparedReadoutDurationFidelity(plan, start_run)
 

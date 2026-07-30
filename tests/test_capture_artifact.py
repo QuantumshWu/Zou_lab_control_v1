@@ -1,12 +1,14 @@
-"""Final-only persistence for exact pulse-triggered camera datasets."""
+"""Direct-output persistence for exact pulse-triggered camera datasets."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+import zlc_neutral_atom.capture.artifact as capture_artifact_impl
 from zlc_data import AxisId, AxisSpec, BlockId, REPEAT
 from zlc_neutral_atom.devices.camera.contract import (
     CameraCaptureTerminalRecord,
@@ -14,8 +16,8 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraWorkingPoint,
 )
 from zlc_neutral_atom.capture.artifact import (
-    CaptureRepository,
     compile_capture_artifact_pipeline,
+    load_capture_artifact,
 )
 from zlc_neutral_atom.devices.camera.endpoint import CameraCaptureEndpoint
 from zlc_neutral_atom.devices.simulation.sequencer_endpoint import (
@@ -50,13 +52,7 @@ from zlc_pulse import (
     load_pulse_document,
     pulse_target_manifest_from_lanes,
 )
-from zlc_storage import (
-    ContentCorruptionError,
-    RepositoryRootBusy,
-    canonical_digest,
-    decode,
-    encode,
-)
+from zlc_storage import canonical_digest
 
 
 _ROOT = Path(__file__).parents[1]
@@ -149,10 +145,9 @@ class _Camera:
 
 def _identity(name: str) -> PhysicalDeviceIdentity:
     return PhysicalDeviceIdentity(
-        name,
-        DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-        f"{name}-evidence",
-        "fixture-assets-v1",
+        stable_device_identity=name,
+        evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+        asset_map_revision="fixture-assets-v1",
     )
 
 
@@ -257,7 +252,7 @@ class _CaptureCase:
             binding.trigger_channel,
             binding.cell_plan,
         )
-        self.repository = CaptureRepository(tmp_path / "captures")
+        self.captures_root = tmp_path / "captures"
         self.resources = ResourceArbiter()
         self.controller = RunController(self.resources)
         self.handle = None
@@ -266,7 +261,7 @@ class _CaptureCase:
         self.handle = self.controller.start(
             compile_capture_artifact_pipeline(
                 self.triggered,
-                self.repository,
+                self.captures_root,
             )
         )
         return self.handle.result(5.0)
@@ -275,7 +270,6 @@ class _CaptureCase:
         assert self.controller.shutdown(2.0)
         self.broker.shutdown()
         self.resources.shutdown()
-        self.repository.close()
         self.sequencer.close()
         self.camera.close()
 
@@ -285,9 +279,8 @@ def test_exact_pipeline_commits_and_reloads_multidimensional_capture(tmp_path) -
     try:
         reference = case.run()
         assert isinstance(reference, CaptureArtifactRef)
-        assert case.handle.snapshot().final_committed
-        artifact = case.repository.load(reference)
-        block = artifact.frame_source.materialize()
+        artifact = load_capture_artifact(case.captures_root, reference)
+        block = artifact.materialize_snapshot().block
         assert block.values.shape == (1, 3, 3, 4)
         assert tuple(
             axis.axis_id.value for axis in block.schema.cell_schema.data_axes
@@ -306,120 +299,119 @@ def test_exact_pipeline_commits_and_reloads_multidimensional_capture(tmp_path) -
         case.close()
 
 
-def test_manifest_contains_current_owner_values_without_mirror_truths(tmp_path) -> None:
+def test_capture_record_is_the_only_visibility_boundary(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    record_writes = []
+    write_record = capture_artifact_impl.atomic_write_text
+
+    def assert_payload_precedes_record(path, text):
+        directory = Path(path).parent
+        assert (directory / "frames.npy").is_file()
+        assert (directory / "pulse.bin").is_file()
+        record_writes.append(Path(path))
+        return write_record(path, text)
+
+    monkeypatch.setattr(
+        capture_artifact_impl,
+        "atomic_write_text",
+        assert_payload_precedes_record,
+    )
     case = _CaptureCase(tmp_path)
     try:
         reference = case.run()
-        payload = case.repository._store_authority.read_manifest(
-            "capture",
-            reference.manifest_digest,
-        )
-        manifest = decode(payload)
-        assert set(manifest) == {
+        record_path = case.captures_root / reference.record_path
+        assert record_writes == [record_path]
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert set(record) == {
             "schema",
-            "repository_id",
-            "frame_index_blob",
-            "compiled_pulse_blob",
+            "run_id",
+            "frames",
             "provenance",
             "terminal",
             "camera_provenance",
             "camera_capability_evidence",
             "camera_arm_spec",
+            "compiled_pulse_file",
             "pulse_evidence",
         }
-        assert "checkpoint" not in manifest
-        admitted = case.repository.admit(reference)
-        assert admitted.reference == reference
+        assert record["camera_provenance"]["binding_stamp"][
+            "physical_identity"
+        ] == {
+            "stable_device_identity": "fixture-camera",
+            "evidence_kind": "INSTALLATION_ASSERTED_ENDPOINT",
+            "asset_map_revision": "fixture-assets-v1",
+        }
+        assert (record_path.parent / "frames.npy").is_file()
+        assert (record_path.parent / "pulse.bin").is_file()
+        frames = np.load(record_path.parent / "frames.npy", allow_pickle=False)
+        assert frames.dtype == np.dtype("<u2")
     finally:
         case.close()
 
 
-def test_failed_terminal_count_never_publishes_a_manifest(tmp_path) -> None:
+def test_failed_terminal_count_never_publishes_a_capture_record(tmp_path) -> None:
     case = _CaptureCase(tmp_path, camera=_Camera(terminal_count_delta=-1))
     try:
         with pytest.raises(RunFailed, match="terminal"):
             case.run()
-        manifests = tmp_path / "captures" / "content" / "manifests" / "capture"
-        assert not manifests.exists() or not tuple(manifests.iterdir())
+        assert not tuple((tmp_path / "captures").glob("*/capture.json"))
     finally:
         case.close()
 
 
-def test_lazy_frame_read_fails_closed_on_chunk_corruption(tmp_path) -> None:
+def test_lazy_frame_read_rejects_a_broken_array(tmp_path) -> None:
     case = _CaptureCase(tmp_path)
     try:
         reference = case.run()
-        artifact = case.repository.load(reference)
-        chunk = artifact.frame_source._chunk_refs[0]
-        case.repository._store._blob_path(chunk.digest).write_bytes(b"corrupt")
-        with pytest.raises(ContentCorruptionError):
-            case.repository.load(reference).frame_source.materialize()
+        artifact = load_capture_artifact(case.captures_root, reference)
+        (case.captures_root / reference.record_path).parent.joinpath(
+            "frames.npy"
+        ).write_bytes(b"broken")
+        with pytest.raises((OSError, ValueError)):
+            artifact.materialize_snapshot()
     finally:
         case.close()
 
 
 def test_capture_ref_has_one_strict_leaf_owner() -> None:
-    reference = CaptureArtifactRef("capture-repository", "a" * 64)
+    reference = CaptureArtifactRef("run-001/capture.json")
     assert capture_artifact_ref_from_tree(
         capture_artifact_ref_to_tree(reference)
     ) == reference
     tree = {
         "schema": "zlc_neutral_atom.capture-artifact-ref",
-        "repository_id": reference.repository_id,
-        "manifest_digest": reference.manifest_digest,
+        "record_path": reference.record_path,
     }
     assert capture_artifact_ref_from_tree(tree) == reference
     with pytest.raises(ValueError, match="unknown field"):
         capture_artifact_ref_from_tree({**tree, "legacy_generation": 1})
-
-
-def test_repository_rejects_foreign_refs_and_parallel_root_owners(tmp_path) -> None:
+def test_capture_record_unknown_fields_are_rejected(tmp_path) -> None:
     case = _CaptureCase(tmp_path)
     try:
         reference = case.run()
-        with pytest.raises(ValueError, match="another repository"):
-            case.repository.load(
-                CaptureArtifactRef("foreign-repository", reference.manifest_digest)
-            )
-        with pytest.raises(RepositoryRootBusy):
-            CaptureRepository(case.repository.root)
+        record_path = case.captures_root / reference.record_path
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["legacy_checkpoint_kind"] = "CHECKPOINT"
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        with pytest.raises(ValueError, match="CaptureArtifact"):
+            load_capture_artifact(case.captures_root, reference)
     finally:
         case.close()
 
 
-def test_capture_repository_exposes_final_only_commit_surface(tmp_path) -> None:
-    repository = CaptureRepository(tmp_path / "captures")
-    try:
-        assert not hasattr(repository, "checkpoint_commit")
-        assert not hasattr(repository, "commit_checkpoint")
-        assert not hasattr(repository, "startup_reconciliations")
-        with pytest.raises(TypeError, match="final"):
-            class _DerivedRepository(CaptureRepository):
-                pass
-        with pytest.raises(AttributeError, match="immutable"):
-            repository.repository_id = "forged"
-    finally:
-        repository.close()
-
-
-def test_manifest_unknown_fields_are_not_treated_as_current_capture(tmp_path) -> None:
+def test_capture_provenance_rejects_a_legacy_identity_digest(tmp_path) -> None:
     case = _CaptureCase(tmp_path)
     try:
         reference = case.run()
-        payload = case.repository._store_authority.read_manifest(
-            "capture",
-            reference.manifest_digest,
-        )
-        manifest = decode(payload)
-        forged = case.repository._store_authority.publish_manifest(
-            "capture",
-            encode({**manifest, "legacy_checkpoint_kind": "CHECKPOINT"}),
-        )
-        forged_ref = CaptureArtifactRef(
-            case.repository.repository_id,
-            forged.content.digest,
-        )
-        with pytest.raises(ValueError, match="CaptureArtifact"):
-            case.repository.load(forged_ref)
+        record_path = case.captures_root / reference.record_path
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["camera_provenance"]["binding_stamp"]["physical_identity"][
+            "evidence_digest"
+        ] = "retired-identity-digest"
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        with pytest.raises(ValueError, match="physical device identity"):
+            load_capture_artifact(case.captures_root, reference)
     finally:
         case.close()

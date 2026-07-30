@@ -500,8 +500,8 @@ def test_commit_is_schema_bound_and_authoritative():
         point_ordinals=(0,),
     )
     assert (
-        resolve_transformed_schema(block.schema, committed).fingerprint
-        == committed.output_schema_fingerprint
+        resolve_transformed_schema(block.schema, committed)
+        == committed.effective_output_schema
     )
     snapshot = OwnedSnapshot(block.ref(StreamGenerationId("generation-1")), block)
     authoritative = apply_transform(snapshot, committed)
@@ -777,7 +777,10 @@ def test_dense_schema_commit_derives_the_expected_output_schema():
         )
     )
     committed = commit_transform(schema, spec)
-    assert committed.output_schema_fingerprint
+    assert committed.effective_output_schema == resolve_transformed_schema(
+        schema,
+        committed,
+    )
     transformed = resolve_transformed_schema(schema, committed)
     assert transformed.repeat_axis.size == 1
     assert transformed.point_table == schema.point_table

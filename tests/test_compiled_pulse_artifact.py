@@ -17,12 +17,14 @@ from zlc_pulse import (
     CompiledPulseArtifact,
     PulseExecutionForm,
     compile_pulse_artifact,
-    compiled_pulse_artifact_from_tree,
-    compiled_pulse_artifact_to_tree,
     decode_compiled_pulse_artifact,
     encode_compiled_pulse_artifact,
     freeze_scan_table,
     load_pulse_document,
+)
+from zlc_pulse.artifact import (
+    compiled_pulse_artifact_from_tree,
+    compiled_pulse_artifact_to_tree,
 )
 
 

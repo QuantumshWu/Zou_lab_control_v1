@@ -168,10 +168,9 @@ def _bound(camera: _Camera, *, qualified: bool = True):
     )
     broker = DeviceBroker()
     identity = PhysicalDeviceIdentity(
-        "fixture-camera",
-        DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-        "fixture-camera-evidence",
-        "fixture-assets-v1",
+        stable_device_identity="fixture-camera",
+        evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+        asset_map_revision="fixture-assets-v1",
     )
     proof = broker.verify_identity(lambda: identity)
     binding = None
@@ -256,9 +255,6 @@ def test_capability_evidence_is_the_public_owner_of_physical_facts() -> None:
         evidence = capability.camera_capability_evidence
         assert evidence.physical_facts.output_shape_yx == (3, 4)
         assert evidence.physical_facts.capture_trigger_channels == ("ch11",)
-        assert capability.payload_contract.fingerprint == (
-            evidence.payload_contract_fingerprint
-        )
         tree = camera_capability_evidence_to_tree(evidence)
         assert tree["schema"] == "zlc_neutral_atom.CameraCapabilityEvidence"
         assert tree["physical_facts"]["capture_trigger_channels"] == ["ch11"]

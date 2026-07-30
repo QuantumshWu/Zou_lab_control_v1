@@ -2,12 +2,10 @@
 
 from .causal import (
     CausalProcessorEvaluation,
-    derive_dataset_event_digest,
     require_causal_processor_evaluation,
 )
 from .hosted_processor import (
     HostedProcessor,
-    ProcessorPublication,
 )
 from .signal_plane import (
     DerivedSignalOutput,
@@ -20,11 +18,9 @@ from .signal_plane import (
 
 __all__ = [
     "CausalProcessorEvaluation",
-    "derive_dataset_event_digest",
     "DerivedSignalOutput",
     "HostedProcessor",
     "LatestProcessorControl",
-    "ProcessorPublication",
     "require_causal_processor_evaluation",
     "SignalDataPlane",
     "SignalFront",

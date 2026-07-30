@@ -8,7 +8,6 @@ from PyQt5 import QtWidgets
 
 from zlc_frontend.plot_kind import PlotKind
 from zlc_frontend.plot_panel import (
-    PanelProvenance,
     PlotPanelContract,
     plot_panel_display_state,
 )
@@ -401,7 +400,14 @@ class OccupancyCellWindow(SerialWorkerWindow):
         )
         display = plot_panel_display_state(contract, {}, revision=0)
         source_key = (contract.session_identity, source.session_identity)
-        frame_key = (navigation_id, address, view.view_identity)
+        frame_key = (
+            navigation_id,
+            address,
+            view.background_input.ref,
+            view.site_state_input.ref,
+            view.cell_selection,
+            id(view.centers_xy),
+        )
         request = FigureSurfaceRenderRequest(
             _PANEL_ID,
             self._request_revision,
@@ -412,11 +418,6 @@ class OccupancyCellWindow(SerialWorkerWindow):
             contract,
             source,
             display,
-            PanelProvenance(
-                view.run_id,
-                view.provenance_epoch_id,
-                view.coherence_identity,
-            ),
             None,
         )
         self._status.setText("RENDERING OCCUPANCY CELL")

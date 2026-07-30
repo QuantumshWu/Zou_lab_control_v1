@@ -22,8 +22,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from zlc_data import AxisSourceRef
-from zlc_storage import sha256_text
-
 from .curve_display import CurveDisplayState
 from .data_figure import (
     DataFigure,
@@ -62,13 +60,11 @@ from .image_display import (
 from .fit_projection import canonical_panel_focus_address
 from .panel_size import DEFAULT_PANEL_SIZE
 from .plot_layout import panel_surface_geometry
-from .render import PanelPresentationIdentity
 
 __all__ = [
     "PanelComposer",
     "FacetedPanelFocus",
     "FacetedPanelResult",
-    "PanelProvenance",
     "PanelRenderError",
     "view_for_schema",
 ]
@@ -76,28 +72,6 @@ __all__ = [
 
 class PanelRenderError(RuntimeError):
     """A snapshot that cannot be shown as asked, with the reason the host shows."""
-
-
-@dataclass(frozen=True, slots=True)
-class PanelProvenance:
-    """Where one composed front came from -- the facts a coherence stamp needs.
-
-    The host supplies these because only the host knows them: the run that
-    produced the data, the causation domain it belongs to, and the digest of the
-    event the snapshot froze.  A composer that invented them would be attesting
-    to a lineage it cannot see.
-    """
-
-    run_id: object
-    epoch_id: object
-    join_digest: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "join_digest",
-            sha256_text(self.join_digest, "panel join_digest"),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,7 +313,7 @@ class PanelComposer:
         self._image_color_cache_value = None
 
     # -------------------------------------------------------------- compose
-    def compose(self, snapshot, *, display, provenance: PanelProvenance):
+    def compose(self, snapshot, *, display):
         """Rasterize ONE frozen snapshot into a single-panel BoardFrame.
 
         ``snapshot`` is an ``OwnedSnapshot`` -- the immutable (ref, block) pair a
@@ -352,7 +326,6 @@ class PanelComposer:
         frame, _figure = self.compose_with_figure(
             snapshot,
             display=display,
-            provenance=provenance,
         )
         return frame
 
@@ -361,7 +334,6 @@ class PanelComposer:
         snapshot,
         *,
         display,
-        provenance: PanelProvenance,
         fit_result=None,
         fit_result_identity: str | None = None,
         histogram_projection_value_range: tuple[float, float] | None = None,
@@ -404,12 +376,9 @@ class PanelComposer:
         )
         return (
             self._frame_for(
-                document,
                 ref,
                 raster,
                 payload,
-                display,
-                provenance,
             ),
             figure,
         )
@@ -419,7 +388,6 @@ class PanelComposer:
         snapshot,
         *,
         display,
-        provenance: PanelProvenance,
         focus: FacetedPanelFocus | None = None,
         fit_result=None,
         fit_result_identity: str | None = None,
@@ -512,13 +480,6 @@ class PanelComposer:
                 raster,
                 regions,
                 self._surface_geometry.logical_size,
-                PanelPresentationIdentity(
-                    self._panel_id,
-                    source_figure.document.document_id,
-                    source_figure.document.revision,
-                    0,
-                    getattr(display, "revision", 0) or 0,
-                ),
             )
             return FacetedPanelResult(source_figure, overview=overview)
 
@@ -544,12 +505,9 @@ class PanelComposer:
             check_cancelled=check_cancelled,
         )
         frame = self._frame_for(
-            focused.document,
             ref,
             raster,
             payload,
-            focused_display,
-            provenance,
         )
         return FacetedPanelResult(
             source_figure,
@@ -562,7 +520,6 @@ class PanelComposer:
         figure: DataFigure,
         *,
         display,
-        provenance: PanelProvenance,
         fit_result=None,
         fit_result_identity: str | None = None,
         histogram_projection_value_range: tuple[float, float] | None = None,
@@ -614,12 +571,9 @@ class PanelComposer:
         )
         return (
             self._frame_for(
-                document,
                 evaluated_input.ref,
                 raster,
                 payload,
-                display,
-                provenance,
             ),
             base,
         )
@@ -712,13 +666,6 @@ class PanelComposer:
             raster,
             regions,
             self._surface_geometry.logical_size,
-            PanelPresentationIdentity(
-                self._panel_id,
-                document.document_id,
-                document.revision,
-                0,
-                getattr(display, "revision", 0) or 0,
-            ),
         )
         return FacetedPanelResult(visible, overview=overview)
 
@@ -846,12 +793,9 @@ class PanelComposer:
 
     def _frame_for(
         self,
-        document,
         ref,
         raster,
         payload,
-        display,
-        provenance: PanelProvenance,
     ):
         """Stamp one already-rendered front with its exact source facts."""
 
@@ -859,27 +803,11 @@ class PanelComposer:
             BoardFrame,
             CoherenceStamp,
             PanelFrame,
-            PanelPresentationIdentity,
             SourceIdentity,
         )
 
         self._sequence += 1
-        presentation = PanelPresentationIdentity(
-            self._panel_id,
-            document.document_id,
-            document.revision,
-            0,
-            getattr(display, "revision", 0) or 0,
-        )
-        stamp = CoherenceStamp(
-            provenance.run_id,
-            provenance.epoch_id,
-            "single-source-event-payload",
-            ref.schema_fingerprint,
-            provenance.join_digest,
-            (EvaluatedInput(self._dataset_id, ref),),
-            (presentation,),
-        )
+        stamp = CoherenceStamp((EvaluatedInput(self._dataset_id, ref),))
         source = SourceIdentity(
             self._dataset_id,
             ref.block_id,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import threading
 from typing import Callable
 import uuid
@@ -30,8 +31,8 @@ from zlc_data import (
 )
 from zlc_data.value import expand_component_validity
 from zlc_neutral_atom.capture.artifact import (
-    CaptureRepository,
     compile_capture_artifact_pipeline,
+    load_capture_artifact,
 )
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.dataset_output import LiveDatasetOutput, single_live_dataset_output
@@ -64,7 +65,6 @@ from zlc_neutral_atom.runtime.run import RunHandle, RunPlan
 from zlc_storage import positive_integer
 
 from .definition import (
-    CameraMeasurementDescriptor,
     CameraMeasurementRequest,
     _finite_camera_event_column,
     camera_measurement_final_outputs,
@@ -249,10 +249,9 @@ class PreparedFiniteCameraMeasurement:
     """Passive finite form of the one public Camera Measurement."""
 
     __slots__ = (
-        "_descriptor",
         "_lock",
         "_pipeline",
-        "_repository",
+        "_captures_root",
         "_request",
         "_start_run",
         "_started",
@@ -261,34 +260,24 @@ class PreparedFiniteCameraMeasurement:
     def __init__(
         self,
         pipeline: MinimalPipelineSpec,
-        repository: CaptureRepository,
+        captures_root: Path,
         start_run: Callable[[RunPlan], RunHandle],
-        descriptor: CameraMeasurementDescriptor,
         request: CameraMeasurementRequest,
     ) -> None:
         if not isinstance(pipeline, MinimalPipelineSpec):
             raise TypeError("pipeline must be MinimalPipelineSpec")
-        if not isinstance(descriptor, CameraMeasurementDescriptor):
-            raise TypeError("descriptor must be CameraMeasurementDescriptor")
         if not isinstance(request, CameraMeasurementRequest):
             raise TypeError("request must be CameraMeasurementRequest")
-        if type(repository) is not CaptureRepository:
-            raise TypeError("repository must be CaptureRepository")
+        if not isinstance(captures_root, Path):
+            raise TypeError("captures_root must be Path")
         if not callable(start_run):
             raise TypeError("start_run must be callable")
         self._pipeline = pipeline
-        self._repository = repository
+        self._captures_root = captures_root.expanduser().resolve()
         self._start_run = start_run
-        self._descriptor = descriptor
         self._request = request
         self._lock = threading.Lock()
         self._started = False
-
-    @property
-    def descriptor(self) -> CameraMeasurementDescriptor:
-        descriptor = self._descriptor
-        assert isinstance(descriptor, CameraMeasurementDescriptor)
-        return descriptor
 
     @property
     def preview_spec(self) -> ExactDatasetPreviewSpec:
@@ -304,7 +293,11 @@ class PreparedFiniteCameraMeasurement:
 
         if not isinstance(reference, CaptureArtifactRef):
             raise TypeError("Camera FINAL result must be CaptureArtifactRef")
-        source = self._repository.materialize_final(reference)
+        source = load_capture_artifact(
+            self._captures_root,
+            reference,
+            materialize=True,
+        ).materialize_snapshot()
         return camera_measurement_final_outputs(
             reference,
             source,
@@ -314,25 +307,30 @@ class PreparedFiniteCameraMeasurement:
     def start(
         self,
         exact_preview: ExactDatasetPreviewPort | None = None,
+        *,
+        lifecycle_owner: object | None = None,
     ) -> RunHandle:
         try:
             self._claim_start()
             plan = (
                 compile_capture_artifact_pipeline(
                     self._pipeline,
-                    self._repository,
+                    self._captures_root,
                     exact_preview=exact_preview,
                 )
                 if self._request.exposure_seconds is None
                 else _compile_exposure_configured_camera_artifact(
                     self._request,
                     self._pipeline,
-                    self._repository,
+                    self._captures_root,
                     exact_preview=exact_preview,
                 )
             )
             return self._start_run(
-                plan.with_lifecycle(owner=self, preemptible=False)
+                plan.with_lifecycle(
+                    owner=self if lifecycle_owner is None else lifecycle_owner,
+                    preemptible=False,
+                )
             )
         except BaseException as error:
             notify_preview_failure(exact_preview, error)
@@ -356,7 +354,7 @@ class _ConfiguredFiniteCapture:
 def _compile_exposure_configured_camera_artifact(
     request: CameraMeasurementRequest,
     pipeline: MinimalPipelineSpec,
-    repository: CaptureRepository,
+    captures_root: Path,
     *,
     exact_preview: ExactDatasetPreviewPort | None = None,
 ) -> RunPlan:
@@ -379,13 +377,13 @@ def _compile_exposure_configured_camera_artifact(
                 state.exposure_session_id,
                 exposure,
             )
-            pipeline, _descriptor = bind_finite_camera_measurement(
+            pipeline = bind_finite_camera_measurement(
                 request,
                 camera_port=leased_port,
             )
             inner = compile_capture_artifact_pipeline(
                 pipeline,
-                repository,
+                captures_root,
                 exact_preview=exact_preview,
                 settle_exact_preview=False,
             )
@@ -393,10 +391,9 @@ def _compile_exposure_configured_camera_artifact(
                 inner.resource_claims != (port.resource_claim,)
                 or inner.bound_devices != (port.device,)
                 or inner.interrupt_operations != port.interrupt_operations
-                or not inner.requires_final_commit
             ):
                 raise RuntimeError(
-                    "configured Camera inner plan changed its admitted authority"
+                    "configured Camera inner plan changed its device binding"
                 )
             state.inner_plan = inner
             prepared = inner.preflight(context)
@@ -408,7 +405,7 @@ def _compile_exposure_configured_camera_artifact(
 
     def execute(context, prepared: _ConfiguredFiniteCapture):
         if prepared is not state or state.inner_plan is None:
-            raise RuntimeError("configured Camera preflight authority differs")
+            raise RuntimeError("configured Camera preflight transaction differs")
         return state.inner_plan.execute(context, state.inner_prepared)
 
     def cleanup(
@@ -469,7 +466,6 @@ def _compile_exposure_configured_camera_artifact(
         cleanup=cleanup,
         finalize=finalize,
         interrupt_operations=port.interrupt_operations,
-        requires_final_commit=True,
         dispose_unfinalized=dispose_unfinalized,
     )
 
@@ -478,7 +474,7 @@ def bind_finite_camera_measurement(
     request: CameraMeasurementRequest,
     *,
     camera_port: BoundCapturePort,
-) -> tuple[MinimalPipelineSpec, CameraMeasurementDescriptor]:
+) -> MinimalPipelineSpec:
     """Bind ``repeat=K`` Camera to K×E passive hardware-triggered frames."""
 
     if not isinstance(request, CameraMeasurementRequest):
@@ -541,33 +537,26 @@ def bind_finite_camera_measurement(
         camera_capture,
         BlockId(f"camera-{schema.fingerprint[:20]}"),
     )
-    descriptor = CameraMeasurementDescriptor(
-        "Camera",
-        request.camera_ref.role,
-        schema,
-        str(camera_port.resource_claim.key),
-    )
-    return pipeline, descriptor
+    return pipeline
 
 
 def prepare_finite_camera_measurement(
     request: CameraMeasurementRequest,
     *,
     camera_port: BoundCapturePort,
-    repository: CaptureRepository,
+    captures_root: Path,
     start_run: Callable[[RunPlan], RunHandle],
 ) -> PreparedFiniteCameraMeasurement:
     """Prepare the finite branch of the one public Camera Measurement."""
 
-    pipeline, descriptor = bind_finite_camera_measurement(
+    pipeline = bind_finite_camera_measurement(
         request,
         camera_port=camera_port,
     )
     return PreparedFiniteCameraMeasurement(
         pipeline,
-        repository,
+        captures_root,
         start_run,
-        descriptor,
         request,
     )
 

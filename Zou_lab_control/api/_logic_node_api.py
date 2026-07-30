@@ -270,7 +270,8 @@ def _logic_node_composition_facts(readout):
         workspace = current.workspace_paths
         catalog = current.catalog
         apparatus = tuple(current.installation.readout_apparatus_facts)
-        capture_repository = current.capture_repository
+        captures_root = current.captures_root
+        calibrations_root = current.calibrations_root
         runtime = current.runtime
         association_authorities = MappingProxyType(
             dict(current.installation.camera_signal_association_authorities)
@@ -379,10 +380,10 @@ def _logic_node_composition_facts(readout):
 
     facts = MappingProxyType(
         {
-            "repository_root": workspace.repository_root,
             "pulses_root": workspace.pulses_root,
             "output_root": workspace.output_root,
-            "capture_repository": capture_repository,
+            "captures_root": captures_root,
+            "calibrations_root": calibrations_root,
             "camera_signal_association_authorities": association_authorities,
             "readout_apparatus_facts": apparatus,
             "camera_roles": camera_roles,

@@ -159,11 +159,6 @@ class CommittedTransform:
             raise TypeError("effective_output_schema must be DatasetSchema")
         object.__setattr__(self, "exact_point_ordinals", ordinals)
 
-    @property
-    def output_schema_fingerprint(self) -> str:
-        return self.effective_output_schema.fingerprint
-
-
 @dataclass(frozen=True, eq=False)
 class TransformedData:
     source_ref: DatasetRevisionRef

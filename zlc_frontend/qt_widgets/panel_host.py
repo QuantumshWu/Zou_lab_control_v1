@@ -23,8 +23,7 @@ from PyQt5 import QtCore, QtWidgets
 
 from ..render import (
     BoardFrame, CoherenceStamp, CurvePanelPayload, HistogramPanelPayload,
-    DocumentPresentationStamp, ImagePanelPayload, PanelFrame,
-    PanelPresentationIdentity,
+    ImagePanelPayload, PanelFrame,
     PulsePanelPayload, RasterBuffer, SiteMapPanelPayload, SourceIdentity)
 from ..figure_outputs import (
     FigureAreaCommit,
@@ -314,22 +313,18 @@ class SinglePanelHost(QtWidgets.QWidget):
 
         Dataset panels require the evaluator's exact ``coherence_stamp``;
         presentation code cannot derive a typed join or runtime lineage from a
-        display payload.  A pulse-document panel derives only its local
-        :class:`DocumentPresentationStamp` and never fabricates dataset/run/
-        join/schema identity.  In both families the panel revision is checked
-        against the viewport's display revision by :class:`PanelFrame`.
+        display payload.  A pulse-document panel uses its exact
+        :class:`DocumentInputIdentity` directly and never fabricates dataset/run/
+        join/schema identity.
         ``pixel_ratio`` is the screen ratio the raster was rendered at: the
         widget pins to the LOGICAL size so the whole-cell blit lands 1:1 on
         device pixels.
         """
 
-        if isinstance(payload, ImagePanelPayload):
-            display_revision = int(payload.viewport.viewport_revision)
-        elif isinstance(
-            payload, (CurvePanelPayload, HistogramPanelPayload, PulsePanelPayload)
+        if not isinstance(
+            payload,
+            (ImagePanelPayload, CurvePanelPayload, HistogramPanelPayload, PulsePanelPayload),
         ):
-            display_revision = int(payload.viewport.display_revision)
-        else:
             raise TypeError(
                 "SinglePanelHost requires an interactive image, curve, "
                 "histogram, or pulse payload"
@@ -349,14 +344,7 @@ class SinglePanelHost(QtWidgets.QWidget):
                     "pulse document panels do not accept a dataset coherence stamp"
                 )
             source = payload.document_input
-            presentation = PanelPresentationIdentity(
-                self._panel_id,
-                source.document_id,
-                source.document_revision,
-                0,
-                display_revision,
-            )
-            stamp = DocumentPresentationStamp(source, (presentation,))
+            stamp = None
         else:
             if not isinstance(coherence_stamp, CoherenceStamp):
                 raise TypeError(

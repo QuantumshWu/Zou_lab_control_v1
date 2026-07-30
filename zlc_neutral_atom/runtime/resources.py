@@ -8,13 +8,7 @@ from math import isfinite
 from dataclasses import dataclass
 from enum import Enum
 
-from zlc_storage import (
-    RepositoryRootLease,
-    RepositoryRootLeaseBorrow,
-    canonical_text as _canonical_text,
-)
-
-from ._failure import record_secondary_failure
+from zlc_storage import canonical_text as _canonical_text
 
 
 def _canonical_segment(value: str, field: str) -> str:
@@ -62,18 +56,16 @@ class DeviceIdentityEvidenceKind(str, Enum):
 
 @dataclass(frozen=True, order=True)
 class PhysicalDeviceIdentity:
-    """Connection-independent identity and the evidence that supports it."""
+    """Connection-independent identity and its deployment-owned source facts."""
 
     stable_device_identity: str
     evidence_kind: DeviceIdentityEvidenceKind
-    evidence_digest: str
     asset_map_revision: str
 
     def __post_init__(self) -> None:
         _canonical_text(self.stable_device_identity, "stable_device_identity")
         if not isinstance(self.evidence_kind, DeviceIdentityEvidenceKind):
             raise TypeError("evidence_kind must be DeviceIdentityEvidenceKind")
-        _canonical_text(self.evidence_digest, "evidence_digest")
         _canonical_text(self.asset_map_revision, "asset_map_revision")
 
 
@@ -98,7 +90,6 @@ def physical_device_identity_to_tree(
     return {
         "stable_device_identity": value.stable_device_identity,
         "evidence_kind": value.evidence_kind.value,
-        "evidence_digest": value.evidence_digest,
         "asset_map_revision": value.asset_map_revision,
     }
 
@@ -107,7 +98,6 @@ def physical_device_identity_from_tree(tree: object) -> PhysicalDeviceIdentity:
     fields = {
         "stable_device_identity",
         "evidence_kind",
-        "evidence_digest",
         "asset_map_revision",
     }
     if not isinstance(tree, dict) or set(tree) != fields:
@@ -115,7 +105,6 @@ def physical_device_identity_from_tree(tree: object) -> PhysicalDeviceIdentity:
     return PhysicalDeviceIdentity(
         stable_device_identity=tree["stable_device_identity"],
         evidence_kind=DeviceIdentityEvidenceKind(tree["evidence_kind"]),
-        evidence_digest=tree["evidence_digest"],
         asset_map_revision=tree["asset_map_revision"],
     )
 
@@ -316,56 +305,3 @@ class ResourceArbiter:
                         f"one run cannot request resource {left.key} twice"
                     )
         return normalized
-
-
-def acquire_repository_borrows(
-    *leases: RepositoryRootLease,
-) -> tuple[RepositoryRootLeaseBorrow, ...]:
-    """Atomically acquire repository holds or roll back the acquired prefix."""
-
-    if any(type(lease) is not RepositoryRootLease for lease in leases):
-        raise TypeError("leases must contain exact RepositoryRootLease values")
-    held: list[RepositoryRootLeaseBorrow] = []
-    try:
-        for lease in leases:
-            held.append(lease.borrow())
-        return tuple(held)
-    except BaseException as primary:
-        try:
-            release_repository_borrows(tuple(held))
-        except BaseException as close_error:
-            record_secondary_failure(
-                primary,
-                "repository borrow rollback also failed",
-                close_error,
-            )
-        raise
-
-
-def release_repository_borrows(
-    borrows: tuple[RepositoryRootLeaseBorrow, ...],
-) -> None:
-    """Release every repository hold in reverse order without hiding failures."""
-
-    first: BaseException | None = None
-    for borrow in reversed(tuple(borrows)):
-        if type(borrow) is not RepositoryRootLeaseBorrow:
-            error: BaseException = TypeError(
-                "borrows must contain exact RepositoryRootLeaseBorrow values"
-            )
-        else:
-            try:
-                borrow.close()
-                continue
-            except BaseException as caught:
-                error = caught
-        if first is None:
-            first = error
-        else:
-            record_secondary_failure(
-                first,
-                "another repository borrow also failed to close",
-                error,
-            )
-    if first is not None:
-        raise first

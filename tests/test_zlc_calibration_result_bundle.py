@@ -4,11 +4,13 @@ import csv
 from dataclasses import replace
 import json
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import numpy as np
 
 from zlc_frontend import (
+    HistogramDisplayState,
     PlotPanelSession,
 )
 from zlc_frontend.plot_panel import PlotPanelComposeRequest
@@ -18,6 +20,7 @@ from zlc_frontend.plot_layout import (
     PANEL_EXPORT_PIXEL_RATIO,
 )
 from zlc_data import (
+    CellValidity,
     SITE,
     SPATIAL_X,
     SPATIAL_Y,
@@ -55,21 +58,15 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.result_bundle import (
 from zlc_neutral_atom.logic_nodes.readout.calibration import (
     result_bundle as calibration_result_bundle,
 )
-from zlc_neutral_atom.logic_nodes.readout.calibration.repository import (
-    CalibrationRepository,
-)
 from zlc_neutral_atom.logic_nodes.readout.calibration.sitemap import (
     ReadoutGridGeometry,
     SitemapAcquisitionProfile,
     load_sitemap_pulse,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.task import (
-    write_calibration_task_outputs,
+    PreparedCalibrationTask,
+    write_calibration_post_final_exports,
 )
-from zlc_neutral_atom.logic_nodes.readout.calibration.task_output import (
-    read_calibration_task_output,
-)
-from zlc_neutral_atom.capture.artifact import CaptureRepository
 from zlc_neutral_atom.capture.reference import (
     CaptureArtifactRef,
 )
@@ -123,11 +120,7 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
         label="box",
         is_default=True,
         signals=np.asarray([[1.0], [8.0], [2.0], [9.0]]),
-        threshold_centered_signals=np.asarray(
-            [[-4.5], [2.5], [-3.5], [3.5]]
-        ),
-        signal_validity=np.ones((4, 1), dtype=np.bool_),
-        bin_edges=np.linspace(0.0, 10.0, 9),
+        signal_validity=np.asarray([[True], [True], [False], [True]]),
         quick_thresholds=np.asarray([5.0]),
         formal_thresholds=np.asarray([5.5]),
         runtime_thresholds=np.asarray([5.5]),
@@ -157,8 +150,8 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
         ablation_errors=np.asarray([0], dtype=np.int64),
         ablation_n_valid=np.asarray([2], dtype=np.int64),
     )
-    calibration_ref = CalibrationArtifactRef("calibration-repository", "a" * 64)
-    capture_ref = CaptureArtifactRef("capture-repository", "b" * 64)
+    calibration_ref = CalibrationArtifactRef("run-calibration/calibration.json")
+    capture_ref = CaptureArtifactRef("run-capture/capture.json")
     view = CalibrationReportProjection(
         frame_schema=frame_schema,
         site_axis=site_axis,
@@ -174,14 +167,14 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
         site_labels=("site-0",),
         occupied_labels=np.asarray([[False], [True], [False], [True]]),
         dark_labels=np.asarray([[True], [False], [True], [False]]),
-        label_validity=np.ones((4, 1), dtype=np.bool_),
+        label_validity=np.asarray([[True], [False], [True], [True]]),
         models=(model,),
         psf_kernels=None,
         psf_mode=None,
         psf_fit_ok=None,
         psf_sigma_xy=None,
         calibration_ref=calibration_ref,
-        source_capture_identity="capture/" + "b" * 64,
+        source_capture_identity=capture_ref.target_ref,
         binding="camera",
         camera_identity="virtual-qcmos",
         roi_shape_yx=(4, 4),
@@ -196,8 +189,6 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
         view,
         calibration_ref,
         capture_ref,
-        calibration_repository_root=tmp_path / "workspace" / "calibrations",
-        capture_repository_root=tmp_path / "workspace" / "captures",
         render_report=_render_current_report,
     )
 
@@ -208,9 +199,22 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
     document = project_calibration_plot_report(view)
     overview = next(page for page in document.pages if page.key == "overview")
     per_site = next(page for page in document.pages if page.key == "hist-box")
-    pooled = next(page for page in document.pages if page.key == "pooled-box")
-    assert per_site.source.snapshot is pooled.source.snapshot
-    assert per_site.source.snapshot.block.schema.physical_shape == (4, 1, 2)
+    assert all(not page.key.startswith("pooled-") for page in document.pages)
+    histogram = per_site.source.snapshot.block
+    assert histogram.schema.physical_shape == (4, 1, 1)
+    assert histogram.schema.cell_schema.is_scalar
+    np.testing.assert_array_equal(
+        histogram.values,
+        np.asarray([1.0, 8.0, 2.0, 9.0]).reshape(4, 1, 1),
+    )
+    assert isinstance(histogram.validity, CellValidity)
+    np.testing.assert_array_equal(
+        histogram.validity.mask,
+        np.asarray([[True], [True], [False], [True]]),
+    )
+    assert isinstance(per_site.display, HistogramDisplayState)
+    assert per_site.display.thresholds == (5.5,)
+    assert per_site.contract.figure.value_label == "count"
     assert overview.contract.size_name == "2x2"
     report_runtime_contract = replace(
         overview.contract,
@@ -219,18 +223,25 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
     session = PlotPanelSession(report_runtime_contract)
     try:
         direct = session.compose(
-            PlotPanelComposeRequest(
-                overview.source,
-                overview.display,
-                overview.provenance,
-            )
+                PlotPanelComposeRequest(
+                    overview.source,
+                    overview.display,
+                )
         )
         assert direct.frame is not None
         assert len(direct.frame.panels) == 1
-        presentation = direct.frame.panels[0].coherence_stamp.presentations
-        assert len(presentation) == 1
-        assert presentation[0].panel_id == report_runtime_contract.panel_id
-        assert presentation[0].panel_revision == overview.display.revision
+        stamp = direct.frame.panels[0].coherence_stamp
+        assert stamp is not None
+        assert overview.source.site_map is not None
+        assert stamp.inputs == tuple(
+            sorted(
+                (
+                    overview.source.site_map.background_input,
+                    overview.source.site_map.site_state_input,
+                ),
+                key=lambda value: value.dataset_id.value,
+            )
+        )
         direct_png = encode_raster_buffer_png(direct.frame.panels[0].raster)
     finally:
         session.close()
@@ -244,12 +255,26 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
         "overview.png",
         "fidelity.png",
         "hist-box.png",
-        "pooled-box.png",
     }
     summary = json.loads((destination / "summary.json").read_text("utf-8"))
     assert summary["schema"] == CALIBRATION_RESULT_BUNDLE_FORMAT
-    assert summary["authority"]["calibration_ref"]["manifest_digest"] == "a" * 64
-    assert summary["authority"]["source_capture_ref"]["manifest_digest"] == "b" * 64
+    assert summary["authority"]["calibration_ref"]["record_path"] == (
+        "run-calibration/calibration.json"
+    )
+    assert summary["authority"]["source_capture_ref"]["record_path"] == (
+        "run-capture/capture.json"
+    )
+    assert set(summary["authority"]) == {
+        "calibration_ref",
+        "source_capture_ref",
+        "record",
+        "rule",
+    }
+    assert summary["authority"]["record"] == "../calibration.json"
+    assert all(
+        set(metadata) == {"description", "size_bytes"}
+        for metadata in summary["files"].values()
+    )
     assert summary["site_map"]["centers_xy"] == [[1.5, 2.0]]
     model_summary = summary["models"][0]
     assert model_summary["runtime_thresholds"] == [5.5]
@@ -292,20 +317,21 @@ def test_calibration_result_bundle_is_discoverable_non_authoritative_export(
     assert rows[0]["model_0_n_train_bright"] == "1"
 
 
-def test_task_output_writes_pointer_and_report_without_duplicate_raw_frames(
+def test_post_final_export_writes_report_without_a_second_pointer(
     tmp_path,
     monkeypatch,
 ) -> None:
-    source = CaptureArtifactRef("capture-repository", "b" * 64)
-    calibration = CalibrationArtifactRef("calibration-repository", "a" * 64)
-    capture_repository = CaptureRepository(tmp_path / "captures")
-    calibration_repository = CalibrationRepository(tmp_path / "calibrations")
-    task_root = tmp_path / "task-output"
-    admitted = SimpleNamespace(
-        artifact=SimpleNamespace(
-            camera_provenance=SimpleNamespace(
-                binding=SimpleNamespace(value="camera")
-            )
+    import zlc_neutral_atom.capture.artifact as capture_artifact
+    import zlc_neutral_atom.logic_nodes.readout.calibration.repository as repository
+
+    source = CaptureArtifactRef("source-run/capture.json")
+    calibration = CalibrationArtifactRef("calibration-run/calibration.json")
+    captures_root = (tmp_path / "captures").resolve()
+    calibrations_root = (tmp_path / "calibrations").resolve()
+    (calibrations_root / "calibration-run").mkdir(parents=True)
+    capture = SimpleNamespace(
+        camera_provenance=SimpleNamespace(
+            binding=SimpleNamespace(value="camera")
         )
     )
     computation = SimpleNamespace(
@@ -315,15 +341,26 @@ def test_task_output_writes_pointer_and_report_without_duplicate_raw_frames(
     )
 
     monkeypatch.setattr(
-        CaptureRepository,
-        "admit",
-        lambda _repository, reference: admitted if reference == source else None,
+        capture_artifact,
+        "load_capture_artifact",
+        lambda root, reference, *, materialize: (
+            capture
+            if root == captures_root and reference == source and not materialize
+            else None
+        ),
+        raising=False,
     )
     monkeypatch.setattr(
-        CalibrationRepository,
-        "load_computation",
-        lambda _repository, reference: (
-            computation if reference == calibration else None
+        repository,
+        "load_calibration_computation",
+        lambda calibration_root, capture_root, reference: (
+            computation
+            if (
+                calibration_root == calibrations_root
+                and capture_root == captures_root
+                and reference == calibration
+            )
+            else None
         ),
     )
     monkeypatch.setattr(
@@ -343,27 +380,163 @@ def test_task_output_writes_pointer_and_report_without_duplicate_raw_frames(
         write_report,
     )
 
-    try:
-        write_calibration_task_outputs(
-            source,
-            calibration,
-            folder=task_root,
-            capture_repository=capture_repository,
-            calibration_repository=calibration_repository,
-            expected_camera_role="camera",
-            render_report=lambda _view: None,
-        )
-    finally:
-        calibration_repository.close()
-        capture_repository.close()
+    write_calibration_post_final_exports(
+        source,
+        calibration,
+        captures_root=captures_root,
+        calibrations_root=calibrations_root,
+        save_frames=False,
+        expected_camera_role="camera",
+        render_report=lambda _view: None,
+    )
 
-    assert not (task_root / "frames").exists()
-    assert (task_root / "report" / "marker.txt").is_file()
-    pointer = read_calibration_task_output(task_root / "calibration_ref.json")
-    assert pointer.calibration_ref == calibration
-    assert pointer.source_capture_ref == source
-    assert not tuple(task_root.glob(".*.tmp"))
-    assert not tuple(task_root.glob(".*.old"))
+    run_root = calibrations_root / "calibration-run"
+    assert (run_root / "report" / "marker.txt").is_file()
+    assert not (run_root / "source_frames.npy").exists()
+    assert not (run_root / "source_frame_validity.npy").exists()
+    assert not (run_root / "calibration_ref.json").exists()
+
+
+def test_post_final_save_frames_preserves_source_dtype(tmp_path, monkeypatch) -> None:
+    import zlc_neutral_atom.capture.artifact as capture_artifact
+    import zlc_neutral_atom.logic_nodes.readout.calibration.repository as repository
+
+    source = CaptureArtifactRef("source-run/capture.json")
+    calibration = CalibrationArtifactRef("calibration-run/calibration.json")
+    captures_root = (tmp_path / "captures").resolve()
+    calibrations_root = (tmp_path / "calibrations").resolve()
+    run_root = calibrations_root / "calibration-run"
+    run_root.mkdir(parents=True)
+    values = np.arange(24, dtype=np.uint16).reshape(2, 3, 2, 2)
+    validity = np.asarray([[True, True, False], [True, False, True]])
+    snapshot = SimpleNamespace(
+        block=SimpleNamespace(
+            values=values,
+            validity=SimpleNamespace(mask=validity),
+        )
+    )
+    capture = SimpleNamespace(
+        camera_provenance=SimpleNamespace(
+            binding=SimpleNamespace(value="camera")
+        ),
+        materialize_snapshot=lambda: snapshot,
+    )
+    computation = SimpleNamespace(
+        artifact=SimpleNamespace(
+            source_binding=SimpleNamespace(source_capture_ref=source)
+        )
+    )
+    observed_materialize = []
+
+    def load_capture(root, reference, *, materialize):
+        assert root == captures_root
+        assert reference == source
+        observed_materialize.append(materialize)
+        return capture
+
+    monkeypatch.setattr(
+        capture_artifact,
+        "load_capture_artifact",
+        load_capture,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        repository,
+        "load_calibration_computation",
+        lambda *_args: computation,
+    )
+    monkeypatch.setattr(
+        calibration_projection,
+        "project_calibration_report",
+        lambda loaded, reference: (loaded, reference),
+    )
+    monkeypatch.setattr(
+        calibration_result_bundle,
+        "write_calibration_result_bundle",
+        lambda destination, *_args, **_kwargs: Path(destination).mkdir(),
+    )
+
+    write_calibration_post_final_exports(
+        source,
+        calibration,
+        captures_root=captures_root,
+        calibrations_root=calibrations_root,
+        save_frames=True,
+        expected_camera_role="camera",
+        render_report=lambda _view: None,
+    )
+
+    assert observed_materialize == [True]
+    saved = np.load(run_root / "source_frames.npy", allow_pickle=False)
+    saved_validity = np.load(
+        run_root / "source_frame_validity.npy",
+        allow_pickle=False,
+    )
+    assert saved.dtype == values.dtype
+    np.testing.assert_array_equal(saved, values)
+    np.testing.assert_array_equal(saved_validity, validity)
+
+
+def test_post_final_export_failure_is_warning_and_preserves_final_outputs(
+    monkeypatch,
+) -> None:
+    source = CaptureArtifactRef("source-run/capture.json")
+    calibration = CalibrationArtifactRef("calibration-run/calibration.json")
+    computation = object()
+    expected_outputs = {"site_map": object()}
+    observed = []
+
+    def fail_export(
+        source_ref,
+        calibration_ref,
+        *,
+        save_frames,
+        expected_camera_role,
+    ) -> None:
+        observed.append(
+            (
+                source_ref,
+                calibration_ref,
+                save_frames,
+                expected_camera_role,
+            )
+        )
+        raise RuntimeError("deterministic post-FINAL export failure")
+
+    monkeypatch.setattr(
+        calibration_projection,
+        "calibration_final_outputs",
+        lambda loaded, reference: (
+            expected_outputs
+            if loaded is computation and reference == calibration
+            else None
+        ),
+    )
+    command = object.__new__(PreparedCalibrationTask)
+    command._lock = threading.Lock()
+    command._analysis_handle = SimpleNamespace(
+        result=lambda timeout: calibration,
+    )
+    command._dependencies = SimpleNamespace(
+        load_calibration_computation=lambda reference: (
+            computation if reference == calibration else None
+        ),
+        write_calibration_post_final_exports=fail_export,
+    )
+    command._plan = SimpleNamespace(
+        intent=SimpleNamespace(save_frames=True, camera_role="camera")
+    )
+    command._source_capture_ref = source
+    command._post_final_exports_attempted = False
+    command._post_final_warning = None
+
+    outputs = command.final_dataset_outputs(calibration)
+
+    assert outputs is expected_outputs
+    assert observed == [(source, calibration, True, "camera")]
+    assert command.post_final_warning() == (
+        "RuntimeError: deterministic post-FINAL export failure"
+    )
 
 
 def test_custom_sitemap_pulse_is_rebound_to_the_live_profile_target() -> None:
@@ -407,7 +580,7 @@ def test_custom_sitemap_pulse_is_rebound_to_the_live_profile_target() -> None:
         camera_facts=camera_facts,
         geometry=geometry,
         maximum_site_residual_px=1.0,
-        pulse_document=base,
+        pulse_target=base.target,
         trigger_channel="ch11",
     )
     authored_target = PulseTarget(

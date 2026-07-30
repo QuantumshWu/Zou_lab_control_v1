@@ -24,9 +24,16 @@ from zlc_neutral_atom.runtime.preview import (
     ExactDatasetPreviewSpec,
     LiveDatasetViewSpec,
 )
-from zlc_storage import canonical_text
-
 from ._failure import safe_error_summary
+
+
+def _required_message(value: str, field: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be str")
+    text = value.strip()
+    if not text:
+        raise ValueError(f"{field} must be non-empty")
+    return text
 
 
 class LiveDatasetPort:
@@ -54,8 +61,6 @@ class LiveDatasetPort:
         self._output_owner = output_owner
         self._lock = threading.Lock()
         self._dataset: LiveDatasetSnapshotSource | None = None
-        self._run_id: str | None = None
-        self._causation_domain_id: str | None = None
         self._listener: Callable[[], None] | None = None
         self._listener_claimed = False
         self._pending_change = False
@@ -108,17 +113,9 @@ class LiveDatasetPort:
     def bind(
         self,
         dataset: LiveDatasetSnapshotSource,
-        *,
-        run_id: str,
-        causation_domain_id: str,
     ) -> None:
         if not isinstance(dataset, LiveDatasetSnapshotSource):
             raise TypeError("dataset must implement LiveDatasetSnapshotSource")
-        run_id = canonical_text(run_id, "run_id")
-        causation_domain_id = canonical_text(
-            causation_domain_id,
-            "causation_domain_id",
-        )
         with self._lock:
             if self._closed:
                 raise RuntimeError("live slot is closed")
@@ -127,8 +124,6 @@ class LiveDatasetPort:
             if self._dataset is not None:
                 raise RuntimeError("live slot already owns a materializer")
             self._dataset = dataset
-            self._run_id = run_id
-            self._causation_domain_id = causation_domain_id
 
     def updated(self) -> None:
         with self._lock:
@@ -141,7 +136,7 @@ class LiveDatasetPort:
         listener()
 
     def notification_failed(self, message: str) -> None:
-        message = canonical_text(message, "live notification failure")
+        message = _required_message(message, "live notification failure")
         with self._lock:
             if self._closed or self._dataset is None:
                 return
@@ -157,33 +152,29 @@ class LiveDatasetPort:
             except BaseException:
                 pass
 
-    def freeze_current(self) -> tuple[str, str, MonitorDatasetSnapshot]:
+    def freeze_current(self) -> MonitorDatasetSnapshot:
         with self._lock:
             if self._closed or self._dataset is None:
                 raise RuntimeError("live slot has no active materializer")
             dataset = self._dataset
-            run_id = self._run_id
-            causation = self._causation_domain_id
         snapshot = dataset.freeze_current()
         with self._lock:
             if self._closed or self._dataset is not dataset:
                 raise RuntimeError("live slot lifetime ended while freezing a snapshot")
-        assert run_id is not None and causation is not None
-        return run_id, causation, snapshot
+        return snapshot
 
     def freeze_live_outputs(
         self,
-    ) -> tuple[str, str, Mapping[str, LiveDatasetOutput]]:
+    ) -> Mapping[str, LiveDatasetOutput]:
         """Delegate naming/materialization to the frozen application owner."""
 
         owner = self._output_owner
         if owner is None:
             raise RuntimeError("live slot has no application output owner")
-        run_id, causation, snapshot = self.freeze_current()
-        return run_id, causation, owner.live_dataset_outputs(snapshot)
+        return owner.live_dataset_outputs(self.freeze_current())
 
     def fail(self, message: str) -> None:
-        message = canonical_text(message, "preview failure")
+        message = _required_message(message, "preview failure")
         dataset, listener = self._detach(message)
         try:
             if dataset is not None:
@@ -266,8 +257,6 @@ class _ExactDeltaLivePort:
         self._projection_lock = threading.Lock()
         self._condition = threading.Condition(threading.Lock())
         self._reader: ExactDatasetPreviewReader | None = None
-        self._run_id: str | None = None
-        self._causation_domain_id: str | None = None
         self._listener: Callable[[], None] | None = None
         self._pending_source_change = False
         self._source_terminal = False
@@ -296,21 +285,11 @@ class _ExactDeltaLivePort:
     def bind(
         self,
         reader: ExactDatasetPreviewReader,
-        *,
-        run_id: str,
-        causation_domain_id: str,
     ) -> None:
         if not isinstance(reader, ExactDatasetPreviewReader):
             raise TypeError("reader must be ExactDatasetPreviewReader")
         if reader.schema.fingerprint != self.spec.source_schema_fingerprint:
             raise ValueError("exact live reader has another source schema")
-        run_id = canonical_text(run_id, "run_id")
-        causation_domain_id = canonical_text(
-            causation_domain_id,
-            "causation_domain_id",
-        )
-        if reader.stream_generation.value != causation_domain_id:
-            raise ValueError("exact live generation differs from causation domain")
         if reader.terminal:
             raise RuntimeError("exact live reader is already terminal")
         with self._condition:
@@ -319,8 +298,6 @@ class _ExactDeltaLivePort:
             if self._reader is not None:
                 raise RuntimeError("exact live port is already bound")
             self._reader = reader
-            self._run_id = run_id
-            self._causation_domain_id = causation_domain_id
             self._condition.notify_all()
 
     def updated(self) -> None:
@@ -344,16 +321,14 @@ class _ExactDeltaLivePort:
 
     def freeze_live_outputs(
         self,
-    ) -> tuple[str, str, Mapping[str, LiveDatasetOutput]]:
+    ) -> Mapping[str, LiveDatasetOutput]:
         with self._condition:
             if self._closed:
                 raise RuntimeError("exact live port is closed")
             if self._failure is not None:
                 raise RuntimeError(self._failure)
             reader = self._reader
-            run_id = self._run_id
-            causation = self._causation_domain_id
-            if reader is None or run_id is None or causation is None:
+            if reader is None:
                 raise RuntimeError("exact live port is not bound")
             if self._after.value < 1:
                 raise RuntimeError("exact live port has no projected revision")
@@ -366,10 +341,10 @@ class _ExactDeltaLivePort:
                 )
             if self._failure is not None:
                 raise RuntimeError(self._failure)
-        return run_id, causation, outputs
+        return outputs
 
     def fail(self, message: str) -> None:
-        message = canonical_text(message, "preview failure")
+        message = _required_message(message, "preview failure")
         with self._condition:
             if self._closed or self._terminal:
                 return

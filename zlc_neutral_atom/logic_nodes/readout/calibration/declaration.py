@@ -20,7 +20,6 @@ from .projection import (
 from .sitemap import SITEMAP_CALIBRATION_TASK_DEFINITION
 from .task import (
     CALIBRATION_LIVE_OUTPUT_DECLARATIONS,
-    DEFAULT_CALIBRATION_FOLDER,
     build_calibration_task_intent_from_authoring,
     calibration_task_authoring_schema,
     calibration_task_default_camera_role,
@@ -115,7 +114,6 @@ CALIBRATION_LOGIC_NODE = LogicNodeDeclaration(
         DefaultOutputView(_FINAL[0].name, "sites"),
     ),
     path_presentations=(
-        PathPresentationHint("folder", mode="dir", base_dir="output"),
         PathPresentationHint(
             "pulse",
             file_filter="Pulse program (*.json);;All files (*)",

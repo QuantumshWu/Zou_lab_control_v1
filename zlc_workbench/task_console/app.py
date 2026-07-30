@@ -51,14 +51,14 @@ def open_task_console(
         request_owner_wake=request_owner_wake,
     )
 
-    def project_signal_presentation(node, output_name, publication):
+    def project_signal_presentation(node, output_name, publication, parents):
         attachment = ports.attachment_for(node.definition_key)
         if attachment is None:
             return None
         projector = attachment.project_signal_presentation
         if projector is None:
             return None
-        return projector(node, output_name, publication)
+        return projector(node, output_name, publication, parents)
 
     def run_factory(
         spec,

@@ -26,7 +26,6 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraCaptureSpec,
     CameraDatasetEventAdapter,
     CameraFrameMetadata,
-    CameraFrameMetadataContract,
     CameraFrameRecord,
     CameraSample,
     CameraSampleContract,
@@ -128,7 +127,6 @@ def _metadata(**changes) -> CameraFrameMetadata:
         timestamp_microseconds=401,
         host_received_at_ns=501,
         driver_buffer_index=0,
-        correlation_id="camera-session:0",
     )
     values.update(changes)
     return CameraFrameMetadata(**values)
@@ -182,7 +180,6 @@ def test_camera_sample_contract_preserves_all_data_axes_and_owned_pixels():
     assert not frozen.image.values.flags.writeable
     assert contract.source_ordinal(frozen) == 0
     assert contract.captured_at(frozen) == pytest.approx(301.000401)
-    assert contract.correlation_id(frozen) == "camera-session:0"
 
 
 def test_camera_record_snapshots_mutable_driver_pixels_once_then_value_reuses():
@@ -206,47 +203,6 @@ def test_camera_record_snapshots_mutable_driver_pixels_once_then_value_reuses():
     assert np.shares_memory(value.values, record.image)
     mutable[:] = 0
     assert np.any(value.values != 0)
-
-
-def test_metadata_digest_covers_every_physical_observation():
-    contract = CameraFrameMetadataContract()
-    baseline = _metadata()
-    baseline_digest = contract.digest(baseline)
-    assert len(baseline_digest) == 64
-    variants = (
-        replace(baseline, source_ordinal=1),
-        replace(baseline, produced_count=5),
-        replace(baseline, frame_stamp=102),
-        replace(baseline, camera_stamp=202),
-        replace(baseline, timestamp_seconds=302),
-        replace(baseline, timestamp_microseconds=402),
-        replace(baseline, host_received_at_ns=502),
-        replace(baseline, driver_buffer_index=1),
-        replace(baseline, correlation_id="camera-session:1"),
-    )
-    assert all(contract.digest(value) != baseline_digest for value in variants)
-
-
-def test_camera_sample_digest_binds_pixels_and_physical_metadata_atomically():
-    value_schema, _dataset_schema = _schemas()
-    contract = CameraSampleContract(value_schema)
-    baseline = _sample(value_schema)
-    baseline_digest = contract.digest(baseline)
-    changed_pixels = np.array(baseline.image.values, copy=True)
-    changed_pixels[1, 2] += 1
-    pixel_variant = CameraSample(
-        Value(changed_pixels, VALID, value_schema),
-        baseline.metadata,
-    )
-    metadata_variant = CameraSample(
-        baseline.image,
-        replace(baseline.metadata, frame_stamp=baseline.metadata.frame_stamp + 1),
-    )
-
-    assert len(baseline_digest) == 64
-    assert contract.digest(_sample(value_schema)) == baseline_digest
-    assert contract.digest(pixel_variant) != baseline_digest
-    assert contract.digest(metadata_variant) != baseline_digest
 
 
 def test_camera_metadata_rejects_partial_timestamp():
@@ -291,17 +247,15 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
     evidence = CameraCapabilityEvidence(
         adapter_type="tests.Camera",
         source_id="camera",
-        payload_contract_fingerprint=payload_contract.fingerprint,
         capture_spec_owner_fingerprint=CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
         max_blocking_call_seconds=1.0,
         physical_facts=physical_facts,
     )
     binding_stamp = DeviceBindingStamp(
         PhysicalDeviceIdentity(
-            "camera:test",
-            DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-            "test-evidence",
-            "test-assets-v1",
+            stable_device_identity="camera:test",
+            evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+            asset_map_revision="test-assets-v1",
         ),
         "camera-binding",
     )

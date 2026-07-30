@@ -17,9 +17,8 @@ from .application import prepare_calibration_artifact_plan
 from .declaration import CALIBRATION_LOGIC_NODE
 from .installation import build_sitemap_acquisition_profile
 from .task import (
-    admit_calibration_task_output,
     start_calibration_task_command,
-    write_calibration_task_outputs,
+    write_calibration_post_final_exports,
 )
 
 
@@ -28,10 +27,9 @@ def _bind_api(
     _dependencies: tuple[object, ...],
 ) -> CalibrationApi:
     (
-        repository_root,
+        captures_root,
+        calibrations_root,
         pulses_root,
-        output_root,
-        capture_repository,
         apparatus_facts,
         resolve_camera_ref,
         resolve_sequencer_ref,
@@ -56,7 +54,7 @@ def _bind_api(
             request,
             pulse_port=pulse_port(request.sequencer_ref),
             camera_port=camera_port(request.camera_ref),
-            repository=capture_repository,
+            captures_root=captures_root,
             start_run=start_run,
         )
     profiles = {}
@@ -67,7 +65,6 @@ def _bind_api(
             pulse_port=pulse_port(
                 resolve_sequencer_ref(apparatus.sequencer_role)
             ),
-            pulses_root=pulses_root,
         )
         binding = profile.readout_binding.value
         if binding in profiles:
@@ -77,32 +74,28 @@ def _bind_api(
     def write_outputs(
         source,
         calibration,
-        calibration_repository,
         **kwargs,
     ):
         from .ui.workbench_jobs import render_calibration_plot_report
 
-        options = dict(kwargs)
-        options["folder"] = str(resolve_under(output_root, options["folder"]))
-        return write_calibration_task_outputs(
+        return write_calibration_post_final_exports(
             source,
             calibration,
-            capture_repository=capture_repository,
-            calibration_repository=calibration_repository,
+            captures_root=captures_root,
+            calibrations_root=calibrations_root,
             render_report=render_calibration_plot_report,
-            **options,
+            **kwargs,
         )
 
     def start_calibration(
         request,
-        calibration_repository,
         lifecycle_owner,
         on_committed,
     ):
         plan = prepare_calibration_artifact_plan(
             request,
-            capture_repository=capture_repository,
-            calibration_repository=calibration_repository,
+            captures_root=captures_root,
+            calibrations_root=calibrations_root,
             on_committed=on_committed,
         )
         if lifecycle_owner is not None:
@@ -112,18 +105,9 @@ def _bind_api(
             )
         return start_run(plan)
 
-    def load_calibration(reference, calibration_repository):
-        return calibration_repository.admit(reference, capture_repository)
-
-    def admit_saved_calibration(path, calibration_repository):
-        return admit_calibration_task_output(
-            path,
-            capture_repository=capture_repository,
-            calibration_repository=calibration_repository,
-        )
-
     return CalibrationApi(
-        repository_path=repository_root / "calibrations",
+        captures_root=captures_root,
+        calibrations_root=calibrations_root,
         profiles=MappingProxyType(profiles),
         camera_roles=tuple(profiles),
         resolve_camera_role=resolve_camera_role,
@@ -133,19 +117,21 @@ def _bind_api(
         bind_capture=prepare_capture,
         wait_run=wait_run,
         operation_guard=operation_guard,
-        admit_capture=capture_repository.admit,
         write_outputs=write_outputs,
         start_calibration=start_calibration,
-        load_calibration=load_calibration,
-        admit_saved_calibration=admit_saved_calibration,
         open_ui=open_ui,
     )
 
 
-def _project_signal_presentation(node, output_name, publication):
+def _project_signal_presentation(node, output_name, publication, parents):
     from .ui.workbench_jobs import project_calibration_signal_presentation
 
-    return project_calibration_signal_presentation(node, output_name, publication)
+    return project_calibration_signal_presentation(
+        node,
+        output_name,
+        publication,
+        parents,
+    )
 
 
 def _prepare_hosted(api, request, event_source):
@@ -166,10 +152,9 @@ LOGIC_NODE_PACKAGE = LogicNodePackage(
     api_name="calibration",
     declaration=CALIBRATION_LOGIC_NODE,
     api_requirements=(
-        "repository_root",
+        "captures_root",
+        "calibrations_root",
         "pulses_root",
-        "output_root",
-        "capture_repository",
         "readout_apparatus_facts",
         "resolve_camera_ref",
         "resolve_sequencer_ref",

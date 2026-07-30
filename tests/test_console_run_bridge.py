@@ -14,6 +14,8 @@ import subprocess
 import sys
 import time
 
+import pytest
+
 from zlc_neutral_atom.catalog import DefinitionKey
 from zlc_neutral_atom.logic_nodes.pulse_scan.reference import ScanArtifactRef
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
@@ -22,6 +24,19 @@ from zlc_neutral_atom.runtime.resources import ResourceArbiter
 from zlc_neutral_atom.runtime.run import RunController, RunPlan
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize(
+    "alias",
+    (
+        "test-scan//scan.json",
+        "test-scan/./scan.json",
+        "test\\alias/scan.json",
+    ),
+)
+def test_scan_artifact_ref_rejects_noncanonical_path_aliases(alias: str) -> None:
+    with pytest.raises(ValueError):
+        ScanArtifactRef(alias)
 
 
 def _successful_handle(result, *, name: str):
@@ -72,7 +87,7 @@ def test_hosted_run_does_not_import_the_application_or_gui_layer():
 
 
 def test_successful_run_result_is_the_only_final_artifact_authority() -> None:
-    reference = ScanArtifactRef("test-scan-repository", "b" * 64)
+    reference = ScanArtifactRef("test-scan/scan.json")
     handle = _successful_handle(reference, name="console final result")
     node = HostedRun(
         definition_key=DefinitionKey("test", "final-result"),

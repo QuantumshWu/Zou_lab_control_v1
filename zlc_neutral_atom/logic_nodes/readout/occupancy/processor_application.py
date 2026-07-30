@@ -23,7 +23,6 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
-    calibration_artifact_input_ref,
 )
 from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
@@ -36,8 +35,6 @@ from zlc_neutral_atom.logic_nodes.readout.occupancy.processor import (
 )
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
 from zlc_neutral_atom.runtime.signal_source import SignalEventSource
-from zlc_storage import sha256_text
-
 from .signal_source import (
     OccupancySignalProcessor,
     RunningOccupancySignalSource,
@@ -46,7 +43,7 @@ from .signal_source import (
 
 @dataclass(frozen=True, slots=True)
 class OccupancyProcessorRequest:
-    """One admitted Camera output and calibration identity.
+    """One bound Camera output and calibration identity.
 
     Console row names are deliberately absent.  They are Workbench routing
     identities, not neutral-atom physics.  The request instead freezes the
@@ -114,7 +111,7 @@ def bind_occupancy_processor_request(
 class PreparedOccupancyProcessor:
     """Closed, replayable evaluation over immutable Camera revisions.
 
-    Repository admission happens once while preparing this value.  ``evaluate``
+    Calibration loading happens once while preparing this value.  ``evaluate``
     is then a deterministic application operation over an immutable source
     snapshot and its exact source coverage/event identity.  It owns no QWidget,
     executor, subscription, mutable latest state, or device session.
@@ -135,11 +132,10 @@ class PreparedOccupancyProcessor:
         if not isinstance(request, OccupancyProcessorRequest):
             raise TypeError("request must be OccupancyProcessorRequest")
         if type(calibration) is not ResolvedCalibration:
-            raise TypeError("calibration must be an admitted ResolvedCalibration")
-        calibration._require_authority()
+            raise TypeError("calibration must be ResolvedCalibration")
         if calibration.reference != request.calibration_ref:
             raise ValueError(
-                "admitted calibration differs from the frozen application request"
+                "loaded calibration differs from the frozen application request"
             )
         source_binding = request.camera_output_binding
         calibration.artifact.frame_contract.assert_compatible_working_point(
@@ -154,7 +150,6 @@ class PreparedOccupancyProcessor:
         self._signal_processor = OccupancySignalProcessor(
             frame_contract=calibration.artifact.frame_contract,
             model=selected,
-            artifact_input=calibration_artifact_input_ref(calibration.reference),
             source_binding=source_binding,
         )
 
@@ -194,8 +189,6 @@ class PreparedOccupancyProcessor:
         self,
         source: OwnedSnapshot,
         coverage: MonitorCoverage,
-        *,
-        source_event_digest: str,
     ) -> OccupancyProcessorEvaluation:
         """Classify one already-routed Camera revision atomically."""
 
@@ -212,14 +205,11 @@ class PreparedOccupancyProcessor:
             )
         if source.block.schema.cell_schema != source_binding.frame_schema:
             raise ValueError("Camera snapshot differs from its bound frame schema")
-        digest = sha256_text(source_event_digest, "source_event_digest")
-        assert digest is not None
         evaluation = _evaluate_occupancy_processor(
             source,
             self._calibration,
             coverage,
             model_kind=self._selected_model_kind,
-            source_event_digest=digest,
         )
         declarations = tuple(
             output.declaration for output in evaluation.outputs.values()
@@ -242,7 +232,7 @@ def prepare_occupancy_processor(
     request: OccupancyProcessorRequest,
     calibration: ResolvedCalibration,
 ) -> PreparedOccupancyProcessor:
-    """Freeze one admitted Occupancy Processor application."""
+    """Freeze one loaded Occupancy Processor application."""
 
     return PreparedOccupancyProcessor(request, calibration)
 

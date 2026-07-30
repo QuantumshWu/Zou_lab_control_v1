@@ -21,7 +21,6 @@ from zlc_data import (
 )
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.logic_nodes.readout.calibration.analysis import (
-    CalibrationAnalysisResult,
     CalibrationAnalysisRequest,
     CalibrationComputation,
     reference_labels,
@@ -93,7 +92,7 @@ def _contracts(
     )
     layout = CalibrationCaptureLayout(AxisId("validity-event"), (0, 2), 1)
     source = CalibrationSourceBinding(
-        CaptureArtifactRef("validity-tests", "0" * 64),
+        CaptureArtifactRef("validity-tests/capture.json"),
         layout,
     )
     contract = FrameContract(
@@ -448,8 +447,6 @@ def test_result_rejects_artifact_thresholds_not_supported_by_report() -> None:
         models=(mismatched_model,),
     )
 
-    with pytest.raises(TypeError, match="returned by a committed calibration Run"):
-        CalibrationAnalysisResult(mismatched_artifact, result.report)
     with pytest.raises(ValueError, match="thresholds differ"):
         CalibrationComputation(mismatched_artifact, result.report)
 

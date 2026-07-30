@@ -53,7 +53,6 @@ from zlc_neutral_atom.runtime.streams import (
     SourceFailed,
     StreamEndedEarly,
     StreamId,
-    TraceContext,
 )
 from zlc_workbench.task_console import attachment_builders
 from zlc_workbench.task_console.capability import ConsoleNodeHost
@@ -70,10 +69,6 @@ from zlc_workbench.task_console.input_binding import (
 SCHEMA = ValueSchema.scalar(np.dtype("<f8"))
 
 
-def _trace(sequence: int) -> TraceContext:
-    return TraceContext("run", "camera", f"frame-{sequence}")
-
-
 def _camera_sample(sequence: int) -> CameraSample:
     return CameraSample(
         Value(np.asarray([float(sequence)]), VALID, SCHEMA),
@@ -86,7 +81,6 @@ def _camera_sample(sequence: int) -> CameraSample:
             timestamp_microseconds=None,
             host_received_at_ns=sequence + 1,
             driver_buffer_index=sequence,
-            correlation_id=f"frame-{sequence}",
         ),
     )
 
@@ -96,7 +90,6 @@ def _emit(producer, sequence: int):
     return producer.emit(
         payload,
         captured_at=payload.metadata.captured_at,
-        trace=_trace(sequence),
     )
 
 
@@ -141,7 +134,6 @@ def test_camera_named_cursor_filters_readout_phase_without_owning_camera() -> No
     assert event.value.values.tolist() == [3.0]
     assert event.value.schema is SCHEMA
     assert event.event_ref is selected.event_ref
-    assert event.trace is selected.trace
     cursor.close()
     producer.finish()
 
@@ -198,13 +190,11 @@ def test_authoritative_signal_projection_commits_multidimensional_area_and_reduc
     envelope = producer.emit(
         Value(raw, VALID, image_schema),
         captured_at=12.5,
-        trace=TraceContext("run", "processor", "image-0"),
     )
     event = cursor.next(timeout=0.1)
 
     assert event.value.values.tolist() == [float(raw[1:3, 1:4].sum())]
     assert event.event_ref is envelope.event_ref
-    assert event.trace is envelope.trace
     assert event.captured_at == 12.5
     assert cursor.stream_id == stream.stream_id
     assert cursor.stream_generation == stream.generation
@@ -213,7 +203,7 @@ def test_authoritative_signal_projection_commits_multidimensional_area_and_reduc
     producer.finish()
 
 
-def test_processor_attachment_binds_the_exact_publication_not_an_event_provider(
+def test_processor_attachment_accepts_an_exact_projected_publication(
     monkeypatch,
 ) -> None:
     input_spec = DatasetInputSpec("camera", "Camera", ("test.frame",))
@@ -232,6 +222,13 @@ def test_processor_attachment_binds_the_exact_publication_not_an_event_provider(
             camera_output,
             object(),
             source_node,
+        ),
+        DataTransformSpec(
+            (
+                Selection(
+                    (IndexRangeSelection(AxisId("selector.axis"), 0, 1),)
+                ),
+            )
         ),
     )
     spec = project_declaration_spec(
@@ -297,6 +294,7 @@ def test_processor_attachment_binds_the_exact_publication_not_an_event_provider(
         plane.close()
 
     assert captured["source_signal"] == "camera/frame"
-    assert captured["source_node"] is source_node
     assert captured["initial_publication"] is exact_publication
+    assert captured["data_plane"] is plane
+    assert "source_node" not in captured
     assert "source_event_source" not in captured

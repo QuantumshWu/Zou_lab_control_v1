@@ -32,7 +32,7 @@ from zlc_pulse import (
     require_deployed_geometry_facts,
     validate_pulse_document_clock_grid,
 )
-from zlc_storage import canonical_digest, normalized_text
+from zlc_storage import normalized_text
 
 @dataclass(frozen=True, slots=True)
 class RemotePulseConnection:
@@ -225,18 +225,10 @@ def create_remote_pulse_installation(
     client = connection.client
     blocking_limit = connection.max_blocking_call_seconds
     endpoint_label = connection.endpoint_label
-    endpoint_host = endpoint_label.rsplit(":", 1)[0]
     devices: dict[str, object] = {"sequencer": client}
     resources: ResourceArbiter | None = None
     broker: DeviceBroker | None = None
     try:
-        endpoint_identity = canonical_digest(
-            {
-                "protocol": "zlc.current-pulse-rpc",
-                "host": endpoint_host,
-                "port": port,
-            }
-        )
         assets = InstallationAssetMap(
             (
                 InstallationAsset(
@@ -247,7 +239,7 @@ def create_remote_pulse_installation(
                     evidence_kind=(
                         DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT
                     ),
-                    expected_identity=f"remote-pulse-endpoint:{endpoint_identity}",
+                    expected_identity=f"remote-pulse-endpoint:{endpoint_label}",
                 ),
             )
         )

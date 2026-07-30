@@ -24,8 +24,8 @@ from .calibration import (
     ThresholdMethod,
 )
 from .reference import CalibrationArtifactRef
-from .repository import CalibrationRepository
 from .sitemap import (
+    DEFAULT_CALIBRATION_PULSE_PATH,
     SitemapAcquisitionProfile,
     SitemapCalibrationRequest,
     build_sitemap_analysis_request,
@@ -69,20 +69,17 @@ class SitemapCalibrationInterrupted(KeyboardInterrupt):
 
 class CalibrationApi:
     __slots__ = (
-        "_admit_capture",
-        "_admit_saved_calibration",
         "_bind_capture",
+        "_calibrations_root",
         "_camera_roles",
+        "_captures_root",
         "_closed",
         "_current_calibration_ref",
         "_lock",
-        "_load_calibration",
         "_load_pulse",
         "_open_ui",
         "_operation_guard",
         "_profiles",
-        "_repository",
-        "_repository_path",
         "_resolve_camera_ref",
         "_resolve_camera_role",
         "_resolve_sequencer_ref",
@@ -94,7 +91,8 @@ class CalibrationApi:
     def __init__(
         self,
         *,
-        repository_path: Path,
+        captures_root: Path,
+        calibrations_root: Path,
         profiles: Mapping[str, SitemapAcquisitionProfile],
         camera_roles: tuple[str, ...],
         resolve_camera_role: Callable,
@@ -104,15 +102,14 @@ class CalibrationApi:
         bind_capture: Callable,
         wait_run: Callable,
         operation_guard: Callable,
-        admit_capture: Callable,
         write_outputs: Callable,
         start_calibration: Callable,
-        load_calibration: Callable,
-        admit_saved_calibration: Callable,
         open_ui: Callable,
     ) -> None:
-        if not isinstance(repository_path, Path):
-            raise TypeError("repository_path must be Path")
+        if not isinstance(captures_root, Path) or not captures_root.is_absolute():
+            raise ValueError("captures_root must be an absolute Path")
+        if not isinstance(calibrations_root, Path) or not calibrations_root.is_absolute():
+            raise ValueError("calibrations_root must be an absolute Path")
         operations = (
             resolve_camera_role,
             resolve_camera_ref,
@@ -121,16 +118,14 @@ class CalibrationApi:
             bind_capture,
             wait_run,
             operation_guard,
-            admit_capture,
             write_outputs,
             start_calibration,
-            load_calibration,
-            admit_saved_calibration,
             open_ui,
         )
         if any(not callable(operation) for operation in operations):
             raise TypeError("Calibration API operations must be callable")
-        self._repository_path = repository_path
+        self._captures_root = captures_root.resolve()
+        self._calibrations_root = calibrations_root.resolve()
         self._profiles = MappingProxyType(dict(profiles))
         self._camera_roles = tuple(camera_roles)
         self._lock = threading.RLock()
@@ -143,28 +138,9 @@ class CalibrationApi:
         self._bind_capture = bind_capture
         self._wait_run = wait_run
         self._operation_guard = operation_guard
-        self._admit_capture = admit_capture
         self._write_outputs = write_outputs
         self._start_calibration_operation = start_calibration
-        self._load_calibration = load_calibration
-        self._admit_saved_calibration = admit_saved_calibration
         self._open_ui = open_ui
-        self._repository: CalibrationRepository | None = None
-
-    def _calibration_repository(self) -> CalibrationRepository:
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("Calibration API is closed")
-            repository = self._repository
-            if repository is None:
-                repository = CalibrationRepository(self._repository_path)
-                self._repository = repository
-            return repository
-
-    def _repository_for_readout_family(self) -> CalibrationRepository:
-        """Share the family-owned repository with dependent readout leaves."""
-
-        return self._calibration_repository()
 
     @property
     def current_calibration_ref(self) -> CalibrationArtifactRef | None:
@@ -198,7 +174,7 @@ class CalibrationApi:
         self,
         reference: CalibrationArtifactRef,
     ) -> None:
-        """Record a ref minted by this API's repository after manifest commit."""
+        """Record the typed ref after ``calibration.json`` becomes visible."""
 
         with self._lock:
             if self._closed:
@@ -209,14 +185,6 @@ class CalibrationApi:
         with self._lock:
             self._closed = True
             self._current_calibration_ref = None
-            repository = self._repository
-            self._repository = None
-        if repository is None:
-            return ()
-        try:
-            repository.close()
-        except Exception as error:
-            return (error,)
         return ()
 
     def prepare_calibration_task(
@@ -285,7 +253,9 @@ class CalibrationApi:
         roi_radius: int | None = None,
     ) -> SitemapCalibrationRequest:
         selected_camera, profile = self._resolve_sitemap_profile(camera_role)
-        selected_pulse = None if pulse is None else self._load_pulse(pulse)
+        selected_pulse = self._load_pulse(
+            DEFAULT_CALIBRATION_PULSE_PATH if pulse is None else pulse
+        )
         camera_ref = self._resolve_camera_ref(selected_camera)
         sequencer_ref = self._resolve_sequencer_ref(profile.sequencer_role)
         return build_sitemap_calibration_request(
@@ -317,12 +287,12 @@ class CalibrationApi:
         except Exception as error:
             raise SitemapCalibrationFailed(source) from error
 
-    def write_calibration_task_outputs(
+    def write_calibration_post_final_exports(
         self,
         source: CaptureArtifactRef,
         calibration: CalibrationArtifactRef,
         *,
-        folder: str | Path,
+        save_frames: bool,
         expected_camera_role: str | None = None,
     ) -> None:
         binding = (
@@ -335,8 +305,7 @@ class CalibrationApi:
         self._write_outputs(
             source,
             calibration,
-            self._calibration_repository(),
-            folder=folder,
+            save_frames=save_frames,
             expected_camera_role=None if binding is None else binding.value,
         )
 
@@ -346,13 +315,15 @@ class CalibrationApi:
         analysis: CalibrationAnalysisRequest,
     ) -> CalibrationArtifactRequest:
         request = build_calibration_artifact_request(
-            self._admit_calibration_capture(source),
+            self._load_calibration_capture(source),
             analysis,
         )
         return request
 
-    def _admit_calibration_capture(self, source: CaptureArtifactRef):
-        return self._admit_capture(source)
+    def _load_calibration_capture(self, source: CaptureArtifactRef):
+        from zlc_neutral_atom.capture.artifact import load_capture_artifact
+
+        return load_capture_artifact(self._captures_root, source, materialize=False)
 
     def start_calibration(
         self,
@@ -364,7 +335,6 @@ class CalibrationApi:
             raise TypeError("request must be CalibrationArtifactRequest")
         return self._start_calibration_operation(
             request,
-            self._calibration_repository(),
             lifecycle_owner,
             self._remember_committed_calibration,
         )
@@ -413,28 +383,25 @@ class CalibrationApi:
         self,
         reference: CalibrationArtifactRef,
     ) -> ResolvedCalibration:
-        resolved = self._load_calibration(
-            reference,
-            self._calibration_repository(),
-        )
-        return resolved
+        from .repository import load_calibration_artifact
 
-    def load_saved_calibration(
-        self,
-        calibration_ref_file: str | Path,
-    ) -> ResolvedCalibration:
-        resolved = self._admit_saved_calibration(
-            calibration_ref_file,
-            self._calibration_repository(),
+        return load_calibration_artifact(
+            self._calibrations_root,
+            self._captures_root,
+            reference,
         )
-        return resolved
 
     def load_calibration_computation(
         self,
         reference: CalibrationArtifactRef,
     ) -> CalibrationComputation:
-        computation = self._calibration_repository().load_computation(reference)
-        return computation
+        from .repository import load_calibration_computation
+
+        return load_calibration_computation(
+            self._calibrations_root,
+            self._captures_root,
+            reference,
+        )
 
     def load_calibration_report(
         self,

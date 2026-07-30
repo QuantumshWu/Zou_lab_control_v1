@@ -1,21 +1,23 @@
-"""Cross-logic-node analysis artifact schemas and repositories."""
+"""Cross-logic-node analysis artifact values and direct file operations."""
 
 from .fit_reference import (
     FIT_RESULT_ARTIFACT_NAMESPACE,
     FitResultArtifactRef,
 )
 from .fit_result import (
-    AdmittedFitResult,
-    FIT_RESULT_ARTIFACT_SCHEMA,
-    FitExecution,
-    FitResultRepository,
+    FIT_RESULT_RECORD_SCHEMA,
+    SavedFitResult,
+    execute_fit,
+    load_fit_result,
+    write_fit_result,
 )
 
 __all__ = [
-    "AdmittedFitResult",
-    "FIT_RESULT_ARTIFACT_SCHEMA",
     "FIT_RESULT_ARTIFACT_NAMESPACE",
-    "FitExecution",
+    "FIT_RESULT_RECORD_SCHEMA",
     "FitResultArtifactRef",
-    "FitResultRepository",
+    "SavedFitResult",
+    "execute_fit",
+    "load_fit_result",
+    "write_fit_result",
 ]

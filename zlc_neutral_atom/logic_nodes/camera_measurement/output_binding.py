@@ -20,7 +20,6 @@ from zlc_neutral_atom.devices.camera.contract import (
 )
 from zlc_neutral_atom.runtime.resources import DeviceBindingStamp
 from zlc_neutral_atom.runtime.streams import StreamId
-from zlc_storage import canonical_digest
 
 from .definition import (
     CAMERA_FRAME_OUTPUT_CONTRACT_ID,
@@ -90,25 +89,5 @@ class CameraFrameOutputBinding:
             raise TypeError("stream_id must be StreamId")
         if not isinstance(self.stream_generation, StreamGenerationId):
             raise TypeError("stream_generation must be StreamGenerationId")
-
-    @property
-    def identity(self) -> str:
-        """Canonical ephemeral binding identity used in processor provenance."""
-
-        return canonical_digest(
-            {
-                "owner": "zlc_neutral_atom.camera-measurement.frame-output-binding",
-                "output_name": self.output.name,
-                "output_contract": self.output.contract_id,
-                "readout_event_index": self.readout_event_index,
-                "readout_binding": self.readout_binding.value,
-                "capability_fingerprint": self.capability_evidence.fingerprint,
-                "binding_instance_id": self.binding_stamp.binding_instance_id,
-                "frame_schema": self.frame_schema.fingerprint,
-                "stream_id": self.stream_id.value,
-                "stream_generation": self.stream_generation.value,
-            }
-        )
-
 
 __all__ = ["CameraFrameOutputBinding"]

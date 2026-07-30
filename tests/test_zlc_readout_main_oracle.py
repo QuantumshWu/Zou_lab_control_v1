@@ -66,7 +66,6 @@ _MODEL_CASES = (
 _MODEL_FIELD_PREFIXES = (
     "quick_thresholds",
     "short_signals",
-    "bin_edges",
     "thresholds",
     "pred",
     "site_fidelity",
@@ -196,7 +195,7 @@ def _calibration_contracts(
     )
     layout = CalibrationCaptureLayout(AxisId(f"{namespace}-event"), (0, 2), 1)
     source_binding = CalibrationSourceBinding(
-        CaptureArtifactRef(namespace, "0" * 64),
+        CaptureArtifactRef(f"{namespace}/capture.json"),
         layout,
     )
     frame_contract = FrameContract(
@@ -624,7 +623,6 @@ def test_complete_main_same_frame_calibration_oracle(
         )
         _assert_close(model_report.short_signals, oracle[f"short_signals_{name}"])
         np.testing.assert_array_equal(model_report.short_validity, True)
-        _assert_close(model_report.bin_edges, oracle[f"bin_edges_{name}"])
         _assert_close(model_report.thresholds, oracle[f"thresholds_{name}"])
         _assert_close(model.thresholds, oracle[f"thresholds_{name}"])
         np.testing.assert_array_equal(

@@ -16,7 +16,6 @@ from fpga.pulse_streamer.host.image import (
 from zlc_storage import canonical_digest
 from zlc_pulse import (
     PulseExecutionForm,
-    SLOT_MULTIPLIER_WIDTH,
     TargetBusDelay,
     TargetBusSegment,
     TargetIR,
@@ -25,6 +24,7 @@ from zlc_pulse import (
     pack_target_ir,
     validate_target_ir_for_target,
 )
+from zlc_pulse.validation import SLOT_MULTIPLIER_WIDTH
 
 
 ROOT = Path(__file__).parents[1]

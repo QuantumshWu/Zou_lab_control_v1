@@ -1,7 +1,7 @@
 """Public headless fit API assembled from the focused fit submodules."""
 
 from .axis import AxisSourceRef
-from .bimodal_distribution import (
+from .fit_solver import (
     BimodalDistributionAnalysis,
     analyze_bimodal_distribution,
 )

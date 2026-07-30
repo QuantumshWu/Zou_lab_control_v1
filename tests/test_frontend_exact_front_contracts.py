@@ -356,18 +356,10 @@ def test_failed_family_change_keeps_the_old_front_and_interaction_family() -> No
     old = BoardFrame("host-board", 0, 0, (curve_panel(0),))
     host.present_frame(old)
     candidate = image_panel(1)
-    presentation = replace(
-        candidate.coherence_stamp.presentations[0],
-        panel_id="curve",
-    )
     candidate = replace(
         candidate,
         panel_id="curve",
         coherence_group="curve",
-        coherence_stamp=replace(
-            candidate.coherence_stamp,
-            presentations=(presentation,),
-        ),
     )
     try:
         import pytest
@@ -397,10 +389,7 @@ def test_failed_family_change_keeps_the_old_front_and_interaction_family() -> No
 def test_faceted_host_accepts_one_indivisible_overview_artifact() -> None:
     from zlc_frontend.data_figure import FacetedOverviewArtifact
     from zlc_frontend.qt_widgets import FacetedPanelHost, ensure_qt_app
-    from zlc_frontend.render import (
-        PanelPresentationIdentity,
-        RasterBuffer,
-    )
+    from zlc_frontend.render import RasterBuffer
 
     figure = _meter_figure()
     _png, regions = figure.to_png_bytes_with_panel_regions()
@@ -410,13 +399,6 @@ def test_faceted_host_accepts_one_indivisible_overview_artifact() -> None:
         raster,
         regions,
         (480, 320),
-        PanelPresentationIdentity(
-            "meter",
-            figure.document.document_id,
-            figure.document.revision,
-            0,
-            0,
-        ),
     )
     application = ensure_qt_app()
     host = FacetedPanelHost("meter")

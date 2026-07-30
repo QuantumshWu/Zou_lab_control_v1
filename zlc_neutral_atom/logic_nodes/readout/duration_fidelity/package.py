@@ -5,9 +5,7 @@ from __future__ import annotations
 from zlc_neutral_atom.logic_node_package import LogicNodePackage
 
 from .api import ReadoutDurationFidelityApi
-from .application import (
-    prepare_readout_duration_fidelity,
-)
+from .application import prepare_readout_duration_fidelity
 from .measurement import (
     READOUT_DURATION_FIDELITY_LOGIC_NODE,
     bind_readout_duration_fidelity_inputs,

@@ -9,7 +9,6 @@ rendered front.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-import hashlib
 import math
 
 import numpy as np
@@ -785,25 +784,6 @@ def histogram_projection_home_x_limits(
     )
 
 
-def _histogram_projection_digest(
-    requested_bin_count: int,
-    bin_edges: np.ndarray,
-    bin_counts: tuple[np.ndarray, ...],
-) -> str:
-    """Digest exact bins once on their worker-owned construction boundary."""
-
-    digest = hashlib.sha256(b"zlc_frontend.HistogramBinProjection\0")
-    digest.update(int(requested_bin_count).to_bytes(8, "little", signed=False))
-    for values in (bin_edges, *bin_counts):
-        digest.update(values.dtype.str.encode("ascii"))
-        digest.update(b"\0")
-        digest.update(int(values.ndim).to_bytes(2, "little", signed=False))
-        for size in values.shape:
-            digest.update(int(size).to_bytes(8, "little", signed=False))
-        digest.update(memoryview(values).cast("B"))
-    return digest.hexdigest()
-
-
 @dataclass(frozen=True, slots=True, eq=False, init=False)
 class HistogramBinProjection:
     """One exact-sample-bound, shared-edge display projection.
@@ -820,7 +800,6 @@ class HistogramBinProjection:
     bin_counts: tuple[np.ndarray, ...]
     bin_edges: np.ndarray
     requested_bin_count: int
-    projection_digest: str
 
     def __init__(
         self,
@@ -862,11 +841,6 @@ class HistogramBinProjection:
         object.__setattr__(self, "bin_counts", tuple(counts))
         object.__setattr__(self, "bin_edges", immutable_edges)
         object.__setattr__(self, "requested_bin_count", bins)
-        object.__setattr__(
-            self,
-            "projection_digest",
-            _histogram_projection_digest(bins, immutable_edges, tuple(counts)),
-        )
 
     @classmethod
     def _from_committed_edges(
@@ -911,15 +885,6 @@ class HistogramBinProjection:
         object.__setattr__(projection, "bin_counts", tuple(counts))
         object.__setattr__(projection, "bin_edges", immutable_edges)
         object.__setattr__(projection, "requested_bin_count", requested)
-        object.__setattr__(
-            projection,
-            "projection_digest",
-            _histogram_projection_digest(
-                requested,
-                immutable_edges,
-                tuple(counts),
-            ),
-        )
         return projection
 
 

@@ -21,11 +21,8 @@ from zlc_pulse import PulseExecutionForm, load_pulse_document
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _workspace(repository_root: Path) -> zlc.WorkspacePaths:
-    return zlc.WorkspacePaths.for_workspace(
-        ROOT,
-        repository_root=repository_root,
-    )
+def _workspace(project_root: Path) -> zlc.WorkspacePaths:
+    return zlc.WorkspacePaths.for_workspace(project_root.resolve())
 
 
 class _LiveView:
@@ -36,8 +33,7 @@ class _LiveView:
         self.updated_event = threading.Event()
         self.failure = None
 
-    def bind(self, dataset, *, run_id: str, causation_domain_id: str) -> None:
-        assert run_id and causation_domain_id
+    def bind(self, dataset) -> None:
         self.dataset = dataset
 
     def updated(self) -> None:

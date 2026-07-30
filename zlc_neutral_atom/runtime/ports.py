@@ -57,7 +57,6 @@ class SessionClosedAck:
     source_stopped: bool
     no_more_work: bool
     joined: bool
-    acknowledgement_digest: str
 
     def __post_init__(self) -> None:
         for field in ("session_id", "binding_instance_id"):
@@ -65,7 +64,6 @@ class SessionClosedAck:
         for field in ("source_stopped", "no_more_work", "joined"):
             if type(getattr(self, field)) is not bool:
                 raise TypeError(f"{field} must be bool")
-        _canonical_text(self.acknowledgement_digest, "acknowledgement_digest")
 
     @property
     def is_terminal(self) -> bool:

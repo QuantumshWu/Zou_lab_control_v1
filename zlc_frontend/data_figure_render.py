@@ -14,7 +14,6 @@ from .data_figure_presentation import (
     DataFigurePanelPayload,
     classify_faceted_data_figure,
     classify_single_data_figure,
-    data_figure_join_digest,
     data_figure_payload_intent,
     data_figure_summary,
     default_data_figure_display_state,
@@ -33,7 +32,6 @@ from .plot_panel import (
     PlotPanelSession,
 )
 from .plot_kind import PlotKind
-from .panel_render import PanelProvenance
 from .panel_params import panel_display_state_intent
 
 
@@ -138,15 +136,6 @@ def render_data_figure_grid_overview(
             PlotPanelComposeRequest(
                 FigureSource(snapshot),
                 display_state,
-                PanelProvenance(
-                    f"figure:{snapshot.ref.block_id.value}",
-                    snapshot.ref.stream_generation.value,
-                    data_figure_join_digest(
-                        base_figure,
-                        intent,
-                        fit_result_identity,
-                    ),
-                ),
                 fit_result=overlay_result,
                 fit_result_identity=fit_result_identity,
                 check_cancelled=check_cancelled,
@@ -227,15 +216,6 @@ def render_data_figure_front(
             PlotPanelComposeRequest(
                 FigureSource(snapshot),
                 state,
-                PanelProvenance(
-                    f"figure:{snapshot.ref.block_id.value}",
-                    snapshot.ref.stream_generation.value,
-                    data_figure_join_digest(
-                        figure,
-                        intent,
-                        None,
-                    ),
-                ),
                 histogram_projection_value_range=(
                     histogram_projection_value_range
                 ),

@@ -23,10 +23,10 @@ from zlc_pulse import (
     PulseTarget,
     RepeatRegion,
     ScanParameter,
-    build_pulse_timeline,
     compile_pulse_artifact,
     compile_pulse_document,
 )
+from zlc_pulse.timeline import build_pulse_timeline
 
 
 def _target() -> PulseTarget:

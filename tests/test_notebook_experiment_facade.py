@@ -26,33 +26,31 @@ from zlc_data import (
 from zlc_data.fit_codec import encode_fit_result_batch
 from zlc_neutral_atom.artifacts import (
     FitResultArtifactRef,
-    FitResultRepository,
 )
-from zlc_neutral_atom.capture.artifact import CaptureRepository
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.installation import DeviceRef
-from zlc_neutral_atom.logic_nodes.readout.calibration.repository import CalibrationRepository
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.runtime.ports import BoundDevice
 from zlc_neutral_atom.runtime.run import RunPlan
 from zlc_pulse import FrozenScanTable, RepeatRegion, load_pulse_document
-from zlc_storage import RepositoryRootBusy
 
 
 ROOT = Path(__file__).resolve().parents[1]
-IMAGING_PULSE = ROOT / "pulses" / "imaging_template.json"
-MOT_SCAN_PULSE = ROOT / "pulses" / "mot_field_template.json"
+IMAGING_PULSE = Path("imaging_template.json")
 
 
-def _workspace(repository_root: Path) -> zlc.WorkspacePaths:
-    return zlc.WorkspacePaths.for_workspace(
-        ROOT,
-        repository_root=repository_root,
+def _workspace(project_root: Path) -> zlc.WorkspacePaths:
+    project_root = project_root.resolve()
+    return zlc.WorkspacePaths(
+        project_root=project_root,
+        pulses_root=(ROOT / "pulses").resolve(),
+        tasks_root=(ROOT / "tasks").resolve(),
+        output_root=project_root / "_output",
     )
 
 
-def _connect(repository_root: Path):
-    return zlc.connect("virtual", workspace=_workspace(repository_root))
+def _connect(project_root: Path):
+    return zlc.connect("virtual", workspace=_workspace(project_root))
 
 
 def _expect(error_type, text: str, operation):
@@ -64,10 +62,12 @@ def _expect(error_type, text: str, operation):
     raise AssertionError(f"expected {error_type.__name__}: {text}")
 
 
-def _assert_repository_roots_released(root: Path) -> None:
-    CaptureRepository(root / "captures").close()
-    CalibrationRepository(root / "calibrations").close()
-    FitResultRepository(root / "fits").close()
+def _assert_direct_output_root_writable(root: Path) -> None:
+    output = root / "_output"
+    output.mkdir(parents=True, exist_ok=True)
+    probe = output / "close-probe.tmp"
+    probe.write_bytes(b"ok")
+    probe.unlink()
 
 
 def _case_capture_and_fit(root: Path) -> None:
@@ -82,7 +82,6 @@ def _case_capture_and_fit(root: Path) -> None:
         assert descriptor.trigger_channel == "ch11"
         assert descriptor.expected_frames == 3
         assert descriptor.output_schema.physical_shape == (1, 3, 96, 128)
-        assert descriptor.resource_claims == ("device/sequencer", "device/camera")
 
         reference = exp.run(request)
         assert isinstance(reference, CaptureArtifactRef)
@@ -123,7 +122,7 @@ def _case_capture_and_fit(root: Path) -> None:
                 else ()
             ),
         )
-        execution = exp.fit(
+        result = exp.fit(
             convenience_reference,
             model="radial_gaussian_center",
             independent_sources=(
@@ -135,22 +134,22 @@ def _case_capture_and_fit(root: Path) -> None:
                 max_evaluations=500,
             ),
         )
-        assert tuple(axis.role for axis in execution.result.fit_axis_specs) == (
+        assert tuple(axis.role for axis in result.fit_axis_specs) == (
             SPATIAL_X,
             SPATIAL_Y,
         )
-        assert execution.result.spec.batch_sources == batch_sources
-        assert execution.result.batch_layout.storage_size == (
+        assert result.spec.batch_sources == batch_sources
+        assert result.batch_layout.storage_size == (
             fit_schema.repeat_axis.size * fit_schema.point_table.row_count
         )
 
-        fit_ref = execution.save()
+        fit_ref = exp.save_fit(convenience_reference, result)
         assert isinstance(fit_ref, FitResultArtifactRef)
         admitted = exp.load_fit(fit_ref)
         assert admitted.reference == fit_ref
         assert admitted.source_artifact_ref == convenience_reference
         assert encode_fit_result_batch(admitted.result) == encode_fit_result_batch(
-            execution.result
+            result
         )
 
 
@@ -197,42 +196,12 @@ def _case_public_authority_and_validation(root: Path) -> None:
             lambda: exp.inspect(replace(request, camera_ref=stale)),
         )
 
-        _expect(
-            RepositoryRootBusy,
-            "live owner",
-            lambda: CaptureRepository(root / "captures"),
-        )
-        _expect(
-            RepositoryRootBusy,
-            "live owner",
-            lambda: FitResultRepository(root / "fits"),
-        )
-
         bound = exp.readout.for_binding(ReadoutBindingKey("camera"))
         _expect(ValueError, "cannot switch", lambda: bound.for_binding("sequencer"))
     finally:
         exp.close()
         exp.close()
-    _assert_repository_roots_released(root)
-
-
-def _case_close_retry(root: Path) -> None:
-    exp = _connect(root)
-    services = exp._services
-    borrow = services.capture_repository._root_lease.borrow()
-    try:
-        _expect(facade_impl._ResourceCleanupError, "close failed", exp.close)
-        assert services.state == "CLOSING"
-        _expect(
-            RuntimeError,
-            "closing or closed",
-            lambda: exp.readout.load_capture(object()),
-        )
-    finally:
-        borrow.close()
-    exp.close()
-    assert services.state == "CLOSED"
-    _assert_repository_roots_released(root)
+    _assert_direct_output_root_writable(root)
 
 
 class _ControlledWorkbenchHandle:
@@ -304,7 +273,7 @@ def _case_concurrent_close_owner(root: Path) -> None:
     assert failures == []
     assert handle.request_count == 2
     assert services.state == "CLOSED"
-    _assert_repository_roots_released(root)
+    _assert_direct_output_root_writable(root)
 
 
 def _case_concurrent_gui_owner_keeps_pumping(root: Path) -> None:
@@ -336,7 +305,7 @@ def _case_concurrent_gui_owner_keeps_pumping(root: Path) -> None:
     assert not foreign.is_alive()
     assert foreign_failures == []
     assert services.state == "CLOSED"
-    _assert_repository_roots_released(root)
+    _assert_direct_output_root_writable(root)
 
 
 def _case_gui_close_retry_preserves_data(root: Path) -> None:
@@ -356,19 +325,13 @@ def _case_gui_close_retry_preserves_data(root: Path) -> None:
     )
     assert services.state == "CLOSING"
     assert services.closing_gui_handles == (handle,)
-    _expect(
-        RepositoryRootBusy,
-        "live owner",
-        lambda: CaptureRepository(root / "captures"),
-    )
-
     handle.wait_owner_closed = (  # type: ignore[method-assign]
         lambda timeout: handle._allow_ack.wait(timeout)
     )
     handle.acknowledge_close()
     exp.close()
     assert services.state == "CLOSED"
-    _assert_repository_roots_released(root)
+    _assert_direct_output_root_writable(root)
 
 
 def _case_runtime_close_retry_preserves_handles(root: Path) -> None:
@@ -395,12 +358,6 @@ def _case_runtime_close_retry_preserves_handles(root: Path) -> None:
         assert services.state == "CLOSING"
         assert services.closing_gui_handles == (handle,)
         assert handle.request_count == 1
-        _expect(
-            RepositoryRootBusy,
-            "live owner",
-            lambda: CaptureRepository(root / "captures"),
-        )
-
         exp.close()
     finally:
         runtime_type.shutdown = original_shutdown
@@ -408,7 +365,7 @@ def _case_runtime_close_retry_preserves_handles(root: Path) -> None:
     assert shutdown_calls == 2
     assert handle.request_count == 3
     assert services.state == "CLOSED"
-    _assert_repository_roots_released(root)
+    _assert_direct_output_root_writable(root)
 
 
 def _case_close_race(root: Path, surface: str) -> None:
@@ -429,8 +386,8 @@ def _case_close_race(root: Path, surface: str) -> None:
 
     setattr(guard_owner, guard_name, observed_guard)
     if surface == "capture":
-        type(services.capture_repository).load = (
-            lambda _self, _reference: backend_calls.append("capture-load")
+        readout_core_impl.load_capture_artifact = (  # type: ignore[assignment]
+            lambda *_args, **_kwargs: backend_calls.append("capture-load")
         )
         operation = lambda: exp.readout.load_capture(object())
     else:
@@ -526,7 +483,7 @@ def _case_fit_close_drain(root: Path) -> None:
     assert len(fit_failures) == 2
     assert all(isinstance(error, FitCancelled) for error in fit_failures)
     assert services.state == "CLOSED"
-    _assert_repository_roots_released(root)
+    _assert_direct_output_root_writable(root)
 
 
 def _case_fit_reentrant_close(root: Path) -> None:
@@ -543,7 +500,7 @@ def _case_fit_reentrant_close(root: Path) -> None:
     assert services.state == "OPEN"
     exp.close()
     assert services.state == "CLOSED"
-    _assert_repository_roots_released(root)
+    _assert_direct_output_root_writable(root)
 
 
 def _case_failed_public_root(root: Path) -> None:
@@ -557,7 +514,7 @@ def _case_failed_public_root(root: Path) -> None:
         lambda: _connect(root),
     )
     assert error.__cause__ is None
-    _assert_repository_roots_released(root)
+    _assert_direct_output_root_writable(root)
 
 
 def _run_case(case: str, root_text: str) -> None:
@@ -565,7 +522,6 @@ def _run_case(case: str, root_text: str) -> None:
     cases = {
         "capture-and-fit": lambda: _case_capture_and_fit(root),
         "public-authority": lambda: _case_public_authority_and_validation(root),
-        "close-retry": lambda: _case_close_retry(root),
         "concurrent-close-owner": lambda: _case_concurrent_close_owner(root),
         "concurrent-gui-owner": lambda: _case_concurrent_gui_owner_keeps_pumping(root),
         "gui-close-retry": lambda: _case_gui_close_retry_preserves_data(root),
@@ -602,7 +558,6 @@ def _run_isolated(case: str, root: Path) -> subprocess.CompletedProcess[str]:
     (
         "capture-and-fit",
         "public-authority",
-        "close-retry",
         "concurrent-close-owner",
         "concurrent-gui-owner",
         "gui-close-retry",

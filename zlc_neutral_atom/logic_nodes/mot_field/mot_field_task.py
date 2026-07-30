@@ -1,4 +1,4 @@
-"""MOT-field task preparation, lifecycle, live output and persistence.
+"""MOT-field task preparation plus live and FINAL domain projection.
 
 A form boundary constructs :class:`MotFieldTaskIntent`; the composition root
 passes its installation-bound semantic service to :func:`prepare_mot_field_task`.
@@ -10,21 +10,12 @@ datasets, but never assembles the scan, projection, analysis or materializer.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
-from pathlib import Path
-import threading
-import uuid
-from typing import Callable, Mapping, Protocol
+from typing import Mapping, Protocol
 
-import numpy as np
-
-from zlc_data import DatasetSchema
-from zlc_neutral_atom.capture.artifact import (
-    CaptureRepository,
-    PendingCaptureArtifact,
-)
+from zlc_data import AxisSourceRef, DatasetSchema
+from zlc_data.codec import axis_source_ref_to_tree
+from zlc_neutral_atom.capture.artifact import CaptureArtifact
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
-from zlc_neutral_atom.capture.triggered import TriggeredPipelineResult
 from zlc_neutral_atom.dataset_output import FinalDatasetOutput
 from zlc_neutral_atom.logic_node_declaration import (
     DefaultOutputView,
@@ -49,12 +40,12 @@ from .mot_field import (
     MINIMUM_MOT_FIELD_POINTS,
     MOT_FIELD_FINAL_OUTPUT_DECLARATIONS,
     MOT_FIELD_TASK_DEFINITION,
+    _MOT_SCAN_COORDINATE_IDS,
     MotFieldAcquisitionResult,
     MotFieldRequest,
     MotFieldResult,
     analyze_mot_scan,
     mot_field_final_outputs,
-    mot_field_source_identity,
     mot_intensity_schema,
 )
 from .mot_field_live import (
@@ -64,15 +55,10 @@ from .mot_field_live import (
 from .application import (
     PreparedMotFieldAcquisition,
 )
-from zlc_neutral_atom.runtime.run import (
-    PostSafetyContext,
-    RunHandle,
-    RunPlan,
-)
+from zlc_neutral_atom.runtime.run import RunHandle
 from zlc_neutral_atom.runtime.preview import (
     ExactDatasetPreviewPort,
     ExactDatasetPreviewSpec,
-    notify_preview_failure,
 )
 from zlc_storage import (
     canonical_text,
@@ -81,11 +67,22 @@ from zlc_storage import (
     normalized_text,
     positive_real,
 )
-from zlc_storage.paths import resolve_under
 
 
-DEFAULT_MOT_FIELD_REPORT_FOLDER = "mot_field"
 DEFAULT_MOT_FIELD_PULSE_PATH = "mot_field_template.json"
+
+_MOT_FIELD_GRID_SOURCES = tuple(
+    axis_source_ref_to_tree(AxisSourceRef.grid_dimension(axis_id))
+    for axis_id in _MOT_SCAN_COORDINATE_IDS
+)
+_MOT_FIELD_DEFAULT_VIEW_PARAMS = {
+    "view_preferences": {
+        "intent": "IMAGE",
+        "image_x_source": _MOT_FIELD_GRID_SOURCES[0],
+        "image_y_source": _MOT_FIELD_GRID_SOURCES[1],
+        "facet_sources": [_MOT_FIELD_GRID_SOURCES[2]],
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -105,7 +102,6 @@ class MotFieldTaskIntent:
     roi_cx: float | None
     roi_cy: float | None
     roi_radius: float
-    folder: str
     camera_role: str
 
     def __post_init__(self) -> None:
@@ -131,7 +127,6 @@ class MotFieldTaskIntent:
             else finite_real(self.roi_cy, "roi_cy", minimum=0.0)
         )
         roi_radius = positive_real(self.roi_radius, "roi_radius")
-        folder = normalized_text(self.folder, "folder")
         camera_role = normalized_text(self.camera_role, "camera_role")
         if camera_role != DEFAULT_MOT_FIELD_CAMERA_ROLE:
             raise ValueError(
@@ -147,7 +142,6 @@ class MotFieldTaskIntent:
         object.__setattr__(self, "roi_cx", roi_cx)
         object.__setattr__(self, "roi_cy", roi_cy)
         object.__setattr__(self, "roi_radius", roi_radius)
-        object.__setattr__(self, "folder", folder)
         object.__setattr__(self, "camera_role", camera_role)
 
 
@@ -244,17 +238,6 @@ _MOT_FIELD_AUTHORING_SCHEMA = AuthoringSchema(
             description="The 1x..2x annulus supplies the local background",
         ),
         AuthoringField(
-            "folder",
-            "path",
-            "Report folder",
-            default=DEFAULT_MOT_FIELD_REPORT_FOLDER,
-            required=True,
-            description=(
-                "Raw intensity block, exact Bx/By/Bz axes, and refined optimum "
-                "are written to mot_field_scan.npz"
-            ),
-        ),
-        AuthoringField(
             "camera_role",
             "choice",
             "Camera role",
@@ -338,8 +321,8 @@ MOT_FIELD_LOGIC_NODE = LogicNodeDeclaration(
     build_request=build_mot_field_intent_from_authoring,
     bind_request=bind_no_node_inputs,
     default_views=(
-        DefaultOutputView("grid", "grid"),
-        DefaultOutputView("mot_field", "grid"),
+        DefaultOutputView("grid", "grid", _MOT_FIELD_DEFAULT_VIEW_PARAMS),
+        DefaultOutputView("mot_field", "grid", _MOT_FIELD_DEFAULT_VIEW_PARAMS),
     ),
     path_presentations=(
         PathPresentationHint(
@@ -347,61 +330,9 @@ MOT_FIELD_LOGIC_NODE = LogicNodeDeclaration(
             file_filter="Pulse program (*.json);;All files (*)",
             base_dir="pulses",
         ),
-        PathPresentationHint(
-            "folder",
-            mode="dir",
-            base_dir="output",
-        ),
     ),
     resolve_dynamic_choices=_mot_camera_choices,
 )
-
-
-def write_mot_field_report(
-    result: MotFieldResult,
-    folder: str | Path,
-) -> Path:
-    """Write the human-readable MOT analysis export after source FINAL.
-
-    The CaptureArtifact CAS reference is the sole machine authority.  This
-    replace-last ``.npz`` is a derived convenience report and never substitutes
-    for repository admission, source lineage, or the frozen analysis request.
-    """
-
-    if not isinstance(result, MotFieldResult):
-        raise TypeError("result must be MotFieldResult")
-    directory = Path(folder).expanduser()
-    if not directory.is_absolute():
-        raise ValueError("MOT report folder must be resolved by composition")
-    directory = directory.resolve()
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / "mot_field_scan.npz"
-    axes = tuple(
-        np.asarray(domain)
-        for domain in result.grid_topology.coordinate_domains
-    )
-    temporary = directory / f".{target.name}.{uuid.uuid4().hex}.tmp"
-    try:
-        with temporary.open("wb") as stream:
-            np.savez(
-                stream,
-                source_identity=np.asarray(result.source_identity),
-                intensity=np.asarray(result.intensity),
-                bx=axes[0],
-                by=axes[1],
-                bz=axes[2],
-                best=np.asarray(result.best_field, dtype=np.float64),
-                best_intensity=np.asarray(
-                    result.best_intensity,
-                    dtype=np.float64,
-                ),
-            )
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return target
 
 
 class MotFieldTaskDependencies(Protocol):
@@ -441,230 +372,67 @@ def _require_dependencies(dependencies) -> MotFieldTaskDependencies:
     return dependencies
 
 
-def _acquisition_from_pipeline(
+def _acquisition_from_capture(
     request: MotFieldRequest,
-    pipeline: TriggeredPipelineResult,
+    artifact: CaptureArtifact,
 ) -> MotFieldAcquisitionResult:
-    """Validate one exact in-process capture as MOT source data."""
+    """Validate one visible direct-output Capture as exact MOT source data."""
 
     if not isinstance(request, MotFieldRequest):
         raise TypeError("request must be MotFieldRequest")
-    if not isinstance(pipeline, TriggeredPipelineResult):
-        raise TypeError("MOT analysis requires TriggeredPipelineResult")
+    if not isinstance(artifact, CaptureArtifact):
+        raise TypeError("MOT analysis requires CaptureArtifact")
+    evidence = artifact.pulse_evidence
+    if evidence is None:
+        raise ValueError("MOT analysis requires pulse-associated Capture evidence")
     if (
         request.trigger_channel is not None
-        and pipeline.lineage.trigger_channel != request.trigger_channel
+        and evidence.trigger_channel != request.trigger_channel
     ):
         raise ValueError("MOT trigger lineage differs from the explicit request")
-    dataset = pipeline.capture.dataset
-    mot_intensity_schema(request, dataset.block.schema)
+    snapshot = artifact.materialize_snapshot()
+    mot_intensity_schema(request, snapshot.block.schema)
     return MotFieldAcquisitionResult(
-        dataset.snapshot,
-        dataset.provenance,
-        mot_field_source_identity(dataset.snapshot, dataset.provenance),
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class _FinalMotFieldTaskResult:
-    """One analysis bound to the CaptureArtifact that made it FINAL."""
-
-    reference: CaptureArtifactRef
-    source: MotFieldAcquisitionResult
-    analysis: MotFieldResult
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.reference, CaptureArtifactRef):
-            raise TypeError("reference must be CaptureArtifactRef")
-        if not isinstance(self.source, MotFieldAcquisitionResult):
-            raise TypeError("source must be MotFieldAcquisitionResult")
-        if not isinstance(self.analysis, MotFieldResult):
-            raise TypeError("analysis must be MotFieldResult")
-        if self.analysis.source_identity != self.source.source_identity:
-            raise ValueError("MOT analysis belongs to another source acquisition")
-
-
-class _MotFieldTaskResultOwner:
-    """One-assignment bridge from pending immutable data to its FINAL ref."""
-
-    __slots__ = ("_analysis", "_final", "_lock", "_source")
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._source: MotFieldAcquisitionResult | None = None
-        self._analysis: MotFieldResult | None = None
-        self._final: _FinalMotFieldTaskResult | None = None
-
-    def publish_analysis(
-        self,
-        source: MotFieldAcquisitionResult,
-        analysis: MotFieldResult,
-    ) -> None:
-        if not isinstance(source, MotFieldAcquisitionResult):
-            raise TypeError("source must be MotFieldAcquisitionResult")
-        if not isinstance(analysis, MotFieldResult):
-            raise TypeError("analysis must be MotFieldResult")
-        if analysis.source_identity != source.source_identity:
-            raise ValueError("MOT analysis belongs to another source acquisition")
-        with self._lock:
-            if self._source is not None or self._analysis is not None:
-                raise RuntimeError("MOT analysis was already published")
-            self._source = source
-            self._analysis = analysis
-
-    def bind_final(
-        self,
-        reference: CaptureArtifactRef,
-    ) -> _FinalMotFieldTaskResult:
-        if not isinstance(reference, CaptureArtifactRef):
-            raise TypeError("reference must be CaptureArtifactRef")
-        with self._lock:
-            current = self._final
-            if current is not None:
-                if current.reference != reference:
-                    raise ValueError("MOT task is already bound to another FINAL capture")
-                return current
-            source = self._source
-            analysis = self._analysis
-            if source is None or analysis is None:
-                raise RuntimeError("MOT task has no completed immutable analysis")
-            final = _FinalMotFieldTaskResult(reference, source, analysis)
-            self._final = final
-            return final
-
-
-def _compile_mot_field_task_plan(
-    request: MotFieldRequest,
-    capture_plan: RunPlan,
-    report_folder: str | Path,
-    result_owner: _MotFieldTaskResultOwner,
-) -> RunPlan:
-    """Extend one capture plan with MOT validation, FINAL, and derived export.
-
-    The wrapped capture plan remains the only hardware and commit lifecycle
-    owner.  MOT analysis validates the pending exact immutable dataset once so
-    invalid physics cannot be committed.  The capture CAS/codec owns persisted
-    byte integrity; after publication the exact same analysis object is bound
-    to the FINAL reference and reused by report and Dataset outputs.
-    """
-
-    if not isinstance(request, MotFieldRequest):
-        raise TypeError("request must be MotFieldRequest")
-    if not isinstance(capture_plan, RunPlan):
-        raise TypeError("capture_plan must be RunPlan")
-    if not isinstance(result_owner, _MotFieldTaskResultOwner):
-        raise TypeError("result_owner must be _MotFieldTaskResultOwner")
-    report_folder = Path(report_folder).expanduser()
-    if not report_folder.is_absolute():
-        raise ValueError("MOT report folder must be resolved by composition")
-    report_folder = report_folder.resolve()
-
-    base_preflight = capture_plan.preflight
-    base_execute = capture_plan.execute
-    base_cleanup = capture_plan.cleanup
-    base_finalize = capture_plan.finalize
-    base_dispose = capture_plan.dispose_unfinalized
-
-    def finalize(
-        context: PostSafetyContext,
-        pending: PendingCaptureArtifact,
-    ) -> CaptureArtifactRef:
-        if not isinstance(pending, PendingCaptureArtifact):
-            raise TypeError("MOT finalize requires PendingCaptureArtifact")
-        try:
-            pipeline = pending.pipeline_result
-            if not isinstance(pipeline, TriggeredPipelineResult):
-                raise TypeError("MOT capture plan lost its triggered result")
-            source = _acquisition_from_pipeline(request, pipeline)
-            analysis = analyze_mot_scan(request, source)
-            result_owner.publish_analysis(source, analysis)
-        except BaseException as error:
-            if base_dispose is not None:
-                try:
-                    base_dispose(pending)
-                except BaseException as dispose_error:
-                    try:
-                        error.add_note(
-                            "pending capture disposal also failed: "
-                            f"{type(dispose_error).__name__}: {dispose_error}"
-                        )
-                    except BaseException:
-                        pass
-            raise
-
-        reference = base_finalize(context, pending)
-        if not isinstance(reference, CaptureArtifactRef):
-            raise TypeError("capture plan returned another FINAL reference type")
-
-        # Everything below this line is post-FINAL derived work.  The runtime
-        # preserves a successful committed result even if this export fails,
-        # recording the failure as a terminal diagnostic.
-        final = result_owner.bind_final(reference)
-        write_mot_field_report(final.analysis, report_folder)
-        return reference
-
-    return RunPlan(
-        name="mot-field-task",
-        resource_claims=capture_plan.resource_claims,
-        bound_devices=capture_plan.bound_devices,
-        preflight=base_preflight,
-        execute=base_execute,
-        cleanup=base_cleanup,
-        finalize=finalize,
-        interrupt_operations=capture_plan.interrupt_operations,
-        timeout_seconds=capture_plan.timeout_seconds,
-        requires_final_commit=True,
-        dispose_unfinalized=base_dispose,
+        snapshot,
+        artifact.provenance,
     )
 
 
 class PreparedMotFieldTask:
-    """One-shot MOT command backed by one ordinary repository RunPlan."""
+    """Stateless MOT projection over one generic direct-output Capture.
+
+    ``mot_field_result()`` exposes the refined optimum; named Dataset outputs
+    expose the complete intensity grid and its raw source scan.
+    """
 
     __slots__ = (
+        "_acquisition",
         "_intent",
-        "_figure_intent",
-        "_lock",
-        "_handle",
-        "_plan_factory",
-        "_request",
-        "_result_owner",
         "_output_schema",
+        "_request",
         "_source_schema",
-        "_start_run",
-        "_started",
     )
 
     def __init__(
         self,
         intent: MotFieldTaskIntent,
         request: MotFieldRequest,
-        source_schema: DatasetSchema,
-        plan_factory: Callable[[ExactDatasetPreviewPort | None], RunPlan],
-        start_run: Callable[[RunPlan], RunHandle],
-        result_owner: _MotFieldTaskResultOwner,
+        acquisition: PreparedMotFieldAcquisition,
     ) -> None:
         if not isinstance(intent, MotFieldTaskIntent):
             raise TypeError("intent must be MotFieldTaskIntent")
         if not isinstance(request, MotFieldRequest):
             raise TypeError("request must be MotFieldRequest")
-        if not isinstance(source_schema, DatasetSchema):
-            raise TypeError("source_schema must be DatasetSchema")
-        if not callable(plan_factory) or not callable(start_run):
-            raise TypeError("MOT task requires plan_factory and start_run")
-        if not isinstance(result_owner, _MotFieldTaskResultOwner):
-            raise TypeError("result_owner must be _MotFieldTaskResultOwner")
+        if not isinstance(acquisition, PreparedMotFieldAcquisition):
+            raise TypeError("acquisition must be PreparedMotFieldAcquisition")
+        if acquisition.request != request:
+            raise ValueError("MOT acquisition belongs to another request")
+        source_schema = acquisition.source_schema
         self._intent = intent
         self._request = request
+        self._acquisition = acquisition
         self._source_schema = source_schema
         self._output_schema = mot_intensity_schema(request, source_schema)
-        self._figure_intent = None
-        self._plan_factory = plan_factory
-        self._start_run = start_run
-        self._result_owner = result_owner
-        self._lock = threading.Lock()
-        self._started = False
-        self._handle: RunHandle | None = None
 
     @property
     def intent(self) -> MotFieldTaskIntent:
@@ -679,20 +447,6 @@ class PreparedMotFieldTask:
         """The generation-static scalar Bx/By/Bz schema shared by live and FINAL."""
 
         return self._output_schema
-
-    def _bind_figure_intent(self, intent: object) -> None:
-        """Freeze the optional UI attachment once during hosted preparation."""
-
-        if intent is None:
-            raise TypeError("MOT Figure intent must not be None")
-        if self._figure_intent is not None:
-            raise RuntimeError("MOT Figure intent is already frozen")
-        self._figure_intent = intent
-
-    def _bound_figure_intent(self) -> object:
-        if self._figure_intent is None:
-            raise RuntimeError("MOT Figure intent was not frozen for this hosted generation")
-        return self._figure_intent
 
     @property
     def preview_spec(self) -> ExactDatasetPreviewSpec:
@@ -709,78 +463,56 @@ class PreparedMotFieldTask:
         self,
         preview: ExactDatasetPreviewPort | None = None,
     ) -> RunHandle:
-        with self._lock:
-            if self._started:
-                raise RuntimeError("PreparedMotFieldTask is one-shot")
-            self._started = True
-        try:
-            plan = self._plan_factory(preview)
-            if not isinstance(plan, RunPlan):
-                raise TypeError("MOT plan factory returned another type")
-            handle = self._start_run(
-                plan.with_lifecycle(owner=self, preemptible=False)
-            )
-            if not isinstance(handle, RunHandle):
-                raise TypeError("MOT start_run returned another handle type")
-            with self._lock:
-                self._handle = handle
-            return handle
-        except BaseException as error:
-            notify_preview_failure(preview, error)
-            raise
-
-    def _require_own_success(
-        self,
-        reference: CaptureArtifactRef,
-    ) -> _FinalMotFieldTaskResult:
-        if not isinstance(reference, CaptureArtifactRef):
-            raise TypeError("MOT FINAL result must be CaptureArtifactRef")
-        with self._lock:
-            handle = self._handle
-        if handle is None:
-            raise RuntimeError("MOT task has not started")
-        successful = handle.result(timeout=0.0)
-        if not isinstance(successful, CaptureArtifactRef):
-            raise TypeError("MOT Run returned another FINAL result type")
-        if successful != reference:
-            raise ValueError("MOT result belongs to another prepared task")
-        # Normal publication binds in finalize.  A durable commit recovered by
-        # RunController deliberately does not re-enter finalize; the successful
-        # exact Run result is then the authority that completes this binding.
-        return self._result_owner.bind_final(reference)
+        return self._acquisition.start(preview)
 
     def final_dataset_outputs(
         self,
         reference: CaptureArtifactRef,
     ) -> dict[str, FinalDatasetOutput]:
-        """Materialize the named FINAL outputs from the committed capture."""
+        """Statelessly analyze one visible Capture into named typed outputs."""
 
-        final = self._require_own_success(reference)
+        source, analysis = self._analyze_final_capture(reference)
         return mot_field_final_outputs(
-            final.analysis,
-            final.source,
+            analysis,
+            source,
             self._output_schema,
         )
 
-    def completion_summary(self, reference: CaptureArtifactRef) -> str:
-        """Name the repository FINAL rather than a replace-last report file."""
+    def mot_field_result(
+        self,
+        reference: CaptureArtifactRef,
+    ) -> MotFieldResult:
+        """Return the refined field and intensity from one FINAL Capture."""
 
-        self._require_own_success(reference)
+        _source, analysis = self._analyze_final_capture(reference)
+        return analysis
+
+    def _analyze_final_capture(
+        self,
+        reference: CaptureArtifactRef,
+    ) -> tuple[MotFieldAcquisitionResult, MotFieldResult]:
+        artifact = self._acquisition.load_capture(reference)
+        source = _acquisition_from_capture(self._request, artifact)
+        analysis = analyze_mot_scan(self._request, source)
+        return source, analysis
+
+    def completion_summary(self, reference: CaptureArtifactRef) -> str:
+        """Name the generic direct-output Capture that made the task FINAL."""
+
+        if not isinstance(reference, CaptureArtifactRef):
+            raise TypeError("MOT FINAL result must be CaptureArtifactRef")
         return f"done; capture: {reference.target_ref}"
 
 
 def start_mot_field_task_command(
     command: PreparedMotFieldTask,
     live_output_host,
-    command_context,
+    _command_context,
 ):
     """Attach MOT's declared live source before its one physical start."""
 
     if not isinstance(command, PreparedMotFieldTask):
         raise TypeError("MOT-field preparer returned another command type")
-    cancel_requested = getattr(command_context, "cancel_requested", None)
-    if not callable(cancel_requested):
-        raise TypeError("MOT-field start requires a hosted command context")
     open_exact_dataset = getattr(live_output_host, "open_exact_dataset", None)
     if not callable(open_exact_dataset):
         raise TypeError("MOT-field start requires an exact Dataset host")
@@ -794,20 +526,12 @@ def start_mot_field_task_command(
 def prepare_mot_field_task(
     intent: MotFieldTaskIntent,
     dependencies: MotFieldTaskDependencies,
-    *,
-    capture_repository: CaptureRepository,
-    output_root: Path,
-    start_run: Callable[[RunPlan], RunHandle],
 ) -> PreparedMotFieldTask:
     """Bind one complete MOT task without starting hardware execution."""
 
     if not isinstance(intent, MotFieldTaskIntent):
         raise TypeError("intent must be MotFieldTaskIntent")
     dependencies = _require_dependencies(dependencies)
-    if type(capture_repository) is not CaptureRepository:
-        raise TypeError("capture_repository must be CaptureRepository")
-    if not callable(start_run):
-        raise TypeError("start_run must be callable")
     request = dependencies.mot_field_request(
         intent.pulse,
         center_x=intent.center_x,
@@ -825,36 +549,15 @@ def prepare_mot_field_task(
     acquisition = dependencies.prepare_mot_field_acquisition(request)
     if not isinstance(acquisition, PreparedMotFieldAcquisition):
         raise TypeError("MOT dependency returned another acquisition type")
-    result_owner = _MotFieldTaskResultOwner()
-    report_folder = resolve_under(output_root, intent.folder)
-
-    def plan_factory(
-        preview: ExactDatasetPreviewPort | None,
-    ) -> RunPlan:
-        capture_plan = acquisition.compile_capture_plan(
-            capture_repository,
-            preview=preview,
-        )
-        return _compile_mot_field_task_plan(
-            request,
-            capture_plan,
-            report_folder,
-            result_owner,
-        )
-
     return PreparedMotFieldTask(
         intent,
         request,
-        acquisition.source_schema,
-        plan_factory,
-        start_run,
-        result_owner,
+        acquisition,
     )
 
 
 __all__ = [
     "DEFAULT_MOT_FIELD_PULSE_PATH",
-    "DEFAULT_MOT_FIELD_REPORT_FOLDER",
     "MOT_FIELD_LOGIC_NODE",
     "MotFieldTaskDependencies",
     "MotFieldTaskIntent",
@@ -863,5 +566,4 @@ __all__ = [
     "mot_field_authoring_schema",
     "mot_field_camera_roles",
     "prepare_mot_field_task",
-    "write_mot_field_report",
 ]

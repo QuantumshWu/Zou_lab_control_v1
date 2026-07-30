@@ -48,26 +48,18 @@ from zlc_neutral_atom.runtime.streams import (
     Envelope,
     EventRef,
     FollowTap,
-    ProcessorStageProvenance,
-    TraceContext,
 )
 from zlc_storage import (
     canonical_text,
-    decode,
-    encode,
     exact_mapping,
     finite_real,
     positive_integer,
-    sha256_digest,
     sha256_text,
 )
 
 
 PayloadT = TypeVar("PayloadT")
 _CURSOR_TOKEN = object()
-SIGNAL_ASSOCIATION_EVIDENCE_SCHEMA = (
-    "zlc_neutral_atom.runtime.signal-association-evidence"
-)
 _SIGNAL_REPEAT_AXIS = AxisSpec(
     AxisId("zlc_neutral_atom.signal-event.repeat"),
     "signal event repeat",
@@ -135,15 +127,6 @@ class SignalProjectionAuthority:
                 "signal projection output differs from its committed transform"
             )
 
-    @property
-    def input_schema_fingerprint(self) -> str:
-        return self.input_value_schema.fingerprint
-
-    @property
-    def output_schema_fingerprint(self) -> str:
-        return self.output_value_schema.fingerprint
-
-
 def signal_projection_authority_to_tree(
     value: SignalProjectionAuthority,
 ) -> dict[str, object]:
@@ -151,14 +134,12 @@ def signal_projection_authority_to_tree(
         raise TypeError("value must be SignalProjectionAuthority")
     return {
         "input_value_schema": value_schema_to_tree(value.input_value_schema),
-        "input_schema_fingerprint": value.input_schema_fingerprint,
         "committed_transform": (
             None
             if value.committed_transform is None
             else committed_transform_to_tree(value.committed_transform)
         ),
         "output_value_schema": value_schema_to_tree(value.output_value_schema),
-        "output_schema_fingerprint": value.output_schema_fingerprint,
     }
 
 
@@ -167,10 +148,8 @@ def signal_projection_authority_from_tree(tree: object) -> SignalProjectionAutho
         tree,
         {
             "input_value_schema",
-            "input_schema_fingerprint",
             "committed_transform",
             "output_value_schema",
-            "output_schema_fingerprint",
         },
         "SignalProjectionAuthority",
         discriminator=None,
@@ -193,7 +172,6 @@ def signal_projection_authority_from_tree(tree: object) -> SignalProjectionAutho
 class SignalAssociationRequest:
     """Pulse cause that a producer must associate with an exact event group."""
 
-    association_id: str
     cause_id: str
     cause_digest: str
     expected_event_count: int
@@ -204,11 +182,6 @@ class SignalAssociationRequest:
     clock_hz: int
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "association_id",
-            canonical_text(self.association_id, "signal association_id"),
-        )
         object.__setattr__(
             self,
             "cause_id",
@@ -277,194 +250,30 @@ class SignalAssociationRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class SignalAssociationEvidence:
-    """Canonical producer evidence bound to one request and terminal receipt."""
-
-    request: SignalAssociationRequest
-    terminal_evidence_digest: str
-    evidence_schema_id: str
-    canonical_evidence: bytes
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.request, SignalAssociationRequest):
-            raise TypeError("signal association evidence requires its request")
-        schema_id = canonical_text(
-            self.evidence_schema_id,
-            "signal association evidence_schema_id",
-        )
-        terminal_digest = sha256_text(
-            self.terminal_evidence_digest,
-            "signal association terminal_evidence_digest",
-        )
-        if not isinstance(self.canonical_evidence, bytes):
-            raise TypeError("canonical_evidence must be immutable canonical bytes")
-        payload = decode(self.canonical_evidence)
-        if not isinstance(payload, dict):
-            raise TypeError("canonical_evidence must decode to a mapping")
-        required = {
-            "schema": schema_id,
-            "association_id": self.request.association_id,
-            "cause_id": self.request.cause_id,
-            "cause_digest": self.request.cause_digest,
-            "expected_event_count": self.request.expected_event_count,
-            "trigger_schedule_fingerprint": (
-                self.request.trigger_schedule_fingerprint
-            ),
-            "trigger_channel": self.request.trigger_channel,
-            "trigger_count": self.request.trigger_count,
-            "minimum_trigger_interval_ticks": (
-                self.request.minimum_trigger_interval_ticks
-            ),
-            "clock_hz": self.request.clock_hz,
-            "terminal_evidence_digest": terminal_digest,
-        }
-        if any(payload.get(name) != value for name, value in required.items()):
-            raise ValueError(
-                "canonical_evidence is not self-bound to its request and terminal"
-            )
-        object.__setattr__(self, "evidence_schema_id", schema_id)
-        object.__setattr__(self, "terminal_evidence_digest", terminal_digest)
-        object.__setattr__(self, "canonical_evidence", bytes(self.canonical_evidence))
-
-    @property
-    def evidence_digest(self) -> str:
-        return sha256_digest(self.canonical_evidence)
-
-
-def _signal_association_request_to_tree(
-    value: SignalAssociationRequest,
-) -> dict[str, object]:
-    if not isinstance(value, SignalAssociationRequest):
-        raise TypeError("value must be SignalAssociationRequest")
-    return {
-        "association_id": value.association_id,
-        "cause_id": value.cause_id,
-        "cause_digest": value.cause_digest,
-        "expected_event_count": value.expected_event_count,
-        "trigger_schedule_fingerprint": value.trigger_schedule_fingerprint,
-        "trigger_channel": value.trigger_channel,
-        "trigger_count": value.trigger_count,
-        "minimum_trigger_interval_ticks": value.minimum_trigger_interval_ticks,
-        "clock_hz": value.clock_hz,
-    }
-
-
-def _signal_association_request_from_tree(tree: object) -> SignalAssociationRequest:
-    data = exact_mapping(
-        tree,
-        {
-            "association_id",
-            "cause_id",
-            "cause_digest",
-            "expected_event_count",
-            "trigger_schedule_fingerprint",
-            "trigger_channel",
-            "trigger_count",
-            "minimum_trigger_interval_ticks",
-            "clock_hz",
-        },
-        "SignalAssociationRequest",
-        discriminator=None,
-    )
-    value = SignalAssociationRequest(
-        data["association_id"],
-        data["cause_id"],
-        data["cause_digest"],
-        data["expected_event_count"],
-        data["trigger_schedule_fingerprint"],
-        data["trigger_channel"],
-        data["trigger_count"],
-        data["minimum_trigger_interval_ticks"],
-        data["clock_hz"],
-    )
-    if _signal_association_request_to_tree(value) != tree:
-        raise ValueError("SignalAssociationRequest tree is non-canonical")
-    return value
-
-
-def signal_association_evidence_to_tree(
-    value: SignalAssociationEvidence,
-) -> dict[str, object]:
-    if not isinstance(value, SignalAssociationEvidence):
-        raise TypeError("value must be SignalAssociationEvidence")
-    return {
-        "schema": SIGNAL_ASSOCIATION_EVIDENCE_SCHEMA,
-        "request": _signal_association_request_to_tree(value.request),
-        "terminal_evidence_digest": value.terminal_evidence_digest,
-        "evidence_schema_id": value.evidence_schema_id,
-        "canonical_evidence": value.canonical_evidence,
-    }
-
-
-def signal_association_evidence_from_tree(tree: object) -> SignalAssociationEvidence:
-    data = exact_mapping(
-        tree,
-        {
-            "schema",
-            "request",
-            "terminal_evidence_digest",
-            "evidence_schema_id",
-            "canonical_evidence",
-        },
-        SIGNAL_ASSOCIATION_EVIDENCE_SCHEMA,
-    )
-    value = SignalAssociationEvidence(
-        _signal_association_request_from_tree(data["request"]),
-        data["terminal_evidence_digest"],
-        data["evidence_schema_id"],
-        data["canonical_evidence"],
-    )
-    if signal_association_evidence_to_tree(value) != tree:
-        raise ValueError("SignalAssociationEvidence tree is non-canonical")
-    return value
-
-
-@dataclass(frozen=True, slots=True)
 class SignalEvent:
     """One fresh source value and the provenance of that exact publication."""
 
     value: Value
     event_ref: EventRef
-    trace: TraceContext
+    direct_parent_refs: tuple[EventRef, ...]
     captured_at: float
-    processor_stages: tuple[ProcessorStageProvenance, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.value, Value):
             raise TypeError("signal event value must be Value")
         if not isinstance(self.event_ref, EventRef):
             raise TypeError("signal event reference must be EventRef")
-        if not isinstance(self.trace, TraceContext):
-            raise TypeError("signal event trace must be TraceContext")
+        parents = tuple(self.direct_parent_refs)
+        if any(not isinstance(parent, EventRef) for parent in parents):
+            raise TypeError("signal event direct_parent_refs must contain EventRef values")
+        if len(set(parents)) != len(parents):
+            raise ValueError("signal event direct_parent_refs cannot contain duplicates")
+        object.__setattr__(self, "direct_parent_refs", parents)
         object.__setattr__(
             self,
             "captured_at",
             finite_real(self.captured_at, "captured_at"),
         )
-        object.__setattr__(
-            self,
-            "processor_stages",
-            _snapshot_processor_stages(self.processor_stages),
-        )
-
-
-def _snapshot_processor_stages(
-    values: tuple[ProcessorStageProvenance, ...],
-) -> tuple[ProcessorStageProvenance, ...]:
-    if not isinstance(values, tuple):
-        raise TypeError("processor_stages must be an immutable tuple")
-    stages = tuple(values)
-    if any(not isinstance(stage, ProcessorStageProvenance) for stage in stages):
-        raise TypeError(
-            "processor_stages must contain ProcessorStageProvenance values"
-        )
-    return tuple(
-        ProcessorStageProvenance(
-            stage.processor_binding_digest,
-            stage.direct_artifact_inputs,
-        )
-        for stage in stages
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,7 +298,7 @@ class SignalEventCursor(Generic[PayloadT]):
     pulse or by any other physical action.
     """
 
-    __slots__ = ("_closed", "_processor_stages", "_projection", "_tap")
+    __slots__ = ("_closed", "_projection", "_tap")
 
     def __init__(
         self,
@@ -497,7 +306,6 @@ class SignalEventCursor(Generic[PayloadT]):
         *,
         tap: FollowTap[PayloadT],
         projection: SignalOutputProjection[PayloadT],
-        processor_stages: tuple[ProcessorStageProvenance, ...],
     ) -> None:
         if authority is not _CURSOR_TOKEN:
             raise PermissionError(
@@ -509,7 +317,6 @@ class SignalEventCursor(Generic[PayloadT]):
             raise TypeError("signal cursor requires a SignalOutputProjection")
         self._tap = tap
         self._projection = projection
-        self._processor_stages = _snapshot_processor_stages(processor_stages)
         self._closed = False
 
     @property
@@ -565,9 +372,8 @@ class SignalEventCursor(Generic[PayloadT]):
             return SignalEvent(
                 value,
                 envelope.event_ref,
-                envelope.trace,
+                envelope.direct_parent_refs,
                 envelope.captured_at,
-                self._processor_stages,
             )
 
     def close(self) -> None:
@@ -645,8 +451,8 @@ class SignalEventAssociationCursor(Protocol):
     def finish_signal_association(
         self,
         token: object,
-    ) -> SignalAssociationEvidence:
-        """Return group-complete evidence self-bound to the terminal digest."""
+    ) -> None:
+        """Finish only after producer-owned physical reconciliation succeeds."""
 
         ...
 
@@ -671,14 +477,12 @@ class SignalEventAssociationSource(SignalEventSource, Protocol):
 class StreamSignalEventSource(Generic[PayloadT]):
     """Bind named, declared output projections to one live stream generation."""
 
-    __slots__ = ("_outputs", "_processor_stages", "_stream")
+    __slots__ = ("_outputs", "_stream")
 
     def __init__(
         self,
         stream: AcquisitionStream[PayloadT],
         outputs: Mapping[str, SignalOutputProjection[PayloadT]],
-        *,
-        processor_stages: tuple[ProcessorStageProvenance, ...] = (),
     ) -> None:
         if not isinstance(stream, AcquisitionStream):
             raise TypeError("signal source stream must be AcquisitionStream")
@@ -696,7 +500,6 @@ class StreamSignalEventSource(Generic[PayloadT]):
             raise ValueError("signal event source must declare at least one output")
         self._stream = stream
         self._outputs = owned
-        self._processor_stages = _snapshot_processor_stages(processor_stages)
 
     @property
     def output_names(self) -> tuple[str, ...]:
@@ -712,7 +515,6 @@ class StreamSignalEventSource(Generic[PayloadT]):
             _CURSOR_TOKEN,
             tap=tap,
             projection=projection,
-            processor_stages=self._processor_stages,
         )
 
     def _projection(self, output_name: str) -> SignalOutputProjection[PayloadT]:
@@ -797,9 +599,8 @@ class AuthoritativeSignalEventCursor:
         return SignalEvent(
             value,
             event.event_ref,
-            event.trace,
+            event.direct_parent_refs,
             event.captured_at,
-            event.processor_stages,
         )
 
     def close(self) -> None:
@@ -844,14 +645,8 @@ class AuthoritativeAssociatedSignalEventCursor(AuthoritativeSignalEventCursor):
     def finish_signal_association(
         self,
         token: object,
-    ) -> SignalAssociationEvidence:
-        evidence = self._cursor.finish_signal_association(token)
-        if not isinstance(evidence, SignalAssociationEvidence):
-            self.close()
-            raise TypeError(
-                "associated source cursor returned another evidence type"
-            )
-        return evidence
+    ) -> None:
+        self._cursor.finish_signal_association(token)
 
 
 class AuthoritativeSignalEventSource:
@@ -1068,7 +863,7 @@ def _apply_signal_value_transform(
     )
     revision = DatasetRevision(event.event_ref.sequence)
     block = DataBlock(
-        BlockId(f"signal-event:{event.event_ref.event_id.value}"),
+        BlockId(f"signal:{event.event_ref.stream_id.value}"),
         revision,
         event.value.values.reshape(input_dataset_schema.physical_shape),
         dataset_validity,
@@ -1108,8 +903,6 @@ def _apply_signal_value_transform(
 
 
 __all__ = [
-    "SIGNAL_ASSOCIATION_EVIDENCE_SCHEMA",
-    "SignalAssociationEvidence",
     "SignalAssociationRequest",
     "SignalAssociationScheduleRequirement",
     "SignalAssociationUnavailable",
@@ -1126,8 +919,6 @@ __all__ = [
     "AuthoritativeAssociatedSignalEventCursor",
     "AuthoritativeAssociatedSignalEventSource",
     "authoritative_signal_event_source",
-    "signal_association_evidence_from_tree",
-    "signal_association_evidence_to_tree",
     "signal_projection_authority_from_tree",
     "signal_projection_authority_to_tree",
 ]

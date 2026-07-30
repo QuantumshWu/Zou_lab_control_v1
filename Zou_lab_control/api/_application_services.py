@@ -12,9 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Protocol, runtime_checkable
 
-from zlc_data import FitCancelled
-from zlc_neutral_atom.artifacts import FitResultRepository
-from zlc_neutral_atom.capture.artifact import CaptureRepository
+from zlc_data import FitCancelled, StreamGenerationId
 from zlc_neutral_atom.devices.sequencer.application import PulseApplicationOwner
 from zlc_neutral_atom.installation import DeviceCatalogView
 from zlc_neutral_atom.installation_config import InstallationConfigDocument
@@ -29,19 +27,19 @@ from zlc_neutral_atom.runtime.run import (
 
 @dataclass(frozen=True, slots=True)
 class WorkspacePaths:
-    """Application-owned roots for user-authored and generated files."""
+    """Application-owned roots derived from one explicit project root."""
 
+    project_root: Path
     pulses_root: Path
     tasks_root: Path
     output_root: Path
-    repository_root: Path
 
     def __post_init__(self) -> None:
         for name in (
+            "project_root",
             "pulses_root",
             "tasks_root",
             "output_root",
-            "repository_root",
         ):
             value = Path(getattr(self, name)).expanduser()
             if not value.is_absolute():
@@ -51,24 +49,21 @@ class WorkspacePaths:
     @classmethod
     def for_workspace(
         cls,
-        authored_root: str | Path,
-        *,
-        repository_root: str | Path,
+        project_root: str | Path,
     ) -> "WorkspacePaths":
-        """Build the conventional four roots from two explicit authorities."""
+        """Build the conventional roots from one explicit project authority."""
 
-        authored = Path(authored_root).expanduser()
-        repository = Path(repository_root).expanduser()
-        if not authored.is_absolute() or not repository.is_absolute():
-            raise ValueError("workspace and repository roots must be absolute")
-        authored = authored.resolve()
-        repository = repository.resolve()
+        project = Path(project_root).expanduser()
+        if not project.is_absolute():
+            raise ValueError("project root must be absolute")
+        project = project.resolve()
         return cls(
-            authored / "pulses",
-            authored / "tasks",
-            repository / "output",
-            repository,
+            project,
+            project / "pulses",
+            project / "tasks",
+            project / "_output",
         )
+
 
 @runtime_checkable
 class WorkbenchHandle(Protocol):
@@ -91,6 +86,19 @@ class ExperimentCloseAttempt:
     owner_thread_id: int
     completed: threading.Event = field(default_factory=threading.Event)
     failure: BaseException | None = None
+
+
+_SignalGenerationRef = tuple[str, StreamGenerationId]
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveRun:
+    """The Experiment's sole control-plane record for one admitted Run."""
+
+    handle: RunHandle
+    preemptible: bool
+    signal_generation_ref: _SignalGenerationRef | None
+    owner: object | None
 
 
 def wait_for_close_attempt(
@@ -124,7 +132,7 @@ def wait_for_close_attempt(
                 # close result.
                 pass
         # Already-closed handles return immediately; yield briefly while the
-        # sole owner finishes repository teardown.
+        # sole owner finishes service teardown.
         attempt.completed.wait(0.005)
 
 
@@ -133,8 +141,8 @@ class ExperimentServices:
     workspace_paths: WorkspacePaths
     installation: object
     runtime: object
-    capture_repository: CaptureRepository
-    fit_repository: FitResultRepository
+    captures_root: Path
+    calibrations_root: Path
     catalog: DeviceCatalogView
     installation_config: InstallationConfigDocument
     pulse_application: PulseApplicationOwner
@@ -143,7 +151,7 @@ class ExperimentServices:
     admission_lock: threading.RLock
     operations_drained: threading.Event
     operation_thread_counts: dict[int, int]
-    active_runs: dict[str, RunHandle]
+    active_runs: dict[str, _ActiveRun]
     gui_handles: dict[str, WorkbenchHandle]
     active_operations: int = 0
     state: str = "OPEN"
@@ -203,7 +211,7 @@ def application_operation_guard(
 def fit_service_guard(
     services: ExperimentServices,
 ) -> Iterator[ExperimentServices]:
-    """Keep repositories alive for one long Fit without serializing figures."""
+    """Keep the Experiment alive for one long Fit without serializing figures."""
 
     completed = False
     with application_operation_guard(services):
@@ -273,28 +281,46 @@ def _check_start_continuation(
 def _prune_terminal_runs_locked(services: ExperimentServices) -> None:
     terminal = tuple(
         run_id
-        for run_id, handle in services.active_runs.items()
-        if handle.snapshot().state.terminal
+        for run_id, active in services.active_runs.items()
+        if active.handle.snapshot().state.terminal
     )
     for run_id in terminal:
+        active = services.active_runs.get(run_id)
+        if active is None:
+            continue
+        if active.signal_generation_ref is not None:
+            services.signal_plane.release_generation_source(
+                active.signal_generation_ref
+            )
         services.active_runs.pop(run_id, None)
-        services.signal_plane.finish_run_lifecycle(run_id)
 
 
-def _abort_pending_lifecycle(
-    services: ExperimentServices,
-    reference: tuple[str, int] | None,
-) -> None:
+def _owner_signal_generation_ref(
+    owner: object | None,
+) -> _SignalGenerationRef | None:
+    if owner is None:
+        return None
+    reference = getattr(owner, "signal_generation_ref", None)
     if reference is None:
-        return
-    services.signal_plane.abort_run_lifecycle(reference)
+        return None
+    if (
+        not isinstance(reference, tuple)
+        or len(reference) != 2
+        or not isinstance(reference[0], str)
+        or not reference[0].strip()
+        or not isinstance(reference[1], StreamGenerationId)
+    ):
+        raise TypeError(
+            "Run application owner exposes an invalid signal_generation_ref"
+        )
+    return reference
 
 
 def _start_frozen_plan(
     services: ExperimentServices,
     plan: RunPlan,
-    reference: tuple[str, int] | None,
     cancel_requested: Callable[[], bool] | None,
+    signal_generation_ref: _SignalGenerationRef | None,
 ) -> RunHandle:
     """Perform the one short runtime admission at the cancellation boundary."""
 
@@ -312,34 +338,102 @@ def _start_frozen_plan(
                 raise CancellationRequested(
                     "Run start was cancelled before admission"
                 )
+            if signal_generation_ref is not None:
+                services.signal_plane.require_active_generation(
+                    signal_generation_ref
+                )
             return services.runtime.start(plan)
 
-    if reference is None:
-        return start_runtime()
-    handle = services.signal_plane.start_run_lifecycle(reference, start_runtime)
+    owner = plan.lifecycle_owner
+    gate = None if owner is None else getattr(owner, "start_if_not_cancelled", None)
+    handle = start_runtime() if not callable(gate) else gate(start_runtime)
     if not isinstance(handle, RunHandle):
-        raise TypeError("Run lifecycle starter returned a non-RunHandle")
+        raise TypeError("Run starter returned a non-RunHandle")
     return handle
 
 
 def _record_admitted_run(
     services: ExperimentServices,
     handle: RunHandle,
-    lifecycle_ref: tuple[str, int] | None,
     *,
+    owner: object | None,
     preemptible: bool,
+    signal_generation_ref: _SignalGenerationRef | None,
 ) -> RunHandle:
-    """Bind one admitted handle to its exact application generation."""
+    """Record one admitted handle in the sole application control plane."""
 
     run_id = handle.run_id.value
-    if lifecycle_ref is not None:
-        services.signal_plane.bind_run_lifecycle(
-            lifecycle_ref,
-            run_id,
-            preemptible=preemptible,
-        )
-    services.active_runs[run_id] = handle
+    services.active_runs[run_id] = _ActiveRun(
+        handle=handle,
+        preemptible=preemptible,
+        signal_generation_ref=signal_generation_ref,
+        owner=owner,
+    )
     return handle
+
+
+def _unique_generation_refs(
+    references,
+) -> tuple[_SignalGenerationRef, ...]:
+    return tuple(dict.fromkeys(
+        reference for reference in references if reference is not None
+    ))
+
+
+def _retirement_for_blockers_locked(
+    services: ExperimentServices,
+    rejection: RunStartRejected,
+) -> tuple[
+    tuple[str, ...],
+    tuple[_ActiveRun, ...],
+    tuple[_SignalGenerationRef, ...],
+] | None:
+    """Withdraw one complete application-authorized dependency closure."""
+
+    blocker_run_ids = tuple(dict.fromkeys(
+        blocker.conflicting_run_id for blocker in rejection.blockers
+    ))
+    blockers = []
+    for run_id in blocker_run_ids:
+        active = services.active_runs.get(run_id)
+        if active is None or not active.preemptible:
+            return None
+        blockers.append(active)
+
+    roots = _unique_generation_refs(
+        active.signal_generation_ref for active in blockers
+    )
+    withdrawable = _unique_generation_refs(
+        active.signal_generation_ref
+        for active in services.active_runs.values()
+        if active.preemptible
+    )
+    retired_refs: tuple[_SignalGenerationRef, ...] = ()
+    if roots:
+        withdrawn = services.signal_plane.withdraw_dependency_closure(
+            roots,
+            withdrawable,
+        )
+        if withdrawn is None:
+            return None
+        retired_refs = tuple(withdrawn)
+
+    retired_ref_set = frozenset(retired_refs)
+    blocker_set = frozenset(blocker_run_ids)
+    retired_run_ids = tuple(
+        run_id
+        for run_id, active in services.active_runs.items()
+        if run_id in blocker_set
+        or active.signal_generation_ref in retired_ref_set
+    )
+    retired = tuple(services.active_runs[run_id] for run_id in retired_run_ids)
+    if any(not active.preemptible for active in retired):
+        raise RuntimeError(
+            "SignalDataPlane retired a non-preemptible application Run"
+        )
+    for run_id in retired_run_ids:
+        services.active_runs.pop(run_id)
+    return retired_run_ids, retired, retired_refs
 
 
 def application_start_run(
@@ -360,106 +454,81 @@ def application_start_run(
         )
     if cancel_requested is not None and not callable(cancel_requested):
         raise TypeError("cancel_requested must be callable or None")
-    if cancel_requested is None and plan.lifecycle_owner is not None:
-        cancel_requested = lambda: services.signal_plane.lifecycle_cancel_requested(
-            plan.lifecycle_owner
-        )
+    owner = plan.lifecycle_owner
+    signal_generation_ref = _owner_signal_generation_ref(owner)
+    if cancel_requested is None and owner is not None:
+        owner_cancel_requested = getattr(owner, "cancel_requested", None)
+        if callable(owner_cancel_requested):
+            cancel_requested = owner_cancel_requested
 
-    lifecycle_ref: tuple[str, int] | None = None
     with application_operation_guard(services):
-        try:
-            with services.admission_lock:
-                _prune_terminal_runs_locked(services)
-                if plan.lifecycle_owner is not None:
-                    lifecycle_ref = services.signal_plane.begin_run_lifecycle(
-                        plan.lifecycle_owner,
-                    )
-                try:
-                    handle = _start_frozen_plan(
-                        services,
-                        plan,
-                        lifecycle_ref,
-                        cancel_requested,
-                    )
-                except RunStartRejected as rejection:
-                    blocker_run_ids = tuple(
-                        dict.fromkeys(
-                            blocker.conflicting_run_id
-                            for blocker in rejection.blockers
-                        )
-                    )
-                    retirement = (
-                        services.signal_plane.retire_preemptible_run_closure(
-                            blocker_run_ids
-                        )
-                    )
-                    if retirement is None:
-                        _abort_pending_lifecycle(services, lifecycle_ref)
-                        lifecycle_ref = None
-                        raise
-                    retired_run_ids = retirement
-                    retired_handles = tuple(
-                        services.active_runs[run_id]
-                        for run_id in retired_run_ids
-                    )
-                    for run_id in retired_run_ids:
-                        services.active_runs.pop(run_id)
-                else:
-                    result = _record_admitted_run(
-                        services,
-                        handle,
-                        lifecycle_ref,
-                        preemptible=plan.preemptible,
-                    )
-                    lifecycle_ref = None
-                    return result
-
-            for retired in retired_handles:
-                retired.cancel("replaced by a newly admitted Experiment Run")
-
-            while not services.runtime.wait_until_released(
-                retired_run_ids,
-                timeout=0.05,
-            ):
-                # Once retirement starts, the old hardware must reach SAFE and
-                # release its exact leases even if the incoming request is
-                # cancelled.  Recheck that request only after safe cleanup.
-                pass
-
-            retirement_errors = (
-                services.signal_plane.finish_preemptible_run_retirement(
-                    retired_run_ids
-                )
-            )
-            if retirement_errors:
-                raise BaseExceptionGroup(
-                    "preemptible signal closure cleanup failed",
-                    list(retirement_errors),
-                )
-            _check_start_continuation(services, cancel_requested)
-
-            with services.admission_lock:
-                _prune_terminal_runs_locked(services)
-                # A new racer is reported once.  It never starts a second
-                # retirement pass and the frozen plan is never rebuilt.
+        with services.admission_lock:
+            _prune_terminal_runs_locked(services)
+            try:
                 handle = _start_frozen_plan(
                     services,
                     plan,
-                    lifecycle_ref,
                     cancel_requested,
+                    signal_generation_ref,
                 )
-                result = _record_admitted_run(
+            except RunStartRejected as rejection:
+                retirement = _retirement_for_blockers_locked(
+                    services,
+                    rejection,
+                )
+                if retirement is None:
+                    raise
+                retired_run_ids, retired, retired_refs = retirement
+            else:
+                return _record_admitted_run(
                     services,
                     handle,
-                    lifecycle_ref,
+                    owner=owner,
                     preemptible=plan.preemptible,
+                    signal_generation_ref=signal_generation_ref,
                 )
-                lifecycle_ref = None
-                return result
-        finally:
-            if lifecycle_ref is not None:
-                with services.admission_lock:
-                    _abort_pending_lifecycle(services, lifecycle_ref)
+
+        for active in retired:
+            active.handle.cancel("replaced by a newly admitted Experiment Run")
+
+        while not services.runtime.wait_until_released(
+            retired_run_ids,
+            timeout=0.05,
+        ):
+            # Once retirement starts, the old hardware must reach SAFE and
+            # release its exact leases even if the incoming request is
+            # cancelled.  Recheck that request only after safe cleanup.
+            pass
+
+        retirement_errors = (
+            services.signal_plane.finish_dependency_retirement(retired_refs)
+            if retired_refs
+            else ()
+        )
+        if retirement_errors:
+            raise BaseExceptionGroup(
+                "signal dependency closure cleanup failed",
+                list(retirement_errors),
+            )
+        _check_start_continuation(services, cancel_requested)
+
+        with services.admission_lock:
+            _prune_terminal_runs_locked(services)
+            # A new racer is reported once.  It never starts a second
+            # retirement pass and the frozen plan is never rebuilt.
+            handle = _start_frozen_plan(
+                services,
+                plan,
+                cancel_requested,
+                signal_generation_ref,
+            )
+            return _record_admitted_run(
+                services,
+                handle,
+                owner=owner,
+                preemptible=plan.preemptible,
+                signal_generation_ref=signal_generation_ref,
+            )
 
 
 def resolve_role(

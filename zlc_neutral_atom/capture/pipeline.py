@@ -21,9 +21,6 @@ from zlc_storage import (
 )
 
 from zlc_neutral_atom.devices.camera.contract import (
-    CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT,
-)
-from zlc_neutral_atom.devices.camera.contract import (
     CameraAcquisitionMode,
     CameraCapabilityEvidence,
     FrozenCaptureSpec,
@@ -60,9 +57,7 @@ from zlc_neutral_atom.runtime.streams import (
     AcquisitionCursor,
     EventSpanRef,
     ExactReservation,
-    ProcessorStageProvenance,
     ReservationState,
-    TraceBinding,
 )
 
 
@@ -208,9 +203,6 @@ class CapturePreviewPort(Protocol):
     def bind(
         self,
         dataset: MonitorDataset,
-        *,
-        run_id: str,
-        causation_domain_id: str,
     ) -> None: ...
 
     def updated(self) -> None: ...
@@ -257,28 +249,20 @@ class PipelineResult:
                 "sealed dataset belongs to another exact terminal consumer"
             )
         provenance = dataset.provenance
-        if provenance.trace_binding.run_id != capture_completion.trace_binding.run_id:
-            raise RuntimeError("pipeline dataset and capture completion run_id differ")
-        derivation = provenance.derivation
+        direct_parent_span = provenance.direct_parent_span
         if capture_completion.direct_terminal_consumer:
-            if derivation is not None or capture_completion.processor_stages:
+            if direct_parent_span is not None:
                 raise RuntimeError(
-                    "direct capture cannot carry processor derivation provenance"
+                    "direct capture cannot carry a processed parent span"
                 )
         else:
-            if derivation is None:
+            if direct_parent_span is None:
                 raise RuntimeError(
-                    "processed capture is missing root derivation provenance"
+                    "processed capture is missing its direct parent span"
                 )
-            if (
-                derivation.chain_contract_digest
-                != capture_completion.chain_contract_digest
-                or derivation.stages != capture_completion.processor_stages
-                or derivation.root_input_span
-                != capture_completion.source_event_span
-            ):
+            if direct_parent_span != capture_completion.source_event_span:
                 raise RuntimeError(
-                    "processed dataset derivation differs from capture readiness chain"
+                    "processed dataset parent span differs from capture source"
                 )
         output_count = provenance.end_sequence - provenance.start_sequence
         if (
@@ -304,24 +288,16 @@ class PipelineResult:
             raise RuntimeError(
                 "direct capture dataset cardinality differs from its source"
             )
-        # A direct materializer projects the source event, so its dataset
-        # metadata is exactly the metadata acknowledged by the physical source.
-        # A processor is allowed (and normally expected) to define a different
-        # output-metadata contract.  Its source binding is instead proven by the
-        # identity-bound terminal reservation plus the exact derivation/root
-        # event span validated above.  Equating source and derived metadata
-        # digests would make every non-identity processor impossible to compose.
         if (
             capture_completion.direct_terminal_consumer
-            and capture_terminal.ordered_metadata_digest
-            != provenance.ordered_metadata_digest
+            and not dataset.cell_schedule.same_order_as(
+                capture_completion.source_cell_schedule
+            )
         ):
-            raise RuntimeError("direct pipeline metadata differs from capture terminal")
+            raise RuntimeError("direct pipeline schedule differs from capture source")
         direct_raw_capture = (
             capture_completion.direct_terminal_consumer
             and dataset.block.schema == capture_completion.source_dataset_schema
-            and capture_completion.source_event_adapter_operator_fingerprint
-            == CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT
         )
         # Install every immutable result reference before the final no-fail
         # authority commit.  The consumed completion has its live session and
@@ -349,7 +325,7 @@ class PipelineResult:
 
     @property
     def run_id(self) -> str:
-        return self._capture_completion.trace_binding.run_id
+        return self._capture_completion.run_id
 
     @property
     def source_dataset_schema(self) -> DatasetSchema:
@@ -374,14 +350,6 @@ class PipelineResult:
     @property
     def source_event_span(self) -> EventSpanRef:
         return self._capture_completion.source_event_span
-
-    @property
-    def processor_stages(self) -> tuple[ProcessorStageProvenance, ...]:
-        return self._capture_completion.processor_stages
-
-    @property
-    def chain_contract_digest(self) -> str:
-        return self._capture_completion.chain_contract_digest
 
     @property
     def is_direct_raw_capture(self) -> bool:
@@ -485,17 +453,6 @@ class ExactCaptureTransaction:
         if not self.session.owns_completion(completion):
             raise RuntimeError("capture completion does not belong to this session")
         dataset = self.builder.seal(completion.eos)
-        provenance = dataset.provenance
-        if (
-            provenance.metadata_contract_fingerprint
-            != self.contract.dataset_edge.metadata_contract_fingerprint
-        ):
-            raise RuntimeError("sealed dataset metadata contract differs from capture")
-        if (
-            provenance.ordered_metadata_digest
-            != completion.terminal.ordered_metadata_digest
-        ):
-            raise RuntimeError("sealed dataset metadata digest differs from capture")
         return finalize_pipeline_result(
             dataset=dataset,
             capture_completion=completion,
@@ -628,8 +585,8 @@ def _capture_preview_spec(
     if (
         spec.dataset_edge.schema.cell_schema is not exact_edge.schema.cell_schema
         or spec.dataset_edge.payload_contract is not exact_edge.payload_contract
-        or spec.dataset_edge.operator_fingerprint
-        != exact_edge.operator_fingerprint
+        or type(spec.dataset_edge.event_adapter)
+        is not type(exact_edge.event_adapter)
     ):
         raise ValueError(
             "capture preview must share the exact capture cell schema and event adapter"
@@ -724,7 +681,6 @@ def _allocate_exact_capture(
     session = open_capture_session(
         port,
         contract,
-        TraceBinding(context.run_id.value, contract.source_id),
         camera_capture.capture_spec,
     )
     reservation = None
@@ -743,11 +699,7 @@ def _allocate_exact_capture(
         if bound_exact_preview is not None:
             assert exact_preview_spec is not None
             try:
-                bound_exact_preview.bind(
-                    builder.open_preview_reader(),
-                    run_id=context.run_id.value,
-                    causation_domain_id=session.stream.generation.value,
-                )
+                bound_exact_preview.bind(builder.open_preview_reader())
             except BaseException as preview_error:
                 notify_preview_failure(bound_exact_preview, preview_error)
                 bound_exact_preview = None
@@ -762,11 +714,7 @@ def _allocate_exact_capture(
                     tap,
                     preview_spec.dataset_edge,
                 )
-                preview.bind(
-                    preview_dataset,
-                    run_id=context.run_id.value,
-                    causation_domain_id=session.stream.generation.value,
-                )
+                preview.bind(preview_dataset)
             except BaseException as preview_error:
                 if preview_dataset is not None:
                     try:
@@ -903,7 +851,6 @@ def compile_pipeline(
         cleanup=cleanup,
         finalize=lambda _context, result: result,
         interrupt_operations=port.interrupt_operations,
-        requires_final_commit=False,
     )
 
 
@@ -943,7 +890,7 @@ def finalize_pipeline_result(
     Domain-specific compilers use this owner API after their live exact chain
     seals.  The public entry point does not weaken authority: ``PipelineResult``
     still proves that ``dataset`` belongs to the opaque terminal reservation in
-    ``capture_completion`` and revalidates the complete derivation chain.
+    ``capture_completion`` and revalidates the exact root event interval.
     """
 
     return PipelineResult(

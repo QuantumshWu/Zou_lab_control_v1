@@ -24,21 +24,19 @@ from zlc_neutral_atom.runtime.ports import DeviceBroker
 from zlc_neutral_atom.runtime.resources import DeviceIdentityEvidenceKind, ResourceArbiter, ResourceKey
 from zlc_neutral_atom.runtime.run import RunController
 from zlc_pulse import PulseDocument, RemotePulseExecutionClient
-from zlc_storage import canonical_digest
 
 from .config import HardwareInstallationConfig
 from .qualification import qualify_external_trigger_path
 
 
-def _asset(role: str, device: object, endpoint: dict[str, object]) -> InstallationAsset:
-    identity = canonical_digest(endpoint)
+def _asset(role: str, device: object, expected_identity: str) -> InstallationAsset:
     return InstallationAsset(
         asset_id=f"hardware-{role}",
         role=role,
         resource_key=ResourceKey.parse(f"device/{role}"),
         adapter_kind=adapter_kind(device),
         evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-        expected_identity=f"installation-endpoint:{identity}",
+        expected_identity=expected_identity,
     )
 
 
@@ -123,21 +121,17 @@ def create_hardware_installation(
                 _asset(
                     "sequencer",
                     client,
-                    {
-                        "protocol": "zlc.current-pulse-rpc",
-                        "host": config.pulse_host,
-                        "port": config.pulse_port,
-                    },
+                    f"remote-pulse-endpoint:{connection.endpoint_label}",
                 ),
                 _asset(
                     "camera",
                     camera,
-                    {"sdk": "dcam", "device_index": config.dcam_device_index},
+                    f"dcam-device-index:{config.dcam_device_index}",
                 ),
                 _asset(
                     "mot_camera",
                     mot_camera,
-                    {"sdk": "pylon", "serial": config.pylon_serial},
+                    f"pylon-serial:{config.pylon_serial}",
                 ),
             )
         )

@@ -10,7 +10,6 @@ from zlc_frontend.plot_panel import FigureIntent
 from zlc_frontend.site_map_view import SiteMapView
 from zlc_neutral_atom.logic_nodes.readout.occupancy.cell import (
     OccupancyCellDomain,
-    _occupancy_cell_coherence_identity,
 )
 
 
@@ -54,11 +53,8 @@ def _load_cell_figure(
     navigation.resolve_address(address)
     if (
         not isinstance(view, SiteMapView)
-        or view.coherence_identity
-        != _occupancy_cell_coherence_identity(
-            navigation.artifact_identity,
-            address,
-        )
+        or view.background_input.ref != navigation.source_ref
+        or view.site_state_input.ref != navigation.occupancy_ref
     ):
         raise ValueError("cell loader returned a different exact address")
     _cancel_point(cancelled)

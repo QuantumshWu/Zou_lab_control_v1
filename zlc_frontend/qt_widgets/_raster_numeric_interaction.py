@@ -30,11 +30,9 @@ from ..selector import (
 from ._raster_front import (
     _HeldPanelFront,
     _panel_bounds,
-    _panel_presentation,
     _presentation_answers,
     _panel_semantics_changed,
     _hold_matches_frame,
-    _raster_geometry,
     _visible_display,
 )
 from ._rectangle_selector import (
@@ -167,10 +165,6 @@ def _numeric_viewport_for_presented_panel(
             f"{binding.kind} interaction requires its exact typed payload"
         )
     candidate = payload.viewport
-    if _panel_presentation(panel).panel_revision != candidate.display_revision:
-        raise ValueError(
-            f"{binding.kind} viewport revision differs from its presentation"
-        )
     current = binding.viewport
     structurally_new = previous is None or binding.panel_id not in previous_panel_ids
     if not structurally_new and previous is not None:
@@ -369,14 +363,8 @@ def _held_panel_from_numeric_target(
     target: _NumericTarget,
 ) -> _HeldPanelFront:
     return _HeldPanelFront(
-        panel_id=target.panel.panel_id,
-        board_id=target.frame.board_id,
-        layout_generation=target.frame.layout_generation,
-        sequence=target.frame.sequence,
-        coherence_group=target.panel.coherence_group,
-        source_identity=target.panel.source_identity,
-        presentation=_panel_presentation(target.panel),
-        raster_geometry=_raster_geometry(target.panel),
+        board=target.frame,
+        panel=target.panel,
         prepared=target.prepared,
         display_payload=target.payload,
     )

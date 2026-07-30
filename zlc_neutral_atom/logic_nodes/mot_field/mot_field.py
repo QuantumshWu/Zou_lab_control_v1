@@ -31,6 +31,7 @@ from zlc_data import (
     BlockId,
     DataBlock,
     DatasetRevision,
+    DatasetRevisionRef,
     DatasetSchema,
     GridTopology,
     OwnedSnapshot,
@@ -38,25 +39,22 @@ from zlc_data import (
     PointTable,
     READOUT_EVENT,
     SCAN_POINT,
-    StreamGenerationId,
     VALID,
     ValidityContract,
     ValueSchema,
 )
 from zlc_data._arrays import immutable_array
-from zlc_data.codec import grid_topology_to_tree, point_table_to_tree
 from zlc_data.value import expand_dataset_validity
 from zlc_neutral_atom.catalog import DefinitionKey, TaskDefinition
 from zlc_neutral_atom.dataset_output import (
     DatasetOutputDeclaration,
     FinalDatasetOutput,
-    final_dataset_join_digest,
 )
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.runtime.dataset import DatasetSealProvenance
 from zlc_pulse import FrozenScanTable, PulseDocument, freeze_scan_table
 from zlc_pulse.document import FIELD_DAC
-from zlc_storage import canonical_digest, canonical_text, finite_real, positive_real
+from zlc_storage import canonical_text, finite_real, positive_real
 
 MOT_SCAN_PARAMETER_IDS = ("da_x", "da_y", "da_z")
 _MOT_SCAN_COORDINATE_IDS = tuple(
@@ -233,18 +231,6 @@ class MotFieldProgram:
             ):
                 raise ValueError("MOT topology coordinates differ from its PointTable")
 
-    @property
-    def fingerprint(self) -> str:
-        return canonical_digest(
-            {
-                "owner": "zlc_neutral_atom.mot-field-program",
-                "pulse_document": self.document.fingerprint,
-                "point_table": point_table_to_tree(self.point_table),
-                "grid_topology": grid_topology_to_tree(self.grid_topology),
-            }
-        )
-
-
 @dataclass(frozen=True)
 class MotFieldRequest:
     """One immutable MOT optimization intent over an autonomous scan."""
@@ -285,44 +271,12 @@ class MotFieldRequest:
 
 
 
-def mot_field_source_identity(
-    snapshot: OwnedSnapshot,
-    provenance: DatasetSealProvenance,
-) -> str:
-    """Digest the exact source facts used by one MOT result."""
-
-    if not isinstance(snapshot, OwnedSnapshot):
-        raise TypeError("snapshot must be OwnedSnapshot")
-    if not isinstance(provenance, DatasetSealProvenance):
-        raise TypeError("provenance must be DatasetSealProvenance")
-    ref = snapshot.ref
-    trace = provenance.trace_binding
-    return canonical_digest(
-        {
-            "owner": "zlc_neutral_atom.mot-field-acquisition",
-            "block_id": ref.block_id.value,
-            "generation": ref.stream_generation.value,
-            "schema": ref.schema_fingerprint,
-            "revision": ref.revision.value,
-            "stream_id": provenance.stream_id.value,
-            "start_sequence": provenance.start_sequence,
-            "end_sequence": provenance.end_sequence,
-            "join_plan": provenance.join_plan_digest,
-            "ordered_metadata": provenance.ordered_metadata_digest,
-            "metadata_contract": provenance.metadata_contract_fingerprint,
-            "run_id": trace.run_id,
-            "source_id": trace.source_id,
-        }
-    )
-
-
 @dataclass(frozen=True)
 class MotFieldAcquisitionResult:
     """Exact raw Camera dataset from one autonomous MOT hardware run."""
 
     snapshot: OwnedSnapshot
     provenance: DatasetSealProvenance
-    source_identity: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, OwnedSnapshot):
@@ -337,18 +291,11 @@ class MotFieldAcquisitionResult:
             raise ValueError("MOT source provenance does not cover every dataset cell")
         if self.snapshot.ref.revision.value != expected:
             raise ValueError("MOT source snapshot is not the complete exact revision")
-        if self.source_identity != mot_field_source_identity(
-            self.snapshot,
-            self.provenance,
-        ):
-            raise ValueError("MOT source identity differs from its exact dataset")
-
-
 @dataclass(frozen=True, eq=False)
 class MotFieldResult:
     """Computed MOT optimum retaining the exact source scan and full 3-D block."""
 
-    source_identity: str
+    source_ref: DatasetRevisionRef
     point_table: PointTable
     grid_topology: GridTopology
     intensity: np.ndarray
@@ -357,7 +304,8 @@ class MotFieldResult:
     __hash__ = None
 
     def __post_init__(self) -> None:
-        canonical_text(self.source_identity, "source_identity")
+        if not isinstance(self.source_ref, DatasetRevisionRef):
+            raise TypeError("source_ref must be DatasetRevisionRef")
         if not isinstance(self.point_table, PointTable):
             raise TypeError("point_table must be PointTable")
         if not isinstance(self.grid_topology, GridTopology):
@@ -676,7 +624,7 @@ def analyze_mot_scan(
     axes = program.grid_topology.coordinate_domains
     best, peak = refine_mot_optimum(logical, axes)
     return MotFieldResult(
-        acquisition.source_identity,
+        acquisition.snapshot.ref,
         program.point_table,
         program.grid_topology,
         logical,
@@ -707,25 +655,14 @@ def materialize_mot_field_snapshot(
     physical = np.empty(schema.physical_shape, dtype="<f8")
     for point_ordinal, cell in enumerate(result.grid_topology.row_to_cell):
         physical[0, point_ordinal, 0] = result.intensity[cell]
-    identity = canonical_digest(
-        {
-            "owner": "zlc_neutral_atom.mot-field-result",
-            "source_identity": result.source_identity,
-            "schema": schema.fingerprint,
-            "intensity": np.asarray(result.intensity).tolist(),
-            "best_field": result.best_field,
-            "best_intensity": result.best_intensity,
-        }
-    )
     block = DataBlock(
-        BlockId(f"mot-field-intensity-{identity[:20]}"),
+        BlockId("mot-field-intensity"),
         DatasetRevision(0),
         physical,
         VALID,
         schema,
     )
-    generation = StreamGenerationId(f"mot-field-result-{identity}")
-    return OwnedSnapshot(block.ref(generation), block)
+    return OwnedSnapshot(block.ref(result.source_ref.stream_generation), block)
 
 
 def mot_field_final_outputs(
@@ -741,9 +678,8 @@ def mot_field_final_outputs(
         raise TypeError("source_scan must be MotFieldAcquisitionResult")
     if not isinstance(output_schema, DatasetSchema):
         raise TypeError("output_schema must be DatasetSchema")
-    if source_scan.source_identity != result.source_identity:
+    if source_scan.snapshot.ref != result.source_ref:
         raise ValueError("MOT result and materialized source name different scans")
-    source_identity = {"mot_field_source_identity": result.source_identity}
     snapshots = (
         materialize_mot_field_snapshot(result, output_schema),
         source_scan.snapshot,
@@ -752,12 +688,6 @@ def mot_field_final_outputs(
         declaration.name: FinalDatasetOutput(
             declaration,
             snapshot,
-            final_dataset_join_digest(
-                owner="mot-field",
-                declaration=declaration,
-                source_identity=source_identity,
-                snapshot=snapshot,
-            ),
         )
         for declaration, snapshot in zip(
             MOT_FIELD_FINAL_OUTPUT_DECLARATIONS,
@@ -791,6 +721,5 @@ __all__ = [
     "mot_intensity_schema",
     "materialize_mot_field_snapshot",
     "mot_field_final_outputs",
-    "mot_field_source_identity",
     "refine_mot_optimum",
 ]

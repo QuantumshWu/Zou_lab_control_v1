@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 import math
 from numbers import Integral
 from typing import TYPE_CHECKING
+import uuid
 
 from zlc_data import (
     AxisSourceRef,
@@ -15,9 +16,8 @@ from zlc_data import (
     HISTOGRAM_BIN,
     HistogramSpec,
 )
-from zlc_data.codec import axis_source_ref_to_tree
 from zlc_data.fit import validate_fit_result_source_binding
-from zlc_storage import canonical_digest, canonical_text
+from zlc_storage import canonical_text
 
 from .figure import (
     AxisResolution,
@@ -38,11 +38,10 @@ from .figure import (
     SourceViewBinding,
     ViewIntent,
     validate_view_spec,
-    view_spec_to_tree,
 )
 from .curve_display import numeric_curve_coordinates
 from .figure.contract import _fit_display_selection_indices
-from .render import PanelPresentationIdentity, RasterBuffer
+from .render import RasterBuffer
 
 if TYPE_CHECKING:
     from .fit_curve_projection import CurveFitOverlayPlan
@@ -369,17 +368,6 @@ class DataFigure:
         source_input = evaluated.inputs[0]
 
         panel = frame.panels[0]
-        presentation = next(
-            item for item in panel.coherence_stamp.presentations
-            if item.panel_id == panel.panel_id
-        )
-        assert isinstance(presentation, PanelPresentationIdentity)
-        if (
-            presentation.document_id != document.document_id
-            or presentation.document_revision != document.revision
-        ):
-            raise ValueError("typed Figure frame belongs to another document revision")
-
         payload = panel.display_payload
         payload_types = (
             ImagePanelPayload,
@@ -416,16 +404,19 @@ class DataFigure:
             raise ValueError("typed Figure payload differs from its evaluated cell")
 
         histogram = isinstance(payload, HistogramPanelPayload)
+        histogram_axis = (
+            tuple(float(value) for value in payload.bin_projection.bin_edges)
+            if histogram
+            else None
+        )
         return (
             (
                 self._fit_overlay_semantic_key,
                 type(payload).__name__,
                 payload.bin_projection.requested_bin_count if histogram else None,
+                histogram_axis,
             ),
-            (
-                self._fit_overlay_exact_key,
-                payload.bin_projection.projection_digest if histogram else None,
-            ),
+            self._fit_overlay_exact_key,
         )
 
     def with_fit_results(
@@ -647,24 +638,13 @@ class DataFigure:
                 raise RuntimeError("focused typed resolution conflicts with its facet")
 
         descriptor = self._document.descriptor(layer.dataset_id)
-        identity = canonical_digest(
-            {
-                "schema": "zlc_frontend.FocusedTypedPanel",
-                "source_document_id": self._document.document_id,
-                "source_document_revision": self._document.revision,
-                "dataset_id": layer.dataset_id.value,
-                "schema_fingerprint": descriptor.schema_fingerprint,
-                "intent": expected_intent.value,
-                "layer_id": layer.layer_id,
-                "view": view_spec_to_tree(focused_view),
-                "panel_index": panel_index,
-                "focus_address": tuple(
-                    (axis_source_ref_to_tree(source), index)
-                    for source, index in actual_address
-                ),
-            }
+        # A focused panel is an ephemeral frontend document, not an artifact
+        # or causal identity.  Give it an opaque operation id instead of
+        # hashing the complete view/focus description.
+        document_id = (
+            f"{self._document.document_id}/focus/{panel_index}/"
+            f"{uuid.uuid4().hex}"
         )
-        document_id = f"typed-focus-{identity}"
         focused_document = FigureDocument(
             document_id,
             0,
@@ -1034,7 +1014,6 @@ class FacetedOverviewArtifact:
     raster: RasterBuffer
     regions: tuple[FigurePanelRegion, ...]
     logical_size: tuple[int, int]
-    presentation: PanelPresentationIdentity
 
     def __post_init__(self) -> None:
         if not isinstance(self.figure, DataFigure):
@@ -1059,18 +1038,6 @@ class FacetedOverviewArtifact:
         ):
             raise ValueError(
                 "faceted overview logical_size must be two positive integers"
-            )
-        if not isinstance(self.presentation, PanelPresentationIdentity):
-            raise TypeError(
-                "faceted overview presentation must be PanelPresentationIdentity"
-            )
-        document = self.figure.document
-        if (
-            self.presentation.document_id != document.document_id
-            or self.presentation.document_revision != document.revision
-        ):
-            raise ValueError(
-                "faceted overview presentation belongs to another Figure"
             )
         object.__setattr__(self, "regions", regions)
         object.__setattr__(self, "logical_size", logical_size)

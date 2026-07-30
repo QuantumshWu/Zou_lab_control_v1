@@ -43,7 +43,6 @@ def curve_panel(
         CoherenceStamp,
         CurvePanelPayload,
         PanelFrame,
-        PanelPresentationIdentity,
         RasterBuffer,
         SourceIdentity,
     )
@@ -83,18 +82,7 @@ def curve_panel(
         (EvaluatedSeries((), first), EvaluatedSeries((), second)),
         ("site 0", "site 1"),
     )
-    presentation = PanelPresentationIdentity(
-        "curve", "curve-document", 0, 0, display_revision
-    )
-    stamp = CoherenceStamp(
-        "run",
-        f"curve-epoch-{sequence}",
-        "curve-frame",
-        input_identity.ref.schema_fingerprint,
-        "c" * 64,
-        (input_identity,),
-        (presentation,),
-    )
+    stamp = CoherenceStamp((input_identity,))
     source = SourceIdentity(
         input_identity.dataset_id,
         input_identity.ref.block_id,
@@ -126,7 +114,6 @@ def image_panel(sequence: int, *, viewport_revision: int = 0):
         ImagePanelPayload,
         ImagePanelRasterGeometry,
         PanelFrame,
-        PanelPresentationIdentity,
         RasterBuffer,
         SourceIdentity,
     )
@@ -189,18 +176,7 @@ def image_panel(sequence: int, *, viewport_revision: int = 0):
             (0.87, 0.10, 0.92, 0.90),
         ),
     )
-    presentation = PanelPresentationIdentity(
-        "image", "image-document", 0, 0, viewport_revision
-    )
-    stamp = CoherenceStamp(
-        "run",
-        f"image-epoch-{sequence}",
-        "image-frame",
-        input_identity.ref.schema_fingerprint,
-        "d" * 64,
-        (input_identity,),
-        (presentation,),
-    )
+    stamp = CoherenceStamp((input_identity,))
     source = SourceIdentity(
         input_identity.dataset_id,
         input_identity.ref.block_id,

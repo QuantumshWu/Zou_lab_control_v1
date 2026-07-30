@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 import Zou_lab_control.api as zlc
+import Zou_lab_control.api._application_services as application_services_impl
 from zlc_data import (
     SITE,
     VALID,
@@ -63,15 +64,13 @@ from zlc_neutral_atom.logic_nodes.pulse_scan.authoring import (
 from zlc_neutral_atom.logic_nodes.readout.occupancy.declaration import (
     OCCUPANCY_LOGIC_NODE,
 )
-from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
-    calibration_artifact_input_ref,
-)
 from zlc_neutral_atom.logic_nodes.pulse_scan.source_binding import (
     PulseScanBoundRequest,
     ScanSignalBinding,
 )
 from zlc_neutral_atom.logic_nodes.pulse_scan.lineage import (
     ApiSegmentedScanExecution,
+    pulse_scan_execution_to_tree,
 )
 from zlc_neutral_atom.runtime.signal_source import (
     SignalAssociationRequest,
@@ -82,24 +81,23 @@ from zlc_neutral_atom.runtime.signal_source import (
 )
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
-    ArtifactInputRef,
-    ProcessorStageProvenance,
     SourceFailed,
     StreamId,
-    TraceContext,
 )
 from zlc_pulse import FrozenScanTable, load_pulse_document
-from zlc_storage import canonical_digest, decode, encode
 
 
 ROOT = Path(__file__).resolve().parents[1]
 _CAMERA_SCAN_PULSE = ROOT / "pulses" / "camera_imaging_address_switch.json"
 
 
-def _workspace(repository: Path) -> zlc.WorkspacePaths:
-    return zlc.WorkspacePaths.for_workspace(
-        ROOT,
-        repository_root=repository,
+def _workspace(project: Path) -> zlc.WorkspacePaths:
+    project = project.resolve()
+    return zlc.WorkspacePaths(
+        project_root=project,
+        pulses_root=(ROOT / "pulses").resolve(),
+        tasks_root=(ROOT / "tasks").resolve(),
+        output_root=project / "_output",
     )
 
 
@@ -127,8 +125,7 @@ class _LiveCameraView:
         self.dataset = None
         self.failure: str | None = None
 
-    def bind(self, dataset, *, run_id: str, causation_domain_id: str) -> None:
-        assert run_id and causation_domain_id
+    def bind(self, dataset) -> None:
         self.dataset = dataset
 
     def updated(self) -> None:
@@ -211,7 +208,6 @@ def _camera_scan_binding(*, transform: DataTransformSpec | None = None):
 
 def _association_request(**changes) -> SignalAssociationRequest:
     values = {
-        "association_id": "camera-association",
         "cause_id": "pulse-session",
         "cause_digest": "a" * 64,
         "expected_event_count": 1,
@@ -231,7 +227,7 @@ class _PublicationAuthority:
     def __init__(self, physical_end: int) -> None:
         self.physical_end = physical_end
         self.token = object()
-        self.terminal_digest: str | None = None
+        self.terminal_bound = False
         self.finish_entered = threading.Event()
 
     def arm_signal_event_association(
@@ -250,21 +246,20 @@ class _PublicationAuthority:
         *,
         artifact_digest,
         trigger_counts,
-        terminal_evidence_digest,
         terminal_evidence_kind,
     ):
         assert token is self.token
         assert artifact_digest == "a" * 64
         assert trigger_counts == (("ch11", self.physical_end),)
         assert terminal_evidence_kind == "SIMULATED"
-        self.terminal_digest = terminal_evidence_digest
+        self.terminal_bound = True
         return "ch11", 0, self.physical_end
 
     def finish_signal_event_association(self, token):
         assert token is self.token
-        assert self.terminal_digest is not None
+        assert self.terminal_bound
         self.finish_entered.set()
-        return "ch11", 0, self.physical_end, self.terminal_digest
+        return "ch11", 0, self.physical_end
 
     def cancel_signal_event_association(self, token) -> None:
         assert token is self.token
@@ -290,8 +285,6 @@ def _associated_camera_cursor(*, operation_deadline_seconds: float = 1.0):
         contract,
         association_authority=authority,
         trigger_channel="ch11",
-        capability_fingerprint="c" * 64,
-        binding_instance_id="camera-binding",
         operation_deadline_seconds=operation_deadline_seconds,
     )
     source.mark_association_running()
@@ -329,13 +322,11 @@ def _emit_associated_camera_sample(producer, sequence: int) -> None:
             timestamp_microseconds=None,
             host_received_at_ns=sequence + 1,
             driver_buffer_index=sequence,
-            correlation_id=f"frame-{sequence}",
         ),
     )
     producer.emit(
         sample,
         captured_at=sample.metadata.captured_at,
-        trace=TraceContext("camera-run", "camera", f"frame-{sequence}"),
     )
 
 
@@ -439,7 +430,7 @@ def test_camera_association_waits_for_every_trailing_sibling_publication() -> No
         assert completed.wait(0.5)
         assert authority.finish_entered.is_set()
         assert not errors
-        assert len(results) == 1
+        assert results == [None]
     finally:
         worker.join(1.0)
         cursor.close()
@@ -466,23 +457,51 @@ def test_camera_association_rejects_a_terminal_stream_at_reached_frontier() -> N
 
 def test_pulse_scan_consumes_virtual_camera_without_claiming_producer(
     tmp_path,
+    monkeypatch,
 ) -> None:
-    program = _autonomous_camera_program(((50_000_000,), (60_000_000,)))
-    request = PulseScanBoundRequest(
-        program,
-        _camera_scan_binding(),
+    started_plans = []
+    start_run = application_services_impl.application_start_run
+
+    def observe_start_run(services, plan, **kwargs):
+        started_plans.append(plan)
+        return start_run(services, plan, **kwargs)
+
+    monkeypatch.setattr(
+        application_services_impl,
+        "application_start_run",
+        observe_start_run,
     )
 
     with zlc.connect(
         "virtual",
         workspace=_workspace(tmp_path / "workspace"),
     ) as experiment:
+        program = experiment.nodes.pulse_scan.scan_slot_program(
+            "camera_imaging_address_switch.json",
+            rows=((50_000_000,), (60_000_000,)),
+            scan_sweep_count=1,
+        )
         source, camera_handle = _start_virtual_readout_camera(experiment)
+        request = experiment.nodes.pulse_scan.bind_scan(
+            program,
+            source,
+            output_name="frame_0",
+        )
         try:
-            prepared = experiment.nodes.pulse_scan.prepare_scan_source(request, source)
-            assert len(prepared.descriptor.resource_claims) == 1
-            assert "sequencer" in prepared.descriptor.resource_claims[0]
-            reference = prepared.start().result(5.0)
+            reference = experiment.nodes.pulse_scan.run_scan(request, source)
+            plans = [
+                plan
+                for plan in started_plans
+                if plan.name.startswith("Pulse scan")
+            ]
+            assert len(plans) == 1
+            plan = plans[0]
+            assert tuple(str(claim.key) for claim in plan.resource_claims) == (
+                "device/sequencer",
+            )
+            assert tuple(str(device.key) for device in plan.bound_devices) == (
+                "device/sequencer",
+            )
             materialized = experiment.nodes.pulse_scan.materialize_scan(reference)
             artifact = experiment.nodes.pulse_scan.load_scan(reference)
             assert not camera_handle.snapshot().state.terminal
@@ -491,22 +510,67 @@ def test_pulse_scan_consumes_virtual_camera_without_claiming_producer(
 
     assert materialized.values.shape == (1, 2, 96, 128)
     assert materialized.values.dtype == np.dtype("<u2")
-    assert artifact.execution.source.source_run_id == camera_handle.run_id.value
-    assert artifact.execution.source.source_id == "camera"
-    associations = artifact.execution.source.associations
-    assert len(associations) == 1
-    assert associations[0].evidence_schema_id.endswith(
-        "camera-measurement.pulse-association"
+    assert artifact.execution.source.count == 2
+    assert artifact.execution.terminal.session_id
+    assert artifact.execution.artifact.fingerprint
+    assert artifact.execution.program == program
+    assert "program_fingerprint" not in pulse_scan_execution_to_tree(
+        artifact.execution
     )
-    assert associations[0].request.expected_event_count == 2
-    assert associations[0].request.cause_id == artifact.execution.terminal.session_id
-    assert (
-        associations[0].request.cause_digest
-        == artifact.execution.artifact.fingerprint
-    )
-    evidence = decode(associations[0].canonical_evidence)
-    assert evidence["trigger_channel"] == "ch11"
-    assert evidence["physical_end_ordinal"] - evidence["physical_start_ordinal"] == 2
+
+
+def test_public_scan_binding_requires_one_declared_owned_output(tmp_path) -> None:
+    with zlc.connect(
+        "virtual",
+        workspace=_workspace(tmp_path / "workspace"),
+    ) as experiment:
+        program = experiment.nodes.pulse_scan.scan_slot_program(
+            "camera_imaging_address_switch.json",
+            rows=((50_000_000,),),
+            scan_sweep_count=1,
+        )
+        camera_request = (
+            experiment.nodes.camera_measurement.camera_measurement_request(
+                camera_role="camera",
+                repeat=0,
+                frames_per_cycle=1,
+            )
+        )
+        camera_source = (
+            experiment.nodes.camera_measurement.prepare_camera_measurement(
+                camera_request
+            )
+        )
+        with pytest.raises(KeyError, match="no unique Dataset output"):
+            experiment.nodes.pulse_scan.bind_scan(
+                program,
+                camera_source,
+                output_name="missing",
+            )
+
+        scalar = ValueSchema.scalar(np.dtype("<f8"), "count")
+        stream, producer = AcquisitionStream.create(
+            StreamId("unowned-running-y"),
+            ValuePayloadContract(scalar),
+        )
+        source = StreamSignalEventSource(
+            stream,
+            {
+                "y": SignalOutputProjection(
+                    scalar,
+                    lambda envelope: envelope.payload,
+                )
+            },
+        )
+        try:
+            with pytest.raises(TypeError, match="DefinitionKey"):
+                experiment.nodes.pulse_scan.bind_scan(
+                    program,
+                    source,
+                    output_name="y",
+                )
+        finally:
+            producer.finish()
 
 
 def test_virtual_camera_rejects_a_terminal_with_an_extra_trigger_channel(
@@ -536,7 +600,7 @@ def test_virtual_camera_rejects_a_terminal_with_an_extra_trigger_channel(
     ) as experiment:
         source, camera_handle = _start_virtual_readout_camera(experiment)
         try:
-            prepared = experiment.nodes.pulse_scan.prepare_scan_source(request, source)
+            prepared = experiment.nodes.pulse_scan.prepare_scan(request, source)
             with pytest.raises(
                 RuntimeError,
                 match="virtual pulse terminal trigger count differs",
@@ -576,32 +640,24 @@ def test_occupancy_scan_artifact_round_trips_expandable_same_shot_lineage(
             experiment.nodes.calibration.current_calibration_ref
             == calibration_ref
         )
-        calibration_input = calibration_artifact_input_ref(calibration_ref)
         camera_source, camera_handle = _start_virtual_readout_camera(experiment)
         camera_binding = camera_source.dataset_output_binding("frame_0")
         prepared_occupancy = experiment.nodes.occupancy.prepare_occupancy_processor(
             camera_binding,
         )
         assert prepared_occupancy.request.calibration_ref == calibration_ref
-        rate_output = next(
-            output
-            for output in prepared_occupancy.output_declarations
-            if output.name == "rate"
-        )
-        request = PulseScanBoundRequest(
-            program,
-            ScanSignalBinding(
-                OCCUPANCY_LOGIC_NODE.definition.key,
-                rate_output,
-            ),
-        )
         occupancy = prepared_occupancy.start_signal_events(camera_source)
+        request = experiment.nodes.pulse_scan.bind_scan(
+            program,
+            occupancy,
+            output_name="rate",
+        )
         cursors = tuple(
             occupancy.open_signal_cursor(name)
             for name in ("counts", "occupied", "rate")
         )
         try:
-            prepared = experiment.nodes.pulse_scan.prepare_scan_source(
+            prepared = experiment.nodes.pulse_scan.prepare_scan(
                 request,
                 occupancy,
             )
@@ -629,32 +685,11 @@ def test_occupancy_scan_artifact_round_trips_expandable_same_shot_lineage(
     sequence = artifact.execution.source
     assert tuple(item.sequence for item in sequence.event_refs) == (0, 1)
     assert all(len(refs) == 1 for refs in sequence.direct_input_event_refs)
-    assert len(sequence.processor_stages) == 1
-    occupancy_stage = sequence.processor_stages[0]
-    assert occupancy_stage.direct_artifact_inputs == (calibration_input,)
-    assert sequence.artifact_inputs == (calibration_input,)
-    assert sequence.source_run_id == camera_handle.run_id.value
-    assert sequence.source_id.startswith("occupancy-associated:")
     for index, (counts, occupied, rate) in enumerate(sibling_events):
         assert counts.event_ref is occupied.event_ref is rate.event_ref
-        assert counts.trace is occupied.trace is rate.trace
-        assert counts.trace.causation_refs == (
-            sequence.direct_input_event_refs[index][0],
-            calibration_input,
-        )
-        assert counts.processor_stages == occupied.processor_stages
-        assert counts.processor_stages == rate.processor_stages
-        assert counts.processor_stages == (occupancy_stage,)
-    assert len(sequence.associations) == 1
-    association_payload = decode(sequence.associations[0].canonical_evidence)
-    assert association_payload["schema"].endswith("occupancy.signal-association")
-    assert association_payload["processor_stage"]["processor_binding_digest"] == (
-        occupancy_stage.processor_binding_digest
-    )
-    assert (
-        association_payload["upstream_evidence"]["evidence_schema_id"]
-        .endswith("camera-measurement.pulse-association")
-    )
+        assert counts.direct_parent_refs == occupied.direct_parent_refs
+        assert counts.direct_parent_refs == rate.direct_parent_refs
+        assert counts.direct_parent_refs == sequence.direct_input_event_refs[index]
 
     with zlc.connect("virtual", workspace=_workspace(repository)) as experiment:
         reloaded = experiment.nodes.pulse_scan.load_scan(reference)
@@ -664,29 +699,23 @@ def test_occupancy_scan_artifact_round_trips_expandable_same_shot_lineage(
 def test_api_segmented_scan_uses_one_terminal_bound_association_per_cell(
     tmp_path,
 ) -> None:
-    document = load_pulse_document(
-        ROOT / "pulses" / DEFAULT_PULSE_SCAN_PULSE_PATH
-    )
-    program = ApiSlotSegmentedProgram(
-        replace(document, scan_sweep_count=2),
-        ApiSegmentTable(
-            ("probe_exposure",),
-            ((2e-8,), (4e-8,)),
-        ),
-        "test one physical terminal-bound association per API segment",
-    )
-    request = PulseScanBoundRequest(
-        program,
-        _camera_scan_binding(),
-    )
-
     with zlc.connect(
         "virtual",
         workspace=_workspace(tmp_path / "workspace"),
     ) as experiment:
+        program = experiment.nodes.pulse_scan.api_slot_program(
+            DEFAULT_PULSE_SCAN_PULSE_PATH,
+            rows=((2e-8,), (4e-8,)),
+            scan_sweep_count=2,
+        )
         source, camera_handle = _start_virtual_readout_camera(experiment)
+        request = experiment.nodes.pulse_scan.bind_scan(
+            program,
+            source,
+            output_name="frame_0",
+        )
         try:
-            prepared = experiment.nodes.pulse_scan.prepare_scan_source(request, source)
+            prepared = experiment.nodes.pulse_scan.prepare_scan(request, source)
             reference = prepared.start().result(5.0)
             artifact = experiment.nodes.pulse_scan.load_scan(reference)
             materialized = experiment.nodes.pulse_scan.materialize_scan(reference)
@@ -696,39 +725,21 @@ def test_api_segmented_scan_uses_one_terminal_bound_association_per_cell(
 
     assert materialized.values.shape == (2, 2, 96, 128)
     assert materialized.values.dtype == np.dtype("<u2")
-    associations = artifact.execution.source.associations
     segments = artifact.execution.segments
-    assert len(associations) == len(segments) == 4
-    assert tuple(item.request.expected_event_count for item in associations) == (
-        1,
-        1,
-        1,
-        1,
+    assert artifact.execution.program == program
+    assert "program_fingerprint" not in pulse_scan_execution_to_tree(
+        artifact.execution
     )
-    assert tuple(item.request.cause_id for item in associations) == tuple(
-        item.terminal.session_id for item in segments
-    )
-    assert tuple(item.request.cause_digest for item in associations) == tuple(
-        item.artifact.fingerprint for item in segments
-    )
-    assert len({item.request.cause_id for item in associations}) == 4
-    assert all(
-        item.evidence_schema_id.endswith(
-            "camera-measurement.pulse-association"
-        )
-        for item in associations
-    )
+    assert len(segments) == artifact.execution.source.count == 4
+    assert len({item.terminal.session_id for item in segments}) == 4
     with pytest.raises(
         ValueError,
-        match="exact pulse artifact and session",
+        match="repeat-major and point-fast",
     ):
         ApiSegmentedScanExecution(
             artifact.execution.program,
-            segments,
-            replace(
-                artifact.execution.source,
-                associations=tuple(reversed(associations)),
-            ),
+            tuple(reversed(segments)),
+            artifact.execution.source,
         )
 
 
@@ -750,12 +761,14 @@ def test_scan_persists_the_single_committed_signal_projection_authority(
                 ),
             )
         )
-        request = PulseScanBoundRequest(
+        request = experiment.nodes.pulse_scan.bind_scan(
             program,
-            _camera_scan_binding(transform=transform),
+            source,
+            output_name="frame_0",
+            transform=transform,
         )
         try:
-            prepared = experiment.nodes.pulse_scan.prepare_scan_source(request, source)
+            prepared = experiment.nodes.pulse_scan.prepare_scan(request, source)
             reference = prepared.start().result(5.0)
             materialized = experiment.nodes.pulse_scan.materialize_scan(reference)
         finally:
@@ -765,14 +778,9 @@ def test_scan_persists_the_single_committed_signal_projection_authority(
         artifact = experiment.nodes.pulse_scan.load_scan(reference)
     projection = artifact.execution.source.projection_authority
     assert projection.input_value_schema == image_schema
-    assert projection.input_schema_fingerprint == image_schema.fingerprint
     assert projection.committed_transform is not None
     assert projection.committed_transform.spec == transform
-    assert projection.output_value_schema == artifact.source_dataset_schema.cell_schema
-    assert (
-        projection.output_schema_fingerprint
-        == artifact.source_dataset_schema.cell_schema.fingerprint
-    )
+    assert projection.output_value_schema == artifact.dataset_schema.cell_schema
     assert artifact.output_contract.committed_transform is None
     assert materialized.values.shape == (1, 1, 1)
     assert materialized.values.dtype == np.dtype("<u2")
@@ -831,7 +839,7 @@ def test_pulse_scan_refuses_ordering_only_source_before_any_fire(
             SignalAssociationUnavailable,
             match="software order only",
         ):
-            experiment.nodes.pulse_scan.prepare_scan_source(request, source)
+            experiment.nodes.pulse_scan.prepare_scan(request, source)
 
     assert not opened.is_set()
     assert fire_calls == []

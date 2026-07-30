@@ -62,10 +62,9 @@ def _bound_virtual_sequencer(document):
     broker = DeviceBroker()
     identity = broker.verify_identity(
         lambda: PhysicalDeviceIdentity(
-            "virtual-sequencer:main",
-            DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-            "fixture-evidence:virtual-sequencer-main",
-            "test-assets-v1",
+            stable_device_identity="virtual-sequencer:main",
+            evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
+            asset_map_revision="test-assets-v1",
         )
     )
     binding = None

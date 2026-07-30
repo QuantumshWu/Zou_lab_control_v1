@@ -29,10 +29,7 @@ def _replace_text(widget, text: str) -> None:
 
 
 def _workspace(tmp_path) -> WorkspacePaths:
-    return WorkspacePaths.for_workspace(
-        (tmp_path / "authored").resolve(),
-        repository_root=(tmp_path / "workspace").resolve(),
-    )
+    return WorkspacePaths.for_workspace((tmp_path / "workspace").resolve())
 
 
 def test_formal_device_manager_edits_locally_then_initializes_and_closes(
@@ -127,7 +124,7 @@ def test_task_console_launcher_initializes_through_device_manager_then_reuses_ow
 
     args = _build_parser().parse_args(
         [
-            "--repository",
+            "--workspace",
             str(tmp_path / "workspace"),
             "--name",
             "launcher-current",

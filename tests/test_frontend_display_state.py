@@ -1,25 +1,13 @@
-"""METER's display state belongs to zlc_frontend, beside the other three.
-
-The four dataset-evaluated intents need display state.  IMAGE, CURVE and
-HISTOGRAM each owned a module under `zlc_frontend/`; METER's state was a private class inside one Qt
-window (`Zou_lab_control/workbench/_figure.py`).  A board could therefore render
-a METER panel but had nowhere to keep its display state, and any second consumer
-would have had to import a GUI module to get one - the exact reverse of the
-package direction this migration exists to establish.
-
-There is deliberately no `meter_display_form_spec`: a METER has no authored
-display parameter yet, and an empty form would put an empty tab in every Setting
-popup.  This test pins that absence as a decision rather than an oversight.
-"""
+"""METER uses the same headless frontend display contract as every Figure host."""
 
 from __future__ import annotations
 
 import inspect
-from pathlib import Path
 
 import pytest
 
 import zlc_frontend
+from zlc_data import AxisId, AxisSourceRef
 from zlc_frontend import MeterDisplayState
 from zlc_frontend.figure import (
     DATASET_VIEW_INTENTS,
@@ -30,9 +18,6 @@ from zlc_frontend.figure import (
     contract_for,
 )
 from zlc_frontend.figure.model import ViewIntent
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_the_state_is_owned_by_the_frontend_package():
@@ -84,17 +69,18 @@ def test_view_contract_catalog_separates_dataset_and_document_sources():
         PanelComposer("pulse", intent=ViewIntent.PULSE)
 
 
-def test_the_state_validates_its_panel_and_selection():
-    state = MeterDisplayState(2, None)
+def test_the_state_validates_its_panel_and_exact_address():
+    address = ((AxisSourceRef.tensor(AxisId("meter.value")), 3),)
+    state = MeterDisplayState(2, address)
     assert state.panel_index == 2
-    assert state.expected_selection is None
+    assert state.expected_address == address
     assert state.revision == 0
 
     with pytest.raises(TypeError, match="panel_index"):
         MeterDisplayState(True, None)
     with pytest.raises(ValueError, match="panel_index"):
         MeterDisplayState(-1, None)
-    with pytest.raises(TypeError, match="expected_selection must be Selection"):
+    with pytest.raises(TypeError):
         MeterDisplayState(0, object())
     with pytest.raises(TypeError, match="meter display revision"):
         MeterDisplayState(0, None, revision="1")
@@ -104,27 +90,3 @@ def test_the_state_is_immutable():
     state = MeterDisplayState(0, None)
     with pytest.raises(Exception):
         state.panel_index = 1  # frozen dataclass
-
-
-def test_no_empty_form_spec_was_invented_to_match_the_siblings():
-    source = (ROOT / "zlc_frontend" / "meter_display.py").read_text(encoding="utf-8")
-    assert "def meter_display_form_spec" not in source
-    assert "FormSpec" not in source
-    # ...and the reason is written down where the next editor will read it.
-    assert "no authored display parameter" in source
-
-
-def test_the_workbench_no_longer_owns_a_private_copy():
-    workbench_sources = {
-        path: path.read_text(encoding="utf-8")
-        for path in (ROOT / "zlc_workbench").rglob("*.py")
-    }
-    assert workbench_sources
-    assert all("_MeterDisplayState" not in source for source in workbench_sources.values())
-    assert all(
-        "class MeterDisplayState" not in source
-        for source in workbench_sources.values()
-    )
-    assert any(
-        "MeterDisplayState" in source for source in workbench_sources.values()
-    ), "the workbench must consume the frontend owner"

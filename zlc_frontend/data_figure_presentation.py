@@ -41,8 +41,6 @@ from .image_view import image_viewport_for_evaluated_image
 from .panel_size import DEFAULT_PANEL_SIZE
 from .panel_params import panel_display_state_intent
 from .plot_layout import optimal_grid_size_for_view
-from zlc_storage import canonical_digest
-
 DATA_FIGURE_PANEL_ID = "generic-typed"
 
 def data_figure_summary(figure: DataFigure) -> str:
@@ -362,29 +360,6 @@ def data_figure_payload_intent(payload: DataFigurePanelPayload) -> ViewIntent:
         return ViewIntent.METER
     raise TypeError("unknown typed payload")
 
-def data_figure_join_digest(
-    figure: DataFigure,
-    intent: ViewIntent,
-    fit_result_identity: str | None,
-) -> str:
-    evaluated = figure.evaluated
-    source = evaluated.inputs[0]
-    return canonical_digest(
-        {
-            "schema": "zlc_frontend.FrozenTypedFigureJoin",
-            "document": {
-                "id": figure.document.document_id,
-                "revision": figure.document.revision,
-            },
-            "intent": intent.value,
-            "fit_result_identity": fit_result_identity,
-            "input": {
-                "dataset_id": source.dataset_id.value,
-                "ref": dataset_revision_ref_to_tree(source.ref),
-            },
-        }
-    )
-
 def data_figure_frame_contract(
     intent: ViewIntent,
     frame: BoardFrame,
@@ -403,11 +378,8 @@ def data_figure_frame_contract(
         ),
     )
     stamp = panel.coherence_stamp
-    if len(stamp.presentations) != 1:
-        raise ValueError("generic typed front requires one presentation identity")
-    presentation = stamp.presentations[0]
-    if presentation.panel_id != panel.panel_id:
-        raise ValueError("typed presentation names another panel")
+    if stamp is None:
+        raise ValueError("generic typed front requires exact dataset inputs")
     if isinstance(payload, ImagePanelPayload):
         # Object ids are safe here because ``exact_data`` keeps both immutable
         # axes/images alive while the token is compared.  They avoid rescanning
@@ -442,24 +414,11 @@ def data_figure_frame_contract(
         panel.panel_id,
         panel.coherence_group,
         panel.source_identity,
-        stamp.run_id,
-        stamp.provenance_epoch_id,
-        stamp.join_key_type,
-        stamp.join_key_schema_fingerprint,
         stamp.inputs,
-        presentation.panel_id,
-        presentation.document_id,
-        presentation.document_revision,
-        presentation.selection_revision,
         payload.evaluated_input,
         family_identity,
     )
-    # Fit-result identity is intentionally part of the per-front join digest
-    # and therefore may change between legitimate overlay commits.  Nest it
-    # outside the stable source identity: self-validation compares both;
-    # cross-front CAS compares only the stable component.
-    identity = (stable_identity, stamp.join_key_digest)
-    return identity, exact_data
+    return stable_identity, exact_data
 
 def same_exact_data_owners(
     left: tuple[object, ...],
@@ -564,7 +523,6 @@ __all__ = [
     "classify_single_data_figure",
     "data_figure_initial_size_name",
     "data_figure_frame_contract",
-    "data_figure_join_digest",
     "data_figure_payload_intent",
     "data_figure_summary",
     "default_data_figure_display_state",

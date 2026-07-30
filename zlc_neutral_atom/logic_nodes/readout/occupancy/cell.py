@@ -1,6 +1,6 @@
-"""Committed exact Occupancy-cell admission facts.
+"""Loaded exact Occupancy-cell facts.
 
-This application boundary owns admission of the occupancy artifact, its source
+This application boundary owns loading of the occupancy artifact, its source
 capture, and its calibration.  It reads exactly one chunk-backed Camera cell;
 callers never join artifacts or materialize the complete frame dataset.
 """
@@ -8,6 +8,7 @@ callers never join artifacts or materialize the complete frame dataset.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -18,33 +19,34 @@ from zlc_data import (
     OwnedSnapshot,
     SPATIAL_X,
     SPATIAL_Y,
-    StreamGenerationId,
     Value,
 )
 from zlc_data.value import dataset_cell_value
-from zlc_storage import canonical_digest, canonical_text
+from zlc_storage import canonical_text
 
 from zlc_neutral_atom.devices.camera.contract import CameraFrameMetadata
 from zlc_neutral_atom.capture.artifact import (
     CaptureArtifact,
-    CaptureRepository,
+    load_capture_artifact,
 )
 from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
 
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     SiteMap,
 )
-from zlc_neutral_atom.logic_nodes.readout.calibration.repository import CalibrationRepository
+from zlc_neutral_atom.logic_nodes.readout.calibration.repository import (
+    load_calibration_artifact,
+)
 from zlc_neutral_atom.logic_nodes.readout.model_contract import ReadoutModelKind
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
-from .processor import OccupancyArtifact
+from .processor import OccupancyArtifact, _occupancy_generation_for_run
 from .reference import OccupancyArtifactRef
-from .repository import OccupancyRepository
+from .artifact import load_occupancy_artifact
 
 
 @dataclass(frozen=True, slots=True)
 class OccupancyCellDomain:
-    """Admitted immutable identities and schemas shared by every cell."""
+    """Validated immutable identities and schemas shared by every cell."""
 
     artifact_identity: str
     source_capture_identity: str
@@ -53,21 +55,15 @@ class OccupancyCellDomain:
     occupancy_schema: DatasetSchema
     source_ref: DatasetRevisionRef
     occupancy_ref: DatasetRevisionRef
-    source_generation: StreamGenerationId
-    occupancy_generation: StreamGenerationId
     site_map: SiteMap
     model_kind: ReadoutModelKind
     readout_binding: ReadoutBindingKey
-    run_id: str
-    provenance_epoch_id: str
 
     def __post_init__(self) -> None:
         for field in (
             "artifact_identity",
             "source_capture_identity",
             "calibration_identity",
-            "run_id",
-            "provenance_epoch_id",
         ):
             canonical_text(getattr(self, field), field)
         if not isinstance(self.source_schema, DatasetSchema) or not isinstance(
@@ -87,16 +83,6 @@ class OccupancyCellDomain:
             raise ValueError("cell-domain refs differ from their declared schemas")
         if self.source_ref.revision != self.occupancy_ref.revision:
             raise ValueError("occupancy revision differs from its Camera source")
-        if not isinstance(self.source_generation, StreamGenerationId) or (
-            self.source_ref.stream_generation != self.source_generation
-        ):
-            raise ValueError("source_ref differs from the admitted Camera generation")
-        if not isinstance(self.occupancy_generation, StreamGenerationId) or (
-            self.occupancy_ref.stream_generation != self.occupancy_generation
-        ):
-            raise ValueError(
-                "occupancy_ref differs from the admitted derived generation"
-            )
         if not isinstance(self.site_map, SiteMap):
             raise TypeError("site_map must be SiteMap")
         if not isinstance(self.model_kind, ReadoutModelKind):
@@ -107,12 +93,11 @@ class OccupancyCellDomain:
     @property
     def identity(
         self,
-    ) -> tuple[str, str, StreamGenerationId, StreamGenerationId]:
+    ) -> tuple[str, DatasetRevisionRef, DatasetRevisionRef]:
         return (
             self.artifact_identity,
-            self.occupancy_schema.fingerprint,
-            self.source_generation,
-            self.occupancy_generation,
+            self.source_ref,
+            self.occupancy_ref,
         )
 
     @property
@@ -213,29 +198,35 @@ class ExactOccupancyCellSource:
 
 def _admit_cell_domain(
     reference: OccupancyArtifactRef,
-    occupancy_repository: OccupancyRepository,
-    capture_repository: CaptureRepository,
-    calibration_repository: CalibrationRepository,
+    occupancy_root: Path,
+    captures_root: Path,
+    calibrations_root: Path,
 ) -> tuple[OccupancyCellDomain, CaptureArtifact, OccupancyArtifact]:
     if not isinstance(reference, OccupancyArtifactRef):
         raise TypeError("reference must be OccupancyArtifactRef")
-    if type(occupancy_repository) is not OccupancyRepository:
-        raise TypeError("occupancy_repository must be OccupancyRepository")
-    if type(capture_repository) is not CaptureRepository:
-        raise TypeError("capture_repository must be CaptureRepository")
-    if type(calibration_repository) is not CalibrationRepository:
-        raise TypeError("calibration_repository must be CalibrationRepository")
+    for field, value in (
+        ("occupancy_root", occupancy_root),
+        ("captures_root", captures_root),
+        ("calibrations_root", calibrations_root),
+    ):
+        if not isinstance(value, Path) or not value.is_absolute():
+            raise TypeError(f"{field} must be an absolute Path")
 
-    resolved = occupancy_repository.admit(
+    resolved = load_occupancy_artifact(
+        occupancy_root,
+        captures_root,
+        calibrations_root,
         reference,
-        capture_repository,
-        calibration_repository,
     )
     artifact = resolved.artifact
-    source_admission = capture_repository.admit(artifact.source_capture_ref)
-    source = source_admission.artifact
-    calibration = calibration_repository.load(artifact.calibration_reference)
-    if calibration.frame_contract.binding != resolved.readout_binding:
+    source = load_capture_artifact(captures_root, artifact.source_capture_ref)
+    calibration = load_calibration_artifact(
+        calibrations_root,
+        captures_root,
+        artifact.calibration_reference,
+    )
+    calibration_artifact = calibration.artifact
+    if calibration_artifact.frame_contract.binding != resolved.readout_binding:
         raise ValueError("occupancy source and calibration bindings differ")
 
     source_schema = source.frame_source.schema
@@ -258,9 +249,9 @@ def _admit_cell_domain(
             "SPATIAL_Y frame axis"
         )
     site_axes = occupancy_schema.cell_schema.data_axes
-    if len(site_axes) != 1 or site_axes[0] != calibration.site_map.site_axis:
+    if len(site_axes) != 1 or site_axes[0] != calibration_artifact.site_map.site_axis:
         raise ValueError("occupancy SITE axis differs from its calibration")
-    coordinate_frame = calibration.site_map.coordinate_frame
+    coordinate_frame = calibration_artifact.site_map.coordinate_frame
     if (
         x_axes[0].coordinate_frame != coordinate_frame
         or y_axes[0].coordinate_frame != coordinate_frame
@@ -271,7 +262,9 @@ def _admit_cell_domain(
 
     source_generation = source.provenance.generation
     source_ref = source.frame_source.ref(source_generation)
-    occupancy_ref = artifact.occupied.ref(artifact.generation)
+    occupancy_ref = artifact.occupied.ref(
+        _occupancy_generation_for_run(artifact.run_id)
+    )
     domain = OccupancyCellDomain(
         artifact_identity=reference.target_ref,
         source_capture_identity=artifact.source_capture_ref.target_ref,
@@ -280,53 +273,49 @@ def _admit_cell_domain(
         occupancy_schema=occupancy_schema,
         source_ref=source_ref,
         occupancy_ref=occupancy_ref,
-        source_generation=source_generation,
-        occupancy_generation=artifact.generation,
-        site_map=calibration.site_map,
+        site_map=calibration_artifact.site_map,
         model_kind=artifact.model_kind,
         readout_binding=resolved.readout_binding,
-        run_id=source.run_id,
-        provenance_epoch_id=source_generation.value,
     )
-    del resolved, source_admission, calibration
+    del resolved, calibration
     return domain, source, artifact
 
 
 def inspect_occupancy_cell_domain(
     reference: OccupancyArtifactRef,
-    occupancy_repository: OccupancyRepository,
-    capture_repository: CaptureRepository,
-    calibration_repository: CalibrationRepository,
+    occupancy_root: Path,
+    captures_root: Path,
+    calibrations_root: Path,
 ) -> OccupancyCellDomain:
-    """Admit and describe a committed occupancy target without reading a frame."""
+    """Validate and describe an Occupancy target without reading a frame."""
 
     domain, _source, _artifact = _admit_cell_domain(
         reference,
-        occupancy_repository,
-        capture_repository,
-        calibration_repository,
+        occupancy_root,
+        captures_root,
+        calibrations_root,
     )
     return domain
 
 
 def load_exact_occupancy_cell_source(
     reference: OccupancyArtifactRef,
-    occupancy_repository: OccupancyRepository,
-    capture_repository: CaptureRepository,
-    calibration_repository: CalibrationRepository,
+    occupancy_root: Path,
+    captures_root: Path,
+    calibrations_root: Path,
     address: DatasetCellAddress | None,
     *,
     expected_domain_identity: (
-        tuple[str, str, StreamGenerationId, StreamGenerationId] | None
+        tuple[str, DatasetRevisionRef, DatasetRevisionRef] | None
     ) = None,
 ) -> ExactOccupancyCellSource:
-    """Read one exact cell after re-admitting all persisted domain facts."""
+    """Read one exact cell after revalidating all persisted domain facts."""
 
     domain, source, artifact = _admit_cell_domain(
         reference,
-        occupancy_repository,
-        capture_repository,
-        calibration_repository,
+        occupancy_root,
+        captures_root,
+        calibrations_root,
     )
     if expected_domain_identity is not None:
         expected = tuple(expected_domain_identity)
@@ -361,22 +350,6 @@ def load_exact_occupancy_cell_source(
         occupied,
         OwnedSnapshot(domain.occupancy_ref, artifact.occupied),
         sample.metadata,
-    )
-
-
-def _occupancy_cell_coherence_identity(
-    artifact_identity: str,
-    address: DatasetCellAddress,
-) -> str:
-    if not isinstance(address, DatasetCellAddress):
-        raise TypeError("address must be DatasetCellAddress")
-    return canonical_digest(
-        {
-            "owner": "zlc_neutral_atom.occupancy-cell",
-            "artifact": artifact_identity,
-            "repeat_index": address.repeat_index,
-            "point_ordinal": address.point_ordinal,
-        }
     )
 
 

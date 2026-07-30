@@ -726,7 +726,6 @@ def _compile_pulse_run_plan(
             raise TypeError("pulse Run finalized an unexpected result")
         if result.run_id != context.run_id.value:
             raise ValueError("pulse Run result belongs to another Run")
-        context.checkpoint()
         return result
 
     return RunPlan(
@@ -739,7 +738,6 @@ def _compile_pulse_run_plan(
         finalize=finalize,
         interrupt_operations=pulse_port.interrupt_operations,
         timeout_seconds=timeout_seconds,
-        requires_final_commit=False,
     )
 
 

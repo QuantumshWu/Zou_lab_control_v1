@@ -23,6 +23,7 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraWorkingPoint,
     validate_camera_external_trigger_spacing,
 )
+from zlc_neutral_atom.devices.rf import RfDetuningTable
 from zlc_neutral_atom.runtime.signal_source import SignalAssociationRequest
 from zlc_pulse import (
     CompiledPulseArtifact,
@@ -724,9 +725,9 @@ class VirtualRfSource:
         self._lock = threading.RLock()
         self._open = True
         self._session_id: str | None = None
-        self._pulse_artifact_digest: str | None = None
-        self._table_digest: str | None = None
-        self._table: tuple[float, ...] = ()
+        self._table: RfDetuningTable | None = None
+        self._playback: PulsePlayback | None = None
+        self._point_indices: tuple[int, ...] = ()
 
     def ensure_open(self) -> "VirtualRfSource":
         if not self._open:
@@ -736,21 +737,20 @@ class VirtualRfSource:
     def prepare_table(
         self,
         session_id: str,
-        pulse_artifact_digest: str,
-        table_digest: str,
-        values: tuple[float, ...],
-    ) -> None:
+        table: RfDetuningTable,
+    ) -> RfDetuningTable:
         self.ensure_open()
-        table = tuple(float(value) for value in values)
-        if not table or any(not math.isfinite(value) for value in table):
-            raise ValueError("virtual RF table must contain finite values")
+        session = canonical_text(session_id, "virtual RF session_id")
+        if type(table) is not RfDetuningTable:
+            raise TypeError("table must be RfDetuningTable")
         with self._lock:
             if self._session_id is not None:
                 raise RuntimeError("virtual RF already owns a prepared table")
-            self._session_id = str(session_id)
-            self._pulse_artifact_digest = str(pulse_artifact_digest)
-            self._table_digest = str(table_digest)
+            self._session_id = session
             self._table = table
+            self._playback = None
+            self._point_indices = ()
+            return self._table
 
     def cooling_factor_for_point(
         self,
@@ -758,63 +758,78 @@ class VirtualRfSource:
         point_index: int | None,
     ) -> float:
         with self._lock:
-            if self._session_id is None:
+            table = self._table
+            if self._session_id is None or table is None:
                 return 1.0
             artifact = self.sequencer.output_artifact
             if (
                 playback is not self.sequencer.last_fired
                 or artifact is None
-                or artifact.fingerprint != self._pulse_artifact_digest
+                or artifact.fingerprint != table.pulse_artifact_digest
             ):
                 raise RuntimeError("virtual RF observed another pulse playback")
-            if point_index is None:
+            if self._playback is None:
+                self._playback = playback
+            elif self._playback is not playback:
+                raise RuntimeError("virtual RF scan clock changed FIRE")
+            if isinstance(point_index, bool) or not isinstance(point_index, int):
                 raise RuntimeError("virtual RF scan point is unavailable")
-            if point_index >= len(self._table):
+            if point_index != len(self._point_indices):
+                raise RuntimeError("virtual RF scan points are not ordered")
+            if point_index >= len(table.detuning_gamma):
                 raise RuntimeError("virtual RF scan clock exceeded its table")
-            return grey_molasses_cooling_factor(self._table[point_index])
+            self._point_indices += (point_index,)
+            return grey_molasses_cooling_factor(
+                table.detuning_gamma[point_index]
+            )
 
     def complete_table(
         self,
         session_id: str,
-        table_digest: str,
-    ) -> tuple[int, str]:
+        table: RfDetuningTable,
+    ) -> tuple[int, ...]:
+        session = canonical_text(session_id, "virtual RF session_id")
+        if type(table) is not RfDetuningTable:
+            raise TypeError("table must be RfDetuningTable")
         with self._lock:
             if (
-                self._session_id != session_id
-                or self._table_digest != table_digest
+                self._session_id != session
+                or self._table != table
             ):
-                raise RuntimeError("virtual RF terminal belongs to another prepared table")
+                raise RuntimeError(
+                    "virtual RF terminal belongs to another prepared table"
+                )
             playback = self.sequencer.last_fired
             artifact = self.sequencer.output_artifact
             if (
                 playback is None
+                or playback is not self._playback
                 or artifact is None
-                or artifact.fingerprint != self._pulse_artifact_digest
+                or artifact.fingerprint != table.pulse_artifact_digest
             ):
                 raise RuntimeError("virtual RF terminal has no matching sequencer FIRE")
             point_indices = tuple(
                 group.point_index for group in playback.trigger_groups
             )
-            if point_indices != tuple(range(len(self._table))):
+            expected_indices = tuple(range(len(table.detuning_gamma)))
+            if (
+                len(point_indices) != len(table.detuning_gamma)
+                or point_indices != expected_indices
+                or self._point_indices != point_indices
+            ):
                 raise RuntimeError(
                     "virtual RF table does not exactly cover completed scan points"
                 )
-            return len(point_indices), canonical_digest(
-                {
-                    "pulse_artifact_digest": self._pulse_artifact_digest,
-                    "table_digest": table_digest,
-                    "advanced_points": point_indices,
-                }
-            )
+            return point_indices
 
     def close_session(self, session_id: str) -> bool:
         with self._lock:
             if self._session_id not in (None, session_id):
                 raise RuntimeError("virtual RF close belongs to another session")
             self._session_id = None
-            self._pulse_artifact_digest = None
-            self._table_digest = None
-            self._table = ()
+            self._table = None
+            self._playback = None
+            self._point_indices = ()
             return True
 
     def set_safe_state(self) -> None:
@@ -1055,7 +1070,6 @@ class VirtualMotFrameSource:
 class _VirtualCameraSignalAssociation:
     """One pre-FIRE reservation owned by the virtual trigger wire."""
 
-    association_id: str
     cause_digest: str
     trigger_schedule_fingerprint: str
     expected_trigger_count: int
@@ -1063,7 +1077,7 @@ class _VirtualCameraSignalAssociation:
     expected_group_count: int
     physical_start_ordinal: int
     physical_end_ordinal: int | None = None
-    terminal_evidence_digest: str | None = None
+    terminal_bound: bool = False
     error: BaseException | None = None
 
 
@@ -1158,7 +1172,6 @@ class VirtualCamera:
 
         if not isinstance(request, SignalAssociationRequest):
             raise TypeError("request must be SignalAssociationRequest")
-        identity = request.association_id
         digest = request.cause_digest
         schedule_fingerprint = request.trigger_schedule_fingerprint
         channel = request.trigger_channel
@@ -1228,7 +1241,6 @@ class VirtualCamera:
                     "virtual camera monitor is not at a complete readout-cycle boundary"
                 )
             association = _VirtualCameraSignalAssociation(
-                identity,
                 digest,
                 schedule_fingerprint,
                 trigger_count,
@@ -1245,7 +1257,6 @@ class VirtualCamera:
         *,
         artifact_digest: str,
         trigger_counts: tuple[tuple[str, int], ...],
-        terminal_evidence_digest: str,
         terminal_evidence_kind: str,
     ) -> tuple[str, int, int]:
         """Bind the observed virtual FIRE group to its exact terminal receipt."""
@@ -1255,10 +1266,6 @@ class VirtualCamera:
                 "virtual camera association requires a simulated pulse terminal"
             )
         artifact = sha256_text(artifact_digest, "artifact_digest")
-        terminal_digest = sha256_text(
-            terminal_evidence_digest,
-            "terminal_evidence_digest",
-        )
         counts = tuple(trigger_counts)
         with self._condition:
             association = self._require_signal_association(token)
@@ -1279,7 +1286,7 @@ class VirtualCamera:
                 raise RuntimeError(
                     "virtual pulse terminal trigger count differs from camera association"
                 )
-            association.terminal_evidence_digest = terminal_digest
+            association.terminal_bound = True
             return (
                 channel,
                 association.physical_start_ordinal,
@@ -1289,7 +1296,7 @@ class VirtualCamera:
     def finish_signal_event_association(
         self,
         token: object,
-    ) -> tuple[str, int, int, str]:
+    ) -> tuple[str, int, int]:
         """Prove the bound ordinal interval was produced completely and exactly."""
 
         deadline = time.monotonic() + self.timeout
@@ -1319,8 +1326,7 @@ class VirtualCamera:
                 raise RuntimeError(
                     "virtual camera produced frames outside the associated FIRE interval"
                 )
-            terminal_digest = association.terminal_evidence_digest
-            if terminal_digest is None:
+            if not association.terminal_bound:
                 raise RuntimeError(
                     "virtual camera association has no bound pulse terminal"
                 )
@@ -1328,7 +1334,6 @@ class VirtualCamera:
                 self.capture_trigger_channels[0],
                 association.physical_start_ordinal,
                 association.physical_end_ordinal,
-                terminal_digest,
             )
             self._signal_association = None
             self._condition.notify_all()

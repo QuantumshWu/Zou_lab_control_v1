@@ -73,10 +73,7 @@ def test_fixed_namespace_packages_are_unique_and_complete() -> None:
 def test_experiment_nodes_are_projected_from_discovered_packages(tmp_path) -> None:
     experiment = connect(
         "virtual",
-        workspace=WorkspacePaths.for_workspace(
-            ROOT,
-            repository_root=tmp_path,
-        ),
+        workspace=WorkspacePaths.for_workspace((tmp_path / "workspace").resolve()),
     )
     try:
         packages = discover_logic_node_packages()

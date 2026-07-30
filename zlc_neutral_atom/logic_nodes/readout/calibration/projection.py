@@ -1,4 +1,4 @@
-"""Typed Dataset projections of one admitted FINAL calibration.
+"""Typed Dataset projections of one loaded FINAL calibration.
 
 Calibration owns the reference image, SITE diagnostics, validity and durable
 lineage.  This module exposes only physical calibration values; the optional UI
@@ -39,10 +39,9 @@ from zlc_data.value import expand_dataset_validity
 from zlc_neutral_atom.dataset_output import (
     DatasetOutputDeclaration,
     FinalDatasetOutput,
-    final_dataset_join_digest,
 )
 from zlc_neutral_atom.artifact_output import ArtifactOutputDeclaration
-from zlc_storage import canonical_digest, canonical_text
+from zlc_storage import canonical_text
 
 from .calibration import (
     PerSitePsfFeature,
@@ -52,7 +51,6 @@ from .calibration import (
 from .reference import (
     CALIBRATION_ARTIFACT_REF_FORMAT,
     CalibrationArtifactRef,
-    calibration_artifact_ref_to_tree,
 )
 
 if TYPE_CHECKING:
@@ -150,9 +148,7 @@ class CalibrationModelReportProjection:
     label: str
     is_default: bool
     signals: np.ndarray
-    threshold_centered_signals: np.ndarray
     signal_validity: np.ndarray
-    bin_edges: np.ndarray
     quick_thresholds: np.ndarray
     formal_thresholds: np.ndarray
     runtime_thresholds: np.ndarray
@@ -227,7 +223,7 @@ def project_calibration_report(
     computation: CalibrationComputation,
     reference: CalibrationArtifactRef,
 ) -> CalibrationReportProjection:
-    """Project an admitted artifact/report pair without presentation inference."""
+    """Project a loaded artifact/report pair without presentation inference."""
 
     from .analysis import calibration_runtime_threshold_sources
 
@@ -270,18 +266,7 @@ def project_calibration_report(
                     artifact_model.kind is artifact.default_model_kind
                 ),
                 signals=model_report.short_signals,
-                threshold_centered_signals=immutable_array(
-                    (
-                        np.asarray(model_report.short_signals, dtype=np.float64)
-                        - np.asarray(artifact_model.thresholds, dtype=np.float64)[
-                            None, :
-                        ]
-                    ),
-                    dtype=np.float64,
-                    shape=model_report.short_signals.shape,
-                ),
                 signal_validity=model_report.short_validity,
-                bin_edges=model_report.bin_edges,
                 quick_thresholds=model_report.quick_thresholds,
                 formal_thresholds=model_report.thresholds,
                 runtime_thresholds=artifact_model.thresholds,
@@ -465,23 +450,19 @@ def _report_snapshot(
     values: np.ndarray,
     validity,
 ) -> OwnedSnapshot:
-    identity = canonical_digest(
-        {
-            "owner": "zlc_neutral_atom.calibration-report-dataset",
-            "calibration_identity": view.calibration_identity,
-            "key": key,
-            "schema_fingerprint": schema.fingerprint,
-        }
+    identity = canonical_text(
+        f"{view.calibration_identity}:{key}",
+        "calibration report Dataset identity",
     )
     block = DataBlock(
-        BlockId(f"calibration-report-{key}-{identity[:20]}"),
+        BlockId(f"calibration-report:{identity}"),
         DatasetRevision(0),
         np.asarray(values).reshape(schema.physical_shape),
         validity,
         schema,
     )
     return OwnedSnapshot(
-        block.ref(StreamGenerationId(f"calibration-report-{identity}")),
+        block.ref(StreamGenerationId(f"calibration-report:{identity}")),
         block,
     )
 
@@ -522,9 +503,9 @@ def _calibration_reference_snapshot(
             frame_schema.value_unit,
         ),
     )
-    identity = reference.manifest_digest
+    identity = reference.record_path
     block = DataBlock(
-        BlockId(f"calibration-reference-{identity[:20]}"),
+        BlockId(f"calibration-reference:{identity}"),
         DatasetRevision(0),
         np.asarray(reference_average, dtype="<f8").reshape(schema.physical_shape),
         DatasetComponentValidity(
@@ -535,7 +516,7 @@ def _calibration_reference_snapshot(
         ),
         schema,
     )
-    generation = StreamGenerationId(f"calibration-reference-{identity}")
+    generation = StreamGenerationId(f"calibration-reference:{identity}")
     return OwnedSnapshot(block.ref(generation), block)
 
 
@@ -546,16 +527,6 @@ def _report_repeat_axis(key: str, size: int) -> AxisSpec:
         REPEAT,
         size,
         tuple(range(size)),
-    )
-
-
-def _report_population_axis(key: str) -> AxisSpec:
-    return AxisSpec(
-        AxisId(f"calibration-report.{key}.population"),
-        "population",
-        COMPONENT,
-        2,
-        ("dark", "bright"),
     )
 
 
@@ -583,34 +554,6 @@ def _point_table_for_axis(axis: AxisSpec) -> PointTable:
                 axis.coordinate_frame,
             ),
         ),
-    )
-
-
-def _report_population_values(
-    view: CalibrationReportProjection,
-    model: CalibrationModelReportProjection,
-    values: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    source = np.asarray(values, dtype="<f8")
-    expected = (view.group_count, len(view.site_labels))
-    if source.shape != expected:
-        raise ValueError(
-            f"calibration model samples have shape {source.shape}, expected {expected}"
-        )
-    common = (
-        np.asarray(model.signal_validity, dtype=np.bool_)
-        & np.asarray(view.label_validity, dtype=np.bool_)
-    )
-    population = np.stack(
-        (
-            np.asarray(view.dark_labels, dtype=np.bool_),
-            np.asarray(view.occupied_labels, dtype=np.bool_),
-        ),
-        axis=-1,
-    )
-    return (
-        np.repeat(source[..., None], 2, axis=-1),
-        common[..., None] & population & np.isfinite(source)[..., None],
     )
 
 
@@ -690,19 +633,22 @@ def materialize_calibration_report_datasets(
 
     for model in view.models:
         histogram_key = f"hist-{model.label}"
-        population_axis = _report_population_axis(histogram_key)
-        histogram_values, histogram_validity = _report_population_values(
-            view,
-            model,
-            model.threshold_centered_signals,
+        histogram_values = np.asarray(model.signals, dtype="<f8")
+        expected = (view.group_count, len(view.site_labels))
+        if histogram_values.shape != expected:
+            raise ValueError(
+                "calibration model samples have shape "
+                f"{histogram_values.shape}, expected {expected}"
+            )
+        histogram_validity = (
+            np.asarray(model.signal_validity, dtype=np.bool_)
+            & np.isfinite(histogram_values)
         )
         histogram_schema = DatasetSchema(
             _report_repeat_axis(histogram_key, view.group_count),
             _point_table_for_axis(view.site_axis),
             None,
-            ValueSchema(
-                (population_axis,),
-                ValidityContract.components(population_axis.axis_id),
+            ValueSchema.scalar(
                 np.dtype("<f8"),
                 view.frame_schema.value_unit,
             ),
@@ -711,11 +657,8 @@ def materialize_calibration_report_datasets(
             view,
             histogram_key,
             histogram_schema,
-            histogram_values,
-            DatasetComponentValidity(
-                (population_axis.axis_id,),
-                histogram_validity.reshape(histogram_schema.physical_shape),
-            ),
+            histogram_values.reshape(histogram_schema.physical_shape),
+            CellValidity(histogram_validity),
         )
 
     if view.psf_kernels is not None:
@@ -724,7 +667,7 @@ def materialize_calibration_report_datasets(
             raise ValueError("PSF report kernels must have shape (site, y, x)")
         key = "psf-kernels"
         psf_frame = CoordinateFrameId(
-            f"calibration-psf-{canonical_digest({'calibration': view.calibration_identity})}"
+            f"calibration-psf:{view.calibration_identity}"
         )
         y_axis = AxisSpec(
             AxisId("calibration-report.psf.y"),
@@ -861,21 +804,18 @@ def _diagnostic_snapshot(
     )
     canonical = np.zeros(schema.physical_shape, dtype="<f8")
     np.copyto(canonical, physical, where=expanded_validity)
-    identity = canonical_digest(
-        {
-            "owner": "zlc_neutral_atom.logic_nodes.readout.calibration.diagnostic",
-            "calibration": calibration_artifact_ref_to_tree(reference),
-            "output_name": output_name,
-        }
+    identity = canonical_text(
+        f"{reference.target_ref}:{output_name}",
+        "calibration diagnostic Dataset identity",
     )
     block = DataBlock(
-        BlockId(f"calibration-{output_name.replace('_', '-')}-{identity[:20]}"),
+        BlockId(f"calibration-diagnostic:{identity}"),
         DatasetRevision(0),
         canonical,
         validity,
         schema,
     )
-    generation = StreamGenerationId(f"calibration-diagnostic-{identity}")
+    generation = StreamGenerationId(f"calibration-diagnostic:{identity}")
     return OwnedSnapshot(block.ref(generation), block)
 
 
@@ -979,7 +919,7 @@ def calibration_final_outputs(
     computation: CalibrationComputation,
     reference: CalibrationArtifactRef,
 ) -> dict[str, FinalDatasetOutput]:
-    """Publish the exact declared outputs of one admitted calibration.
+    """Publish the exact declared outputs of one loaded calibration.
 
     Numeric diagnostics and the reference-average SiteMap carrier are ordinary
     FINAL Datasets.  The ``calibration`` Artifact output is declared separately
@@ -990,7 +930,6 @@ def calibration_final_outputs(
     """
 
     _require_inputs(computation, reference)
-    source_identity = calibration_artifact_ref_to_tree(reference)
     snapshots = {
         CALIBRATION_FINAL_OUTPUT_DECLARATIONS[0].name: (
             materialize_calibration_reference_snapshot(computation, reference)
@@ -1011,12 +950,6 @@ def calibration_final_outputs(
         outputs[declaration.name] = FinalDatasetOutput(
             declaration,
             snapshot,
-            final_dataset_join_digest(
-                owner="zlc_neutral_atom.logic_nodes.readout.calibration.final-output",
-                declaration=declaration,
-                source_identity=source_identity,
-                snapshot=snapshot,
-            ),
         )
     return outputs
 

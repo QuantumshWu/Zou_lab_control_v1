@@ -22,7 +22,7 @@ from zlc_pulse import (
     resolve_api_parameters,
     resolve_api_segment_document,
 )
-from zlc_storage import canonical_digest, canonical_text, exact_mapping
+from zlc_storage import canonical_text, exact_mapping
 
 
 PULSE_PARAMETER_SCAN_PROGRAM_SCHEMA = (
@@ -221,16 +221,15 @@ class AutonomousScanSlotProgram:
         return _point_table_from_pulse_document(self.document)
 
     @property
+    def point_count(self) -> int:
+        return self.point_table.row_count
+
+    @property
     def sweep_count(self) -> int:
         return _scan_sweep_count(
             self.document,
             execution_name="autonomous SCAN_SLOT",
         )
-
-    @property
-    def fingerprint(self) -> str:
-        return canonical_digest(pulse_parameter_scan_program_to_tree(self))
-
 
 @dataclass(frozen=True)
 class ApiSlotSegmentedProgram:
@@ -305,11 +304,6 @@ class ApiSlotSegmentedProgram:
         if len(documents) != self.point_count:
             raise RuntimeError("API segment resolution changed the point count")
         return documents
-
-    @property
-    def fingerprint(self) -> str:
-        return canonical_digest(pulse_parameter_scan_program_to_tree(self))
-
 
 PulseParameterScanProgram = AutonomousScanSlotProgram | ApiSlotSegmentedProgram
 

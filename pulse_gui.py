@@ -30,16 +30,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Remote pulse server port.",
     )
     parser.add_argument(
-        "--repository",
-        type=Path,
-        default=Path.home() / ".zlc" / "pulse-workbench",
-        help="Standalone artifact repository root.",
-    )
-    parser.add_argument(
         "--workspace",
         type=Path,
         default=Path(__file__).resolve().parent,
-        help="Authored workspace containing pulses/ and tasks/.",
+        help="Project root containing pulses/, tasks/, and user-visible _output/.",
     )
     return parser
 
@@ -68,7 +62,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         remote_endpoint=remote_endpoint,
         workspace=WorkspacePaths.for_workspace(
             args.workspace.expanduser().resolve(),
-            repository_root=args.repository.expanduser().resolve(),
         ),
     )
     auto_close_ms = os.environ.get("ZLC_PULSE_GUI_AUTO_CLOSE_MS")

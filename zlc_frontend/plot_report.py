@@ -22,7 +22,6 @@ from .plot_panel import (
 )
 from .plot_kind import PlotKind
 from .figure_source import FigureSource
-from .panel_render import PanelProvenance
 from .plot_layout import (
     PANEL_EXPORT_PIXEL_RATIO,
     optimal_grid_size_for_view,
@@ -39,7 +38,6 @@ class PlotReportPage:
     contract: PlotPanelContract
     source: FigureSource
     display: PlotDisplayState
-    provenance: PanelProvenance
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "key", canonical_text(self.key, "report page key"))
@@ -47,8 +45,6 @@ class PlotReportPage:
             raise TypeError("report page contract must be PlotPanelContract")
         if not isinstance(self.source, FigureSource):
             raise TypeError("report page source must be FigureSource")
-        if not isinstance(self.provenance, PanelProvenance):
-            raise TypeError("report page provenance must be PanelProvenance")
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +74,6 @@ def plot_report_page(
     figure: FigureIntent,
     source: FigureSource,
     display: PlotDisplayState | None = None,
-    provenance: PanelProvenance,
 ) -> PlotReportPage:
     """Create one report page using the frontend's single report surface."""
 
@@ -103,7 +98,7 @@ def plot_report_page(
     )
     if display is None:
         display = plot_panel_display_state(contract, {}, revision=0)
-    return PlotReportPage(key, contract, source, display, provenance)
+    return PlotReportPage(key, contract, source, display)
 
 
 def _one_panel_png(frame) -> bytes:
@@ -155,7 +150,6 @@ def render_plot_report(
                 PlotPanelComposeRequest(
                     page.source,
                     page.display,
-                    page.provenance,
                 )
             )
             if result.frame is not None:

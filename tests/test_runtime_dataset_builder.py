@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 
 import numpy as np
 import pytest
@@ -38,23 +37,15 @@ from zlc_neutral_atom.runtime.dataset import (
     MissingDatasetCells,
     MonitorCoverage,
     MonitorDataset,
-    OrderedDatasetMetadataHasher,
     SnapshotExpired,
     SealedDatasetArtifact,
-    dataset_cell_permutation_digest,
 )
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionStream,
     ReservationStateError,
     StreamEndedEarly,
     StreamId,
-    TraceContext,
-    TraceBinding,
 )
-
-
-FINGERPRINT = "3" * 64
-TRACE_BINDING = TraceBinding("run", "camera")
 
 
 def test_formal_and_monitor_coverage_have_distinct_loss_semantics():
@@ -62,33 +53,6 @@ def test_formal_and_monitor_coverage_have_distinct_loss_semantics():
     assert not hasattr(DatasetCoverage(1, 1), "missed_events")
     assert MonitorCoverage(1, 1, 1, current_gap=False).complete
     assert not MonitorCoverage(1, 1, 1, current_gap=True).complete
-
-
-def test_ordered_metadata_hasher_matches_frozen_golden_and_preserves_order():
-    fingerprint = "a" * 64
-    metadata_digests = ("b" * 64, "c" * 64)
-    expected = "b20dd8bdd812e18599a5f4b49437265f5ef51619181f1b0f6f57775bf1fbae60"
-
-    hasher = OrderedDatasetMetadataHasher(fingerprint)
-    for digest in metadata_digests:
-        hasher.update(digest)
-
-    assert hasher.digest() == expected
-    assert hasher.digest() == expected
-
-    reversed_order = OrderedDatasetMetadataHasher(fingerprint)
-    for digest in reversed(metadata_digests):
-        reversed_order.update(digest)
-    changed_content = OrderedDatasetMetadataHasher(fingerprint)
-    for digest in (metadata_digests[0], "d" * 64):
-        changed_content.update(digest)
-    assert reversed_order.digest() != expected
-    assert changed_content.digest() != expected
-
-    with pytest.raises(ValueError, match="SHA-256"):
-        OrderedDatasetMetadataHasher("not-a-digest")
-    with pytest.raises(ValueError, match="SHA-256"):
-        hasher.update("not-a-digest")
 
 
 def axis(name: str, role, size: int) -> AxisSpec:
@@ -187,8 +151,6 @@ def cell_schedule(schema: DatasetSchema) -> DatasetCellSchedule:
 
 @dataclass(frozen=True)
 class _NoDatasetMetadataContract:
-    fingerprint: str = "7" * 64
-
     @staticmethod
     def snapshot(_payload):
         return None
@@ -198,17 +160,10 @@ class _NoDatasetMetadataContract:
         if metadata is not None:
             raise TypeError("value event has no metadata")
 
-    @staticmethod
-    def digest(metadata):
-        _NoDatasetMetadataContract.validate(metadata)
-        return hashlib.sha256(b"null").hexdigest()
-
-
 @dataclass(frozen=True)
 class _ValueDatasetEventAdapter:
     payload_contract: ValuePayloadContract
     metadata_contract: _NoDatasetMetadataContract = _NoDatasetMetadataContract()
-    operator_fingerprint: str = "8" * 64
 
     @property
     def value_schema(self):
@@ -233,7 +188,6 @@ def emit(producer, payload, address: DatasetCellAddress, sequence_value: int):
     return producer.emit(
         payload,
         captured_at=float(sequence_value),
-        trace=TraceContext("run", "camera", "capture"),
         join_key=address,
     )
 
@@ -256,7 +210,7 @@ def dataset_edge(
     )
 
 
-def test_cell_key_domain_excludes_value_schema_but_formal_permutation_does_not():
+def test_cell_key_and_schedule_depend_only_on_repeat_and_point_rows():
     first = dataset_schema(points=2)
     alternate_cell = ValueSchema(
         first.cell_schema.data_axes,
@@ -272,12 +226,10 @@ def test_cell_key_domain_excludes_value_schema_but_formal_permutation_does_not()
     )
     cells = cell_schedule(first)
     assert first.fingerprint != second.fingerprint
-    assert DatasetCellKeyContract.from_schema(first).fingerprint == (
-        DatasetCellKeyContract.from_schema(second).fingerprint
+    assert DatasetCellKeyContract.from_schema(first) == (
+        DatasetCellKeyContract.from_schema(second)
     )
-    assert dataset_cell_permutation_digest(first, cells) != (
-        dataset_cell_permutation_digest(second, cells)
-    )
+    cells.validate_schema(second)
 
 
 def test_frozen_edge_rejects_normally_mutable_adapter_configuration():
@@ -296,7 +248,6 @@ def test_frozen_edge_rejects_normally_mutable_adapter_configuration():
         metadata_contract: object = _ValueDatasetEventAdapter(
             ValuePayloadContract(image_value_schema())
         ).metadata_contract
-        operator_fingerprint: str = "e" * 64
 
         @property
         def value_schema(self):
@@ -331,7 +282,6 @@ def test_metadata_contract_validation_precedes_exact_commit(monkeypatch):
     monkeypatch.setattr(type(edge.metadata_contract), "validate", staticmethod(reject))
     reservation = stream.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     builder = DatasetBuilder(BlockId("metadata-validation"), reservation, edge)
@@ -357,9 +307,8 @@ def test_frozen_edge_projects_one_prevalidated_exact_schedule():
     )
 
     assert edge.cell_schedule is schedule
-    assert edge.schedule_digest == schedule.digest_for_schema(schema)
-    assert edge.key_sequence_digest == schedule.key_sequence_digest
-    assert len(edge.consumer_contract_digest) == 64
+    assert edge.key_contract == DatasetCellKeyContract.from_schema(schema)
+    assert tuple(edge.cell_schedule) == tuple(schedule)
 
 
 @pytest.mark.parametrize(
@@ -405,7 +354,6 @@ def test_exact_builder_preserves_all_named_data_axes_and_snapshot_revisions():
     stream, producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=3,
-        trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     builder = DatasetBuilder(
@@ -443,7 +391,6 @@ def test_exact_preview_delta_copies_only_new_cells_in_frozen_order():
     stream, producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=2,
-        trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     schedule = DatasetCellSchedule.from_cells(
@@ -499,7 +446,6 @@ def test_bound_builder_owns_reservation_completion():
     stream, producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     builder = DatasetBuilder(
@@ -523,7 +469,6 @@ def test_builder_context_preserves_body_error_and_releases_zero_event_preflight(
     stream, _producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     reservation.activate()
     with pytest.raises(RuntimeError, match="body failure"):
@@ -535,7 +480,6 @@ def test_builder_context_preserves_body_error_and_releases_zero_event_preflight(
             raise RuntimeError("body failure")
     replacement = stream.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     replacement.abort()
     replacement.release()
@@ -546,7 +490,6 @@ def test_exact_wrong_key_and_missing_cells_fail_without_acknowledging_delivery()
     stream, producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=2,
-        trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     builder = DatasetBuilder(
@@ -566,7 +509,6 @@ def test_exact_wrong_key_and_missing_cells_fail_without_acknowledging_delivery()
     missing_stream, missing_producer, missing_payload_contract = source(schema)
     missing_reservation = missing_stream.reserve(
         total_events=2,
-        trace_binding=TRACE_BINDING,
     )
     missing_cursor = missing_reservation.activate()
     missing_builder = DatasetBuilder(
@@ -592,7 +534,6 @@ def test_component_validity_is_aligned_by_axis_id_not_trailing_shape_guess():
     stream, producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     builder = DatasetBuilder(
@@ -809,11 +750,9 @@ def test_exact_delivery_cannot_cross_source_authority_even_when_ids_match():
     stream_b, producer_b, payload_contract_b = source(schema)
     reservation_a = stream_a.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     reservation_b = stream_b.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     cursor_a = reservation_a.activate()
     cursor_b = reservation_b.activate()
@@ -845,7 +784,6 @@ def test_exact_join_key_must_match_the_frozen_plan_schedule():
     stream, producer, payload_contract = source(schema)
     reservation = stream.reserve(
         total_events=2,
-        trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     builder = DatasetBuilder(
@@ -859,33 +797,6 @@ def test_exact_join_key_must_match_the_frozen_plan_schedule():
         builder.consume(delivery)
     assert not delivery.acknowledged
     assert builder.revision.value == 0
-    builder.abort()
-    reservation.release()
-
-
-def test_exact_reservation_rejects_cross_run_trace_mixing():
-    schema = dataset_schema(points=1)
-    stream, producer, payload_contract = source(schema)
-    reservation = stream.reserve(
-        total_events=1,
-        trace_binding=TRACE_BINDING,
-    )
-    cursor = reservation.activate()
-    builder = DatasetBuilder(
-        BlockId("trace-binding"),
-        reservation,
-        dataset_edge(payload_contract, schema),
-    )
-    payload = Value(value(7).values, VALID, schema.cell_schema)
-    with pytest.raises(Exception, match="reserved formal run/source"):
-        producer.emit(
-            payload,
-            captured_at=0.0,
-            trace=TraceContext("another-run", "camera", "capture"),
-            join_key=DatasetCellAddress(0, 0),
-        )
-    assert builder.revision.value == 0
-    assert stream.next_sequence == 0
     builder.abort()
     reservation.release()
 
@@ -958,7 +869,6 @@ def test_value_payload_contract_requires_generation_owned_schema_identity():
         producer.emit(
             payload,
             captured_at=0.0,
-            trace=TraceContext("run", "camera", "capture"),
             join_key=DatasetCellAddress(0, 0),
         )
 
@@ -970,7 +880,6 @@ def test_minted_generation_prevents_revision_ref_collision_across_sources():
         stream, producer, payload_contract = source(schema)
         reservation = stream.reserve(
             total_events=1,
-            trace_binding=TRACE_BINDING,
         )
         cursor = reservation.activate()
         builder = DatasetBuilder(
@@ -1006,7 +915,6 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
     @dataclass(frozen=True)
     class CameraSampleContract:
         schema: ValueSchema
-        fingerprint: str = "4" * 64
 
         def snapshot(self, payload):
             self.validate(payload)
@@ -1016,21 +924,8 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
             if not isinstance(payload, CameraSample) or payload.image.schema is not self.schema:
                 raise TypeError("invalid CameraSample")
 
-        def digest(self, payload):
-            self.validate(payload)
-            value_digest = ValuePayloadContract(self.schema).digest(payload.image)
-            metadata = payload.metadata
-            metadata_digest = hashlib.sha256(
-                f"{metadata.physical_ordinal}:{metadata.frame_stamp}".encode("ascii")
-            ).hexdigest()
-            return hashlib.sha256(
-                f"{value_digest}:{metadata_digest}".encode("ascii")
-            ).hexdigest()
-
     @dataclass(frozen=True)
     class FrameMetadataContract:
-        fingerprint: str = "5" * 64
-
         @staticmethod
         def snapshot(payload):
             return payload.metadata
@@ -1040,17 +935,10 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
             if not isinstance(metadata, FrameMetadata):
                 raise TypeError("invalid FrameMetadata")
 
-        @staticmethod
-        def digest(metadata):
-            FrameMetadataContract.validate(metadata)
-            encoded = f"{metadata.physical_ordinal}:{metadata.frame_stamp}".encode("ascii")
-            return hashlib.sha256(encoded).hexdigest()
-
     @dataclass(frozen=True)
     class CameraSampleAdapter:
         payload_contract: CameraSampleContract
         metadata_contract: FrameMetadataContract = FrameMetadataContract()
-        operator_fingerprint: str = "a" * 64
 
         @property
         def value_schema(self):
@@ -1068,7 +956,6 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
     )
     reservation = stream.reserve(
         total_events=1,
-        trace_binding=TRACE_BINDING,
     )
     cursor = reservation.activate()
     builder = DatasetBuilder(
@@ -1086,7 +973,6 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
     producer.emit(
         sample,
         captured_at=1.0,
-        trace=TraceContext("run", "camera", "capture"),
         join_key=DatasetCellAddress(0, 0),
     )
     builder.consume(cursor.next())
@@ -1096,5 +982,6 @@ def test_typed_event_adapter_seals_image_and_metadata_in_one_delivery():
     artifact = builder.seal(producer.finish())
     assert artifact.block.values[0, 0, 0, 0] == 5
     assert artifact.event_metadata == (metadata,)
-    assert len(artifact.provenance.ordered_metadata_digest) == 64
+    assert artifact.provenance.output_span.start_sequence == 0
+    assert artifact.provenance.output_span.end_sequence == 1
     reservation.release()

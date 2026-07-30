@@ -3,10 +3,92 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
 from zlc_storage import durable_mkdir, flush_directory
+from zlc_storage.durability import (
+    atomic_write_bytes,
+    atomic_write_file,
+    atomic_write_text,
+)
+
+
+def test_atomic_writers_replace_through_a_same_directory_temporary(
+    tmp_path,
+    monkeypatch,
+):
+    import zlc_storage.durability as durability
+
+    target = tmp_path / "record.json"
+    target.write_bytes(b"old")
+    observed = []
+    durability_events = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def fsync(descriptor):
+        durability_events.append("file-fsync")
+        real_fsync(descriptor)
+
+    def replace(source, destination):
+        durability_events.append("replace")
+        source_path = Path(source)
+        destination_path = Path(destination)
+        observed.append(
+            (
+                source_path,
+                destination_path,
+                source_path.read_bytes(),
+                target.read_bytes(),
+            )
+        )
+        real_replace(source, destination)
+
+    def flush(directory):
+        durability_events.append("directory-flush")
+        observed.append(Path(directory).resolve())
+
+    monkeypatch.setattr(durability.os, "fsync", fsync)
+    monkeypatch.setattr(durability.os, "replace", replace)
+    monkeypatch.setattr(durability, "flush_directory", flush)
+
+    assert atomic_write_text(target, "new") == target.resolve()
+    source, destination, payload, previous = observed[0]
+    assert source.parent == target.parent.resolve()
+    assert source.name.startswith(f".{target.name}.")
+    assert destination == target.resolve()
+    assert payload == b"new"
+    assert previous == b"old"
+    assert observed[1] == target.parent.resolve()
+    assert durability_events == ["file-fsync", "replace", "directory-flush"]
+    assert target.read_text(encoding="utf-8") == "new"
+
+    durability_events.clear()
+    assert atomic_write_bytes(target, b"bytes") == target.resolve()
+    _, _, payload, previous = observed[2]
+    assert payload == b"bytes"
+    assert previous == b"new"
+    assert durability_events == ["file-fsync", "replace", "directory-flush"]
+    assert target.read_bytes() == b"bytes"
+
+
+def test_atomic_write_file_cleans_temporary_and_preserves_target_on_failure(
+    tmp_path,
+):
+    target = tmp_path / "array.npy"
+    target.write_bytes(b"old")
+
+    def fail(stream):
+        stream.write(b"partial")
+        raise RuntimeError("writer failed")
+
+    with pytest.raises(RuntimeError, match="writer failed"):
+        atomic_write_file(target, fail)
+
+    assert target.read_bytes() == b"old"
+    assert not tuple(tmp_path.glob(f".{target.name}.*.tmp"))
 
 
 def test_durable_mkdir_flushes_one_child_before_its_existing_parent(

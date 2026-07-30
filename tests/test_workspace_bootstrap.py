@@ -1,11 +1,4 @@
-"""A first run on a machine with no workspace root still starts.
-
-The composition root creates exactly one repository below an existing parent and
-refuses to guess missing ancestors, which is why the launchers - whose default
-repository is two levels below the home directory - must own the levels above
-it.  Without that, connecting on a machine that has never held a `~/.zlc` died
-with FileNotFoundError before any window appeared.
-"""
+"""Current durable-directory and single-root workspace bootstrap contracts."""
 
 from __future__ import annotations
 
@@ -54,15 +47,17 @@ def test_a_file_in_the_way_fails_closed(tmp_path: Path):
         durable_makedirs(blocker / "below")
 
 
-def test_composition_root_prepares_the_workspace_before_children():
-    """Workspace creation belongs to ``connect``, not to each GUI launcher."""
+def test_connect_prepares_owned_output_roots_before_composition(tmp_path: Path):
+    """Composition creates output roots without inventing authored content."""
 
-    import inspect
+    from Zou_lab_control.api import WorkspacePaths, connect
 
-    from Zou_lab_control.api import connect
+    project = (tmp_path / "project").resolve()
+    workspace = WorkspacePaths.for_workspace(project)
 
-    source = inspect.getsource(connect)
-    prepare = source.index("durable_makedirs(repository_root)")
-    first_child = source.index("CaptureRepository(")
-    installation = source.index("create_installation(")
-    assert prepare < first_child < installation
+    with connect("virtual", workspace=workspace):
+        assert workspace.output_root.is_dir()
+        assert (workspace.output_root / "captures").is_dir()
+        assert (workspace.output_root / "calibrations").is_dir()
+        assert not workspace.pulses_root.exists()
+        assert not workspace.tasks_root.exists()

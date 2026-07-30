@@ -1,16 +1,17 @@
 """Human-readable export of one canonical calibration result.
 
-The Calibration/Capture repositories remain the only machine authority.  This
-module writes an operator-facing, explicitly non-authoritative projection of an
-already admitted ``CalibrationComputation``: a JSON index, numeric tables and
-arrays, and frontend-rendered PNG pages.  None of these files is admitted as a
-CalibrationArtifact or consumed by Occupancy.
+The sibling Calibration record and its source Capture record remain the only
+machine authority.  This module writes an operator-facing, explicitly
+non-authoritative projection of an already loaded ``CalibrationComputation``: a
+JSON index, numeric tables and arrays, and frontend-rendered PNG pages.  None of
+these files is loaded as a CalibrationArtifact or consumed by Occupancy.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 import csv
+import io
 import json
 import math
 from pathlib import Path
@@ -19,7 +20,13 @@ from typing import Protocol
 
 import numpy as np
 
-from zlc_storage import canonical_text, sha256_digest
+from zlc_storage import canonical_text
+from zlc_storage.durability import (
+    atomic_write_bytes,
+    atomic_write_file,
+    atomic_write_text,
+    durable_mkdir,
+)
 
 from zlc_neutral_atom.capture.reference import (
     CaptureArtifactRef,
@@ -93,7 +100,8 @@ def _write_sites_csv(path: Path, view: CalibrationReportProjection) -> None:
         "site_valid",
         *model_columns,
     ]
-    with path.open("w", newline="", encoding="utf-8") as stream:
+    stream = io.StringIO(newline="")
+    try:
         writer = csv.DictWriter(stream, fieldnames=columns)
         writer.writeheader()
         for site, label in enumerate(view.site_labels):
@@ -154,6 +162,10 @@ def _write_sites_csv(path: Path, view: CalibrationReportProjection) -> None:
                     }
                 )
             writer.writerow(row)
+        payload = stream.getvalue()
+    finally:
+        stream.close()
+    atomic_write_text(path, payload)
 
 
 def _write_diagnostics_npz(
@@ -188,7 +200,6 @@ def _write_diagnostics_npz(
                     model.signal_validity,
                     dtype=np.bool_,
                 ),
-                f"{prefix}_bin_edges": np.asarray(model.bin_edges),
                 f"{prefix}_quick_thresholds": np.asarray(
                     model.quick_thresholds
                 ),
@@ -241,7 +252,7 @@ def _write_diagnostics_npz(
                 ),
             }
         )
-    np.savez(path, **arrays)
+    atomic_write_file(path, lambda stream: np.savez(stream, **arrays))
 
 
 def _model_summary(index: int, model) -> dict[str, object]:
@@ -294,15 +305,13 @@ def write_calibration_result_bundle(
     calibration_ref: CalibrationArtifactRef,
     source_capture_ref: CaptureArtifactRef,
     *,
-    calibration_repository_root: str | Path,
-    capture_repository_root: str | Path,
     render_report: Callable[[CalibrationReportProjection], _RasterDocument],
 ) -> None:
     """Write one complete operator bundle into a new empty directory.
 
     ``render_report`` is the explicit composition seam: neutral owns all physical
-    values and the file index, while frontend owns pixels.  The caller atomically
-    installs this fully staged directory before publishing ``calibration_ref.json``.
+    values and the file index, while frontend owns pixels.  This optional export
+    is written only after the sibling ``calibration.json`` is already FINAL.
     """
 
     if not isinstance(view, CalibrationReportProjection):
@@ -317,8 +326,7 @@ def write_calibration_result_bundle(
         raise ValueError("calibration report projection belongs to another artifact")
     if view.source_capture_identity != source_capture_ref.target_ref:
         raise ValueError("calibration report projection belongs to another capture")
-    root = Path(destination).expanduser().resolve()
-    root.mkdir(parents=False, exist_ok=False)
+    root = durable_mkdir(Path(destination).expanduser().resolve())
 
     document = render_report(view)
     summary_text = canonical_text(document.summary, "calibration report summary")
@@ -338,10 +346,9 @@ def write_calibration_result_bundle(
             raise ValueError("calibration report page must be encoded PNG bytes")
         filename = f"{key}.png"
         page_path = root / filename
-        page_path.write_bytes(payload)
+        atomic_write_bytes(page_path, payload)
         files[filename] = {
             "description": title,
-            "sha256": sha256_digest(page_path.read_bytes()),
             "size_bytes": page_path.stat().st_size,
         }
 
@@ -351,29 +358,24 @@ def write_calibration_result_bundle(
         "description": (
             "non-authoritative numeric export of the stored CalibrationReport"
         ),
-        "sha256": sha256_digest(diagnostics_path.read_bytes()),
         "size_bytes": diagnostics_path.stat().st_size,
     }
     sites_path = root / "sites.csv"
     _write_sites_csv(sites_path, view)
     files[sites_path.name] = {
         "description": "per-site operator table",
-        "sha256": sha256_digest(sites_path.read_bytes()),
         "size_bytes": sites_path.stat().st_size,
     }
 
-    calibration_root = Path(calibration_repository_root).expanduser().resolve()
-    capture_root = Path(capture_repository_root).expanduser().resolve()
     summary = {
         "schema": CALIBRATION_RESULT_BUNDLE_FORMAT,
         "authority": {
             "calibration_ref": calibration_artifact_ref_to_tree(calibration_ref),
             "source_capture_ref": capture_artifact_ref_to_tree(source_capture_ref),
-            "calibration_repository_root": str(calibration_root),
-            "capture_repository_root": str(capture_root),
+            "record": "../calibration.json",
             "rule": (
-                "The repositories and typed refs above are the only machine "
-                "authority. This report directory is a human-readable projection."
+                "The sibling calibration.json record and typed refs above are "
+                "the only machine authority. This directory is a human projection."
             ),
         },
         "physical_context": {
@@ -401,21 +403,20 @@ def write_calibration_result_bundle(
         "render_summary": summary_text,
         "files": files,
     }
-    (root / "summary.json").write_text(
+    atomic_write_text(
+        root / "summary.json",
         json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
     )
-    (root / "README.txt").write_text(
+    atomic_write_text(
+        root / "README.txt",
         "Calibration result bundle\n"
         "=========================\n\n"
-        "Open summary.json for the result index and canonical repository paths.\n"
+        "Open summary.json for the result index and typed source references.\n"
         "Open the PNG pages for SiteMap, fidelity, per-site distributions, "
-        "pooled populations, and optional PSF diagnostics.\n"
+        "and optional PSF diagnostics.\n"
         "sites.csv and diagnostics.npz are convenient, non-authoritative exports.\n\n"
-        "Do not use this directory as a calibration database. Occupancy and all\n"
-        "machine consumers admit the CalibrationArtifactRef in ../calibration_ref.json\n"
-        "from the canonical Calibration/Capture repositories listed in summary.json.\n",
-        encoding="utf-8",
+        "Do not use this directory as a calibration database. Machine consumers\n"
+        "load the sibling ../calibration.json through its CalibrationArtifactRef.\n",
     )
 
 

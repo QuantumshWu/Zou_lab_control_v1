@@ -627,10 +627,6 @@ class FitProblem:
         object.__setattr__(self, "observations", observations)
         object.__setattr__(self, "independent_values", independent)
 
-    @property
-    def effective_schema_fingerprint(self) -> str:
-        return self.spec.committed_transform.output_schema_fingerprint
-
 @dataclass(frozen=True, eq=False)
 class FitResultBatch:
     source_ref: DatasetRevisionRef
@@ -871,10 +867,6 @@ class FitResultBatch:
             / self.used_observation_counts[converged]
         )
         return _immutable_numeric(values, "<f8", values.shape)
-
-    @property
-    def effective_schema_fingerprint(self) -> str:
-        return self.spec.committed_transform.output_schema_fingerprint
 
     @property
     def parameter_definitions(self) -> tuple[FitParameterDefinition, ...]:

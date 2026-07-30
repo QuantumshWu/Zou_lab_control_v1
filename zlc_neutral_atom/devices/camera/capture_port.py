@@ -42,8 +42,6 @@ class CapturePayloadContract(PayloadContract[PayloadT], Protocol[PayloadT]):
 
     def captured_at(self, payload: PayloadT) -> float: ...
 
-    def correlation_id(self, payload: PayloadT) -> str: ...
-
 
 
 
@@ -60,12 +58,6 @@ class CaptureCapabilitySnapshot:
         if not isinstance(evidence, CameraCapabilityEvidence):
             raise TypeError(
                 "camera_capability_evidence must be CameraCapabilityEvidence"
-            )
-        if getattr(self.payload_contract, "fingerprint", None) != (
-            evidence.payload_contract_fingerprint
-        ):
-            raise ValueError(
-                "camera capability payload contract differs from its fingerprint"
             )
         if evidence.physical_facts.camera_identity != (
             self.binding_stamp.physical_identity.stable_device_identity
@@ -347,7 +339,6 @@ class CaptureTerminalAck:
     source_stopped: bool
     no_more_frames: bool
     joined: bool
-    ordered_metadata_digest: str
     settings_fingerprint: str
     capability_fingerprint: str
     capture_spec_fingerprint: str
@@ -368,7 +359,6 @@ class CaptureTerminalAck:
         for name in ("source_stopped", "no_more_frames", "joined"):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be bool")
-        _sha256(self.ordered_metadata_digest, "ordered_metadata_digest")
         _sha256(self.settings_fingerprint, "settings_fingerprint")
         _sha256(self.capability_fingerprint, "capability_fingerprint")
         _sha256(self.capture_spec_fingerprint, "capture_spec_fingerprint")
@@ -385,7 +375,6 @@ def capture_terminal_ack_to_tree(value: CaptureTerminalAck) -> dict[str, object]
         "source_stopped": value.source_stopped,
         "no_more_frames": value.no_more_frames,
         "joined": value.joined,
-        "ordered_metadata_digest": value.ordered_metadata_digest,
         "settings_fingerprint": value.settings_fingerprint,
         "capability_fingerprint": value.capability_fingerprint,
         "capture_spec_fingerprint": value.capture_spec_fingerprint,
@@ -403,7 +392,6 @@ def capture_terminal_ack_from_tree(tree: object) -> CaptureTerminalAck:
             "source_stopped",
             "no_more_frames",
             "joined",
-            "ordered_metadata_digest",
             "settings_fingerprint",
             "capability_fingerprint",
             "capture_spec_fingerprint",

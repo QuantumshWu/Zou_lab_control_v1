@@ -9,13 +9,12 @@ from zlc_neutral_atom.logic_node_declaration import (
 )
 
 from .authoring import (
-    build_pulse_scan_program,
+    _freeze_pulse_scan_authoring,
     pulse_scan_authoring_schema,
     pulse_scan_input_specs,
 )
 from .contracts import PULSE_SCAN_MEASUREMENT_DEFINITION
 from .final_output import PULSE_SCAN_FINAL_OUTPUT_DECLARATIONS
-from .source_binding import bind_pulse_scan_request
 
 
 PULSE_SCAN_LOGIC_NODE = LogicNodeDeclaration(
@@ -31,8 +30,8 @@ PULSE_SCAN_LOGIC_NODE = LogicNodeDeclaration(
             "scan result",
         ),
     ),
-    build_request=build_pulse_scan_program,
-    bind_request=bind_pulse_scan_request,
+    build_request=_freeze_pulse_scan_authoring,
+    bind_request=None,
     path_presentations=(
         PathPresentationHint(
             "pulse",

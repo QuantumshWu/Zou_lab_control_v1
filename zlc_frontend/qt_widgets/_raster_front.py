@@ -19,7 +19,6 @@ from ..render import (
     ImagePanelPayload,
     MeterPanelPayload,
     PanelFrame,
-    PanelPresentationIdentity,
     PulsePanelPayload,
     RasterBuffer,
     SiteMapPanelPayload,
@@ -214,17 +213,6 @@ def _validated_panel_layout(
     return ids, min(columns, len(ids))
 
 
-def _panel_presentation(panel: PanelFrame) -> PanelPresentationIdentity:
-    matches = tuple(
-        value
-        for value in panel.coherence_stamp.presentations
-        if value.panel_id == panel.panel_id
-    )
-    if len(matches) != 1:
-        raise RuntimeError("panel coherence stamp has no unique presentation identity")
-    return matches[0]
-
-
 def _presentation_answers(
     origin: PanelInteractionOrigin,
     panel: PanelFrame,
@@ -242,19 +230,12 @@ def _presentation_answers(
         raise TypeError("origin must be PanelInteractionOrigin")
     if not isinstance(panel, PanelFrame):
         raise TypeError("panel must be PanelFrame")
-    presentation = _panel_presentation(panel)
-    if not isinstance(presentation, PanelPresentationIdentity):
-        raise TypeError("presentation must be PanelPresentationIdentity")
     return (
         _payload_input(panel.display_payload) == origin.input_identity
         and panel.source_identity == origin.source_identity
-        and presentation.panel_id == origin.presentation.panel_id
-        and presentation.document_id == origin.presentation.document_id
-        and presentation.document_revision
-        == origin.presentation.document_revision
-        and presentation.selection_revision
-        == origin.presentation.selection_revision
-        and presentation.panel_revision == target_revision
+        and panel.panel_id == origin.panel_id
+        and panel.coherence_group == origin.panel.coherence_group
+        and _payload_revision(panel.display_payload) == target_revision
     )
 
 
@@ -296,6 +277,21 @@ def _payload_input(
     return payload.evaluated_input
 
 
+def _payload_revision(payload: DisplayPayload) -> int:
+    if isinstance(payload, SiteMapPanelPayload):
+        return int(payload.background.viewport.viewport_revision)
+    if isinstance(payload, ImagePanelPayload):
+        return int(payload.viewport.viewport_revision)
+    if isinstance(
+        payload,
+        (CurvePanelPayload, HistogramPanelPayload, PulsePanelPayload),
+    ):
+        return int(payload.viewport.display_revision)
+    if isinstance(payload, MeterPanelPayload):
+        return int(payload.display_revision)
+    raise TypeError("panel interaction requires a typed display payload")
+
+
 def _input_structure(evaluated_input) -> tuple[object, object, object, str]:
     """Return producer structure while deliberately excluding normal revisions."""
 
@@ -312,14 +308,8 @@ def _input_structure(evaluated_input) -> tuple[object, object, object, str]:
 class _HeldPanelFront:
     """One GUI-owned display overlay; it is never an authoritative BoardFrame."""
 
-    panel_id: str
-    board_id: str
-    layout_generation: int
-    sequence: int
-    coherence_group: str
-    source_identity: SourceIdentity | DocumentInputIdentity
-    presentation: PanelPresentationIdentity
-    raster_geometry: tuple[int, int]
+    board: BoardFrame
+    panel: PanelFrame
     prepared: tuple[bytes, QtGui.QImage]
     display_payload: (
         ImagePanelPayload
@@ -329,6 +319,34 @@ class _HeldPanelFront:
         | SiteMapPanelPayload
         | None
     )
+
+    @property
+    def panel_id(self) -> str:
+        return self.panel.panel_id
+
+    @property
+    def board_id(self) -> str:
+        return self.board.board_id
+
+    @property
+    def layout_generation(self) -> int:
+        return self.board.layout_generation
+
+    @property
+    def sequence(self) -> int:
+        return self.board.sequence
+
+    @property
+    def coherence_group(self) -> str:
+        return self.panel.coherence_group
+
+    @property
+    def source_identity(self) -> SourceIdentity | DocumentInputIdentity:
+        return self.panel.source_identity
+
+    @property
+    def raster_geometry(self) -> tuple[int, int]:
+        return _raster_geometry(self.panel)
 
     @property
     def gesture_identity(
@@ -357,13 +375,10 @@ def _visible_display(
         if not isinstance(payload, payload_type):
             return None, None
         return payload, PanelInteractionOrigin(
-            hold.panel_id,
-            hold.board_id,
-            hold.layout_generation,
-            hold.sequence,
-            hold.source_identity,
-            hold.presentation,
+            hold.board,
+            hold.panel,
             _payload_input(payload),
+            _payload_revision(payload),
         )
     if front is None or panel_id is None or panel_id not in panel_ids:
         return None, None
@@ -372,21 +387,16 @@ def _visible_display(
     if not isinstance(payload, payload_type):
         return None, None
     return payload, PanelInteractionOrigin(
-        panel.panel_id,
-        front[0].board_id,
-        front[0].layout_generation,
-        front[0].sequence,
-        panel.source_identity,
-        _panel_presentation(panel),
+        front[0],
+        panel,
         _payload_input(payload),
+        _payload_revision(payload),
     )
 
 
 def _panel_semantics_changed(old: PanelFrame, new: PanelFrame) -> bool:
     """Whether a retained data-space interaction no longer has the same meaning."""
 
-    old_presentation = _panel_presentation(old)
-    new_presentation = _panel_presentation(new)
     old_payload = old.display_payload
     new_payload = new.display_payload
 
@@ -420,7 +430,7 @@ def _panel_semantics_changed(old: PanelFrame, new: PanelFrame) -> bool:
                 _input_structure(payload.background.evaluated_input),
                 payload.site_axis,
                 payload.coordinate_frame,
-                payload.geometry_identity,
+                id(payload.centers_xy),
             )
         return (None,)
 
@@ -428,10 +438,6 @@ def _panel_semantics_changed(old: PanelFrame, new: PanelFrame) -> bool:
         old.panel_id != new.panel_id
         or old.coherence_group != new.coherence_group
         or old.source_identity != new.source_identity
-        or old_presentation.panel_id != new_presentation.panel_id
-        or old_presentation.document_id != new_presentation.document_id
-        or old_presentation.document_revision != new_presentation.document_revision
-        or old_presentation.selection_revision != new_presentation.selection_revision
         or interaction_geometry(old_payload) != interaction_geometry(new_payload)
     )
 
@@ -483,23 +489,22 @@ def _hold_matches_frame(
             == _input_structure(held_payload.background.evaluated_input)
             and current_payload.site_axis == held_payload.site_axis
             and current_payload.coordinate_frame == held_payload.coordinate_frame
-            and current_payload.geometry_identity == held_payload.geometry_identity
+            and current_payload.centers_xy is held_payload.centers_xy
         )
     else:
         payload_matches = current_payload is None
-    current = _panel_presentation(panel)
-    presentation_matches = (
-        current.panel_id == hold.presentation.panel_id
-        and current.document_id == hold.presentation.document_id
-        and current.selection_revision == hold.presentation.selection_revision
-        and current.document_revision >= hold.presentation.document_revision
-        and current.panel_revision >= hold.presentation.panel_revision
+    revision_matches = (
+        current_payload is None and held_payload is None
+    ) or (
+        current_payload is not None
+        and held_payload is not None
+        and _payload_revision(current_payload) >= _payload_revision(held_payload)
     )
     return (
         panel.panel_id == hold.panel_id
         and panel.coherence_group == hold.coherence_group
         and panel.source_identity == hold.source_identity
-        and presentation_matches
+        and revision_matches
         and _raster_geometry(panel) == hold.raster_geometry
         and payload_matches
     )

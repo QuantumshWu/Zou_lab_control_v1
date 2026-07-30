@@ -68,17 +68,6 @@ class CameraFrameFactsLike(Protocol):
     count_unit: str
 
 
-CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT = canonical_digest(
-    {
-        "owner": (
-            "zlc_neutral_atom.devices.camera.contract."
-            "CameraDatasetEventAdapter"
-        ),
-        "operator": "camera-sample.image-identity",
-    }
-)
-
-
 def _pair(value: object, field: str, *, positive: bool) -> tuple[int, int]:
     try:
         pair = tuple(value)  # type: ignore[arg-type]
@@ -716,7 +705,7 @@ def decode_camera_capture_spec(value: FrozenCaptureSpec | bytes) -> CameraCaptur
 
 @dataclass(frozen=True)
 class CameraFrameMetadata:
-    """One frame's frozen physical observations plus run correlation identity."""
+    """One frame's frozen physical observations."""
 
     source_ordinal: int
     produced_count: int | None
@@ -726,7 +715,6 @@ class CameraFrameMetadata:
     timestamp_microseconds: int | None
     host_received_at_ns: int
     driver_buffer_index: int | None
-    correlation_id: str
 
     def __post_init__(self) -> None:
         for field in ("source_ordinal", "host_received_at_ns"):
@@ -764,7 +752,6 @@ class CameraFrameMetadata:
             raise ValueError("timestamp_microseconds must be less than 1_000_000")
         if (self.timestamp_seconds is None) != (self.timestamp_microseconds is None):
             raise ValueError("camera timestamp seconds and microseconds must appear together")
-        _canonical_text(self.correlation_id, "correlation_id")
 
     @property
     def captured_at(self) -> float:
@@ -788,7 +775,6 @@ def camera_frame_metadata_to_tree(metadata: CameraFrameMetadata) -> dict[str, ob
         "timestamp_microseconds": metadata.timestamp_microseconds,
         "host_received_at_ns": metadata.host_received_at_ns,
         "driver_buffer_index": metadata.driver_buffer_index,
-        "correlation_id": metadata.correlation_id,
     }
 
 
@@ -802,7 +788,6 @@ def camera_frame_metadata_from_tree(tree: object) -> CameraFrameMetadata:
         "timestamp_microseconds",
         "host_received_at_ns",
         "driver_buffer_index",
-        "correlation_id",
     }
     if not isinstance(tree, dict) or set(tree) != fields:
         raise ValueError("camera frame metadata has an unknown field set")
@@ -823,10 +808,6 @@ class CameraSample:
 
 @dataclass(frozen=True)
 class CameraFrameMetadataContract:
-    @property
-    def fingerprint(self) -> str:
-        return canonical_digest({"contract": "zlc.camera-frame-metadata"})
-
     def snapshot(self, payload: CameraSample) -> CameraFrameMetadata:
         if not isinstance(payload, CameraSample):
             raise TypeError("metadata snapshot requires CameraSample")
@@ -839,12 +820,6 @@ class CameraFrameMetadataContract:
         if not math.isfinite(metadata.captured_at):
             raise ValueError("captured_at must be finite")
 
-    def digest(self, metadata: object) -> str:
-        self.validate(metadata)
-        assert isinstance(metadata, CameraFrameMetadata)
-        return canonical_digest(camera_frame_metadata_to_tree(metadata))
-
-
 @dataclass(frozen=True)
 class CameraSampleContract:
     value_schema: ValueSchema
@@ -856,16 +831,6 @@ class CameraSampleContract:
         if not isinstance(self.metadata_contract, CameraFrameMetadataContract):
             raise TypeError("metadata_contract must be CameraFrameMetadataContract")
 
-    @property
-    def fingerprint(self) -> str:
-        return canonical_digest(
-            {
-                "contract": "zlc.camera-sample",
-                "value_schema_fingerprint": self.value_schema.fingerprint,
-                "metadata_contract_fingerprint": self.metadata_contract.fingerprint,
-            }
-        )
-
     def snapshot(self, payload: CameraSample) -> CameraSample:
         self.validate(payload)
         return payload
@@ -876,36 +841,6 @@ class CameraSampleContract:
         ValuePayloadContract(self.value_schema).validate(payload.image)
         self.metadata_contract.validate(payload.metadata)
 
-    def digest(self, payload: CameraSample) -> str:
-        """Bind one physical frame's pixels and acquisition metadata together."""
-
-        self.validate(payload)
-        return self.digest_components(
-            payload.image.values,
-            payload.image.validity,
-            payload.metadata,
-        )
-
-    def digest_components(
-        self,
-        image_values: np.ndarray,
-        image_validity: Valid | Invalid | ComponentValidity,
-        metadata: CameraFrameMetadata,
-    ) -> str:
-        """Digest a durable frame cell through the transient payload owner."""
-
-        self.metadata_contract.validate(metadata)
-        return canonical_digest(
-            {
-                "schema": "zlc.camera-sample-content",
-                "image": ValuePayloadContract(self.value_schema).digest_content(
-                    image_values,
-                    image_validity,
-                ),
-                "metadata": self.metadata_contract.digest(metadata),
-            }
-        )
-
     @staticmethod
     def source_ordinal(payload: CameraSample) -> int:
         return payload.metadata.source_ordinal
@@ -914,23 +849,13 @@ class CameraSampleContract:
     def captured_at(payload: CameraSample) -> float:
         return payload.metadata.captured_at
 
-    @staticmethod
-    def correlation_id(payload: CameraSample) -> str:
-        return payload.metadata.correlation_id
-
-
 @dataclass(frozen=True)
 class CameraDatasetEventAdapter:
     payload_contract: CameraSampleContract
-    operator_fingerprint: str = CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT
 
     def __post_init__(self) -> None:
         if not isinstance(self.payload_contract, CameraSampleContract):
             raise TypeError("payload_contract must be CameraSampleContract")
-        if self.operator_fingerprint != CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT:
-            raise ValueError(
-                "CameraDatasetEventAdapter operator identity cannot be overridden"
-            )
 
     @property
     def value_schema(self) -> ValueSchema:
@@ -1150,13 +1075,6 @@ class CameraPhysicalFacts:
                 + ", ".join(mismatches)
             )
 
-    @property
-    def fingerprint(self) -> str:
-        """Digest of this owner-minted physical-facts value."""
-
-        return canonical_digest(_camera_physical_facts_to_tree(self))
-
-
 _CAMERA_PHYSICAL_FACTS_SCHEMA = "zlc_neutral_atom.CameraPhysicalFacts"
 _CAMERA_CAPABILITY_EVIDENCE_SCHEMA = "zlc_neutral_atom.CameraCapabilityEvidence"
 
@@ -1259,7 +1177,6 @@ class CameraCapabilityEvidence:
 
     adapter_type: str
     source_id: str
-    payload_contract_fingerprint: str
     capture_spec_owner_fingerprint: str
     max_blocking_call_seconds: float
     physical_facts: CameraPhysicalFacts
@@ -1268,11 +1185,10 @@ class CameraCapabilityEvidence:
     def __post_init__(self) -> None:
         _canonical_text(self.adapter_type, "adapter_type")
         _canonical_text(self.source_id, "source_id")
-        for name in (
-            "payload_contract_fingerprint",
+        _sha256(
+            self.capture_spec_owner_fingerprint,
             "capture_spec_owner_fingerprint",
-        ):
-            _sha256(getattr(self, name), name)
+        )
         object.__setattr__(
             self,
             "max_blocking_call_seconds",
@@ -1328,7 +1244,6 @@ def camera_capability_evidence_to_tree(
         "schema": _CAMERA_CAPABILITY_EVIDENCE_SCHEMA,
         "adapter_type": value.adapter_type,
         "source_id": value.source_id,
-        "payload_contract_fingerprint": value.payload_contract_fingerprint,
         "capture_spec_owner_fingerprint": value.capture_spec_owner_fingerprint,
         "max_blocking_call_seconds": value.max_blocking_call_seconds,
         "physical_facts": _camera_physical_facts_to_tree(value.physical_facts),
@@ -1343,7 +1258,6 @@ def camera_capability_evidence_from_tree(tree: object) -> CameraCapabilityEviden
         "schema",
         "adapter_type",
         "source_id",
-        "payload_contract_fingerprint",
         "capture_spec_owner_fingerprint",
         "max_blocking_call_seconds",
         "physical_facts",
@@ -1354,7 +1268,6 @@ def camera_capability_evidence_from_tree(tree: object) -> CameraCapabilityEviden
     return CameraCapabilityEvidence(
         adapter_type=data["adapter_type"],
         source_id=data["source_id"],
-        payload_contract_fingerprint=data["payload_contract_fingerprint"],
         capture_spec_owner_fingerprint=data["capture_spec_owner_fingerprint"],
         max_blocking_call_seconds=data["max_blocking_call_seconds"],
         physical_facts=facts,
@@ -1604,7 +1517,6 @@ class CameraAssociationProgress(Protocol):
 
 __all__ = [
     "CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT",
-    "CAMERA_DATASET_IDENTITY_OPERATOR_FINGERPRINT",
     "CAMERA_FRAME_FACT_FIELDS",
     "CameraAcquisitionMode",
     "CameraAdapter",

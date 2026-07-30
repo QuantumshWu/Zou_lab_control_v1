@@ -751,7 +751,8 @@ class SinglePanelAggRenderer:
                 projection.bin_counts,
                 projection.bin_edges,
             )
-            automatic_analysis = self._hist_analysis_cache[1]
+            if self._hist_analysis_cache is not None:
+                automatic_analysis = self._hist_analysis_cache[1]
 
         (
             self._hist_fit_artists,

@@ -58,7 +58,9 @@ class LogicNodePackage:
     resolve_artifact_reference: (
         Callable[[object, object, Callable[..., object]], object] | None
     ) = None
-    project_signal_presentation: Callable[[object, str, object], object | None] | None = None
+    project_signal_presentation: (
+        Callable[[object, str, object, tuple[object, ...]], object | None] | None
+    ) = None
     ui_contributions: tuple[UiContributionDescriptor, ...] = ()
     close_api: Callable[[object], tuple[Exception, ...]] | None = None
     bind_artifact_capabilities: (

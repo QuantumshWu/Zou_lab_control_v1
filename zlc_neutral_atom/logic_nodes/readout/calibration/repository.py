@@ -1,592 +1,375 @@
-"""Durable storage and admission for readout calibrations.
-
-The repository has one job: make an already computed
-``CalibrationAnalysisResult`` atomically visible.  Scientific validation lives
-in the calibration/analysis values; canonical encoding lives in the
-capability-local ``codec``; durability lives in ``zlc_storage``.  The canonical
-CAS manifest is the sole durable visibility authority.
-"""
+"""Direct record-last persistence for readout Calibration artifacts."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
-import math
-from pathlib import Path
-import threading
-from typing import TYPE_CHECKING
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from typing import Any
+import uuid
+
+import numpy as np
 
 from zlc_storage import (
-    ContentAddressedStore,
-    ContentCorruptionError,
-    ContentRef,
-    ContentStoreAuthority,
-    RepositoryRootLease,
-    RepositoryRootLeaseBorrow,
     canonical_text,
-    content_ref_from_tree,
-    content_ref_to_tree,
     decode,
     encode,
     exact_mapping,
     positive_real,
-    sha256_digest,
 )
+from zlc_storage.durability import (
+    atomic_write_bytes,
+    atomic_write_file,
+    durable_makedirs,
+    durable_mkdir,
+)
+from zlc_storage.paths import resolve_under
 
+from zlc_neutral_atom.capture.artifact import CaptureArtifact
 from zlc_neutral_atom.capture.reference import (
     CaptureArtifactRef,
+    capture_artifact_ref_from_tree,
+    capture_artifact_ref_to_tree,
 )
-from zlc_neutral_atom.runtime.commit import (
-    PreparedArtifactCommit,
-)
+from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
-from zlc_neutral_atom.runtime._failure import record_secondary_failure
-from zlc_neutral_atom.runtime.run import (
-    PostSafetyContext,
-    RunContext,
-    RunPlan,
-)
+from zlc_neutral_atom.runtime.run import PostSafetyContext, RunContext, RunPlan
+
 from .calibration import (
     CalibrationAnalysisRequest,
-    CalibrationArtifact,
     ResolvedCalibration,
-    _RESOLVED_CALIBRATION_TOKEN,
     _ResolvedCalibrationSource,
     _resolve_calibration_source,
     _validate_calibration_artifact_source_compatibility,
 )
 from .codec import (
-    calibration_report_blob_refs,
-    decode_calibration_artifact,
-    decode_calibration_report,
-    decode_calibration_report_arrays,
-    encode_calibration_artifact,
-    encode_calibration_reference_average,
-    encode_calibration_reference_average_validity,
-    encode_calibration_report_metadata,
+    calibration_artifact_from_tree,
+    calibration_artifact_to_tree,
+    calibration_report_from_tree,
+    calibration_report_to_tree,
 )
-from .reference import (
-    CALIBRATION_ARTIFACT_NAMESPACE,
-    CalibrationArtifactRef,
+from .reference import CalibrationArtifactRef
+
+
+CALIBRATION_RECORD_FORMAT = (
+    "zlc_neutral_atom.logic_nodes.readout.calibration.record"
 )
-from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
-from zlc_neutral_atom.runtime.resources import (
-    acquire_repository_borrows,
-    release_repository_borrows,
-)
-
-if TYPE_CHECKING:
-    from zlc_neutral_atom.capture.artifact import (
-        AdmittedCapture,
-        CaptureRepository,
-    )
-    from .analysis import (
-        CalibrationAnalysisResult,
-        CalibrationComputation,
-        CalibrationReport,
-    )
+_RECORD_FIELDS = {
+    "schema",
+    "run_id",
+    "source_capture_ref",
+    "artifact",
+    "report",
+}
+_ARRAY_PATH_FIELD = "array_path"
+_PreparedCalibrationAnalysis = tuple[CaptureArtifact, _ResolvedCalibrationSource]
 
 
-CALIBRATION_MANIFEST_FORMAT = "zlc_neutral_atom.logic_nodes.readout.calibration.manifest"
-_MANIFEST_FIELDS = frozenset(
-    {
-        "format",
-        "repository_id",
-        "run_id",
-        "artifact_blob",
-        "report_blob",
-    }
-)
-_PreparedCalibrationAnalysis = tuple[
-    object,
-    _ResolvedCalibrationSource,
-    tuple[RepositoryRootLeaseBorrow, ...],
-]
+def _load_capture(
+    captures_root: Path,
+    reference: CaptureArtifactRef,
+) -> CaptureArtifact:
+    from zlc_neutral_atom.capture.artifact import load_capture_artifact
+
+    capture = load_capture_artifact(captures_root, reference, materialize=False)
+    if not isinstance(capture, CaptureArtifact):
+        raise TypeError("load_capture_artifact returned a non-CaptureArtifact")
+    return capture
 
 
-def _manifest_payload(
-    repository_id: str,
-    run_id: str,
-    artifact_blob: ContentRef,
-    report_blob: ContentRef,
-) -> bytes:
-    """Encode the sole current manifest shape.
-
-    The format and repository identify the durable owner; ``run_id`` carries
-    the artifact's execution provenance, and the two content references bind
-    the scientific result and its report.
-    """
-
-    return encode(
-        {
-            "format": CALIBRATION_MANIFEST_FORMAT,
-            "repository_id": repository_id,
-            "run_id": canonical_text(run_id, "run_id"),
-            "artifact_blob": content_ref_to_tree(artifact_blob),
-            "report_blob": content_ref_to_tree(report_blob),
-        },
-    )
+def _run_name() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"{stamp}-{uuid.uuid4().hex[:8]}"
 
 
-def _decode_manifest(
-    payload: bytes,
-) -> tuple[str, str, ContentRef, ContentRef]:
-    if not isinstance(payload, bytes):
-        raise TypeError("calibration manifest payload must be bytes")
-    tree = exact_mapping(
-        decode(payload),
-        _MANIFEST_FIELDS,
-        CALIBRATION_MANIFEST_FORMAT,
-        discriminator="format",
-    )
-    repository_id = canonical_text(tree["repository_id"], "repository_id")
-    run_id = canonical_text(tree["run_id"], "run_id")
-    artifact_blob = content_ref_from_tree(tree["artifact_blob"])
-    report_blob = content_ref_from_tree(tree["report_blob"])
+def _externalize_arrays(
+    value: Any,
+    prefix: str,
+    arrays: list[tuple[str, np.ndarray]],
+) -> Any:
+    if isinstance(value, np.ndarray):
+        if value.dtype.hasobject:
+            raise ValueError("Calibration records cannot persist object arrays")
+        ordinal = sum(path.startswith(f"arrays/{prefix}-") for path, _ in arrays)
+        relative = f"arrays/{prefix}-{ordinal:04d}.npy"
+        arrays.append((relative, value))
+        return {_ARRAY_PATH_FIELD: relative}
+    if isinstance(value, dict):
+        return {
+            key: _externalize_arrays(item, prefix, arrays)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_externalize_arrays(item, prefix, arrays) for item in value]
+    return value
+
+
+def _array_path(value: object, prefix: str) -> str:
+    canonical = canonical_text(value, "array_path")
+    path = PurePosixPath(canonical)
+    ordinal = path.stem.removeprefix(f"{prefix}-")
     if (
-        _manifest_payload(
-            repository_id,
-            run_id,
-            artifact_blob,
-            report_blob,
-        )
-        != payload
+        path.is_absolute()
+        or path.as_posix() != canonical
+        or len(path.parts) != 2
+        or path.parts[0] != "arrays"
+        or path.suffix != ".npy"
+        or not path.name.startswith(f"{prefix}-")
+        or len(ordinal) < 4
+        or not ordinal.isdigit()
+        or any(part in {"", ".", ".."} for part in path.parts)
     ):
-        raise ValueError("calibration manifest is not canonical current format")
-    return repository_id, run_id, artifact_blob, report_blob
+        raise ValueError("Calibration array path is not canonical for its owner")
+    return path.as_posix()
 
 
-class CalibrationRepository:
-    """Content-addressed calibration store with manifest-only visibility."""
+def _materialize_arrays(
+    value: Any,
+    run_directory: Path,
+    prefix: str,
+    seen: set[str],
+) -> Any:
+    if isinstance(value, np.ndarray):
+        raise ValueError("calibration.json must not embed ndarray payloads")
+    if isinstance(value, dict):
+        if _ARRAY_PATH_FIELD in value:
+            if set(value) != {_ARRAY_PATH_FIELD}:
+                raise ValueError("Calibration array reference has unknown fields")
+            relative = _array_path(value[_ARRAY_PATH_FIELD], prefix)
+            if relative in seen:
+                raise ValueError("Calibration record reuses one array path")
+            seen.add(relative)
+            path = resolve_under(run_directory, relative)
+            with path.open("rb") as stream:
+                loaded = np.load(stream, allow_pickle=False)
+            if not isinstance(loaded, np.ndarray):
+                close = getattr(loaded, "close", None)
+                if callable(close):
+                    close()
+                raise ValueError("Calibration array path must contain one .npy array")
+            if loaded.dtype.hasobject:
+                raise ValueError("Calibration record contains an object array")
+            loaded.setflags(write=False)
+            return loaded
+        return {
+            key: _materialize_arrays(item, run_directory, prefix, seen)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _materialize_arrays(item, run_directory, prefix, seen)
+            for item in value
+        ]
+    return value
 
-    def __init__(
-        self,
-        root: str | Path,
-        *,
-        repository_id: str = "zlc-neutral-calibration",
-    ) -> None:
-        self.root = Path(root).expanduser().resolve()
-        self.repository_id = canonical_text(repository_id, "repository_id")
-        self._lock = threading.RLock()
-        self._closed = False
-        self._root_lease = RepositoryRootLease(self.root)
-        try:
-            self._store = ContentAddressedStore(self.root / "content")
-            self._store_authority = self._store.authority()
-        except BaseException:
-            self._root_lease.close()
-            raise
 
-    def _require_open(self) -> None:
-        if self._closed:
-            raise RuntimeError("calibration repository is closed")
-        self._root_lease.require_active()
+def _write_npy(path: Path, value: np.ndarray) -> None:
+    def write(stream) -> None:
+        np.save(stream, value, allow_pickle=False)
 
-    def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._root_lease.close()
-            self._closed = True
+    atomic_write_file(path, write)
 
-    def __enter__(self) -> "CalibrationRepository":
-        with self._lock:
-            self._require_open()
-        return self
 
-    def __exit__(self, _exc_type, _exc, _traceback) -> None:
-        self.close()
+def _read_record(
+    calibrations_root: str | Path,
+    reference: CalibrationArtifactRef,
+):
+    from .analysis import CalibrationComputation
 
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except BaseException:
-            pass
-
-    def _validate_reference(self, reference: CalibrationArtifactRef) -> None:
-        if not isinstance(reference, CalibrationArtifactRef):
-            raise TypeError("reference must be CalibrationArtifactRef")
-        if reference.repository_id != self.repository_id:
-            raise ValueError("CalibrationArtifactRef belongs to another repository")
-
-    def _read_manifest(
-        self,
-        reference: CalibrationArtifactRef,
-    ) -> bytes:
-        return self._content_authority().read_manifest(
-            CALIBRATION_ARTIFACT_NAMESPACE,
-            reference.manifest_digest,
+    if not isinstance(reference, CalibrationArtifactRef):
+        raise TypeError("reference must be CalibrationArtifactRef")
+    root = Path(calibrations_root).expanduser().resolve()
+    record_path = resolve_under(root, reference.record_path)
+    payload = record_path.read_bytes()
+    record = exact_mapping(
+        decode(payload),
+        _RECORD_FIELDS,
+        CALIBRATION_RECORD_FORMAT,
+    )
+    if encode(record) != payload:
+        raise ValueError("calibration.json is not canonical current format")
+    run_id = canonical_text(record["run_id"], "run_id")
+    source_ref = capture_artifact_ref_from_tree(record["source_capture_ref"])
+    seen: set[str] = set()
+    artifact = calibration_artifact_from_tree(
+        _materialize_arrays(
+            record["artifact"],
+            record_path.parent,
+            "artifact",
+            seen,
         )
-
-    def _content_authority(self) -> ContentStoreAuthority:
-        with self._lock:
-            self._require_open()
-            return self._store_authority
-
-    def _storage_refs(
-        self,
-        reference: CalibrationArtifactRef,
-        *,
-        manifest_payload: bytes | None = None,
-    ) -> tuple[str, ContentRef, ContentRef]:
-        self._validate_reference(reference)
-        payload = (
-            self._read_manifest(reference)
-            if manifest_payload is None
-            else manifest_payload
+    )
+    report = calibration_report_from_tree(
+        _materialize_arrays(
+            record["report"],
+            record_path.parent,
+            "report",
+            seen,
         )
-        repository_id, run_id, artifact_ref, report_ref = _decode_manifest(payload)
-        if repository_id != self.repository_id:
-            raise ValueError("calibration manifest belongs to another repository")
-        return run_id, artifact_ref, report_ref
+    )
+    if artifact.source_binding.source_capture_ref != source_ref:
+        raise ValueError("calibration.json source differs from its artifact")
+    return run_id, source_ref, CalibrationComputation(artifact, report)
 
-    def _materialize_artifact(
-        self,
-        artifact_ref: ContentRef,
-    ) -> CalibrationArtifact:
-        try:
-            payload = self._content_authority().read_blob(artifact_ref)
-        except FileNotFoundError as error:
-            raise ContentCorruptionError(
-                "visible calibration manifest references a missing artifact blob"
-            ) from error
-        return decode_calibration_artifact(payload)
 
-    def _report_storage_refs(
-        self,
-        artifact: CalibrationArtifact,
-        reference: ContentRef,
-    ) -> tuple[bytes, ContentRef, ContentRef]:
-        authority = self._content_authority()
-        try:
-            payload = authority.read_blob(reference)
-        except FileNotFoundError as error:
-            raise ContentCorruptionError(
-                "visible calibration manifest references a missing report blob"
-            ) from error
-        average_ref, validity_ref = calibration_report_blob_refs(payload)
-        pixels = math.prod(artifact.frame_contract.frame_schema.data_shape)
-        expected = (pixels * 8, pixels)
-        if (average_ref.size, validity_ref.size) != expected:
-            raise ValueError(
-                "calibration diagnostic blob sizes differ from the FrameContract"
-            )
-        return payload, average_ref, validity_ref
+def _load_validated(
+    calibrations_root: str | Path,
+    captures_root: str | Path,
+    reference: CalibrationArtifactRef,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+):
+    if checkpoint is not None and not callable(checkpoint):
+        raise TypeError("checkpoint must be callable or None")
+    run_id, source_ref, computation = _read_record(calibrations_root, reference)
+    if checkpoint is not None:
+        checkpoint()
+    capture = _load_capture(
+        Path(captures_root).expanduser().resolve(),
+        source_ref,
+    )
+    _validate_calibration_artifact_source_compatibility(
+        computation.artifact,
+        capture,
+        checkpoint=checkpoint,
+    )
+    if checkpoint is not None:
+        checkpoint()
+    return run_id, computation
 
-    def _load_computation_ref(
-        self,
-        artifact: CalibrationArtifact,
-        reference: ContentRef,
-    ) -> CalibrationComputation:
-        from .analysis import CalibrationComputation
 
-        authority = self._content_authority()
-        payload, average_ref, validity_ref = self._report_storage_refs(
-            artifact,
-            reference,
+def load_calibration_artifact(
+    calibrations_root: str | Path,
+    captures_root: str | Path,
+    reference: CalibrationArtifactRef,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> ResolvedCalibration:
+    """Cold-open one record and validate its exact Capture source."""
+
+    run_id, computation = _load_validated(
+        calibrations_root,
+        captures_root,
+        reference,
+        checkpoint=checkpoint,
+    )
+    return ResolvedCalibration(reference, computation.artifact, run_id)
+
+
+def load_calibration_computation(
+    calibrations_root: str | Path,
+    captures_root: str | Path,
+    reference: CalibrationArtifactRef,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+):
+    """Cold-open one validated CalibrationArtifact/CalibrationReport pair."""
+
+    _run_id, computation = _load_validated(
+        calibrations_root,
+        captures_root,
+        reference,
+        checkpoint=checkpoint,
+    )
+    return computation
+
+
+def write_calibration_artifact(
+    calibrations_root: str | Path,
+    result,
+    *,
+    run_id: str,
+) -> CalibrationArtifactRef:
+    """Write original-dtype arrays first and publish ``calibration.json`` last."""
+
+    from .analysis import CalibrationAnalysisResult, CalibrationComputation
+
+    if not isinstance(result, CalibrationAnalysisResult):
+        raise TypeError("result must be CalibrationAnalysisResult")
+    run_id = canonical_text(run_id, "run_id")
+    resolved = result._source_resolution
+    if not resolved.join.matches_contexts(result.report.group_contexts):
+        raise ValueError(
+            "calibration report group contexts differ from its CaptureArtifact"
         )
-        try:
-            average_payload = authority.read_blob(average_ref)
-            validity_payload = authority.read_blob(validity_ref)
-        except FileNotFoundError as error:
-            raise ContentCorruptionError(
-                "calibration report references missing array content"
-            ) from error
-        average, validity = decode_calibration_report_arrays(
-            average_payload,
-            validity_payload,
-            image_shape=artifact.frame_contract.frame_schema.data_shape,
+    if result.artifact.source_binding.source_capture_ref != result.source.ref:
+        raise ValueError("calibration result source changed before persistence")
+
+    root = Path(calibrations_root).expanduser().resolve()
+    durable_makedirs(root)
+    run_directory = durable_mkdir(resolve_under(root, _run_name()))
+    arrays_directory = durable_mkdir(run_directory / "arrays")
+    record_path = run_directory / "calibration.json"
+    reference = CalibrationArtifactRef(record_path.relative_to(root).as_posix())
+
+    arrays: list[tuple[str, np.ndarray]] = []
+    artifact_tree = _externalize_arrays(
+        calibration_artifact_to_tree(result.artifact),
+        "artifact",
+        arrays,
+    )
+    report_tree = _externalize_arrays(
+        calibration_report_to_tree(result.report),
+        "report",
+        arrays,
+    )
+    for relative, array in arrays:
+        target = resolve_under(run_directory, relative)
+        if target.parent != arrays_directory:
+            raise RuntimeError("Calibration array escaped its owned directory")
+        _write_npy(target, array)
+
+    seen: set[str] = set()
+    round_trip_artifact = calibration_artifact_from_tree(
+        _materialize_arrays(artifact_tree, run_directory, "artifact", seen)
+    )
+    round_trip_report = calibration_report_from_tree(
+        _materialize_arrays(report_tree, run_directory, "report", seen)
+    )
+    CalibrationComputation(round_trip_artifact, round_trip_report)
+    if round_trip_artifact.source_binding.source_capture_ref != result.source.ref:
+        raise ValueError("Calibration array round-trip changed its source")
+
+    record = {
+        "schema": CALIBRATION_RECORD_FORMAT,
+        "run_id": run_id,
+        "source_capture_ref": capture_artifact_ref_to_tree(result.source.ref),
+        "artifact": artifact_tree,
+        "report": report_tree,
+    }
+    payload = encode(record)
+    if encode(
+        exact_mapping(
+            decode(payload),
+            _RECORD_FIELDS,
+            CALIBRATION_RECORD_FORMAT,
         )
-        report = decode_calibration_report(
-            payload,
-            reference_average=average,
-            reference_average_validity=validity,
-        )
-        # The analysis owner performs the complete artifact/report binding check.
-        return CalibrationComputation(artifact, report)
-
-    def load(
-        self,
-        reference: CalibrationArtifactRef,
-    ) -> CalibrationArtifact:
-        """Load a calibration named by an exact visible manifest."""
-
-        with self._root_lease.borrow() as read_borrow:
-            read_borrow.require_active()
-            _run_id, artifact_ref, _report_ref = self._storage_refs(reference)
-            return self._materialize_artifact(artifact_ref)
-
-    def load_computation(
-        self,
-        reference: CalibrationArtifactRef,
-    ) -> CalibrationComputation:
-        """Load one validated artifact/report pair."""
-
-        with self._root_lease.borrow() as read_borrow:
-            read_borrow.require_active()
-            _run_id, artifact_ref, report_ref = self._storage_refs(reference)
-            artifact = self._materialize_artifact(artifact_ref)
-            return self._load_computation_ref(artifact, report_ref)
-
-    def load_report(
-        self,
-        reference: CalibrationArtifactRef,
-    ) -> CalibrationReport:
-        """Load diagnostics for one visible calibration manifest."""
-
-        return self.load_computation(reference).report
-
-    def has(self, reference: CalibrationArtifactRef) -> bool:
-        with self._root_lease.borrow() as read_borrow:
-            read_borrow.require_active()
-            self._validate_reference(reference)
-            try:
-                payload = self._read_manifest(reference)
-            except FileNotFoundError:
-                return False
-            try:
-                _run_id, artifact_ref, report_ref = self._storage_refs(
-                    reference,
-                    manifest_payload=payload,
-                )
-                artifact = self._materialize_artifact(artifact_ref)
-                _report_payload, average_ref, validity_ref = self._report_storage_refs(
-                    artifact,
-                    report_ref,
-                )
-                authority = self._content_authority()
-                authority.verify_blob(average_ref)
-                authority.verify_blob(validity_ref)
-            except FileNotFoundError as error:
-                raise ContentCorruptionError(
-                    "visible calibration manifest references missing content"
-                ) from error
-            return True
-
-    @staticmethod
-    def _validate_source_admission(
-        artifact: CalibrationArtifact,
-        source: "AdmittedCapture",
-        *,
-        checkpoint: Callable[[], None] | None = None,
-    ) -> _ResolvedCalibrationSource:
-        from zlc_neutral_atom.capture.artifact import AdmittedCapture
-
-        if type(source) is not AdmittedCapture:
-            raise TypeError("source must be an exact AdmittedCapture")
-        return _validate_calibration_artifact_source_compatibility(
-            artifact,
-            source.artifact,
-            checkpoint=checkpoint,
-        )
-
-    def admit(
-        self,
-        reference: CalibrationArtifactRef,
-        capture_repository: "CaptureRepository",
-        *,
-        checkpoint: Callable[[], None] | None = None,
-    ) -> ResolvedCalibration:
-        """Admit a visible target and validate its persisted source."""
-
-        from zlc_neutral_atom.capture.artifact import CaptureRepository
-
-        if type(capture_repository) is not CaptureRepository:
-            raise TypeError("capture_repository must be CaptureRepository")
-        with self._root_lease.borrow() as admission_borrow:
-            admission_borrow.require_active()
-            with capture_repository._root_lease.borrow() as source_borrow:
-                source_borrow.require_active()
-                _run_id, artifact_ref, _report_ref = self._storage_refs(reference)
-                artifact = self._materialize_artifact(artifact_ref)
-                source_capture_ref = artifact.source_binding.source_capture_ref
-                source = capture_repository.admit(source_capture_ref)
-                self._validate_source_admission(
-                    artifact,
-                    source,
-                    checkpoint=checkpoint,
-                )
-                return ResolvedCalibration._from_admission(
-                    _RESOLVED_CALIBRATION_TOKEN,
-                    repository_token=self._root_lease,
-                    reference=reference,
-                    artifact=artifact,
-                )
-
-    def _stage_result(
-        self,
-        result: CalibrationAnalysisResult,
-        *,
-        run_id: str,
-    ) -> tuple[CalibrationArtifactRef, bytes]:
-        authority = self._content_authority()
-        report = result.report
-        artifact_payload = encode_calibration_artifact(result.artifact)
-        decode_calibration_artifact(artifact_payload)
-        average_payload = encode_calibration_reference_average(
-            report.reference_average
-        )
-        validity_payload = encode_calibration_reference_average_validity(
-            report.reference_average_validity
-        )
-        average_blob = authority.identify_blob(average_payload)
-        validity_blob = authority.identify_blob(validity_payload)
-        report_payload = encode_calibration_report_metadata(
-            report,
-            reference_average_blob=average_blob,
-            reference_average_validity_blob=validity_blob,
-        )
-        decode_calibration_report(
-            report_payload,
-            reference_average=report.reference_average,
-            reference_average_validity=report.reference_average_validity,
-        )
-        if calibration_report_blob_refs(report_payload) != (
-            average_blob,
-            validity_blob,
-        ):
-            raise ValueError("calibration report failed its durable codec round-trip")
-        # Only self-readable, fully admitted values reach the CAS.  Resource or
-        # codec rejection above therefore cannot leave diagnostic orphan blobs.
-        artifact_blob = authority.put_blob(artifact_payload)
-        if authority.put_blob(average_payload) != average_blob:
-            raise RuntimeError("calibration average content identity changed while staging")
-        if authority.put_blob(validity_payload) != validity_blob:
-            raise RuntimeError("calibration validity content identity changed while staging")
-        report_blob = authority.put_blob(report_payload)
-        payload = _manifest_payload(
-            self.repository_id,
-            run_id,
-            artifact_blob,
-            report_blob,
-        )
-        reference = CalibrationArtifactRef(
-            self.repository_id,
-            sha256_digest(payload),
-        )
-        return reference, payload
-
-    def final_commit(
-        self,
-        context: PostSafetyContext,
-        result: CalibrationAnalysisResult,
-    ) -> PreparedArtifactCommit[CalibrationArtifactRef]:
-        """Prepare publication from the exact admission retained by analysis."""
-
-        from .analysis import CalibrationAnalysisResult
-
-        if not isinstance(context, PostSafetyContext):
-            raise TypeError("calibration commit requires PostSafetyContext")
-        if type(result) is not CalibrationAnalysisResult:
-            raise TypeError("result must be CalibrationAnalysisResult")
-        source, resolved = result._source_for_commit()
-        source._require_authority()
-        if not resolved.join.matches_contexts(result.report.group_contexts):
-            raise ValueError(
-                "calibration report group contexts differ from the admitted source"
-            )
-        run_id = context.authorize_commit_preparation()
-        # Staging writes CAS blobs, so repository lifetime begins before the
-        # first write and overlaps prepare() minting the commit-lifetime hold.
-        with self._root_lease.borrow() as staging_borrow:
-            staging_borrow.require_active()
-            reference, payload = self._stage_result(result, run_id=run_id)
-            confirmed = context.authorize_commit_preparation()
-            if confirmed != run_id:
-                raise RuntimeError("calibration commit subject changed while staging")
-            commit_borrow = self._root_lease.borrow()
-        try:
-            def publish(manifest_payload: bytes) -> None:
-                if manifest_payload != payload:
-                    raise ValueError("calibration commit payload changed after staging")
-                self._content_authority().publish_manifest(
-                    CALIBRATION_ARTIFACT_NAMESPACE,
-                    manifest_payload,
-                    expected_digest=reference.manifest_digest,
-                )
-
-            def inspect(manifest_payload: bytes) -> bool | None:
-                if manifest_payload != payload:
-                    raise ValueError("calibration inspection payload changed")
-                authority = self._content_authority()
-                try:
-                    confirmed_payload = authority.confirm_manifest_durable(
-                        CALIBRATION_ARTIFACT_NAMESPACE,
-                        reference.manifest_digest,
-                    )
-                except FileNotFoundError:
-                    return False
-                except OSError:
-                    return None
-                if confirmed_payload != manifest_payload:
-                    raise ContentCorruptionError(
-                        "calibration manifest differs from its immutable reference"
-                    )
-                try:
-                    stored_run_id, artifact_ref, report_ref = self._storage_refs(
-                        reference,
-                        manifest_payload=confirmed_payload,
-                    )
-                    if stored_run_id != run_id:
-                        raise ValueError(
-                            "visible calibration provenance belongs to another Run"
-                        )
-                    artifact = self._materialize_artifact(artifact_ref)
-                    _report_payload, average_ref, validity_ref = (
-                        self._report_storage_refs(artifact, report_ref)
-                    )
-                    authority.verify_blob(average_ref)
-                    authority.verify_blob(validity_ref)
-                except FileNotFoundError as error:
-                    raise ContentCorruptionError(
-                        "visible calibration manifest references missing content"
-                    ) from error
-                except OSError:
-                    return None
-                return True
-
-            operation = PreparedArtifactCommit(
-                run_id=run_id,
-                result=reference,
-                manifest_payload=payload,
-                publish=publish,
-                inspect=inspect,
-                repository_borrow=commit_borrow,
-            )
-        except BaseException:
-            commit_borrow.close()
-            raise
-        try:
-            context.track_prepared_commit(operation)
-        except BaseException:
-            operation.abandon()
-            raise
-        return operation
+    ) != payload:
+        raise ValueError("calibration.json failed its canonical round-trip")
+    atomic_write_bytes(record_path, payload)
+    return reference
 
 
 def compile_calibration_artifact_plan(
     source_capture_ref: CaptureArtifactRef,
-    capture_repository: "CaptureRepository",
-    calibration_repository: CalibrationRepository,
+    captures_root: Path,
+    calibrations_root: Path,
     request: CalibrationAnalysisRequest,
     *,
     expected_readout_binding: ReadoutBindingKey,
     timeout_seconds: float,
     on_committed: Callable[[CalibrationArtifactRef], None] | None = None,
 ) -> RunPlan:
-    """Adapt one synchronous calibration calculation to the generic RunPlan."""
+    """Adapt one synchronous Calibration calculation to the generic RunPlan."""
 
-    from zlc_neutral_atom.capture.artifact import CaptureRepository
-    from .analysis import (
-        CalibrationAnalysisResult,
-        _analyze_calibration_resolved,
-    )
+    from .analysis import _analyze_calibration_resolved
 
     if not isinstance(source_capture_ref, CaptureArtifactRef):
         raise TypeError("source_capture_ref must be CaptureArtifactRef")
-    if type(capture_repository) is not CaptureRepository:
-        raise TypeError("capture_repository must be CaptureRepository")
-    if type(calibration_repository) is not CalibrationRepository:
-        raise TypeError("calibration_repository must be CalibrationRepository")
+    if not isinstance(captures_root, Path) or not captures_root.is_absolute():
+        raise ValueError("captures_root must be an absolute Path")
+    if not isinstance(calibrations_root, Path) or not calibrations_root.is_absolute():
+        raise ValueError("calibrations_root must be an absolute Path")
     if not isinstance(request, CalibrationAnalysisRequest):
         raise TypeError("request must be CalibrationAnalysisRequest")
     if request.expected_centers_xy is None:
@@ -599,105 +382,52 @@ def compile_calibration_artifact_plan(
     if on_committed is not None and not callable(on_committed):
         raise TypeError("on_committed must be callable or None")
     timeout = positive_real(timeout_seconds, "timeout_seconds")
-    if source_capture_ref.repository_id != capture_repository.repository_id:
-        raise ValueError("source capture belongs to another repository")
+    capture_root = captures_root.resolve()
+    calibration_root = calibrations_root.resolve()
 
     def preflight(context: RunContext) -> _PreparedCalibrationAnalysis:
-        borrows = acquire_repository_borrows(
-            capture_repository._root_lease,
-            calibration_repository._root_lease,
+        context.checkpoint()
+        source = _load_capture(capture_root, source_capture_ref)
+        if source.camera_provenance.binding != expected_readout_binding:
+            raise ValueError(
+                "source capture readout binding differs from the frozen request"
+            )
+        resolved = _resolve_calibration_source(
+            source,
+            request.layout,
+            checkpoint=context.checkpoint,
         )
-        try:
-            context.checkpoint()
-            source = capture_repository.admit(source_capture_ref)
-            if source.artifact.camera_provenance.binding != expected_readout_binding:
-                raise ValueError(
-                    "source capture readout binding differs from the frozen request"
-                )
-            resolved = _resolve_calibration_source(
-                source.artifact,
-                request.layout,
-                checkpoint=context.checkpoint,
-            )
-            context.checkpoint()
-            return (
-                source,
-                resolved,
-                borrows,
-            )
-        except BaseException as primary:
-            try:
-                release_repository_borrows(borrows)
-            except BaseException as close_error:
-                record_secondary_failure(
-                    primary,
-                    "repository borrow release also failed",
-                    close_error,
-                )
-            raise
+        context.checkpoint()
+        return source, resolved
 
     def execute(
         context: RunContext,
         prepared: _PreparedCalibrationAnalysis,
-    ) -> tuple[
-        CalibrationAnalysisResult,
-        tuple[RepositoryRootLeaseBorrow, ...],
-    ]:
-        (
-            source,
-            resolved,
-            borrows,
-        ) = prepared
+    ):
+        source, resolved = prepared
         context.checkpoint()
-        result = _analyze_calibration_resolved(
-            source,
-            request,
-            resolved,
-        )
+        result = _analyze_calibration_resolved(source, request, resolved)
         context.checkpoint()
-        return result, borrows
+        return result
 
     def cleanup(
         _context: RunContext,
-        prepared: _PreparedCalibrationAnalysis | None,
-        primary: BaseException | None,
+        _prepared: _PreparedCalibrationAnalysis | None,
+        _primary: BaseException | None,
     ) -> CleanupReport:
-        if prepared is not None and primary is not None:
-            (
-                _source,
-                _resolved,
-                borrows,
-            ) = prepared
-            release_repository_borrows(borrows)
         return CleanupReport()
 
-    def finalize(
-        context: PostSafetyContext,
-        executed: tuple[
-            CalibrationAnalysisResult,
-            tuple[RepositoryRootLeaseBorrow, ...],
-        ],
-    ) -> CalibrationArtifactRef:
-        result, borrows = executed
-        try:
-            for borrow in borrows:
-                borrow.require_active()
-            operation = calibration_repository.final_commit(context, result)
-            reference = context.commit_final(operation)
-            if on_committed is not None:
-                on_committed(reference)
-            return reference
-        finally:
-            release_repository_borrows(borrows)
-
-    def dispose_unfinalized(
-        executed: tuple[
-            CalibrationAnalysisResult,
-            tuple[RepositoryRootLeaseBorrow, ...],
-        ],
-    ) -> None:
-        _result, borrows = executed
-        release_repository_borrows(borrows)
+    def finalize(context: PostSafetyContext, result) -> CalibrationArtifactRef:
+        if not isinstance(context, PostSafetyContext):
+            raise TypeError("calibration finalize requires PostSafetyContext")
+        reference = write_calibration_artifact(
+            calibration_root,
+            result,
+            run_id=context.run_id.value,
+        )
+        if on_committed is not None:
+            on_committed(reference)
+        return reference
 
     return RunPlan(
         name="calibrate committed camera capture",
@@ -708,13 +438,13 @@ def compile_calibration_artifact_plan(
         cleanup=cleanup,
         finalize=finalize,
         timeout_seconds=timeout,
-        requires_final_commit=True,
-        dispose_unfinalized=dispose_unfinalized,
     )
 
 
 __all__ = [
-    "CALIBRATION_MANIFEST_FORMAT",
-    "CalibrationRepository",
+    "CALIBRATION_RECORD_FORMAT",
     "compile_calibration_artifact_plan",
+    "load_calibration_artifact",
+    "load_calibration_computation",
+    "write_calibration_artifact",
 ]

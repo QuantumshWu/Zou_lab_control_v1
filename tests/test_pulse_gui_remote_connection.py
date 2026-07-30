@@ -143,10 +143,7 @@ def _server_manifest():
 
 
 def _workspace_paths(root: Path) -> WorkspacePaths:
-    return WorkspacePaths.for_workspace(
-        (root / "authored").resolve(),
-        repository_root=root.resolve(),
-    )
+    return WorkspacePaths.for_workspace(root.resolve())
 
 
 def _run_offline_dac_target_gui(workspace: Path, application) -> None:

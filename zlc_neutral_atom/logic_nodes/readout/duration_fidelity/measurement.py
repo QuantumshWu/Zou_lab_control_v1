@@ -344,8 +344,8 @@ def bind_readout_duration_fidelity(
 
     if not isinstance(request, ReadoutDurationFidelityRequest):
         raise TypeError("request must be ReadoutDurationFidelityRequest")
-    if type(calibration) is not ResolvedCalibration:
-        raise TypeError("calibration must be an admitted ResolvedCalibration")
+    if not isinstance(calibration, ResolvedCalibration):
+        raise TypeError("calibration must be a loaded ResolvedCalibration")
     if not isinstance(pulse_port, BoundPulsePort):
         raise TypeError("pulse_port must be BoundPulsePort")
     if not isinstance(camera_port, BoundCapturePort):

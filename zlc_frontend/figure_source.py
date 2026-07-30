@@ -57,7 +57,9 @@ class FigureSource:
                 if self.site_map is None
                 else (
                     self.site_map.presentation_kind,
-                    self.site_map.site_geometry_identity,
+                    self.site_map.site_axis,
+                    self.site_map.coordinate_frame,
+                    id(self.site_map.centers_xy),
                 )
             ),
         )

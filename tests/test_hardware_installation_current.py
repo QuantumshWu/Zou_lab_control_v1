@@ -35,6 +35,7 @@ from zlc_neutral_atom.logic_nodes.camera_measurement.monitor import (
     CameraMonitorViewSpec,
     prepare_live_camera_measurement,
 )
+from zlc_neutral_atom.runtime.resources import DeviceIdentityEvidenceKind
 from zlc_neutral_atom.runtime.signal_source import SignalAssociationRequest
 from zlc_pulse import (
     PreparedPulseRef,
@@ -49,7 +50,7 @@ from zlc_pulse import (
     load_deployed_pulse_target,
     pulse_target_manifest_from_lanes,
 )
-from zlc_storage import canonical_digest, decode
+from zlc_storage import canonical_digest
 
 
 def _four_trigger_document(
@@ -314,8 +315,7 @@ class _LiveView:
         self.dataset = None
         self.failure = None
 
-    def bind(self, dataset, *, run_id, causation_domain_id):
-        assert run_id and causation_domain_id
+    def bind(self, dataset):
         self.dataset = dataset
 
     def updated(self):
@@ -365,12 +365,36 @@ def test_fake_real_installation_runs_both_active_e0_paths_and_binds_ports() -> N
         assert all(camera.arm_calls == [(4, (4,), 4)] for camera in cameras)
         catalog = composition.runtime.device_catalog
         assert catalog.roles("camera") == ("camera", "mot_camera")
+        physical_identities = {}
         for role in ("camera", "mot_camera"):
             reference = catalog.require(role).ref
             port = composition.runtime.camera_port(reference)
+            physical_identities[role] = port.capability.binding_stamp.physical_identity
             evidence = port.capability.camera_capability_evidence
             assert evidence.exact_external_trigger_qualification_digest is not None
             assert port.capability.payload_contract.value_schema.dtype == np.dtype("u1")
+        pulse_port = composition.runtime.pulse_port(catalog.require("sequencer").ref)
+        physical_identities["sequencer"] = (
+            pulse_port.device.binding_stamp.physical_identity
+        )
+        assert {
+            role: identity.stable_device_identity
+            for role, identity in physical_identities.items()
+        } == {
+            "camera": "dcam-device-index:0",
+            "mot_camera": "pylon-serial:test-basler",
+            "sequencer": f"remote-pulse-endpoint:test-host:{config.pulse_port}",
+        }
+        assert {
+            identity.evidence_kind for identity in physical_identities.values()
+        } == {DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT}
+        asset_map_revisions = {
+            identity.asset_map_revision for identity in physical_identities.values()
+        }
+        assert len(asset_map_revisions) == 1
+        asset_map_revision = next(iter(asset_map_revisions))
+        assert len(asset_map_revision) == 64
+        assert catalog.installation_id == f"installation-{asset_map_revision[:20]}"
         assert composition.readout_apparatus_facts[0].trigger_channel == "ch11"
         assert tuple(
             role for role, _authority in composition.camera_signal_association_authorities
@@ -483,7 +507,6 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
         cursor = prepared.open_associated_signal_cursor("frame_0")
         token = cursor.arm_signal_association(
             SignalAssociationRequest(
-                "fake-hardware-window",
                 session_id,
                 artifact.fingerprint,
                 4,
@@ -516,20 +539,14 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
             cursor.bind_signal_association(token, extra_channel_terminal)
         cursor.bind_signal_association(token, terminal)
         events = tuple(cursor.next_associated_signal(token, 1.0) for _ in range(4))
-        evidence = cursor.finish_signal_association(token)
+        cursor.finish_signal_association(token)
         cursor.close()
 
         assert tuple(event.event_ref.sequence for event in events) == (0, 1, 2, 3)
-        payload = decode(evidence.canonical_evidence)
-        assert payload["schema"].endswith("camera-measurement.pulse-association")
-        assert payload["terminal_evidence_kind"] == "HARDWARE_RAW_REGISTERS"
-        assert payload["physical_start_ordinal"] == 0
-        assert payload["physical_end_ordinal"] == 4
 
         rejected = prepared.open_associated_signal_cursor("frame_0")
         bad_token = rejected.arm_signal_association(
             SignalAssociationRequest(
-                "reject-simulated-terminal",
                 "simulated-cause",
                 artifact.fingerprint,
                 4,
@@ -563,7 +580,6 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
         missing_session_id = "missing-hardware-stamp"
         missing_token = missing_stamp.arm_signal_association(
             SignalAssociationRequest(
-                "reject-missing-hardware-stamp",
                 missing_session_id,
                 artifact.fingerprint,
                 4,
@@ -676,7 +692,6 @@ def test_real_camera_association_rejects_an_undrained_pre_fire_frame() -> None:
             with pytest.raises(RuntimeError, match="has produced frames"):
                 cursor.arm_signal_association(
                     SignalAssociationRequest(
-                        "reject-undrained-frame",
                         "undrained-cause",
                         artifact.fingerprint,
                         4,

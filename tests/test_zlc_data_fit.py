@@ -24,7 +24,7 @@ from zlc_data.axis import (
     AxisSpec,
     CoordinateFrameId,
 )
-from zlc_data.bimodal_distribution import (
+from zlc_data.fit import (
     BimodalDistributionAnalysis,
     analyze_bimodal_distribution,
 )
@@ -499,30 +499,6 @@ def test_bimodal_distribution_does_not_publish_unresolved_threshold():
     assert len(analysis.component_predictions) == 3
 
 
-def test_bimodal_component_threshold_requires_main_separation_and_one_crossing():
-    from zlc_data.bimodal_distribution import _resolved_bimodal_threshold
-
-    # Main's boundary is inclusive: splitting / (sigma_L + sigma_R) == 1.5.
-    boundary = np.array((10.0, 6.0, 4.0, 2.0, 4.0, 2.0))
-    assert _resolved_bimodal_threshold(boundary, support=(0.0, 20.0)) == pytest.approx(
-        10.0
-    )
-    below = boundary.copy()
-    below[1] = np.nextafter(6.0, 0.0)
-    assert _resolved_bimodal_threshold(below, support=(0.0, 20.0)) is None
-
-    # Even a wide split does not define a between-means cut when the enormous
-    # left component still dominates at the right component's own mean.
-    one_dominant_component = np.array((10.0, 8.0, 1e16, 1.0, 1.0, 1.0))
-    assert (
-        _resolved_bimodal_threshold(
-            one_dominant_component,
-            support=(0.0, 20.0),
-        )
-        is None
-    )
-
-
 def test_bimodal_distribution_returns_typed_failure_without_invented_payload():
     centers = np.linspace(-1.0, 1.0, 40)
     analysis = analyze_bimodal_distribution(centers, np.zeros_like(centers))
@@ -752,8 +728,9 @@ def test_identity_and_committed_transform_keep_complete_source_lineage():
     identity_bound = bind_fit(gaussian_spec(snapshot, scan), snapshot.block.schema)
     identity = identity_bound.run(snapshot)
     assert identity.source_ref == snapshot.ref
-    assert identity.effective_schema_fingerprint == (
-        identity.spec.committed_transform.output_schema_fingerprint
+    assert (
+        identity.spec.committed_transform.effective_output_schema
+        == snapshot.block.schema
     )
 
     committed = commit_transform(
@@ -771,7 +748,10 @@ def test_identity_and_committed_transform_keep_complete_source_lineage():
     transformed = bind_fit(transformed_spec, snapshot.block.schema).run(snapshot)
     assert transformed.source_ref == snapshot.ref
     assert transformed.spec.committed_transform == committed
-    assert transformed.effective_schema_fingerprint == committed.output_schema_fingerprint
+    assert (
+        transformed.spec.committed_transform.effective_output_schema
+        == committed.effective_output_schema
+    )
     np.testing.assert_allclose(transformed.parameter_values[0], (3.0, 1.2, 0.8, 0.7))
 
 

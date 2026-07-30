@@ -1,7 +1,7 @@
 """Exact named Dataset outputs published by neutral-atom applications.
 
 Output owners freeze the catalog-visible bare name together with the immutable
-Dataset and its join identity.  Desktop shells route these values; they do not
+Dataset.  Desktop shells route these values; they do not
 reconstruct arrays, axes, coverage, or lineage.
 """
 
@@ -11,14 +11,13 @@ from dataclasses import dataclass
 from typing import Mapping, Protocol, runtime_checkable
 
 from zlc_data import OwnedSnapshot
-from zlc_data.codec import dataset_revision_ref_to_tree
 from zlc_neutral_atom.runtime.dataset import (
     DatasetCoverage,
     DatasetPreviewSnapshot,
     MonitorCoverage,
     MonitorDatasetSnapshot,
 )
-from zlc_storage import canonical_digest, canonical_text, sha256_text
+from zlc_storage import canonical_text
 from .output_name import bare_output_name
 
 
@@ -48,15 +47,12 @@ class FinalDatasetOutput:
 
     declaration: DatasetOutputDeclaration
     snapshot: OwnedSnapshot
-    join_digest: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.declaration, DatasetOutputDeclaration):
             raise TypeError("declaration must be DatasetOutputDeclaration")
         if not isinstance(self.snapshot, OwnedSnapshot):
             raise TypeError("snapshot must be OwnedSnapshot")
-        digest = sha256_text(self.join_digest, "join_digest")
-        object.__setattr__(self, "join_digest", digest)
 
     @property
     def name(self) -> str:
@@ -74,7 +70,6 @@ class LiveDatasetOutput:
     declaration: DatasetOutputDeclaration
     snapshot: OwnedSnapshot
     coverage: DatasetCoverage | MonitorCoverage
-    join_digest: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.declaration, DatasetOutputDeclaration):
@@ -89,8 +84,6 @@ class LiveDatasetOutput:
         )
         if self.coverage.total_cells != total:
             raise ValueError("live coverage differs from projected Dataset geometry")
-        digest = sha256_text(self.join_digest, "join_digest")
-        object.__setattr__(self, "join_digest", digest)
 
     @property
     def name(self) -> str:
@@ -137,23 +130,11 @@ def single_live_dataset_output(
 
     if not isinstance(declaration, DatasetOutputDeclaration):
         raise TypeError("declaration must be DatasetOutputDeclaration")
-    name = declaration.name
     if isinstance(frozen, MonitorDatasetSnapshot):
         if frozen.head is None:
             raise RuntimeError("monitor dataset has no accepted event head")
-        join_digest = frozen.head.payload_digest
     elif isinstance(frozen, DatasetPreviewSnapshot):
-        join_digest = canonical_digest(
-            {
-                "owner": "zlc_neutral_atom.identity-live-output",
-                "output_name": name,
-                "revision": dataset_revision_ref_to_tree(frozen.ref),
-                "coverage": {
-                    "written_cells": frozen.coverage.written_cells,
-                    "total_cells": frozen.coverage.total_cells,
-                },
-            }
-        )
+        pass
     else:
         raise TypeError(
             "live output requires MonitorDatasetSnapshot or DatasetPreviewSnapshot"
@@ -162,33 +143,6 @@ def single_live_dataset_output(
         declaration,
         frozen.snapshot,
         frozen.coverage,
-        join_digest,
-    )
-
-
-def final_dataset_join_digest(
-    *,
-    owner: str,
-    declaration: DatasetOutputDeclaration,
-    source_identity: object,
-    snapshot: OwnedSnapshot,
-) -> str:
-    """Return the canonical join identity shared by every FINAL owner."""
-
-    owner_name = canonical_text(owner, "final output owner")
-    if not isinstance(declaration, DatasetOutputDeclaration):
-        raise TypeError("declaration must be DatasetOutputDeclaration")
-    if not isinstance(snapshot, OwnedSnapshot):
-        raise TypeError("snapshot must be OwnedSnapshot")
-    return canonical_digest(
-        {
-            "owner": "zlc_neutral_atom.final-dataset-output",
-            "domain_owner": owner_name,
-            "output_name": declaration.name,
-            "output_contract_id": declaration.contract_id,
-            "source_identity": source_identity,
-            "dataset": dataset_revision_ref_to_tree(snapshot.ref),
-        }
     )
 
 
@@ -198,6 +152,5 @@ __all__ = [
     "LiveDatasetOutput",
     "LiveDatasetOutputOwner",
     "LiveDatasetSnapshotSource",
-    "final_dataset_join_digest",
     "single_live_dataset_output",
 ]

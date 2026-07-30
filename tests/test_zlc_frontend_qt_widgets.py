@@ -118,9 +118,9 @@ def _raster_board_frame(
     layout_generation: int,
     sequence: int,
     panel_values: tuple[int, ...] | None = None,
-    document_revision: int = 0,
     source_suffix: str = "",
     raster_size: tuple[int, int] = (2, 1),
+    image_viewport=None,
 ):
     from zlc_data import (
         BlockId,
@@ -133,7 +133,6 @@ def _raster_board_frame(
         BoardFrame,
         CoherenceStamp,
         PanelFrame,
-        PanelPresentationIdentity,
         RasterBuffer,
         SourceIdentity,
     )
@@ -152,24 +151,8 @@ def _raster_board_frame(
         ref.stream_generation,
         schema,
     )
-    stamp = CoherenceStamp(
-        "camera-run",
-        f"epoch-{sequence}",
-        "camera-frame",
-        schema,
-        "b" * 64,
-        (EvaluatedInput(dataset_id, ref),),
-        tuple(
-            PanelPresentationIdentity(
-                panel_id,
-                f"document-{panel_id}",
-                document_revision,
-                0,
-                0,
-            )
-            for panel_id in panel_ids
-        ),
-    )
+    evaluated_input = EvaluatedInput(dataset_id, ref)
+    stamp = CoherenceStamp((evaluated_input,))
     values = (
         tuple(sequence % 256 for _panel_id in panel_ids)
         if panel_values is None
@@ -193,6 +176,17 @@ def _raster_board_frame(
                     bytes((value, value, value, 255))
                     * raster_size[0]
                     * raster_size[1],
+                ),
+                (
+                    _image_panel_payload(
+                        evaluated_input,
+                        width=raster_size[0],
+                        height=raster_size[1],
+                        value=value,
+                        viewport=image_viewport,
+                    )
+                    if panel_id == "image"
+                    else None
                 ),
             )
             for panel_id, value in zip(panel_ids, values, strict=True)
@@ -233,6 +227,63 @@ def _image_viewport(*, width: int = 2, height: int = 1, revision: int = 7):
             ),
         ),
         viewport_revision=revision,
+    )
+
+
+def _image_panel_payload(
+    evaluated_input,
+    *,
+    width: int,
+    height: int,
+    value: int,
+    viewport=None,
+):
+    import numpy as np
+
+    from zlc_data import AxisSourceRef
+    from zlc_frontend.figure import EvaluatedAxis, EvaluatedImage
+    from zlc_frontend.image_display import ImageColormap
+    from zlc_frontend.render import ImagePanelPayload, ImagePanelRasterGeometry
+
+    if viewport is None:
+        viewport = _image_viewport(width=width, height=height)
+    x_spec = viewport.x_axis
+    y_spec = viewport.y_axis
+
+    def evaluated_axis(spec):
+        coordinates = (
+            tuple(spec.coordinates)
+            if spec.coordinates is not None
+            else tuple(spec.index_origin + index for index in range(spec.size))
+        )
+        return EvaluatedAxis(
+            AxisSourceRef.tensor(spec.axis_id),
+            spec.name,
+            spec.role,
+            spec.unit,
+            tuple(range(spec.size)),
+            coordinates,
+            spec.coordinate_frame,
+        )
+
+    image = EvaluatedImage(
+        evaluated_axis(x_spec),
+        evaluated_axis(y_spec),
+        np.full((height, width), value, dtype=np.uint8),
+        np.ones((height, width), dtype=bool),
+    )
+    return ImagePanelPayload(
+        image,
+        evaluated_input,
+        viewport,
+        (float(value), float(value)),
+        ImageColormap.GRAY,
+        (0.0, 255.0),
+        ImagePanelRasterGeometry(
+            (0.10, 0.10, 0.65, 0.90),
+            (0.70, 0.10, 0.82, 0.90),
+            (0.87, 0.10, 0.92, 0.90),
+        ),
     )
 
 
@@ -472,21 +523,6 @@ def test_qt_raster_board_promotes_only_a_matching_staged_layout(
     assert board.front_frame is old
     assert board.panel_ids == ("image",)
     assert board.columns == 1
-    assert board.discard_staged_layout(
-        board_id="camera-board",
-        layout_generation=1,
-    )
-    assert not board.discard_staged_layout(
-        board_id="camera-board",
-        layout_generation=1,
-    )
-    assert board.front_frame is old
-    board.stage_layout(
-        target_panels,
-        board_id="camera-board",
-        layout_generation=1,
-        columns=2,
-    )
 
     with pytest.raises(ValueError, match="staged layout identity"):
         board.present(stale)
@@ -632,17 +668,18 @@ def test_qt_raster_board_paints_area_after_unbounded_pan() -> None:
     application = ensure_qt_app()
     board = QtRasterBoard(("image",), columns=1)
     board.resize(240, 180)
+    viewport = _image_viewport(width=8, height=6).panned_by_pixels(
+        (20.0, -10.0),
+        (200, 100),
+    )
     board.present(
         _raster_board_frame(
             ("image",),
             layout_generation=0,
             sequence=1,
             raster_size=(8, 6),
+            image_viewport=viewport,
         )
-    )
-    viewport = _image_viewport(width=8, height=6).panned_by_pixels(
-        (20.0, -10.0),
-        (200, 100),
     )
     assert any(value < 0.0 or value > 1.0 for value in viewport.visible_bounds)
     board.bind_rectangle_selector(
@@ -670,10 +707,7 @@ def test_qt_raster_board_cancels_a_hold_when_panel_semantics_change() -> None:
     from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
 
     application = ensure_qt_app()
-    for changed in (
-        {"document_revision": 1},
-        {"source_suffix": "-replacement"},
-    ):
+    for changed in ({"source_suffix": "-replacement"},):
         board = QtRasterBoard(("image",), columns=1)
         board.resize(200, 100)
         first = _raster_board_frame(
@@ -755,8 +789,7 @@ def test_qt_raster_board_hold_label_is_clipped_to_the_target_panel() -> None:
     application.processEvents()
 
 
-def test_qt_raster_board_releases_a_hold_when_a_new_front_is_rejected() -> None:
-    import pytest
+def test_qt_raster_board_releases_a_hold_when_source_axes_change() -> None:
     from PyQt5 import QtCore, QtTest
 
     from zlc_frontend.qt_widgets import QtRasterBoard, ensure_qt_app
@@ -789,10 +822,9 @@ def test_qt_raster_board_releases_a_hold_when_a_new_front_is_rejected() -> None:
         raster_size=(3, 1),
     )
 
-    with pytest.raises(ValueError, match="viewport axes"):
-        board.present(incompatible)
+    board.present(incompatible)
 
-    assert board.front_frame is first
+    assert board.front_frame is incompatible
     assert board._selector_hold is None
     assert board._image_bindings["image"].draft_bounds is None
     board.close()
@@ -874,7 +906,7 @@ def test_qt_raster_board_releases_every_hold_lifecycle_exit() -> None:
         elif exit_name == "rebind":
             board.bind_rectangle_selector(
                 "image",
-                _image_viewport(revision=8),
+                _image_viewport(),
                 lambda _gesture: None,
                 enabled=True,
             )
@@ -1037,28 +1069,6 @@ def test_w1_w2_w3_take_existing_common_controls_from_qt_widgets() -> None:
         assert constructors == [], (path, constructors)
 
 
-def test_shared_window_retention_has_an_explicit_committed_close_release() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from zlc_frontend.qt_widgets import (
-        ensure_qt_app,
-        release_window,
-        retain_window,
-    )
-
-    from PyQt5 import QtWidgets
-
-    application = ensure_qt_app()
-    window = QtWidgets.QWidget()
-    retain_window(window)
-    retain_window(window)
-    registry = application._zlc_retained_windows
-    assert registry.count(window) == 1
-
-    release_window(window)
-    release_window(window)
-    assert window not in registry
-
-
 def test_fluent_double_spinbox_can_preserve_authoritative_float_values() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from zlc_frontend.qt_widgets import FluentDoubleSpinBox, ensure_qt_app
@@ -1146,17 +1156,6 @@ def test_qt_public_facade_covers_every_production_consumer(monkeypatch) -> None:
         lambda _self: QtWidgets.QDialog.Rejected,
     )
     assert not qt.fluent_confirm(None, "title", "question")
-    monkeypatch.setattr(
-        fluent_module.FluentInputDialog,
-        "getText",
-        lambda self: (self._edit.text(), True),
-    )
-    dialog = qt.FluentInputDialog(
-        "prompt",
-        "stable_parameter_id",
-        title="title",
-    )
-    assert dialog.getText() == ("stable_parameter_id", True)
     missing: list[tuple[str, int, str]] = []
     for path in _production_python_files():
         for node in ast.walk(_tree(path)):

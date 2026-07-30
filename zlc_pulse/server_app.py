@@ -26,14 +26,14 @@ from .manifest import PulseTargetManifest, pulse_target_manifest_from_xdc
 from .server import PulseExecutionService, serve_pulse_execution_service
 from .target import PulseTarget, load_pulse_target
 from .transport import (
-    DeployedStreamerSession as CurrentDeployedStreamerSession,
+    DeployedStreamerSession as _CurrentDeployedStreamerSession,
     InterprocessDeviceLease,
     UartRegisterTransport,
     VivadoAxiRegisterTransport,
 )
 
 
-class DeployedStreamerSession(Protocol):
+class _DeployedStreamerSessionPort(Protocol):
     def start(self): ...
 
     def clear_host_config(self) -> None: ...
@@ -71,7 +71,7 @@ class DeployedStreamerSession(Protocol):
 class PulseServerRuntime:
     service: PulseExecutionService
     rpc_server: object
-    session: DeployedStreamerSession
+    session: _DeployedStreamerSessionPort
     _closed: bool = field(default=False, init=False, repr=False)
     _rpc_closed: bool = field(default=False, init=False, repr=False)
     _session_closed: bool = field(default=False, init=False, repr=False)
@@ -127,7 +127,7 @@ class PulseServerRuntime:
 
 def build_service_for_session(
     manifest: PulseTargetManifest,
-    session: DeployedStreamerSession,
+    session: _DeployedStreamerSessionPort,
     *,
     params: StreamerParams,
     clock_hz: float,
@@ -156,7 +156,7 @@ def build_service_for_session(
     )
 
 
-def bring_up_frozen_session(session: DeployedStreamerSession) -> None:
+def bring_up_frozen_session(session: _DeployedStreamerSessionPort) -> None:
     """Verify the approved deployment without synthesizing or programming hardware."""
 
     session.start()
@@ -195,7 +195,7 @@ def open_deployed_session(
     clock_hz: float,
     uart_port: str | None,
     uart_baud: int,
-) -> DeployedStreamerSession:
+) -> _DeployedStreamerSessionPort:
     if backend == "jtag-axi":
         transport = VivadoAxiRegisterTransport(
             state_dir=state_dir,
@@ -210,7 +210,7 @@ def open_deployed_session(
         )
     else:
         raise ValueError("backend must be 'jtag-axi' or 'uart'")
-    return CurrentDeployedStreamerSession(
+    return _CurrentDeployedStreamerSession(
         transport,
         device_lease=InterprocessDeviceLease(),
         deployed_target=target,

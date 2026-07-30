@@ -9,6 +9,7 @@ contracts remain covered by their owning tests.
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
 
 import nbformat
 from nbclient import NotebookClient
@@ -36,9 +37,11 @@ _REQUIRED_CURRENT_CODE = (
     "exp.nodes.occupancy",
     "exp.nodes.camera_measurement",
     "exp.nodes.pulse_scan",
+    "scan_slot_program",
+    "bind_scan",
+    "run_scan",
     "exp.nodes.temperature",
     "resolve_api_parameters",
-    "FrozenScanTable",
     "temperature_release_recapture_request",
     "aggregate_fidelity",
     "global_fidelity",
@@ -74,19 +77,26 @@ def test_there_is_one_complete_current_user_tutorial() -> None:
         assert text in markdown
     for text in _REQUIRED_CURRENT_CODE:
         assert text in code
+    assert "zlc_neutral_atom" not in code
 
 
 def test_the_checked_in_tutorial_executes_on_the_virtual_installation(
     tmp_path,
     monkeypatch,
 ) -> None:
+    project = (tmp_path / "tutorial-workspace").resolve()
+    pulses = project / "pulses"
+    pulses.mkdir(parents=True)
+    for name in (
+        "camera_imaging_address_switch.json",
+        "imaging_template.json",
+        "probe_template.json",
+        "release_recapture.json",
+    ):
+        shutil.copyfile(ROOT / "pulses" / name, pulses / name)
     monkeypatch.setenv(
-        "ZLC_TUTORIAL_AUTHORED_ROOT",
-        str(ROOT),
-    )
-    monkeypatch.setenv(
-        "ZLC_TUTORIAL_REPOSITORY_ROOT",
-        str(tmp_path / "tutorial-workspace"),
+        "ZLC_TUTORIAL_PROJECT_ROOT",
+        str(project),
     )
     notebook = _load_notebook()
     executed = NotebookClient(

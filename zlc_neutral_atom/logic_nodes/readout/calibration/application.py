@@ -1,15 +1,13 @@
-"""Application request for one committed-capture calibration Run."""
+"""Application request for one direct CaptureArtifact calibration Run."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from zlc_neutral_atom.capture.artifact import (
-    AdmittedCapture,
-    CaptureRepository,
-)
+from zlc_neutral_atom.capture.artifact import CaptureArtifact
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.runtime.run import RunPlan
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
@@ -25,7 +23,7 @@ _CALIBRATION_RUN_DEADLINE_SECONDS = 300.0
 
 @dataclass(frozen=True)
 class CalibrationArtifactRequest:
-    """Freeze one committed capture, its binding, and calibration intent."""
+    """Freeze one persisted capture, its binding, and calibration intent."""
 
     source_capture_ref: CaptureArtifactRef
     readout_binding: ReadoutBindingKey
@@ -43,11 +41,11 @@ class CalibrationArtifactRequest:
 def calibration_request_from_computation(
     computation: CalibrationComputation,
 ) -> CalibrationArtifactRequest:
-    """Recover the exact editable request owned by one admitted computation.
+    """Recover the exact editable request owned by one loaded computation.
 
     Artifact internals remain a readout-domain concern.  A GUI may edit the
     returned request, but it never reconstructs source binding or analysis
-    authority from the artifact/report pair itself.
+    intent outside the artifact/report pair itself.
     """
 
     from .analysis import CalibrationComputation
@@ -63,19 +61,18 @@ def calibration_request_from_computation(
 
 
 def build_calibration_artifact_request(
-    source: AdmittedCapture,
+    source: CaptureArtifact,
     analysis: CalibrationAnalysisRequest,
 ) -> CalibrationArtifactRequest:
-    """Bind calibration intent to one admitted capture's physical identity."""
+    """Bind calibration intent to one loaded capture's physical identity."""
 
-    if type(source) is not AdmittedCapture:
-        raise TypeError("source must be an admitted capture")
-    source._require_authority()
+    if not isinstance(source, CaptureArtifact):
+        raise TypeError("source must be CaptureArtifact")
     if not isinstance(analysis, CalibrationAnalysisRequest):
         raise TypeError("analysis must be CalibrationAnalysisRequest")
     return CalibrationArtifactRequest(
-        source.reference,
-        source.artifact.camera_provenance.binding,
+        source.ref,
+        source.camera_provenance.binding,
         analysis,
     )
 
@@ -83,29 +80,26 @@ def build_calibration_artifact_request(
 def prepare_calibration_artifact_plan(
     request: CalibrationArtifactRequest,
     *,
-    capture_repository: CaptureRepository,
-    calibration_repository,
+    captures_root: Path,
+    calibrations_root: Path,
     on_committed: Callable[[CalibrationArtifactRef], None] | None = None,
 ) -> RunPlan:
     """Compile one calibration request without exposing its physical join."""
 
     if not isinstance(request, CalibrationArtifactRequest):
         raise TypeError("request must be CalibrationArtifactRequest")
-    from .repository import (
-        CalibrationRepository,
-        compile_calibration_artifact_plan,
-    )
+    from .repository import compile_calibration_artifact_plan
 
-    if type(capture_repository) is not CaptureRepository:
-        raise TypeError("capture_repository must be CaptureRepository")
-    if type(calibration_repository) is not CalibrationRepository:
-        raise TypeError("calibration_repository must be CalibrationRepository")
+    if not isinstance(captures_root, Path) or not captures_root.is_absolute():
+        raise ValueError("captures_root must be an absolute Path")
+    if not isinstance(calibrations_root, Path) or not calibrations_root.is_absolute():
+        raise ValueError("calibrations_root must be an absolute Path")
     if on_committed is not None and not callable(on_committed):
         raise TypeError("on_committed must be callable or None")
     return compile_calibration_artifact_plan(
         request.source_capture_ref,
-        capture_repository,
-        calibration_repository,
+        captures_root,
+        calibrations_root,
         request.analysis,
         expected_readout_binding=request.readout_binding,
         timeout_seconds=_CALIBRATION_RUN_DEADLINE_SECONDS,
