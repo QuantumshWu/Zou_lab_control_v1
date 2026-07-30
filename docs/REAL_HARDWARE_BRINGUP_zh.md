@@ -62,7 +62,7 @@ python pulse_gui.py            # 默认 Offline，可编辑/Preview但执行按�
 
   ```python
   from pathlib import Path
-  from Zou_lab_control.api import InstallationConfigDocument, connect
+  from Zou_lab_control.api import InstallationConfigDocument, WorkspacePaths, connect
 
   installation = InstallationConfigDocument.from_parameters(
       "remote_pulse",
@@ -72,9 +72,8 @@ python pulse_gui.py            # 默认 Offline，可编辑/Preview但执行按�
           "transport_timeout_seconds": 120.0,
       },
   )
-  repository = Path("results") / "remote-pulse"
-  repository.parent.mkdir(exist_ok=True)
-  exp = connect(installation, repository=repository)
+  workspace = WorkspacePaths.for_workspace(Path.cwd())
+  exp = connect(installation, workspace=workspace)
   exp.pulse_gui()
   ```
 
@@ -99,7 +98,7 @@ ordinal、hardware stamp、produced count、terminal drain 与 FPGA completed sc
 
 ```python
 from pathlib import Path
-from Zou_lab_control.api import InstallationConfigDocument, connect
+from Zou_lab_control.api import InstallationConfigDocument, WorkspacePaths, connect
 
 installation = InstallationConfigDocument.from_parameters(
     "hardware",
@@ -113,7 +112,10 @@ installation = InstallationConfigDocument.from_parameters(
         # 按实际工作点覆盖 exposure / ROI / binning / trigger source。
     },
 )
-exp = connect(installation, repository=Path("results") / "hardware")
+exp = connect(
+    installation,
+    workspace=WorkspacePaths.for_workspace(Path.cwd()),
+)
 exp.task_console()
 ```
 

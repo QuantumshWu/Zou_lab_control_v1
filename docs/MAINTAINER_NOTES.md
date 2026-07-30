@@ -139,6 +139,10 @@ symbols are zero.
   shared selector geometry, and no GUI-thread Agg during wheel/pan.
 - `git diff --check`, exact user-file isolation, and both current and cumulative
   RTL/Tcl/XDC/bitstream diff checks pass with zero frozen-hardware changes.
+- The final real-hardware runbook audit removed the retired `repository=` call
+  shape from both executable examples; they now bind the current public
+  `WorkspacePaths` contract. README storage wording likewise describes the
+  direct-file/record-last model rather than the deleted content-addressed store.
 
 ## Remaining external acceptance
 

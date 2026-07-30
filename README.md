@@ -10,7 +10,7 @@ The current public products are:
 - a sequencer-only `remote_pulse` installation;
 - a full `hardware` installation package composing the remote FPGA, qCMOS DCAM
   readout camera, and Pylon MOT camera;
-- content-addressed experiment artifacts that can be reopened without exposing raw devices.
+- typed direct-file experiment artifacts that can be reopened without exposing raw devices.
 
 The full hardware package is software-ready for real-device E0/bring-up, but a
 particular apparatus is not qualified merely because the package exists or the
@@ -48,7 +48,7 @@ sequencer-only or complete hardware installation through DeviceManager.
 
 ```text
 zlc_data/          multidimensional data, selections, reductions, and fit
-zlc_storage/       canonical encoding and content-addressed persistence
+zlc_storage/       canonical encoding and durable atomic filesystem operations
 zlc_pulse/         PulseDocument, compiler, target contract, and wire protocol
 zlc_neutral_atom/  experiment domains, devices, SignalDataPlane, hosted runtime
 zlc_frontend/      figure/selector/Fit semantics, renderers, and shared Qt surfaces
