@@ -1,155 +1,34 @@
 # Maintainer checkpoint
 
-This file is only the current hand-off checkpoint. Normative architecture lives in
-`docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md`; execution and recovery rules live in
-`AGENTS.md`. Do not preserve superseded slice narratives here.
+本文件只记录当前交接点。规范架构见`docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md`，执行方法见`AGENTS.md`，活动问题清单见仓库外`../ARCHITECTURE_AUDIT_CURRENT.md`。
 
-## Repository state
+## 当前状态
 
-- Branch: `codex/system-architecture-migration`.
-- Reopened M1–M6 closure HEAD: `a74b12bed9c1153a9c66956e6752a7bddd8d32c4`.
-- Current checkpoint: the commit containing this file closes the M7 software
-  evidence and cleanup cut. It is GO for the connected-hardware E0 run; it does
-  not claim that the real qCMOS/FPGA path has already been exercised.
-- External audit ledger: `../ARCHITECTURE_AUDIT_CURRENT.md`. It remains a temporary
-  implementation checklist until the real-hardware E0 gate is closed, then must
-  be deleted rather than retained as a second architecture document.
-- Expected worktree exception: untracked user file `pulses/scan_test.json`. Never
-  read, modify, move, delete, stage, or commit it.
-- RTL, Tcl, XDC, bitstream, wire protocol, and deployed hardware assets are frozen
-  and unchanged.
+- Branch：`codex/system-architecture-migration`。
+- 重开基线HEAD：`476d125304fc90b6ef4f5009184dd2119206fcc2`。
+- 当前checkpoint：C0规范与清单冻结；旧“M7软件已闭合/只剩真机E0”结论已被用户现场证据推翻，不得继续引用。
+- 当前实现仍为NOT DONE；下一唯一工作是§8 C1的`zlc_plot`单一绘图全栈替换。
+- 预期worktree例外：未跟踪用户文件`pulses/scan_test.json`。永远不得读取、修改、移动、删除、stage或commit。
+- RTL、Tcl、XDC、bitstream和wire protocol冻结；C0无硬件改动。
 
-## Resume protocol
+## C0 已冻结的事实
 
-1. Read the complete active `/goal`, then `AGENTS.md` and this file.
-2. Derive state from branch, HEAD/tree, status, recent log, and diff. Do not replay
-   M1–M6 or re-explain already closed work.
-3. Read audit §1.0–§1.6, M7, §9, and only the System Architecture sections needed
-   for the failing M7 gate.
-4. Recheck production owner/deletion/public-concept/LOC deltas, frozen hardware,
-   and user-file isolation before editing.
-5. A broad-test failure may repair only a still-valid physical/public contract.
-   Rewrite or delete stale tests; never restore a retired owner or compatibility
-   surface.
+- 生产包固定基线：381 Python modules / 161,566 physical LOC / 918 top-level classes / 552 dataclasses / 32 enums。tests为131 modules / 49,822 LOC。
+- 外部接纳源：`zlc_plot main@4fca73fcafc5b0a65a994399cf4641ed3b52bc8a`。只纳入tracked核心、`py.typed`和唯一Helvetica asset；排除外部`zlc_data`、`qt_controls.py`、notebook/PNG/build/egg-info/cache。
+- 拟纳入zlc_plot基线：30 modules / 25,000 LOC / 178 classes / 131 dataclasses / 17 enums。
+- 当前frontend旧绘图删除闭包：69 modules / 36,910 LOC；当前data Fit删除闭包：7 modules / 4,931 LOC；DataFigure第二Fit/worker闭包另有3 modules。C1必须明显净删，不能再包wrapper。
+- 数据权威仍是当前`zlc_data`的`OwnedSnapshot/DataSchema/PointTable/GridTopology/dtype/validity`；zlc_plot只通过一个私有readonly、尽量零拷贝adapter消费，不引入第二public Dataset。
+- 接纳源的未引用轴聚合/全数组Histogram flatten/R-as-Rolling-history已被证伪。必要public修订固定为`HistogramPlot.samples`、移除`RollingPlot.x`并使用session-private revision history、`PlotSession.replace_spec()`、现有`SelectionData/FitSelection.source_revisions`、`fit_all_facets: bool`和`FacetFitBatchResult`；不增加public axis-selection/history Dataset/DTO。`FitScope`继续表示selector/viewport/all样本范围。
+- Device终态是ordered heterogeneous DeviceInstance graph + leaf type descriptor；Logic终态是一个generic host + 极小leaf；Task takeover、Plot/Logic Edit同draft、visible project task/run outputs与Pulse narrow hold/step均已写入唯一架构文档。
 
-## Reopened M1–M6 closure
+## C1 完成条件
 
-The implementation now follows the System Architecture's smaller terminal model:
+1. 先建立接纳源characterization：六plot kinds、selector、Fit、DPR/resize、live/raster/style/export/PulseTimeline、N-D/validity/non-grid/grid/dtype/zero-copy，以及物理维覆盖、Histogram显式samples、无topology双point-axis拒绝、Rolling私有history/monitor-latest/exact displayed revisions/spec-change reset、Camera monitor publication=`(1,1,*frame)`。
+2. 在同一未提交dependency-closed cut中纳入zlc_plot、完成唯一data adapter并迁移TaskConsole、Calibration、Occupancy、DataFigure、FigureViewer、Edit、Pulse preview与public API。
+3. 同cut删除全部旧plot/projection/selector/Fit/render/raster/style/layout owners、`MONITOR_HISTORY` Dataset role、Camera `history_cycles`与point-history/capture-preview路径、`MonitorDataset.append_window`环形分支、旧tests、font副本和死imports；`MonitorDataset.latest_cell`必须保留原stream validation/revision/event-ref/gap/atomic snapshot职责。不得出现兼容re-export、history-in-P或双runtime checkpoint。
+4. 正式Qt快轨至少证明Camera→live Image→Area→第二Image→Fit、Distribution、Calibration report、FacetGrid all-facets、FigureViewer与Pulse preview。
+5. 记录固定口径LOC/class/dataclass/enum、删除owner、profiling和GUI证据后才能commit并进入C2。
 
-- Runtime identity uses typed stream/generation/sequence/event/parent facts. Ordinary
-  live values, Camera payloads, signal joins, Figure derivations, spans, and ordinary
-  artifacts no longer compute payload SHA or mirror the same lineage through digest
-  lattices.
-- Experiment application is the only Run/admission lifecycle owner. SignalPlane owns
-  generations, routes, publications, exact parents, dependency closure, and atomic
-  withdrawal; its duplicate Run lifecycle API/state is gone.
-- Project `_output` is the only experimental output root. Capture, PulseScan,
-  Calibration, Occupancy, Fit, and Figure persistence use typed relative path refs,
-  original-dtype direct files, and domain-record-last atomic publication. Generic CAS,
-  repository leases, prepared commit/pending inspection, and hidden repository roots
-  are gone. Hardware interprocess leases remain unchanged.
-- Calibration owns physical readout facts and raw per-site samples. The generic
-  frontend Distribution/Histogram owner alone performs bins, bimodal analysis,
-  threshold validation, overlay, and style. Synthetic population axes, centered-zero
-  thresholds, pooled pseudo-pages, and leaf-local plotting truth are gone. Explicit
-  frame saving and saved-frame recalibration write below
-  `_output/calibrations/<run-name>/`.
-- Camera finite/live products preserve source dtype and fixed `R×P×data_shape`.
-  Occupancy, MOT, duration fidelity, release-recapture, selectors, and Fit retain exact
-  parent/event semantics without duplicate repository, presentation, or result owners.
-- PulseScan remains autonomous streamed and consumes an arbitrary associated `y`
-  signal. `exp.nodes.pulse_scan` now provides public scan-slot/API-slot authoring,
-  bind, prepare, start, run, load, and materialize operations. TaskConsole stores a
-  portable relative pulse path; the PulseScan package resolves it through the same
-  application-injected pulse loader used by the public API before program binding.
-- Tutorial PulseScan code imports no neutral internals. Direct artifact/archive modules
-  are named for what they do rather than pretending to be generic repositories.
+## 恢复协议
 
-## Deleted owner closure
-
-Ten production modules are deleted from the base tree:
-
-- `zlc_data/bimodal_distribution.py`
-- `zlc_neutral_atom/logic_nodes/mot_field/ui/__init__.py`
-- `zlc_neutral_atom/logic_nodes/mot_field/ui/view_projection.py`
-- `zlc_neutral_atom/logic_nodes/pulse_scan/repository.py`
-- `zlc_neutral_atom/logic_nodes/readout/calibration/task_output.py`
-- `zlc_neutral_atom/logic_nodes/readout/occupancy/repository.py`
-- `zlc_neutral_atom/runtime/commit.py`
-- `zlc_storage/content_store.py`
-- `zlc_storage/repository_lease.py`
-- `zlc_workbench/data_figure/archive_repository.py`
-
-The three replacement files are direct domain operations, not new layers:
-
-- `zlc_neutral_atom/logic_nodes/pulse_scan/artifact.py`
-- `zlc_neutral_atom/logic_nodes/readout/occupancy/artifact.py`
-- `zlc_workbench/data_figure/archive_io.py`
-
-Production imports of every retired module and of CAS/commit/presentation mirror
-symbols are zero.
-
-## Fixed-scope complexity
-
-- Package Python (`Zou_lab_control`, `zlc_data`, `zlc_frontend`, `zlc_neutral_atom`,
-  `zlc_pulse`, `zlc_storage`, `zlc_workbench`): 381 modules, 161,566 physical lines,
-  918 top-level classes, 552 dataclass declarations, and 32 enum declarations.
-- Root launchers: 4 modules / 396 lines.
-- Formal FPGA Python outside verification/tests: 8 modules / 2,825 lines.
-- Complete package diff from `41f39da`, with renames expanded for a stable deletion
-  count: `+5,846/-15,291`, net `-9,445`, added/deleted ratio `0.382`.
-- The M7 production delta itself is `+43/-78`, net `-35`; its current-contract test
-  delta is `+17/-124`, net `-107`. It adds no class, dataclass, enum, module, manager,
-  registry, session/lane, compatibility model, memory budget, or hardware capability.
-
-## M7 closure evidence
-
-- Final broad current-contract suite: `1,139 passed, 1 skipped, 1 warning` in
-  250.18 s. The skip is the platform where NumPy `longdouble` is `float64`; the
-  warning is the documented Windows Jupyter/ZMQ Proactor-loop compatibility warning.
-- The only real broad-suite production defect was an application-boundary regression:
-  the public facade interpreted Capture storage fields. Capture now owns the direct
-  artifact-to-`ArtifactDatasetSource` projection, loads metadata first, checks cancel,
-  and materializes exactly once; the facade only delegates.
-- Remaining broad-suite failures were stale contracts for removed payload digests,
-  panel provenance, old `RunSnapshot` fields, and absolute Pulse paths. Their tests
-  now exercise the current public/physical contracts. The zero-consumer
-  `canonical_value_array` left by payload hashing is deleted rather than preserved for
-  a test.
-- The canonical style owner still uses bundled Helvetica Light for ordinary text and
-  now supplies ordered Arial glyph fallback for the Pulse infinity symbol. Ordinary
-  raster bytes were unchanged and the missing-glyph warning is gone; no leaf-local
-  font workaround was added.
-- Production compileall plus import-DAG, application-boundary, public-hardware,
-  installation, device/Logic-node discovery, and first-party-import ratchets:
-  `58 passed`.
-- The full production retired-symbol/module scan is zero, including the point/repeat,
-  Presented/presentation-sidecar, Fit lane/live-pin, TaskConsole lock, CAS/repository,
-  ordinary digest, Calibration fork, old panel-provenance, and old `RunSnapshot`
-  vocabularies. Forbidden reverse imports and concrete Logic-node imports from the
-  application tree are also zero.
-- Direct 2,304×2,304 `uint8` radial-Fit profile through the formal data entry uses the
-  private regular representation: packing 3.20 ms with 79,937-byte `tracemalloc`
-  peak; observations remain readonly, share source memory, and keep `uint8`; only two
-  2,304-element float64 axis vectors and broadcast validity exist. A warmed complete
-  solve took 446.25 ms, converged in 10 evaluations over all 5,308,416 pixels, and
-  used about 4.4–4.6 MiB peak working set. No H×W coordinate/index grid or full-size
-  float64 image is formed. The formal Qt product tests separately prove off-owner
-  submission, continuing live base fronts, exact overlay/parameter publication,
-  shared selector geometry, and no GUI-thread Agg during wheel/pan.
-- `git diff --check`, exact user-file isolation, and both current and cumulative
-  RTL/Tcl/XDC/bitstream diff checks pass with zero frozen-hardware changes.
-- The final real-hardware runbook audit removed the retired `repository=` call
-  shape from both executable examples; they now bind the current public
-  `WorkspacePaths` contract. README storage wording likewise describes the
-  direct-file/record-last model rather than the deleted content-addressed store.
-
-## Remaining external acceptance
-
-Only System Architecture §9.8 remains unclaimed: run the real E0 qualification and a
-representative autonomous streamed scan against the connected qCMOS/FPGA installation,
-using current working-point readback and per-run terminal/count/stamp/quiet-window
-reconciliation. A virtual adapter or short synthetic test cannot substitute for that
-physical evidence. If it passes, delete the external audit ledger and close the Goal;
-if it exposes a real adapter/RTL defect, reopen only the proven physical owner and keep
-the frozen-hardware rule until separate authorization exists.
+每次恢复严格依次完整读取当前Goal、`AGENTS.md`、本文件，再检查branch/HEAD/status/recent log；只读临时台账§0与当前C1相关的系统设计§2–§4、§6.4–§6.5、§8 C1、§9。不得重答或重做C0，不得从旧M1–M7叙事恢复。
