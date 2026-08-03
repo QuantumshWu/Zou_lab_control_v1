@@ -162,7 +162,7 @@
   `git diff --check`；Notebook/Pulse 相关合同为 `24 passed`。当前全仓 broad suite
   为 `832 passed, 1 skipped, 1 warning`（124.00 s），仅有既存 Windows zmq
   Proactor selector-thread warning。生产包当前 tracked Python 口径为 `297 modules /
-  129,823 physical LOC`，tests 为 `107 modules / 33,095 physical LOC`。
+  130,063 physical LOC`，tests 为 `107 modules / 33,095 physical LOC`。
 - C6-R7 将 `RasterPlotHost` 的 worker 调度从字符串/枚举反射改为显式的
   `_WorkerSessionAdapter` 方法调用；公开 host 方法直接声明 operation、dispatch mode 与
   coalescing 语义，pointer/facet 的 host-side transaction 仍保留在 host owner 内。
