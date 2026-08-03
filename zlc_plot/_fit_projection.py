@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import copy
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
@@ -492,7 +492,10 @@ class FitProjection:
             )
         elif isinstance(self._spec, HistogramPlot):
             bins = self._histogram_bins(self._view, state)
-            self._payload = self._view.histogram(bins=bins)
+            self._payload = self._view.histogram(
+                bins=bins,
+                samples=self._spec.samples,
+            )
         elif isinstance(self._spec, RollingPlot):
             group = () if self._spec.group is None else (self._spec.group,)
             payload = self._view.rolling(
@@ -505,7 +508,11 @@ class FitProjection:
         elif isinstance(self._spec, FacetGridPlot):
             cell = self._spec.cell
             bins = (
-                self._histogram_bins(self._view, state)
+                self._histogram_bins(
+                    self._view,
+                    state,
+                    sample_refs=(self._spec.facet, *cell.samples),
+                )
                 if isinstance(cell, HistogramPlot)
                 else None
             )
@@ -579,13 +586,19 @@ class FitProjection:
         self,
         view: Any,
         state: DisplayState,
+        *,
+        sample_refs: Iterable[AxisRef] = (),
     ) -> np.ndarray:
         """Return stable display-unit edges for one histogram projection."""
 
         count = int(state["bin_count"])
         samples = view.samples
-        canonical = np.asarray(samples.value.canonical).reshape(-1)
-        valid = np.asarray(samples.valid_mask, dtype=bool).reshape(-1)
+        refs = tuple(sample_refs)
+        if not refs and isinstance(self._spec, HistogramPlot):
+            refs = self._spec.samples
+        canonical, valid_mask = view.histogram_values(refs)
+        canonical = np.asarray(canonical).reshape(-1)
+        valid = np.asarray(valid_mask, dtype=bool).reshape(-1)
         finite = valid & np.isfinite(canonical)
         values = np.asarray(canonical[finite], dtype=float)
         previous = self._histogram_projection

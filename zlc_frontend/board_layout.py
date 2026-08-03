@@ -141,7 +141,14 @@ def pack(order: Sequence, metrics: BoardMetrics, board_w: int | None = None) -> 
     return moved
 
 
-def drop_index(cfg, others: Sequence, metrics: BoardMetrics, board_w: int | None = None) -> int:
+def drop_index(
+    cfg,
+    others: Sequence,
+    metrics: BoardMetrics,
+    board_w: int | None = None,
+    *,
+    raw_position: tuple[int, int] | None = None,
+) -> int:
     """The ORDER index at which to insert a card DROPPED at its raw pixel ``(cfg.col, cfg.row)`` among
     ``others`` (already in order), so it lands NEAREST the drop point under :func:`pack` gravity.
 
@@ -153,7 +160,24 @@ def drop_index(cfg, others: Sequence, metrics: BoardMetrics, board_w: int | None
     at the bottom (append).  Ties -> the earliest index, so dropping squarely onto a card displaces
     it.  Board width None -> the same headless fallback :func:`pack` uses."""
     board_w = (board_width(list(others) + [cfg], metrics) if board_w is None else board_w)
-    drop_x, drop_y = int(round(cfg.col)), int(round(cfg.row))
+    # ``cfg`` is the persisted semantic layout record.  During a Qt drag the
+    # widget moves before the drop is committed, so its transient pixel
+    # position is not allowed to leak into that record.  The caller supplies
+    # the actual release point explicitly; headless callers retain the old
+    # convenient default of reading the probe coordinates.
+    if raw_position is None:
+        drop_x, drop_y = int(round(cfg.col)), int(round(cfg.row))
+    else:
+        if (
+            not isinstance(raw_position, tuple)
+            or len(raw_position) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in raw_position
+            )
+        ):
+            raise TypeError("raw_position must be a pair of integer pixels")
+        drop_x, drop_y = raw_position
     proxies = [GeomProxy(o.size) for o in others]
     best_i, best_d = 0, None
     for k in range(len(proxies) + 1):

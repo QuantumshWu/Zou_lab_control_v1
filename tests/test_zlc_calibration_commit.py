@@ -121,7 +121,11 @@ def test_calibration_leaf_has_one_descriptor_and_no_prepared_lifecycle():
     )
 
     assert LOGIC_NODE.definition.kind == "task"
-    assert len(LOGIC_NODE.outputs) == 7
+    # The task exposes one transient raw-capture preview plus the seven FINAL
+    # calibration datasets.  The preview has its own declaration because its
+    # camera-cell schema is intentionally different from the calibrated map.
+    assert len(LOGIC_NODE.outputs) == 8
+    assert LOGIC_NODE.outputs[0].name == "capture_preview"
     assert LOGIC_NODE.device_requirements == (
         ("camera_instance_id", ("camera.capture",)),
         ("sequencer_instance_id", ("pulse.execute",)),

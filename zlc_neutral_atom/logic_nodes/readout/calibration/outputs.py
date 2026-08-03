@@ -63,6 +63,13 @@ CALIBRATION_ARTIFACT_OUTPUT_DECLARATION = ArtifactOutputDeclaration(
     "calibration",
     CALIBRATION_ARTIFACT_REF_FORMAT,
 )
+# Raw capture preview and calibrated FINAL site map are different contracts.
+# Keeping separate declarations prevents the live capture generation from
+# changing schema when the analysis result is published at terminal time.
+CALIBRATION_CAPTURE_PREVIEW_DECLARATION = DatasetOutputDeclaration(
+    "capture_preview",
+    "zlc_neutral_atom.calibration.capture-preview",
+)
 CALIBRATION_FINAL_OUTPUT_DECLARATIONS = (
     DatasetOutputDeclaration(
         "site_map",
@@ -413,6 +420,7 @@ def calibration_final_outputs(
 
 __all__ = [
     "CALIBRATION_ARTIFACT_OUTPUT_DECLARATION",
+    "CALIBRATION_CAPTURE_PREVIEW_DECLARATION",
     "CALIBRATION_DIAGNOSTIC_OUTPUT_DECLARATIONS",
     "CALIBRATION_FINAL_OUTPUT_DECLARATIONS",
     "calibration_final_outputs",

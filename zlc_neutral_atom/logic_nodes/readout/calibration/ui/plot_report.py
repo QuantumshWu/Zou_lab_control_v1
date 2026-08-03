@@ -26,6 +26,7 @@ from zlc_plot import (
     default_plot_spec,
 )
 from zlc_storage.durability import atomic_write_bytes, durable_mkdir
+from zlc_workbench.data_figure.archive_io import FigureArchive, save_figure_archive
 
 from ..outputs import CALIBRATION_FINAL_OUTPUT_DECLARATIONS
 
@@ -169,6 +170,31 @@ def _configure_distribution(session, outputs) -> None:
     session.fit("bimodal_gaussian", live=False, fit_all_facets=True)
 
 
+def calibration_plot_pages(outputs: Mapping[str, FinalDatasetOutput]):
+    """Return the one page mapping shared by export and the Qt report viewer."""
+
+    return _calibration_pages(_calibration_outputs(outputs))
+
+
+def _page_metadata(key: str, source: object, outputs) -> dict[str, object]:
+    metadata: dict[str, object] = {"calibration_page": key}
+    if isinstance(source, ImageFrame):
+        overlay = source.overlay
+        metadata["overlay"] = {
+            "revision": int(overlay.revision),
+            "coordinates": overlay.coordinates.tolist(),
+            "point_ids": None if overlay.point_ids is None else list(overlay.point_ids),
+            "labels": None if overlay.labels is None else list(overlay.labels),
+            "statuses": None
+            if overlay.statuses is None
+            else [status.value for status in overlay.statuses],
+        }
+    if key == "distribution":
+        sample_axis = outputs["readout_samples"].snapshot.block.schema.cell_schema.data_axes[0]
+        metadata["facet_thresholds"] = list(_site_thresholds(outputs["fidelity_threshold"], sample_axis))
+    return metadata
+
+
 def export_calibration_plot_pages(
     destination: str | Path,
     outputs: Mapping[str, FinalDatasetOutput],
@@ -178,7 +204,7 @@ def export_calibration_plot_pages(
     values = _calibration_outputs(outputs)
     root = durable_mkdir(Path(destination).expanduser().resolve())
     written: list[Path] = []
-    for key, _title, source, spec in _calibration_pages(values):
+    for key, _title, source, spec in calibration_plot_pages(values):
         session = PlotSession(source, spec)
         try:
             if key == "distribution":
@@ -188,9 +214,21 @@ def export_calibration_plot_pages(
             path = root / f"{key}.png"
             atomic_write_bytes(path, stream.getvalue())
             written.append(path)
+            # Keep a reloadable, structured page beside the PNG.  The archive
+            # is not another renderer: the report window reopens it through
+            # DataFigure/Qt5PlotWidget, while the PNG remains the explicit
+            # operator export.
+            snapshot = source.snapshot if isinstance(source, ImageFrame) else source
+            archive = FigureArchive(
+                snapshot,
+                spec,
+                "1x2",
+                metadata=_page_metadata(key, source, values),
+            )
+            save_figure_archive(archive, root / f"{key}.npz")
         finally:
             session.close()
     return tuple(written)
 
 
-__all__ = ["export_calibration_plot_pages"]
+__all__ = ["calibration_plot_pages", "export_calibration_plot_pages"]

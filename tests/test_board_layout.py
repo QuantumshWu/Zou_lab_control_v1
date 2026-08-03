@@ -109,6 +109,22 @@ def test_a_drop_lands_where_it_was_dropped():
         assert drop_index(probe, others, METRICS, 1200) == expected, (drop_x, drop_y)
 
 
+def test_drop_position_can_be_supplied_without_mutating_the_layout_record():
+    """A live Qt drag uses widget pixels until release, not stale config pixels."""
+
+    others = [GeomProxy(size) for size in ("1x2", "1x2", "1x2")]
+    pack(others, METRICS, 1200)
+    probe = GeomProxy("1x2", 8, 8)
+    assert drop_index(
+        probe,
+        others,
+        METRICS,
+        1200,
+        raw_position=(600, 0),
+    ) == 1
+    assert (probe.col, probe.row) == (8, 8)
+
+
 def test_a_snapshotted_card_size_is_refused():
     """The reason card_size is a callable, made mechanical.
 

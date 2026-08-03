@@ -88,17 +88,22 @@ def curve(
 def histogram(
     data: OwnedSnapshot,
     *,
-    samples: Iterable[AxisRef | str] = (),
+    samples: Iterable[AxisRef | str] | None = None,
     bins: int | None = None,
     labels: PlotLabels | None = None,
     size: str | None = None,
     parameters: Mapping[str, object] | None = None,
     **session_options: Any,
 ) -> PlotSession:
+    sample_refs = (
+        (AxisRef.repeat(), AxisRef.point_rows())
+        if samples is None
+        else tuple(_axis(sample) for sample in samples)
+    )
     values = _with_parameter_alias(parameters, "bin_count", bins, alias="bins")
     return PlotSession(
         data,
-        HistogramPlot(tuple(_axis(sample) for sample in samples), labels or PlotLabels()),
+        HistogramPlot(sample_refs, labels or PlotLabels()),
         size=size,
         parameters=values,
         **session_options,

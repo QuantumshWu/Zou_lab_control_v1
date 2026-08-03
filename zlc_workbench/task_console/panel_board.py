@@ -66,8 +66,16 @@ def drop_index(
     config: PanelConfig,
     others: Sequence[PanelConfig],
     board_width_px: int | None = None,
+    *,
+    raw_position: tuple[int, int] | None = None,
 ) -> int:
-    return _layout.drop_index(config, others, _metrics(), board_width_px)
+    return _layout.drop_index(
+        config,
+        others,
+        _metrics(),
+        board_width_px,
+        raw_position=raw_position,
+    )
 
 
 def opaque_white_composite(pixmap: QtGui.QPixmap) -> QtGui.QPixmap:

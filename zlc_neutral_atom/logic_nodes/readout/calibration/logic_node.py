@@ -24,6 +24,7 @@ from zlc_neutral_atom.logic_node import (
     UiContribution,
 )
 from zlc_neutral_atom.runtime.hosted_run import LogicNodeExecutionContext
+from zlc_neutral_atom.runtime.preview import ExactDatasetPreviewSpec
 from zlc_plot.kinds import PlotKind
 from zlc_pulse import load_pulse_document
 from zlc_storage.paths import resolve_under
@@ -37,9 +38,11 @@ from .artifact import (
 from .installation import build_sitemap_acquisition_profile
 from .outputs import (
     CALIBRATION_ARTIFACT_OUTPUT_DECLARATION,
+    CALIBRATION_CAPTURE_PREVIEW_DECLARATION,
     CALIBRATION_FINAL_OUTPUT_DECLARATIONS,
     calibration_final_outputs,
 )
+from .preview import CalibrationCapturePreview
 from .reference import CalibrationArtifactRef
 from .sitemap import SitemapCalibrationRequest, build_sitemap_calibration_request
 from .task import (
@@ -51,6 +54,7 @@ from .task import (
 
 
 _OUTPUT_LABELS = {
+    "capture_preview": ("capture preview", "Raw camera frame"),
     "site_map": ("site map", "Counts"),
     "fidelity_site": ("site fidelity", "Readout fidelity"),
     "fidelity_threshold": ("site threshold", "Readout threshold"),
@@ -132,6 +136,7 @@ def _capture_plan(
     camera,
     sequencer,
     project_root: Path,
+    exact_preview=None,
 ):
     binding = bind_finite_capture_request(
         sequence.capture_request,
@@ -150,7 +155,32 @@ def _capture_plan(
         binding.trigger_channel,
         binding.cell_plan,
     )
-    return compile_capture_artifact_pipeline(triggered, project_root)
+    return compile_capture_artifact_pipeline(
+        triggered,
+        project_root,
+        exact_preview=exact_preview,
+    )
+
+
+def _capture_source_schema(
+    sequence: SitemapCalibrationRequest,
+    *,
+    camera,
+    sequencer,
+):
+    """Resolve the capture schema without opening hardware.
+
+    The preview projection needs the capability-owned frame ``ValueSchema``;
+    binding it here keeps the preview contract identical to the actual capture
+    plan while leaving all device I/O inside the RunPlan.
+    """
+
+    binding = bind_finite_capture_request(
+        sequence.capture_request,
+        pulse_port=sequencer,
+        camera_port=camera,
+    )
+    return binding.capture.capture_contract.dataset_schema
 
 
 def _bind_execute(
@@ -161,14 +191,27 @@ def _bind_execute(
         raise TypeError("Calibration request must be CalibrationTaskRequest")
     sequence, camera, sequencer, readout_binding = _sequence_for(request, context)
     project_root = context.project_root
-    capture_plan = _capture_plan(
+    source_schema = _capture_source_schema(
         sequence,
         camera=camera,
         sequencer=sequencer,
-        project_root=project_root,
     )
 
     def execute(execution: LogicNodeExecutionContext):
+        preview = execution.open_exact_dataset(
+            ExactDatasetPreviewSpec(source_schema.fingerprint),
+            projection=CalibrationCapturePreview(
+                source_schema,
+                CALIBRATION_CAPTURE_PREVIEW_DECLARATION,
+            ),
+        )
+        capture_plan = _capture_plan(
+            sequence,
+            camera=camera,
+            sequencer=sequencer,
+            project_root=project_root,
+            exact_preview=preview,
+        )
         source = execution.start_and_wait(
             lambda: context.start_run(
                 capture_plan.with_lifecycle(execution, preemptible=False)
@@ -255,13 +298,20 @@ LOGIC_NODE = LogicNodeDescriptor(
     description="Acquire reference/readout frames and commit a Calibration",
     authoring_schema=calibration_task_authoring_schema(),
     input_specs=(),
-    outputs=tuple(
+    outputs=(
         DatasetOutputSpec(
-            declaration,
-            _OUTPUT_LABELS[declaration.name][0],
-            _OUTPUT_LABELS[declaration.name][1],
-        )
-        for declaration in CALIBRATION_FINAL_OUTPUT_DECLARATIONS
+            CALIBRATION_CAPTURE_PREVIEW_DECLARATION,
+            _OUTPUT_LABELS[CALIBRATION_CAPTURE_PREVIEW_DECLARATION.name][0],
+            _OUTPUT_LABELS[CALIBRATION_CAPTURE_PREVIEW_DECLARATION.name][1],
+        ),
+        *tuple(
+            DatasetOutputSpec(
+                declaration,
+                _OUTPUT_LABELS[declaration.name][0],
+                _OUTPUT_LABELS[declaration.name][1],
+            )
+            for declaration in CALIBRATION_FINAL_OUTPUT_DECLARATIONS
+        ),
     ),
     artifact_outputs=(
         ArtifactOutputSpec(
@@ -276,7 +326,7 @@ LOGIC_NODE = LogicNodeDescriptor(
         ("camera_instance_id", (CAPABILITY_CAMERA_CAPTURE,)),
         ("sequencer_instance_id", (CAPABILITY_PULSE_EXECUTE,)),
     ),
-    task_previews=(TaskPreview("site_map", PlotKind.IMAGE),),
+    task_previews=(TaskPreview("capture_preview", PlotKind.IMAGE),),
     ui_contributions=(_REPORT_UI,),
     operations={"load": _load, "sitemap": _sitemap, "report": _report},
 )

@@ -6,7 +6,7 @@
 
 - Branch：`codex/system-architecture-migration`。
 - 重开基线：`476d125304fc90b6ef4f5009184dd2119206fcc2`；C0规范提交：`ed6dfe21c0d99999444c099d8c644a20b44e561d`。
-- 当前checkpoint：§8 C4 Task takeover、Edit 与输出已 dependency-closed；下一唯一工作是 C5 PulseGUI narrow hold/step。不得返回旧 M1–M7 叙事，也不得重做已经闭合的 C1/C2/C3/C4。
+- 当前checkpoint：C6-R1–R4 已按现场反证闭合；C1/C2/C3/C4/C5 仍闭合，不返回旧 M1–M7 叙事，也不重做与新证据无关的旧切片。
 - 预期worktree例外：未跟踪用户文件`pulses/scan_test.json`。永远不得读取、修改、移动、删除、stage或commit。
 - RTL、Tcl、XDC、bitstream和wire protocol仍冻结；C1/C2没有硬件改动。
 
@@ -86,8 +86,61 @@
 - 定向 PulseGUI/应用集合：`32 passed`，16.20 秒；Remote server 流 5.44 秒，Virtual hold/step 流 1.77 秒，编译与 transport I/O 均不在 Qt 线程。
 - 全套回归：`824 passed, 1 skipped`，总耗时 150.31 秒；仅有既存 zmq Proactor selector-thread warning。`git diff --check`通过，C5 未改 RTL/Tcl/XDC/bitstream/wire protocol，受保护用户文件仍未读取、未修改、未 stage、未 commit。
 
-## 当前下一步：C6 领域E2E、性能与全仓清理
+## C6 重开前既有证据（历史记录）
 
-只按 `docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md` §8 C6、§9 推进：领域 E2E、性能证据和全仓删除扫描。不得重做已经闭合的 C1–C5；不得为旧测试/API留兼容。若发现设计与实现矛盾，先停止该 cut，更新设计与删除清单后再实现。
+- 代表性产品集合：`42 passed`（Device Manager、Camera Measurement→live Image→Area→第二
+  Figure→Fit、Occupancy 手动绑定、MOT Ready→Running→FINAL、Calibration 输出、Distribution
+  双高斯/threshold、Figure archive、Logic discovery、Virtual operator flow）；正式 Qt 合同集合
+  `15 passed`；Camera/Occupancy 两条真实 offscreen 产品流 `2 passed`。这三组均使用正式
+  `ensure_qt_app()`/composition root/真实 Qt input，不构造第二窗口、尺寸、DPI 或 style。
+- 最终性能 profiling 覆盖 1024²、2048²、2304² 的 uint8/uint16 `RegularImageFitInput`：
+  观测数组保持原 dtype 且 `shares_memory=True`，峰值约 `4.18 MiB`，完成时间分别约
+  `0.11–0.12 s`、`0.47 s`、`1.30–1.32 s`（`max_nfev=100`）。没有 H×W 坐标 mesh、整图
+  float64 副本或 Qt 线程求解；现有 2304² compact-diagnostics contract 仍通过。
+- tracked source 逐文件 change-impact 扫描覆盖 `294` 个生产 Python 模块、`129,549` 行、
+  `858` 个顶层 class、`1,407` 个顶层 function；语法错误 `0`、import-DAG 违规 `0`、
+  Workbench/public facade 具体 leaf import `0`。测试口径为 `106` 个 Python 模块、`32,718`
+  行。最大模块属于唯一 owner 的 zlc_plot raster/session、通用 Qt shell、SignalPlane/runtime
+  与校准科学算法；没有因单一成员或兼容性保留的 owner。
+- 残余扫描确认 PointLayout/RepeatViewMode、旧 Presentation sidecar、ConsolePresentationIndex、
+  CAS/普通 payload SHA、软件预算、旧 TaskConsole conflict scanner、中央 concrete leaf
+  import、tracked 空目录和旧 plot owner 均为 `0`。仅保留 zlc_data schema identity 与
+  zlc_pulse/FPGA/transport 的真实 artifact/geometry identity；这些不是普通实验 payload SHA。
+- Git worktree 只有用户保护文件 `pulses/scan_test.json`，从未读取、修改、移动、stage 或
+  commit。tracked 大文件只有明确的 `tests/fixtures/main_readout_oracle.npz`；FPGA build/cache
+  与 `_output`/`.tmp_*`/`.diag-*` 均被忽略且不污染当前 commit。RTL、Tcl、XDC、bitstream 与
+  wire protocol 无 diff。
+- `docs/REAL_HARDWARE_BRINGUP_zh.md` 已逐条核对：入口、remote server、DeviceManager Apply、
+  qCMOS/Pylon E0、AUTONOMOUS_STREAMED 与 per-run fail-closed 对账路径均指向当前 API。软件 GO
+  不宣称未连接的真实装置已经 qualified；下一步仅是按该 runbook 做现场 E0。
 
-恢复时严格依次完整读取当前 Goal、`AGENTS.md`、本文件、Git branch/HEAD/status/recent log，再只读台账当前未闭合项和设计对应章节。不得重答、重审或重做 C1/C2/C3/C4/C5；若发现矛盾，先停止该 cut，更新设计与删除清单后再实现。
+## C6-R1..R4 闭合记录
+
+- R1 Calibration 现在由 leaf 声明 `capture_preview` typed transient output；正式 Qt 快轨
+  已观察到 `(1,1,*frame)` 的原始 dtype live 2D 图，FINAL 后仍移除 transient card。领域
+  输出写在项目根下 `tasks/calibration/<run>/calibration.json`，报告写在同目录
+  `report/{site_map,fidelity,distribution}.{png,npz}`；`save_frames=True` 才额外写
+  `source_frames.npy` 与 validity，路径由 `CalibrationReportWindow` 明示，未引入 SHA/manifest。
+- R2 Panel drag/drop 的提交边已接回唯一 `zlc_frontend.board_layout.pack`：释放事件以实际
+  widget 位置计算插入序，再一次性 `_arrange()` 物化顺序并恢复 north-west gravity；正式
+  `ensure_qt_app()` 测试覆盖拖动、重排与位置恢复，没有第二个 packer。
+- R3 Calibration report 不再读 PNG 作为界面：每个 archive 由通用 `DataFigureWindow`/
+  `Qt5PlotWidget` 打开，selector、Fit、zoom、Divider、size/DPR 与 TaskConsole 共用同一
+  `zlc_plot.PlotSession`；报告页 selector 回归已验证 front sequence 改变。
+- R4 外部 `zlc_plot` 当前 `15bbc7d` 的增量已选择性接入本地 readonly `zlc_data` bridge：
+  Curve/Image/Facet 的 authored-axis coverage、Histogram 显式 `samples`（含 bins/domain
+  discovery）、无 GridTopology 的双 point-coordinate Image 拒绝、Histogram/Raster/
+  Facet 的 ordered `source_revisions` 与 `RollingSample` 已成为唯一投影路径；没有复制外部
+  树、没有恢复外部 data/Qt owner。新增 coverage 合同与现有产品流共同通过。
+
+### C6 证据与验收
+
+- C6 定向回归 `90 passed`；全仓 `831 passed, 1 skipped`，仅有既存 zmq Proactor
+  selector-thread warning。全套耗时约 126 秒；无测试失败。
+- 本轮未读取、修改、移动、stage 或 commit 用户保护文件 `pulses/scan_test.json`；RTL、Tcl、
+  XDC、bitstream、wire protocol 未改。C6 完成后才允许以新的 Git checkpoint 交接，不能把
+  C6 的中间态宣称为终态。
+
+恢复时仍严格依次完整读取当前 Goal、`AGENTS.md`、本文件、Git branch/HEAD/status/recent log，
+再只读当前台账和 R1–R4 对应设计章节；不得重答、重审或重做 C1/C2/C3/C4/C5，除非新证据
+直接触及其 owner。

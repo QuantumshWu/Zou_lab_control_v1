@@ -2058,9 +2058,19 @@ class TaskConsole(QtWidgets.QWidget):
         if card not in self.cards:
             return
         others = [c.config for c in self.cards if c is not card]
-        idx = drop_index(card.config, others, self._pack_width([c.config for c in self.cards]))
+        idx = drop_index(
+            card.config,
+            others,
+            self._pack_width([c.config for c in self.cards]),
+            raw_position=(int(card.x()), int(card.y())),
+        )
         self.cards.remove(card)
         self.cards.insert(idx, card)
+        # ``dropped`` is the drag transaction's commit edge.  Reordering the
+        # semantic list alone leaves the widget at its transient mouse
+        # position; the sole board packer must immediately materialize the
+        # committed order and restore north-west gravity for every card.
+        self._arrange()
 
     def _arrange(self) -> None:
         # ONE order-driven north-west pack (:func:`pack`): each card, IN ``self.cards`` ORDER, floats

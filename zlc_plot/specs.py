@@ -198,7 +198,9 @@ class ImagePlot:
 
 @dataclass(frozen=True, slots=True)
 class HistogramPlot:
-    samples: tuple[AxisRef, ...] = ()
+    samples: tuple[AxisRef, ...] = field(
+        default_factory=lambda: (AxisRef.repeat(), AxisRef.point_rows())
+    )
     labels: PlotLabels = field(default_factory=PlotLabels)
     kind: ClassVar[PlotKind] = PlotKind.HISTOGRAM
 

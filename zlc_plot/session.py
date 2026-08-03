@@ -300,8 +300,6 @@ class _PointerGestureBase:
 class _SelectorGesture(_PointerGestureBase):
     kind: SelectorKind
     external_scene: bool
-    fit_context_changed: bool = False
-    fit_accepted_revision: int | None = None
 
 
 @dataclass(slots=True)
@@ -1522,7 +1520,8 @@ class PlotSession:
             with self._lock:
                 self._assert_open()
             assert self._renderer is not None
-            self._renderer.draw()
+            with self._renderer.raster_transaction():
+                self._renderer.draw()
 
     @property
     def parameter_schema(self) -> ParameterSchema:
@@ -1631,21 +1630,25 @@ class PlotSession:
 
     @property
     def last_facet_fit(self) -> FacetFitBatchResult | None:
-        """Latest batch result only while it still matches this exact front."""
+        """Latest batch result for the current immutable data revision."""
 
         with self._lock:
             accepted = self._accepted_facet_fit
             if (
                 accepted is None
                 or accepted.result.source_revision != self.data_revision
-                or accepted.context_generation != self._fit_context_generation
             ):
                 return None
             return accepted.result
 
     @property
     def fit_status(self) -> str | None:
-        """Whether the painted fit matches the current data and fit context."""
+        """Whether the painted fit belongs to the current data revision.
+
+        Selector/viewport/layout gestures are display operations.  They do not
+        create a second fit clock or a transient ``lagging`` state; a fit is
+        either the accepted result for this data frame or absent.
+        """
 
         with self._lock:
             accepted = self._accepted_fit
@@ -1653,9 +1656,8 @@ class PlotSession:
                 return None
             current = (
                 accepted.result.data_revision == self.data_revision
-                and accepted.context_generation == self._fit_context_generation
             )
-        return "current" if current else "lagging"
+        return "current" if current else None
 
     @property
     def live_fit_enabled(self) -> bool:
@@ -1768,13 +1770,17 @@ class PlotSession:
         if (
             batch is not None
             and batch.result.source_revision == self.data_revision
-            and batch.context_generation == self._fit_context_generation
             and isinstance(self._spec, FacetGridPlot)
         ):
             fit_overlay = batch.overlays
         else:
             fit_overlay = (
-                None if self._accepted_fit is None else self._accepted_fit.overlay
+                None
+                if (
+                    self._accepted_fit is None
+                    or self._accepted_fit.result.data_revision != self.data_revision
+                )
+                else self._accepted_fit.overlay
             )
         renderer.present(RenderFrame(
             payload=self._payload,
@@ -1803,13 +1809,11 @@ class PlotSession:
         self,
         effects: RenderEffect,
         *,
-        schedule_fit: bool = True,
+        schedule_fit: bool = False,
     ) -> None:
         with self._render_lock:
             assert self._renderer is not None
             self._update_renderer(self._renderer, effects)
-            if schedule_fit:
-                self._start_pending_live_fit()
 
     def _present_projection_transaction(
         self,
@@ -1946,7 +1950,7 @@ class PlotSession:
         self,
         plan: SurfacePlan,
         *,
-        schedule_fit: bool = True,
+        schedule_fit: bool = False,
         notify_surface: bool = True,
     ) -> tuple[SurfaceCallback, ...]:
         if not isinstance(notify_surface, bool):
@@ -1971,8 +1975,6 @@ class PlotSession:
                     self._connect_mpl_events()
         if notify_surface:
             self._notify_surface_callbacks(callbacks)
-        if schedule_fit:
-            self._start_pending_live_fit()
         return callbacks
 
     def set_parameter(self, name: str, value: object) -> DisplayState:
@@ -2316,7 +2318,6 @@ class PlotSession:
                 raise
             if fit_cancel is not None:
                 fit_cancel.set()
-            self._start_pending_live_fit()
         self._notify_surface_callbacks(surface_callbacks)
         self._notify_display(state)
         return state
@@ -2360,7 +2361,6 @@ class PlotSession:
                 except BaseException:
                     pass
                 raise
-            self._start_pending_live_fit()
         self._notify_surface_callbacks(callbacks)
         return plan
 
@@ -2525,7 +2525,6 @@ class PlotSession:
                 except BaseException:
                     pass
                 raise
-            self._start_pending_live_fit()
         self._notify_surface_callbacks(callbacks)
         return plan
 
@@ -3053,33 +3052,11 @@ class PlotSession:
                     and isinstance(self._gesture, _SelectorGesture)
                 ):
                     self._cancel_gesture()
-                fit_previous = (
-                    self._fit_context_generation,
-                    self._live_fit_pending,
-                    self._accepted_fit,
-                )
-                fit_cancel = self._fit_cancel
-                request = self._live_fit_request
                 previous, stored = (
                     self._selector_controller.install(state)
                     if finished_gesture is None
                     else self._selector_controller._commit_finished(state)
                 )
-                affects_fit = self._selector_change_affects_fit(
-                    stored.kind,
-                    request,
-                )
-                fit_is_current = bool(
-                    finished_gesture is not None
-                    and finished_gesture.fit_accepted_revision == stored.revision
-                )
-                invalidate_fit = affects_fit and not fit_is_current
-                if invalidate_fit:
-                    self._fit_context_generation += 1
-                    if request is not None:
-                        self._live_fit_pending = True
-                    else:
-                        self._clear_fit_presentation()
             try:
                 self._render_current(
                     RenderEffect.OVERLAY,
@@ -3088,11 +3065,6 @@ class PlotSession:
             except BaseException:
                 with self._lock:
                     self._selector_controller._rollback_install(stored, previous)
-                    (
-                        self._fit_context_generation,
-                        self._live_fit_pending,
-                        self._accepted_fit,
-                    ) = fit_previous
                 try:
                     self._render_current(
                         RenderEffect.OVERLAY,
@@ -3101,38 +3073,12 @@ class PlotSession:
                 except BaseException:
                     pass
                 raise
-            if invalidate_fit:
-                fit_cancel.set()
-                if request is not None:
-                    self._start_pending_live_fit()
         if emit_change:
             self._emit_selection(
                 SelectionChange.ADDED if previous is None else SelectionChange.UPDATED,
                 stored,
             )
         return stored
-
-    def _selector_change_affects_fit(
-        self,
-        kind: SelectorKind,
-        request: _LiveFitRequest | None,
-    ) -> bool:
-        if request is not None:
-            return self._fit_request_uses_selector(request, kind)
-        if self._accepted_facet_fit is not None:
-            return kind in {
-                SelectorKind.AREA,
-                SelectorKind.X_RANGE,
-                SelectorKind.THRESHOLD,
-            }
-        accepted = self._accepted_fit
-        return bool(
-            accepted is not None
-            and (
-                kind in {SelectorKind.AREA, SelectorKind.X_RANGE}
-                or accepted.selection.selector_kind is kind
-            )
-        )
 
     def set_threshold_selector(
         self, value: float, *, display: bool = True
@@ -3400,7 +3346,6 @@ class PlotSession:
         """Remove a selector and notify external subscribers."""
 
         cancelled_fit: Future[FitResult] | None = None
-        restart_live_fit = False
         with self._render_lock:
             with self._lock:
                 self._assert_open()
@@ -3425,26 +3370,15 @@ class PlotSession:
                 bound_request = bool(
                     request is not None and request.selector_kind is state.kind
                 )
-                affects_fit = self._selector_change_affects_fit(
-                    state.kind,
-                    request,
-                )
                 self._selector_controller.remove(kind)
-                if affects_fit:
+                if bound_request:
                     self._fit_context_generation += 1
-                    if bound_request:
-                        self._fit_request_generation += 1
-                        cancelled_fit = self._live_fit_completion
-                        self._live_fit_completion = None
-                        self._live_fit_request = None
-                        self._live_fit_future = None
-                        self._live_fit_pending = False
-                        self._clear_fit_presentation()
-                    elif request is not None:
-                        self._live_fit_pending = True
-                        restart_live_fit = True
-                    else:
-                        self._clear_fit_presentation()
+                    self._fit_request_generation += 1
+                    cancelled_fit = self._live_fit_completion
+                    self._live_fit_completion = None
+                    self._live_fit_request = None
+                    self._live_fit_future = None
+                    self._live_fit_pending = False
             try:
                 if self._renderer is not None:
                     self._render_current(
@@ -3472,10 +3406,8 @@ class PlotSession:
                 except BaseException:
                     pass
                 raise
-            if affects_fit:
+            if bound_request:
                 fit_cancel.set()
-            if restart_live_fit:
-                self._start_pending_live_fit()
         self._emit_selection(SelectionChange.REMOVED, state)
         if cancelled_fit is not None and not cancelled_fit.done():
             cancelled_fit.set_exception(
@@ -3960,7 +3892,12 @@ class PlotSession:
         return selected
 
     def _set_viewport_state(self, selected: RectangleRange | None) -> bool:
-        """Commit viewport and fit authority only after their frame draws."""
+        """Commit a display viewport without changing fit/data authority.
+
+        A viewport is a presentation transform.  It must not clear a fit or
+        arm a second solve while the pointer is moving; the accepted fit is
+        recomputed only for a newer data revision or an explicit Fit command.
+        """
 
         if selected is not None and not isinstance(selected, RectangleRange):
             raise TypeError("selected must be RectangleRange or None")
@@ -3972,17 +3909,10 @@ class PlotSession:
                 previous = (
                     self._viewport,
                     self._fit_context_generation,
-                    self._live_fit_pending,
-                    self._accepted_fit,
                 )
                 fit_cancel = self._fit_cancel
-                request = self._live_fit_request
                 self._viewport = selected
                 self._fit_context_generation += 1
-                if request is not None:
-                    self._live_fit_pending = True
-                else:
-                    self._clear_fit_presentation()
             effects = (
                 RenderEffect.AXIS_TRANSFORM
                 | RenderEffect.FIT_SELECTION
@@ -3995,8 +3925,6 @@ class PlotSession:
                     (
                         self._viewport,
                         self._fit_context_generation,
-                        self._live_fit_pending,
-                        self._accepted_fit,
                     ) = previous
                 try:
                     self._render_current(effects, schedule_fit=False)
@@ -4004,8 +3932,6 @@ class PlotSession:
                     pass
                 raise
             fit_cancel.set()
-            if request is not None:
-                self._start_pending_live_fit()
         return True
 
     def reset_viewport(self) -> None:
@@ -4762,7 +4688,6 @@ class PlotSession:
                 if (
                     self._closed
                     or result.source_revision != self.data_revision
-                    or started.context_generation != self._fit_context_generation
                     or started.request_generation != self._fit_request_generation
                     or not isinstance(self._spec, FacetGridPlot)
                 ):
@@ -4850,37 +4775,10 @@ class PlotSession:
                 if (
                     self._closed
                     or result.data_revision != self.data_revision
-                    or started.context_generation != self._fit_context_generation
                     or started.request_generation != self._fit_request_generation
                 ):
                     return None
-                try:
-                    authority_current = (
-                        selection._authority
-                        == self._projected._fit_selection_authority(
-                            started.request.selector_kind
-                        )
-                    )
-                except (KeyError, TypeError, ValueError):
-                    authority_current = False
-                if (
-                    selection.data_revision != self.data_revision
-                    or not authority_current
-                ):
-                    if self._live_fit_request is started.request and not self._closed:
-                        self._live_fit_pending = True
-                    return None
-                if (
-                    not result.success
-                    and isinstance(self._gesture, _SelectorGesture)
-                    and self._fit_request_uses_selector(
-                        started.request,
-                        self._gesture.kind,
-                    )
-                ):
-                    # A transient domain may briefly contain too little signal.
-                    # Keep the last complete fit front instead of replacing it
-                    # with a failure topology while the pointer is still down.
+                if selection.data_revision != self.data_revision:
                     return None
                 overlay = self._projected._make_fit_overlay(result, selection)
                 previous = self._accepted_fit
@@ -4899,15 +4797,6 @@ class PlotSession:
                 )
                 self._accepted_fit = accepted
                 self._accepted_facet_fit = None
-                gesture = self._gesture
-                authority = selection._authority
-                selected = None if authority is None else authority.selector
-                if (
-                    isinstance(gesture, _SelectorGesture)
-                    and selected is not None
-                    and selected.kind is gesture.kind
-                ):
-                    gesture.fit_accepted_revision = selected.revision
             try:
                 self._render_current(
                     RenderEffect.OVERLAY,
@@ -5570,33 +5459,23 @@ class PlotSession:
             handle=handle,
             draft=draft,
         )
-        accepted = self._accepted_fit
-        accepted_authority = (
-            None if accepted is None else accepted.selection._authority
-        )
-        accepted_selector = (
-            None if accepted_authority is None else accepted_authority.selector
-        )
         self._gesture = _SelectorGesture(
             selector_axes,
             interaction_transform,
             state.kind,
             external_selector_scene,
-            fit_accepted_revision=(
-                state.revision if accepted_selector == state else None
-            ),
         )
         if external_selector_scene:
             self._renderer.begin_external_selector_gesture(
                 state.kind,
-                self._display_selector_snapshot(),
             )
             self._render_current(RenderEffect.OVERLAY)
         elif hit is None:
             self._render_current(RenderEffect.OVERLAY)
         if external_selector_scene:
             return
-        self._renderer.begin_selector_gesture(state.kind)
+        with self._renderer.raster_transaction():
+            self._renderer.begin_selector_gesture(state.kind)
 
 
     def _start_pointer_selection(
@@ -5680,11 +5559,11 @@ class PlotSession:
         if external_selector_scene:
             self._renderer.begin_external_selector_gesture(
                 SelectorSceneKind.COLOR_LIMITS,
-                self._display_selector_snapshot(),
             )
             self._render_current(RenderEffect.OVERLAY, schedule_fit=False)
         else:
-            self._renderer.begin_color_limit_gesture(candidate)
+            with self._renderer.raster_transaction():
+                self._renderer.begin_color_limit_gesture(candidate)
         return True
 
     def _area_drag_handle(
@@ -5998,17 +5877,18 @@ class PlotSession:
             candidate = self._display_color_limit_candidate()
             assert candidate is not None
             assert self._renderer is not None
-            if not gesture.external_scene:
-                self._renderer.preview_color_limit_candidate(candidate)
-            if gesture.lane_due(
-                "raster",
-                self._defaults.interaction.raster_preview_interval_ms,
-            ):
-                self._renderer.preview_color_limits(
-                    candidate.value.low,
-                    candidate.value.high,
-                )
-                self._render_current(RenderEffect.OVERLAY, schedule_fit=False)
+            with self._renderer.raster_transaction():
+                if not gesture.external_scene:
+                    self._renderer.preview_color_limit_candidate(candidate)
+                if gesture.lane_due(
+                    "raster",
+                    self._defaults.interaction.raster_preview_interval_ms,
+                ):
+                    self._renderer.preview_color_limits(
+                        candidate.value.low,
+                        candidate.value.high,
+                    )
+                    self._render_current(RenderEffect.OVERLAY, schedule_fit=False)
             return
         if self._selector_controller.active_gesture is None:
             self._cancel_gesture()
@@ -6031,22 +5911,8 @@ class PlotSession:
                 else self._special_display_selector_state(updated)
             )
             if not gesture.external_scene:
-                self._renderer.preview_selector(displayed)
-            if (
-                updated.kind in {
-                    SelectorKind.AREA,
-                    SelectorKind.X_RANGE,
-                    SelectorKind.THRESHOLD,
-                }
-                and self._pointer_live_fit_uses(updated)
-                and gesture.lane_due(
-                    "fit",
-                    self._defaults.interaction.selector_fit_update_interval_ms,
-                )
-            ):
-                self._invalidate_fit_context()
-                gesture.fit_context_changed = True
-                self._start_pending_live_fit()
+                with self._renderer.raster_transaction():
+                    self._renderer.preview_selector(displayed)
             self._emit_selection(SelectionChange.UPDATED, updated)
 
     def _on_button_release(self, event: Any) -> None:
@@ -6145,8 +6011,6 @@ class PlotSession:
         if committed is not None and committed.kind is SelectorKind.AREA:
             self.remove_selector(committed.kind)
             return
-        if gesture.fit_context_changed:
-            self._invalidate_fit_context()
         self._render_current(RenderEffect.OVERLAY)
 
     def _on_figure_leave(self, _event: Any) -> None:
@@ -6180,25 +6044,6 @@ class PlotSession:
         if state.kind is SelectorKind.AREA:
             raise ValueError("area selector requires non-degenerate x and y ranges")
         raise ValueError(f"{state.kind.value} selector requires a non-degenerate range")
-
-    def _pointer_live_fit_uses(self, state: SelectorState) -> bool:
-        """Whether the active live request reads this transient selector."""
-
-        with self._lock:
-            request = self._live_fit_request
-            return bool(
-                request is not None
-                and self._fit_request_uses_selector(request, state.kind)
-            )
-
-    @staticmethod
-    def _fit_request_uses_selector(
-        request: _LiveFitRequest,
-        kind: SelectorKind,
-    ) -> bool:
-        if request.selector_kind is not None:
-            return request.selector_kind is kind
-        return kind in {SelectorKind.AREA, SelectorKind.X_RANGE}
 
     def _update_pan(
         self,
@@ -6254,34 +6099,6 @@ class PlotSession:
         gesture = self._gesture
         if gesture is None:
             return None
-        candidate = (
-            self._selector_controller.candidate_state()
-            if isinstance(gesture, _SelectorGesture)
-            else None
-        )
-        committed = None
-        if candidate is not None:
-            try:
-                committed = self._selector_controller.state(candidate.kind)
-            except KeyError:
-                pass
-        request = self._live_fit_request
-        fit_authority_changed = bool(
-            candidate is not None
-            and candidate != committed
-            and (
-                candidate.kind in {SelectorKind.AREA, SelectorKind.X_RANGE}
-                or (
-                    request is not None
-                    and request.selector_kind is candidate.kind
-                )
-                or (
-                    self._accepted_fit is not None
-                    and self._accepted_fit.selection.selector_kind
-                    is candidate.kind
-                )
-            )
-        )
         cancelled = None
         try:
             if isinstance(gesture, _SelectorGesture):
@@ -6298,18 +6115,12 @@ class PlotSession:
                 RenderEffect.AXIS_TRANSFORM | RenderEffect.OVERLAY,
                 schedule_fit=False,
             )
-        fit_context_changed = bool(
-            isinstance(gesture, _SelectorGesture)
-            and (gesture.fit_context_changed or fit_authority_changed)
-        )
-        if fit_context_changed:
-            self._invalidate_fit_context()
         restore_committed = isinstance(gesture, _ColorGesture) or cancelled is not None
         if restore_committed and self._renderer is not None and not self._closed:
             color_gesture = isinstance(gesture, _ColorGesture)
             self._render_current(
                 RenderEffect.BASE_GEOMETRY if color_gesture else RenderEffect.OVERLAY,
-                schedule_fit=not color_gesture,
+                schedule_fit=False,
             )
         return cancelled
 
@@ -6334,14 +6145,16 @@ class PlotSession:
             with self._lock:
                 self._assert_open()
             assert self._renderer is not None
-            self._renderer.save(path, dpi=selected_dpi, **kwargs)
+            with self._renderer.raster_transaction():
+                self._renderer.save(path, dpi=selected_dpi, **kwargs)
 
     def rgba(self) -> np.ndarray:
         with self._render_lock:
             with self._lock:
                 self._assert_open()
             assert self._renderer is not None
-            return self._renderer.rgba()
+            with self._renderer.raster_transaction():
+                return self._renderer.rgba()
 
     def close(self) -> None:
         logical_completion: Future[FitResult] | None = None

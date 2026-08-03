@@ -38,6 +38,7 @@ from zlc_plot import (
     RasterOperation,
     RasterPlotHost,
 )
+from zlc_plot.primitives import ImageFrame, PlotInput
 from zlc_workbench.window_runtime import submit_compute
 
 from .archive_io import FigureArchive, LoadedFigureArchive, save_figure_archive
@@ -53,7 +54,7 @@ class DataFigureWindow(QtWidgets.QWidget):
 
     def __init__(
         self,
-        snapshot: OwnedSnapshot,
+        snapshot: PlotInput,
         spec: PlotSpec,
         *,
         output_root: Path,
@@ -65,12 +66,13 @@ class DataFigureWindow(QtWidgets.QWidget):
         embedded: bool = False,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
-        if not isinstance(snapshot, OwnedSnapshot):
-            raise TypeError("snapshot must be OwnedSnapshot")
+        if not isinstance(snapshot, (OwnedSnapshot, ImageFrame)):
+            raise TypeError("snapshot must be a zlc_plot PlotInput")
         if not isinstance(open_fit, bool) or not isinstance(embedded, bool):
             raise TypeError("open_fit and embedded must be bool")
         super().__init__(parent)
         self._snapshot = snapshot
+        self._archive_enabled = isinstance(snapshot, OwnedSnapshot)
         self._output_root = Path(output_root).expanduser()
         if not self._output_root.is_absolute():
             raise ValueError("DataFigure output_root must be absolute")
@@ -160,6 +162,8 @@ class DataFigureWindow(QtWidgets.QWidget):
         self.fit_button.clicked.connect(self._toggle_fit)
         self.export_button.clicked.connect(self._choose_export)
         self.save_button.clicked.connect(self._choose_archive)
+        if not self._archive_enabled:
+            self.save_button.hide()
         self._futureReady.connect(self._accept_future, QtCore.Qt.QueuedConnection)
         self._track(self._host.describe_display(), "initial", self._accept_initial)
 
@@ -424,6 +428,12 @@ class DataFigureWindow(QtWidgets.QWidget):
             self.save_archive(selected)
 
     def save_archive(self, path: str | Path) -> None:
+        if not self._archive_enabled or not isinstance(self._snapshot, OwnedSnapshot):
+            self.status.show_message(
+                "This plot input has no standalone Dataset archive",
+                severity="error",
+            )
+            return
         target = self._resolve_archive_path(path)
         if target is None:  # pragma: no cover - path is required by this method
             raise TypeError("archive path must not be None")

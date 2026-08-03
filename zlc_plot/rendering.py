@@ -564,10 +564,14 @@ class MatplotlibRenderer:
         self._selector_candidate: SelectorState | None = None
         self._color_limit_candidate: ColorLimitCandidate | None = None
         self._selector_scene_exclusion_kind: SceneKind | None = None
-        self._external_selector_scene_owner: SelectorSceneOwner | None = None
         self._last_selectors = SelectorSnapshot(())
         self._fit_artists: list[Any] = []
         self._fit_slots: dict[str, Any] = {}
+        # A fit accepted while a selector gesture is using a cached blit
+        # background changes the artists beneath that background.  Remember the
+        # last complete fit front so the next presentation can recompose once
+        # and recapture a coherent gesture background.
+        self._last_fit_overlay: FitOverlay | None = None
         self._fit_source_scatter: Any | None = None
         self._fit_hidden_source_lines: tuple[tuple[Any, bool], ...] = ()
         self._fit_axis: Any | None = None
@@ -762,10 +766,10 @@ class MatplotlibRenderer:
         self._selector_candidate = None
         self._color_limit_candidate = None
         self._selector_scene_exclusion_kind = None
-        self._external_selector_scene_owner = None
         self._last_selectors = SelectorSnapshot(())
         self._fit_artists.clear()
         self._fit_slots.clear()
+        self._last_fit_overlay = None
         self._fit_source_scatter = None
         self._fit_hidden_source_lines = ()
         self._fit_axis = None
@@ -800,6 +804,7 @@ class MatplotlibRenderer:
         previous_payload = self._last_payload
         previous_state = self._last_state
         previous_data_revision = self._data_revision
+        previous_fit_overlay = self._last_fit_overlay
         state_changed = previous_state is None or state.revision != previous_state.revision
         payload_changed = (
             payload is not previous_payload
@@ -891,11 +896,13 @@ class MatplotlibRenderer:
             )
         else:
             painted_fit = None if overview else frame.fit_overlay
+        fit_changed = painted_fit is not previous_fit_overlay
         with style_context(self.style):
             self._requested_view_limits = frame.view_limits
             self._last_payload = payload
             self._last_state = state
             self._data_revision = frame.data_revision
+            self._last_fit_overlay = painted_fit
             if base_changed:
                 self._update_plot(payload, state)
                 self._capture_home_limits(self.primary_axes)
@@ -913,6 +920,15 @@ class MatplotlibRenderer:
             self._update_fit(painted_fit)
             self._update_facet_thresholds(frame.facet_thresholds)
             self._update_image_point_overlay(payload, frame.image_overlay, state)
+            # A native selector gesture blits against a cached scene.  If a
+            # newly accepted fit changes that scene, recompose once and let the
+            # next pointer frame capture the new base; never expose stale fit
+            # pixels or a partially erased data layer.
+            if fit_changed and self._selector_gesture_kind is not None:
+                self._invalidate_layer_backgrounds()
+                self._selector_gesture_backgrounds = ()
+                self.draw()
+                return
             partial_axes = (
                 self._image_layer_axes()
                 if not selected_effects & (full_draw_effects | RenderEffect.TEXT)
@@ -1042,7 +1058,7 @@ class MatplotlibRenderer:
                     axis.set_animated(True)
                 try:
                     with _hidden_artists(semantic_text):
-                        canvas.draw()
+                        self._native_draw(canvas)
                         self._local_chrome_underlay = canvas.copy_from_bbox(
                             self._figure.bbox
                         )
@@ -1055,7 +1071,7 @@ class MatplotlibRenderer:
                     for axis in local_chrome_axes:
                         axis.set_animated(False)
             else:
-                canvas.draw()
+                self._native_draw(canvas)
             if supports_blit:
                 if self._figure_background is not None and self._try_blit():
                     self._chrome_dirty_axes.clear()
@@ -1063,8 +1079,42 @@ class MatplotlibRenderer:
                     return
                 self._invalidate_layer_backgrounds()
                 self._set_dynamic_animated(False)
-                canvas.draw()
+                self._native_draw(canvas)
             self._chrome_dirty_axes.clear()
+
+    @staticmethod
+    def _native_draw(canvas: Any) -> None:
+        """Draw through the raw canvas channel owned by an optional host.
+
+        Notebook backends route their public ``draw`` method back through the
+        session so a browser never receives a low-level partial frame.  The
+        renderer's own composition must bypass that callback exactly once.
+        """
+
+        raw_draw = getattr(canvas, "_zlc_plot_raw_draw", None)
+        draw = raw_draw if callable(raw_draw) else getattr(canvas, "draw", None)
+        if not callable(draw):
+            raise RuntimeError("the native canvas has no callable draw method")
+        draw()
+
+    @contextmanager
+    def raster_transaction(self) -> Iterator[None]:
+        """Expose at most one complete raster through an attached host."""
+
+        canvas = self._figure.canvas
+        begin = getattr(canvas, "_zlc_plot_begin_raster_transaction", None)
+        end = getattr(canvas, "_zlc_plot_end_raster_transaction", None)
+        if not callable(begin) or not callable(end):
+            yield
+            return
+        begin()
+        try:
+            yield
+        except BaseException:
+            end(False)
+            raise
+        else:
+            end(True)
 
     def _pixel_aligned_bbox(self, bounds: Any) -> Any:
         from matplotlib.transforms import Bbox
@@ -1298,17 +1348,17 @@ class MatplotlibRenderer:
     def begin_external_selector_gesture(
         self,
         kind: SceneKind,
-        snapshot: SelectorSnapshot,
     ) -> None:
-        """Freeze the scene context represented by a raster pointer front."""
+        """Exclude one selector kind for an external raster compositor.
+
+        The pointer transform is press-time input state; selector geometry and
+        labels are rebuilt from each current session snapshot.  No scene owner
+        is frozen here, so a live data/fit front cannot become stale during a
+        drag.
+        """
 
         if not isinstance(kind, (SelectorKind, SelectorSceneKind)):
             raise TypeError("kind must be a selector scene kind")
-        if not isinstance(snapshot, SelectorSnapshot):
-            raise TypeError("snapshot must be SelectorSnapshot")
-        self._external_selector_scene_owner = self._make_selector_scene_owner(
-            snapshot
-        )
         self._selector_scene_exclusion_kind = kind
 
     def preview_selector(self, state: SelectorState) -> bool:
@@ -1351,9 +1401,12 @@ class MatplotlibRenderer:
         was_color = self._selector_gesture_kind is SelectorSceneKind.COLOR_LIMITS
         self._selector_gesture_kind = None
         self._selector_candidate = None
+        try:
+            setattr(self._figure.canvas, "_zlc_plot_force_full_next", True)
+        except (AttributeError, TypeError):
+            pass
         if was_color:
             self._color_limit_candidate = None
-        self._external_selector_scene_owner = None
         self._selector_gesture_backgrounds = ()
         self._selector_gesture_limits = ()
 
@@ -1826,19 +1879,36 @@ class MatplotlibRenderer:
             collection.set_alpha(alpha)
         self._artists[f"{key}:projection"] = (edges, counts)
         if limits is not None:
-            self._set_xlim(axes, *limits[0])
-            self._set_ylim(axes, *limits[1])
+            selected_x = limits[0]
+            selected_y = limits[1]
         else:
-            if edges.size >= 2:
-                self._set_xlim(axes, float(edges[0]), float(edges[-1]))
-            self._set_ylim(
-                axes,
-                *self._resolve_histogram_y_limits(key, counts, state),
+            selected_x = (
+                (float(edges[0]), float(edges[-1]))
+                if edges.size >= 2
+                else None
             )
+            selected_y = self._resolve_histogram_y_limits(key, counts, state)
+
         scale = "log" if bool(state["log_y"]) else "linear"
+        if scale == "log" and selected_y[0] <= 0.0:
+            raise RuntimeError("resolved logarithmic limits are not positive")
         if axes.get_yscale() != scale:
+            if scale == "log":
+                old_low, _old_high = sorted(map(float, axes.get_ylim()))
+                if old_low <= 0.0:
+                    axes.set_ylim(
+                        float(selected_y[0]),
+                        max(float(selected_y[1]), float(selected_y[0]) * 10.0),
+                    )
             axes.set_yscale(scale)
             self._mark_axes_chrome_dirty(axes)
+        if limits is not None:
+            self._set_xlim(axes, *selected_x)
+            self._set_ylim(axes, *selected_y)
+        else:
+            if selected_x is not None:
+                self._set_xlim(axes, *selected_x)
+            self._set_ylim(axes, *selected_y)
         semantic = self.spec.cell if isinstance(self.spec, FacetGridPlot) else self.spec
         labels = getattr(semantic, "labels", None)
         explicit_x = _state_label(state, "x_label", None)
@@ -3249,9 +3319,10 @@ class MatplotlibRenderer:
 
         if not isinstance(snapshot, SelectorSnapshot):
             raise TypeError("snapshot must be SelectorSnapshot")
-        owner = self._external_selector_scene_owner
-        if owner is None:
-            owner = self._make_selector_scene_owner(snapshot)
+        # Rebuild the owner from each transient snapshot.  The press-time
+        # transform belongs to the input adapter, not to a frozen scene owner;
+        # this keeps labels/geometry synchronized with the current live front.
+        owner = self._make_selector_scene_owner(snapshot)
         return owner.build(
             snapshot,
             color_state=(

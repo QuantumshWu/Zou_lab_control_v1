@@ -35,6 +35,7 @@ from zlc_data import REPEAT, SPATIAL_X, SPATIAL_Y
 from zlc_frontend.qt_widgets import FluentPlotFitPanel, ensure_qt_app
 from zlc_plot import PlotKind
 from zlc_workbench.task_console.console_records import (
+    PanelConfig,
     console_signal_key,
     panel_signal_key,
 )
@@ -439,6 +440,76 @@ def test_camera_live_image_area_second_image_and_fit_use_one_plot_stack(
         _close_flow(flow, console_wrapper, application)
 
 
+def test_panel_drag_release_commits_order_and_restores_north_west_gravity(
+    tmp_path,
+) -> None:
+    """A drag release must enter the sole board packer, not leave a transient pixel pose."""
+
+    configure_offscreen_fast_path()
+    application = ensure_qt_app()
+    require_offscreen_platform(application)
+    from task_console import _StandaloneTaskConsoleFlow, _build_parser
+
+    flow = _StandaloneTaskConsoleFlow(
+        _build_parser().parse_args(
+            [
+                "--workspace",
+                str(tmp_path / "workspace"),
+                "--name",
+                "board-drag-flow",
+                "--seed",
+                "43",
+            ]
+        )
+    )
+    devices = flow.open()
+    console_wrapper = None
+    try:
+        QtTest.QTest.mouseClick(devices.apply_button, QtCore.Qt.LeftButton)
+        until(
+            application,
+            lambda: flow.console is not None or flow.failure is not None,
+            timeout=15.0,
+        )
+        assert flow.failure is None
+        console = flow.console
+        console_wrapper = console.window()
+        for index in range(3):
+            console._attach_card(
+                console._new_panel_card(
+                    PanelConfig(
+                        panel_id=f"drag-{index}",
+                        plot=PlotKind.IMAGE,
+                        title=f"drag-{index}",
+                    )
+                )
+            )
+        console._arrange()
+        application.processEvents()
+        card = console.cards[0]
+        start = card.rect().topLeft() + QtCore.QPoint(30, 15)
+        stop = QtCore.QPoint(38, 450)
+        QtTest.QTest.mousePress(card, QtCore.Qt.LeftButton, pos=start)
+        drag_mouse_move(card, stop, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseRelease(card, QtCore.Qt.LeftButton, pos=stop)
+        until(
+            application,
+            lambda: console.cards[0].panel_id == "drag-1"
+            and console.cards[1].panel_id == "drag-0"
+            and console.cards[0].config.row < console.cards[1].config.row,
+        )
+        assert console.cards[0].pos() == QtCore.QPoint(
+            console.cards[0].config.col,
+            console.cards[0].config.row,
+        )
+        assert console.cards[1].pos() == QtCore.QPoint(
+            console.cards[1].config.col,
+            console.cards[1].config.row,
+        )
+    finally:
+        _close_flow(flow, console_wrapper, application)
+
+
 def test_occupancy_start_does_not_open_panel_and_manual_binding_displays(
     tmp_path,
 ) -> None:
@@ -482,11 +553,33 @@ def test_occupancy_start_does_not_open_panel_and_manual_binding_displays(
         calibration_row = console.logic_nodes[-1]
         calibration_editor = _current_logic_editor(console, application)
         calibration_widgets = _visible_form_widgets(calibration_editor)
-        _replace_spin_value(calibration_widgets["threshold_frames"], "10")
+        # Keep the capture long enough to observe the typed transient raw-frame
+        # preview before the Task reaches its terminal FINAL result.
+        _replace_spin_value(calibration_widgets["threshold_frames"], "40")
         QtTest.QTest.mouseClick(
             calibration_editor.form.start_button,
             QtCore.Qt.LeftButton,
         )
+        calibration_preview_signal = console_signal_key(
+            calibration_row.node.node_id,
+            "capture_preview",
+        )
+        until(
+            application,
+            lambda: any(
+                card.config.signal == calibration_preview_signal
+                for card in console.cards
+            ),
+            timeout=10.0,
+        )
+        calibration_preview = next(
+            card
+            for card in console.cards
+            if card.config.signal == calibration_preview_signal
+        )
+        _wait_for_plot(application, calibration_preview, timeout=10.0)
+        assert calibration_preview.presented_value.dtype == np.dtype("uint16")
+        assert calibration_preview.presented_value.shape[:2] == (1, 1)
         calibration_signal = console_signal_key(
             calibration_row.node.node_id,
             "calibration",
@@ -515,6 +608,14 @@ def test_occupancy_start_does_not_open_panel_and_manual_binding_displays(
             "distribution.png",
             "fidelity.png",
             "site_map.png",
+        ]
+        assert (calibration_root / "calibration.json").is_file()
+        assert sorted(
+            path.name for path in (calibration_root / "report").glob("*.npz")
+        ) == [
+            "distribution.npz",
+            "fidelity.npz",
+            "site_map.npz",
         ]
         assert all(
             (calibration_root / "report" / page).stat().st_size > 0

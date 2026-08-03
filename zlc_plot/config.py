@@ -76,7 +76,6 @@ class InteractionDefaults:
     """Backend-independent pointer cadence and hit/zoom policy."""
 
     pointer_update_interval_ms: int
-    selector_fit_update_interval_ms: int
     raster_preview_interval_ms: int
     double_click_interval_ms: int
     double_click_radius_px: float
@@ -92,14 +91,6 @@ class InteractionDefaults:
             _positive_integer(
                 self.pointer_update_interval_ms,
                 "pointer_update_interval_ms",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "selector_fit_update_interval_ms",
-            _positive_integer(
-                self.selector_fit_update_interval_ms,
-                "selector_fit_update_interval_ms",
             ),
         )
         object.__setattr__(
@@ -206,7 +197,6 @@ DEFAULTS = PlotLibraryDefaults(
     runtime=RuntimeDefaults(analysis_worker_count=1, shutdown_timeout_ms=5_000),
     interaction=InteractionDefaults(
         pointer_update_interval_ms=30,
-        selector_fit_update_interval_ms=100,
         raster_preview_interval_ms=100,
         double_click_interval_ms=500,
         double_click_radius_px=6.0,

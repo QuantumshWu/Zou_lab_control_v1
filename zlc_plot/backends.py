@@ -130,11 +130,167 @@ def _prepare_native_canvas(canvas: object, plan: object) -> None:
     figure = getattr(canvas, "figure", None)
     if figure is None:
         raise TypeError("native Matplotlib canvas has no Figure")
+    # ipympl inherits the Agg renderer and implements the WebAgg diff-image
+    # transport (`copy_from_bbox`/`restore_region`/`blit`), but advertises
+    # ``supports_blit = False`` so Matplotlib's generic animation path does
+    # not assume a GUI blit surface.  This package owns the complete draw
+    # transaction and can safely enable the renderer-side path: the widget
+    # still receives an immutable diff (or a full frame when transparency or
+    # resize requires it), while selector motion never schedules a second
+    # asynchronous ``draw_idle`` round trip.
+    if not bool(getattr(canvas, "supports_blit", False)) and all(
+        callable(getattr(canvas, name, None))
+        for name in ("copy_from_bbox", "restore_region", "blit", "get_renderer")
+    ):
+        try:
+            setattr(canvas, "supports_blit", True)
+        except (AttributeError, TypeError):
+            # A third-party canvas may expose a read-only capability flag;
+            # the renderer retains its complete-draw fallback in that case.
+            pass
     figure._original_dpi = _surface_logical_dpi(plan)
     setter = getattr(canvas, "_set_device_pixel_ratio", None)
     if callable(setter):
         setter(_surface_device_pixel_ratio(plan))
     _restore_native_canvas_geometry(canvas, plan)
+
+
+def _bind_notebook_draw_owner(
+    canvas: object,
+    session: "PlotSession",
+) -> Callable[[], None]:
+    """Route notebook raster work through one :class:`PlotSession` owner.
+
+    ipympl sends ``draw`` messages asynchronously during widget
+    initialisation, resize, and DPR negotiation.  Calling the Matplotlib
+    canvas directly while the renderer's artists are animated produces a
+    partial frame (data and fit artists are intentionally skipped by that
+    draw).  The session must own those requests just like an explicit
+    presentation; the renderer uses ``_zlc_plot_raw_draw`` for its internal
+    raw Agg/WebAgg draw so the bridge cannot recurse.  WebAgg also emits a
+    message for every low-level ``draw``/``blit`` call, so the manager's
+    refresh edge is coalesced into one complete binary frame per renderer
+    transaction.
+    """
+
+    if not callable(getattr(canvas, "draw", None)):
+        raise BackendUnavailableError("the notebook canvas has no draw method")
+    existing_release = getattr(canvas, "_zlc_plot_draw_release", None)
+    if callable(existing_release):
+        return existing_release
+    original_draw = getattr(canvas, "draw")
+    manager = getattr(canvas, "manager", None)
+    original_refresh = None if manager is None else getattr(manager, "refresh_all", None)
+    if not callable(original_refresh):
+        raise BackendUnavailableError(
+            "the notebook canvas manager has no refresh_all method"
+        )
+    transaction_depth = 0
+    refresh_pending = False
+
+    def owned_refresh(*_args: object, **_kwargs: object) -> object:
+        nonlocal refresh_pending
+        if transaction_depth:
+            refresh_pending = True
+            return None
+        return original_refresh()
+
+    def begin_transaction() -> None:
+        nonlocal transaction_depth
+        transaction_depth += 1
+
+    def end_transaction(success: bool = True) -> None:
+        nonlocal refresh_pending, transaction_depth
+        if not isinstance(success, bool):
+            raise TypeError("raster transaction success must be bool")
+        if transaction_depth <= 0:
+            raise RuntimeError("raster transaction is not active")
+        transaction_depth -= 1
+        if transaction_depth:
+            return
+        pending = refresh_pending
+        refresh_pending = False
+        if success:
+            # WebAgg diff frames are relative to the last frame that the
+            # browser has decoded.  During a selector gesture the notebook
+            # can queue several binary messages before the previous PNG has
+            # painted; a diff then has no reliable base and briefly exposes
+            # an empty canvas.  Gesture fronts are small and transient, so
+            # publish them as independent full frames while ordinary live
+            # data keeps the cheaper diff transport.
+            renderer = getattr(session, "_renderer", None)
+            gesture_kind = (
+                None
+                if renderer is None
+                else getattr(renderer, "_selector_gesture_kind", None)
+            )
+            force_next = bool(
+                getattr(canvas, "_zlc_plot_force_full_next", False)
+            )
+            if (
+                (gesture_kind is not None or force_next)
+                and hasattr(canvas, "_force_full")
+            ):
+                setattr(canvas, "_force_full", True)
+            if pending:
+                original_refresh()
+                if force_next:
+                    setattr(canvas, "_zlc_plot_force_full_next", False)
+            return
+        # Keep the current notebook front untouched after a failed compose;
+        # the next successful transaction must send a complete frame.
+        if hasattr(canvas, "_force_full"):
+            setattr(canvas, "_force_full", True)
+        if hasattr(canvas, "_png_is_old"):
+            setattr(canvas, "_png_is_old", True)
+
+    def owned_draw(*_args: object, **_kwargs: object) -> object:
+        return session.redraw_surface()
+
+    setattr(canvas, "_zlc_plot_raw_draw", original_draw)
+    setattr(canvas, "draw", owned_draw)
+    setattr(manager, "_zlc_plot_raw_refresh_all", original_refresh)
+    setattr(manager, "refresh_all", owned_refresh)
+    setattr(canvas, "_zlc_plot_begin_raster_transaction", begin_transaction)
+    setattr(canvas, "_zlc_plot_end_raster_transaction", end_transaction)
+
+    released = False
+
+    def release() -> None:
+        nonlocal released
+        if released:
+            return
+        released = True
+        if getattr(canvas, "draw", None) is owned_draw:
+            setattr(canvas, "draw", original_draw)
+        if getattr(canvas, "_zlc_plot_raw_draw", None) is original_draw:
+            try:
+                delattr(canvas, "_zlc_plot_raw_draw")
+            except AttributeError:
+                pass
+        if getattr(manager, "refresh_all", None) is owned_refresh:
+            setattr(manager, "refresh_all", original_refresh)
+        if getattr(manager, "_zlc_plot_raw_refresh_all", None) is original_refresh:
+            try:
+                delattr(manager, "_zlc_plot_raw_refresh_all")
+            except AttributeError:
+                pass
+        for name in (
+            "_zlc_plot_begin_raster_transaction",
+            "_zlc_plot_end_raster_transaction",
+        ):
+            try:
+                delattr(canvas, name)
+            except AttributeError:
+                pass
+        if getattr(canvas, "_zlc_plot_draw_release", None) is release:
+            try:
+                delattr(canvas, "_zlc_plot_draw_release")
+            except AttributeError:
+                pass
+
+    setattr(canvas, "_zlc_plot_draw_release", release)
+    return release
 
 
 def _restore_native_canvas_geometry(canvas: object, plan: object) -> None:
@@ -321,6 +477,8 @@ class NotebookView:
         self._modules: _NotebookModules | None = None
         self._canvas: object | None = None
         self._manager: object | None = None
+        self._canvas_draw_release: Callable[[], None] | None = None
+        self._applied_surface_plan: object | None = None
         self._canvas_dpr_callback: Callable[..., object] | None = None
         self._surface_apply_scheduled = False
         self._displayed = False
@@ -345,8 +503,9 @@ class NotebookView:
         try:
             self._modules.display(canvas)
             self._displayed = True
-            # Rebuild dynamic artists for the newly attached non-blitting canvas.
-            # The real ipympl view owns its own refresh/initialized handshake.
+            # Rebuild the current dynamic front after the widget is attached.
+            # The real ipympl view owns its refresh/initialized handshake;
+            # selector motion uses the renderer-side diff path when available.
             self._session.redraw_surface()
         except BaseException:
             try:
@@ -415,6 +574,11 @@ class NotebookView:
             release, self._release_dispatch = self._release_dispatch, None
             canvas, self._canvas = self._canvas, None
             manager, self._manager = self._manager, None
+            self._applied_surface_plan = None
+            canvas_draw_release, self._canvas_draw_release = (
+                self._canvas_draw_release,
+                None,
+            )
             dpr_callback, self._canvas_dpr_callback = (
                 self._canvas_dpr_callback,
                 None,
@@ -431,6 +595,8 @@ class NotebookView:
             callbacks.append(self._session._connect_mpl_events)
         if release is not None:
             callbacks.append(release)
+        if canvas_draw_release is not None:
+            callbacks.append(canvas_draw_release)
         if canvas is not None and dpr_callback is not None:
             def remove_dpr_callback() -> None:
                 on_msg = getattr(canvas, "on_msg", None)
@@ -540,7 +706,11 @@ class NotebookView:
             if self._closed:
                 return
             self._pending_surface = snapshot
-            if self._canvas is None or self._surface_apply_scheduled:
+            if (
+                self._canvas is None
+                or snapshot.plan == self._applied_surface_plan
+                or self._surface_apply_scheduled
+            ):
                 return
             self._surface_apply_scheduled = True
         try:
@@ -622,6 +792,7 @@ class NotebookView:
         canvas = self._canvas
         manager = self._manager
         existing_canvas = canvas is not None
+        plan_changed = snapshot.plan != self._applied_surface_plan
         if canvas is None:
             canvas, manager = self._interactive_canvas(
                 snapshot.figure,
@@ -629,28 +800,26 @@ class NotebookView:
             )
             self._canvas = canvas
             self._manager = manager
+            self._canvas_draw_release = _bind_notebook_draw_owner(
+                canvas,
+                self._session,
+            )
             self._observe_notebook_pixel_ratio(canvas)
+            self._applied_surface_plan = snapshot.plan
+            plan_changed = True
         else:
             if getattr(canvas, "figure", None) is not snapshot.figure:
                 raise RuntimeError(
                     "NotebookView requires one stable Figure and canvas model"
                 )
-            _restore_native_canvas_geometry(canvas, snapshot.plan)
+            if plan_changed:
+                _restore_native_canvas_geometry(canvas, snapshot.plan)
+                self._applied_surface_plan = snapshot.plan
         if existing_canvas:
             assert manager is not None
             figure = getattr(canvas, "figure", None)
-            ratio = _surface_device_pixel_ratio(snapshot.plan)
-            physical_size = tuple(float(value) for value in figure.bbox.size)
-            expected_size = tuple(value / ratio for value in physical_size)
-            current_size = tuple(float(value) for value in getattr(canvas, "_size", ()))
-            if len(current_size) != 2 or any(
-                not math.isclose(current, expected, rel_tol=0.0, abs_tol=0.01)
-                for current, expected in zip(
-                    current_size,
-                    expected_size,
-                    strict=True,
-                )
-            ):
+            if plan_changed:
+                physical_size = tuple(float(value) for value in figure.bbox.size)
                 manager.resize(*physical_size)
         width, height = _surface_logical_size(snapshot.plan)
         widget_layout = getattr(canvas, "layout", None)
@@ -1779,6 +1948,14 @@ def _qt5_plot_widget_class() -> type[Any]:
             if candidate is None or role is None:
                 if action in {"release", "cancel", "key"} or not active_pan:
                     self._clear_interaction()
+                elif action == "move":
+                    # A pan front is already complete when it reaches this
+                    # owner-thread callback.  ``update()`` may be deferred
+                    # behind a burst of queued mouse events, making the
+                    # visible change appear only at release.  Repaint only
+                    # this cheap QImage promotion path; Matplotlib rendering
+                    # remains on the raster worker and is not repeated here.
+                    self.repaint()
                 return
             front = self._gesture_front or self._front
             if front is None:
@@ -1804,7 +1981,14 @@ def _qt5_plot_widget_class() -> type[Any]:
             self._gesture_front = front
             self._gesture_axes = axes
             self._gesture_kind = candidate.kind
-            self.update()
+            if action == "move":
+                # Candidate scenes are immutable and already resolved by the
+                # shared PlotSession interaction engine.  Paint them in the
+                # same owner callback as the corresponding pointer event so
+                # notebook and Qt cannot diverge by one release event.
+                self.repaint()
+            else:
+                self.update()
 
         def mousePressEvent(self, event: object) -> None:
             if self._closed:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, TypeAlias
 import warnings
 
@@ -140,6 +141,33 @@ class AxisValue:
 
 
 @dataclass(frozen=True, slots=True)
+class RollingSample:
+    """One scalar-per-group projection for a rolling plot history."""
+
+    revision: int
+    generation: str
+    values: NDArray[Any] | ArrayLike
+    valid: NDArray[np.bool_] | ArrayLike
+    group_keys: tuple[tuple[AxisValue, ...], ...] = ()
+
+    def __post_init__(self) -> None:
+        values = _readonly(self.values)
+        valid = _readonly(self.valid, dtype=np.bool_)
+        if values.ndim != 1 or valid.shape != values.shape:
+            raise ValueError(
+                "rolling sample values and validity must be one-dimensional"
+            )
+        keys = tuple(tuple(item) for item in self.group_keys)
+        if len(keys) != values.size:
+            raise ValueError("rolling sample group keys must match value count")
+        if any(not isinstance(item, AxisValue) for key in keys for item in key):
+            raise TypeError("rolling sample group keys must contain AxisValue values")
+        object.__setattr__(self, "values", values)
+        object.__setattr__(self, "valid", valid)
+        object.__setattr__(self, "group_keys", keys)
+
+
+@dataclass(frozen=True, slots=True)
 class CurveSeries:
     x: QuantityArray
     y: QuantityArray
@@ -214,6 +242,7 @@ class ImageData:
     y: QuantityArray
     z: QuantityArray
     valid: NDArray[np.bool_] | ArrayLike
+    source_revisions: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         valid = _readonly(self.valid, dtype=np.bool_)
@@ -223,6 +252,15 @@ class ImageData:
         if self.z.canonical.shape != expected or valid.shape != expected:
             raise ValueError("image z and validity do not match its coordinate grid")
         object.__setattr__(self, "valid", valid)
+        revisions = tuple(self.source_revisions) or (self.revision,)
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, Integral)
+            or int(value) < 0
+            for value in revisions
+        ):
+            raise TypeError("source_revisions must contain non-negative integers")
+        object.__setattr__(self, "source_revisions", tuple(map(int, revisions)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +270,7 @@ class HistogramData:
     edges: QuantityArray
     centers: QuantityArray
     counts: NDArray[np.int64] | ArrayLike
+    source_revisions: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         counts = _readonly(self.counts, dtype=np.int64)
@@ -242,6 +281,15 @@ class HistogramData:
         if self.centers.canonical.size != counts.size:
             raise ValueError("histogram centers and counts must have equal length")
         object.__setattr__(self, "counts", counts)
+        revisions = tuple(self.source_revisions) or (self.revision,)
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, Integral)
+            or int(value) < 0
+            for value in revisions
+        ):
+            raise TypeError("source_revisions must contain non-negative integers")
+        object.__setattr__(self, "source_revisions", tuple(map(int, revisions)))
 
 
 FacetPayload: TypeAlias = CurveData | ImageData | HistogramData
@@ -266,6 +314,7 @@ class FacetData:
     generation: str
     spec: FacetGridPlot
     cells: tuple[FacetCell, ...]
+    source_revisions: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         cells = tuple(self.cells)
@@ -287,6 +336,21 @@ class FacetData:
         ):
             raise ValueError("facet cell revisions must match their FacetData revision")
         object.__setattr__(self, "cells", cells)
+        revisions = tuple(self.source_revisions) or (self.revision,)
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, Integral)
+            or int(value) < 0
+            for value in revisions
+        ):
+            raise TypeError("source_revisions must contain non-negative integers")
+        if any(
+            tuple(getattr(cell.payload, "source_revisions", (self.revision,)))
+            != revisions
+            for cell in cells
+        ):
+            raise ValueError("facet cells must share FacetData source revisions")
+        object.__setattr__(self, "source_revisions", tuple(map(int, revisions)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,6 +481,7 @@ class DataView:
         if x in groups:
             raise DataViewError("curve x axis cannot also be a group axis")
         aggregation = _validate_aggregation(aggregation)
+        self._validate_axis_coverage((x, *groups), kind="curve")
         positions = self._all_positions()
         return self._curve_from_positions(x, positions, groups, aggregation)
 
@@ -567,6 +632,15 @@ class DataView:
         if x == y:
             raise DataViewError("image x and y axes must differ")
         aggregation = _validate_aggregation(aggregation)
+        self._validate_axis_coverage((x, y), kind="image")
+        if {x.domain, y.domain} <= {
+            AxisDomain.POINT_ROW,
+            AxisDomain.POINT_COORDINATE,
+        }:
+            raise DataViewError(
+                "Image requires two declared GridTopology dimensions when both "
+                "axes come from ordinary point rows/coordinates"
+            )
         dense = self._dense_data_image(x, y, aggregation)
         if dense is not None:
             return dense
@@ -831,9 +905,70 @@ class DataView:
         self,
         *,
         bins: int | Sequence[float],
+        samples: Iterable[AxisRef] = (),
     ) -> HistogramData:
-        positions = self._all_positions()
+        sample_refs = tuple(samples)
+        positions = self._sample_positions(sample_refs)
         return self._histogram_from_positions(bins, positions)
+
+    def histogram_values(
+        self,
+        samples: Iterable[AxisRef] = (),
+    ) -> tuple[NDArray[Any], NDArray[np.bool_]]:
+        """Return the exact values consumed by an explicit histogram projection.
+
+        This is the data-view owner for histogram-domain discovery.  Keeping
+        the sample contract here prevents FitProjection and renderers from
+        independently flattening unlisted axes while choosing bin edges.
+        """
+
+        positions = self._sample_positions(tuple(samples))
+        flat_values = self._samples.value.canonical.reshape(-1)
+        flat_valid = self._samples.valid_mask.reshape(-1)
+        values = _readonly(flat_values[positions])
+        valid = _readonly(flat_valid[positions], dtype=np.bool_)
+        return values, valid
+
+    def rolling_sample(
+        self,
+        *,
+        group: AxisRef | None = None,
+        aggregation: Reduction = Reduction.MEAN,
+    ) -> RollingSample:
+        """Reduce one source revision to one scalar per optional group."""
+
+        if group is not None:
+            if not isinstance(group, AxisRef):
+                raise TypeError("rolling group must be an AxisRef or None")
+            self._resolve(group)
+        aggregation = _validate_aggregation(aggregation)
+        positions = self._all_positions()
+        flat_values = self._samples.value.canonical.reshape(-1)
+        flat_valid = self._samples.valid_mask.reshape(-1)
+        if group is None:
+            codes = np.zeros(positions.size, dtype=np.int64)
+            domain_size = 1
+            keys: tuple[tuple[AxisValue, ...], ...] = ((),)
+        else:
+            domain = self._domain(group, positions)
+            codes = domain.codes
+            domain_size = len(domain.values)
+            keys = tuple((value,) for value in domain.values)
+        usable = flat_valid[positions] & (codes >= 0)
+        values, counts = _aggregate_by_codes(
+            flat_values[positions],
+            usable,
+            codes,
+            domain_size,
+            aggregation,
+        )
+        return RollingSample(
+            revision=self._samples.revision,
+            generation=self._samples.generation,
+            values=values,
+            valid=(counts > 0) & np.isfinite(values),
+            group_keys=keys,
+        )
 
     def _histogram_from_positions(
         self,
@@ -902,15 +1037,34 @@ class DataView:
         cell = spec.cell
         if not isinstance(cell, HistogramPlot) and bins is not None:
             raise ValueError("bins are accepted only for Histogram facet cells")
+        semantic_refs: tuple[AxisRef, ...]
+        if isinstance(cell, CurvePlot):
+            semantic_refs = (spec.facet, cell.x) + (
+                () if cell.group is None else (cell.group,)
+            )
+        elif isinstance(cell, ImagePlot):
+            semantic_refs = (spec.facet, cell.x, cell.y)
+        else:
+            semantic_refs = (spec.facet, *cell.samples)
+        self._validate_axis_coverage(semantic_refs, kind="facet")
+        if isinstance(cell, ImagePlot) and {cell.x.domain, cell.y.domain} <= {
+            AxisDomain.POINT_ROW,
+            AxisDomain.POINT_COORDINATE,
+        }:
+            raise DataViewError(
+                "Image requires two declared GridTopology dimensions when both "
+                "axes come from ordinary point rows/coordinates"
+            )
         shared_bins = bins
         if isinstance(cell, HistogramPlot) and isinstance(bins, bool):
             raise TypeError("histogram bin count must be an integer")
         if isinstance(cell, HistogramPlot) and isinstance(bins, (int, np.integer)):
             if int(bins) <= 0:
                 raise ValueError("histogram bin count must be positive")
+            sample_positions = self._sample_positions((spec.facet, *cell.samples))
             flat_valid = self._samples.valid_mask.reshape(-1)
             display_values = np.asarray(self._samples.value.display).reshape(-1)
-            values = display_values[base_positions[flat_valid[base_positions]]]
+            values = display_values[sample_positions[flat_valid[sample_positions]]]
             _require_real_numeric(values, None)
             values = values[np.isfinite(values)]
             shared_bins = np.histogram_bin_edges(values, bins=int(bins))
@@ -935,9 +1089,15 @@ class DataView:
                 if bins is None:
                     raise DataViewError("histogram facet cells require explicit bins")
                 assert shared_bins is not None
+                sample_positions = self._sample_positions((spec.facet, *cell.samples))
+                allowed = np.zeros(
+                    self._samples.value.canonical.size,
+                    dtype=np.bool_,
+                )
+                allowed[cell_positions] = True
                 payload = self._histogram_from_positions(
                     shared_bins,
-                    cell_positions,
+                    sample_positions[allowed[sample_positions]],
                 )
             cells.append(
                 FacetCell(
@@ -953,7 +1113,94 @@ class DataView:
             generation=self._samples.generation,
             spec=spec,
             cells=tuple(cells),
+            source_revisions=(self._samples.revision,),
         )
+
+    def _sample_positions(
+        self,
+        samples: tuple[AxisRef, ...],
+    ) -> NDArray[np.int64]:
+        """Resolve an explicit histogram pooling contract to flat positions."""
+
+        if any(not isinstance(ref, AxisRef) for ref in samples):
+            raise TypeError("histogram samples must contain AxisRef objects")
+        if len(set(samples)) != len(samples):
+            raise DataViewError("histogram samples must contain unique AxisRef values")
+        schema = self._snapshot.schema
+        for ref in samples:
+            self._resolve(ref)
+        selected = self._indices
+        if schema.R > 1 and AxisRef.repeat() not in samples and AxisRef.repeat() not in selected:
+            raise DataViewError(
+                "histogram leaves repeat axis unconsumed; include AxisRef.repeat() "
+                "in samples or select it explicitly"
+            )
+        if schema.P > 1 and not any(
+            ref.domain
+            in {
+                AxisDomain.POINT_ROW,
+                AxisDomain.POINT_COORDINATE,
+                AxisDomain.POINT_DIMENSION,
+            }
+            for ref in samples
+        ) and not any(
+            ref.domain
+            in {
+                AxisDomain.POINT_ROW,
+                AxisDomain.POINT_COORDINATE,
+                AxisDomain.POINT_DIMENSION,
+            }
+            for ref in selected
+        ):
+            raise DataViewError(
+                "histogram leaves point rows unconsumed; include an explicit "
+                "point sample axis"
+            )
+        for axis in schema.data_axes:
+            if axis.size <= 1:
+                continue
+            ref = AxisRef.data(axis.name)
+            if ref not in samples and ref not in selected:
+                raise DataViewError(
+                    f"histogram leaves data axis {axis.name!r} unconsumed; "
+                    "declare it in HistogramPlot.samples or select it explicitly"
+                )
+        return self._all_positions()
+
+    def _validate_axis_coverage(
+        self,
+        refs: tuple[AxisRef, ...],
+        *,
+        kind: str,
+    ) -> None:
+        """Reject projections that would silently fold authored dimensions."""
+
+        schema = self._snapshot.schema
+        references = tuple(refs)
+        for ref in references:
+            self._resolve(ref)
+        selected = self._indices
+        for axis in schema.data_axes:
+            if axis.size <= 1:
+                continue
+            ref = AxisRef.data(axis.name)
+            if ref not in references and ref not in selected:
+                raise DataViewError(
+                    f"{kind} leaves data axis {axis.name!r} unreferenced; "
+                    "select, group, facet, or plot that axis explicitly"
+                )
+        point_references = {
+            AxisDomain.POINT_ROW,
+            AxisDomain.POINT_COORDINATE,
+            AxisDomain.POINT_DIMENSION,
+        }
+        point_covered = any(ref.domain in point_references for ref in references)
+        point_covered |= any(ref.domain in point_references for ref in selected)
+        if schema.P > 1 and not point_covered:
+            raise DataViewError(
+                f"{kind} leaves the authored point-row domain unreferenced; "
+                "select a point row/coordinate or group it explicitly"
+            )
 
     def _all_positions(self) -> NDArray[np.int64]:
         shape = self._samples.shape
@@ -1305,6 +1552,7 @@ __all__ = [
     "FacetPayload",
     "HistogramData",
     "ImageData",
+    "RollingSample",
     "QuantityArray",
     "SampleProjection",
     "TopologyRequiredError",

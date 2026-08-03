@@ -40,7 +40,7 @@ tutorials/_executed_check/
 **/_output/
 
 # Figures + data dumps are NEVER committed: panel/Figure exports live below
-# _output/figures while tasks/ contains only reloadable layout JSON source,
+# the explicit project ``figures/`` root (or the local ``_output/`` tree) while tasks/ contains only reloadable layout JSON source,
 # calibration reports, scan exports, scratch captures.  The only binary assets admitted
 # to git are deliverable manual figures and explicitly named independent test oracles.
 # (Saved task LAYOUTS tasks/*.json are not data, so they stay committable.)
@@ -49,6 +49,9 @@ tutorials/_executed_check/
 *.npy
 !docs/**/assets/*.png
 !tests/fixtures/main_readout_oracle.npz
+/runs/
+/figures/
+/tasks/calibration/
 _shots/
 **/_shots/
 

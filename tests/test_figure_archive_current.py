@@ -36,6 +36,13 @@ from zlc_frontend.qt_widgets import (
     ensure_qt_app,
 )
 from zlc_plot import AxisRef, ImagePlot
+from zlc_plot import NumericRange
+from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
+    CalibrationArtifactRef,
+)
+from zlc_neutral_atom.logic_nodes.readout.calibration.ui.report_window import (
+    CalibrationReportWindow,
+)
 from zlc_workbench.data_figure.archive_io import (
     FigureArchive,
     LoadedFigureArchive,
@@ -179,4 +186,65 @@ def test_formal_viewer_embeds_the_same_host_for_plot_settings_fit_and_save(
         window = getattr(viewer, "_zlc_window", None)
         if window is not None:
             window.close()
+        application.processEvents()
+
+
+def test_calibration_report_pages_use_shared_interactive_plot_host(
+    tmp_path: Path,
+) -> None:
+    """Every exported calibration page remains a real interactive DataFigure.
+
+    The report must not regress to static PNG/QLabel rendering: one selector
+    operation should advance each page's shared raster front and every page
+    must expose its own ordinary DataFigure host.
+    """
+
+    application = ensure_qt_app()
+    report_root = tmp_path / "report"
+    report_root.mkdir()
+    for name in ("site_map", "fidelity", "extra"):
+        archive = _archive()
+        archive = FigureArchive(
+            archive.snapshot,
+            archive.spec,
+            archive.size,
+            archive.parameters,
+            {"calibration_page": name},
+        )
+        save_figure_archive(archive, report_root / f"{name}.npz")
+
+    report = CalibrationReportWindow(
+        report_root,
+        CalibrationArtifactRef("tasks/calibration/test/calibration.json"),
+    )
+    report.show()
+    try:
+        _wait_until(
+            application,
+            lambda: all(
+                pane.plot_widget is not None and pane._initial_outcome == "ready"
+                for pane in report._panes
+            ),
+        )
+        assert len(report._panes) == 3
+        assert all(pane.host is not None for pane in report._panes)
+        before = [pane.host.front.identity.sequence for pane in report._panes]
+        for pane in report._panes:
+            operation = pane.host.set_area_selector(
+                NumericRange(1.0, 4.0),
+                NumericRange(1.0, 4.0),
+                display=False,
+            )
+            _wait_until(application, operation.done)
+            assert operation.exception() is None
+        _wait_until(
+            application,
+            lambda: all(
+                pane.host.front.identity.sequence > previous
+                for pane, previous in zip(report._panes, before, strict=True)
+            ),
+        )
+    finally:
+        _wait_until(application, report.teardown)
+        report.close()
         application.processEvents()

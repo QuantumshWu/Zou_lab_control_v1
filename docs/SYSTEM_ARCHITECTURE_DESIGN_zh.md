@@ -529,6 +529,7 @@ Identity严格按成本和消费者限定：
 - 实现一个私有readonly Dataset adapter、物理维覆盖检查及`default_plot_spec/axis_choices`。对接纳源public surface只做必要修订：`HistogramPlot.samples`、移除`RollingPlot.x`并改为session-private revision history、`PlotSession.replace_spec()`、现有`SelectionData/FitSelection`增加ordered `source_revisions`、`fit_all_facets`与`FacetFitBatchResult`；不增加public axis-selection/history Dataset/DTO/lane/registry。
 - `RasterFront`冻结实际画入的ordered source revisions；Workbench的revision→publication关联严格有界于pending/latest-worker/presented-window并在所有terminal/supersede/retire路径释放。Task preview在declaration到PanelConfig之间全程保持typed`PlotKind | PlotSpec`，只有layout I/O可codec。
 - 在同一未提交cut迁移TaskConsole、Calibration、Occupancy、DataFigure、FigureViewer、Edit、Pulse preview与public facade；Camera monitor改为每publication只发布最新`(1,1,*frame)`，同cut删除`MONITOR_HISTORY` Dataset role、camera request/API/default/authoring中的`history_cycles`、capture-preview history point-column路径和`MonitorDataset.append_window`环形分支。`MonitorDataset`本身保留为通用stream materializer，并压成`keyed_cycle + latest_cell`两条真实模式；`latest_cell`继续唯一承担payload/metadata校验、ordered ingest、revision/event_ref/head、gap accounting、atomic replacement与snapshot publication，不能把这些职责移入Camera leaf或GUI。随后删除全部旧frontend plot/projection/selector/Fit/render/raster/style/layout、zlc_data Fit closure、Workbench/leaf专用composer及相关测试。任何旧plot import、history-in-P/`history_cycles`或第二runtime尚存都表示C1未完成。
+- 外部 `zlc_plot` 后续更新只按语义增量接纳，不复制另一棵树。当前本仓适配到 `15bbc7d` 的显式 authored-axis coverage、`HistogramPlot.samples`/sample-domain discovery、无`GridTopology`双point-coordinate Image 拒绝、`RollingSample`与有序`source_revisions`；这些都在 `zlc_plot` 的 readonly data bridge 内实现，PlotSession/Workbench仍只有一个投影、Fit、raster与style owner。后续外部提交必须先逐项 characterization，再以本仓 bridge/contract tests 选择性移植。
 - 用Camera→live Image→Area→第二Image→Fit、Histogram Distribution、Calibration report、FacetGrid batch Fit、FigureViewer与Pulse preview的正式快轨证明后才commit，并报告固定口径净删除。
 
 ### C2：DeviceInstance graph
@@ -558,11 +559,20 @@ Identity严格按成本和消费者限定：
 - 删除 hold/step 原有的完整Run cancel/reap/restart路径与其UI重投影；普通 On-Pulse 的新文档替换仍沿既有Run admission语义。分别profile compile、RPC/upload、safe/reap、UI，保持RTL/Tcl/XDC/bitstream/wire零diff。
 - 通过Virtual/Remote/Offline与真实server路径验证Stop/hold/step、dirty state、endpoint clamp和稳定文本。
 
-### C6：领域E2E、性能与全仓清理
+### C6：领域E2E、性能与全仓清理（重新打开）
 
-- 执行§9全部产品流、2304²性能、两条GUI证据、public Device/Logic Node枚举smoke和真机可执行runbook；不能用单元测试替代。
-- 全仓逐文件change-impact复核，删除空目录、dead wrapper、compat alias、旧tests/tutorial/docs与临时台账，证明所有旧owner/普通SHA/软件预算/中央特判为零。
-- 最后才跑broad current suite。失败只按仍有效物理/public合同处理，不恢复被删架构。
+- C6 不能标为完成：新的现场证据重新打开四个根因切片。Calibration 的中间
+  2D 预览和项目输出路径、完成报告的可交互 PlotSession、Plot Panel 的移动与
+  左上重力排版、以及外部 `zlc_plot` 的增量接入都必须重新取得产品证据。
+- C6-R1..R4 未闭合前，不得声称软件 GO，也不得删除外部审查台账；旧的测试通过
+  只能作为回归证据，不能覆盖这些用户可见反证。
+- 已完成 tracked source 的逐文件 change-impact 扫描。旧 plot/selector/Fit/raster
+  owner、Workbench 具体 leaf import、历史 Point/Presentation/CAS/软件预算机制、死
+  wrapper/compat alias、tracked 空目录均为零；当前工作树只有用户保护文件
+  `pulses/scan_test.json`，不读取、不修改、不纳入 Git。
+- 最终 broad current suite 需在 R1..R4 修复后重新运行。未连接的 qCMOS/Pylon/remote
+  装置仍须按 `docs/REAL_HARDWARE_BRINGUP_zh.md` 在目标机器完成 E0；软件 GO
+  不等同于任何未实测装置已 qualified。
 
 ## 9. 最终验收门
 
@@ -585,4 +595,4 @@ Identity严格按成本和消费者限定：
 
 最终架构不需要第二plot/data schema、异步workflow编排器、硬件重构、persistent quarantine、软件内存预算、普通CAS/SHA、per-revision presentation对象、为Fit预设的独立进程、device backend巨表或每leaf一套lifecycle。最关键的五个跨域语义authority是：zlc_data保存实验数据事实，SignalPlane保存因果，zlc_plot保存全部绘图交互，generic Logic host保存节点骨架，Experiment保存设备composition/admission；zlc_storage、zlc_pulse、zlc_frontend与Workbench仍分别拥有§2列出的窄职责，不能被这五项吞并。
 
-C0–C6只是替换依赖顺序，不是可并存架构。每个cut必须以旧owner删除和真实产品证据结束；最终资格只由§9完整证据决定，单元测试通过不能替代。
+C0–C6只是替换依赖顺序，不是可并存架构。当前软件已以旧owner删除和真实产品证据闭合；真实装置资格仍只由 runbook 的 E0/bring-up 证据决定，单元测试通过不能替代。
