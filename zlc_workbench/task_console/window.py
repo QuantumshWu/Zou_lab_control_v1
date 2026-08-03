@@ -1506,14 +1506,21 @@ class TaskConsole(QtWidgets.QWidget):
                 retained is not None
                 and retained.final_result_resolved
             )
-            published.extend(
-                (
-                    str(output.label or output.name),
-                    "FINAL artifact" if artifact_ready else "artifact",
-                    str(output.description),
+            artifacts = self._artifacts_for_row(row)
+            for output in artifacts:
+                reference = self._artifact_result_for_output(
+                    retained,
+                    output.name,
+                    output_count=len(artifacts),
+                    resolved=artifact_ready,
                 )
-                for output in self._artifacts_for_row(row)
-            )
+                published.append(
+                    (
+                        str(output.label or output.name),
+                        self._artifact_status_text(reference, ready=artifact_ready),
+                        str(output.description),
+                    )
+                )
             row.set_publishes(published)
             return
         node = self._logic_nodes.get(id(row))
@@ -1750,6 +1757,38 @@ class TaskConsole(QtWidgets.QWidget):
             for editor in self._logic_editors.values():
                 if editor.isVisible():
                     editor.refresh_on_show()
+
+    @staticmethod
+    def _artifact_result_for_output(
+        host: LogicNodeHost | None,
+        output_name: str,
+        *,
+        output_count: int,
+        resolved: bool,
+    ) -> object | None:
+        """Return one FINAL owner result without knowing a leaf's artifact type.
+
+        Artifact references are deliberately opaque to TaskConsole.  The only
+        optional convention it projects is the common ``record_path`` field;
+        Calibration, pulse scan, and future Tasks therefore expose their real
+        project-relative record path without a task-specific branch here.
+        """
+
+        if not resolved or host is None:
+            return None
+        result = host.final_result
+        if isinstance(result, Mapping):
+            return result.get(str(output_name))
+        return result if output_count == 1 else None
+
+    @staticmethod
+    def _artifact_status_text(reference: object | None, *, ready: bool) -> str:
+        if not ready:
+            return "artifact"
+        path = getattr(reference, "record_path", None)
+        if isinstance(path, str) and path.strip():
+            return f"FINAL {path}"
+        return "FINAL artifact"
 
     def _current_signal_projection(self) -> _SignalTopologyProjection:
         """Return the sole projection, reconciling one explicit dirty edge."""
@@ -3145,6 +3184,11 @@ class TaskConsole(QtWidgets.QWidget):
             succeeded = error is None and observation.phase == "done"
             self._stop_logic_node(row, _silent=True)
             self._promote_data_front(self._data.freeze())
+            # The hosted result becomes authoritative at the same terminal
+            # edge that retains its FINAL artifact.  Refresh the generic
+            # publication legend here; otherwise a completed ArtifactRef can
+            # exist while the Logic tab still shows the pre-run placeholder.
+            self._update_row_publishes(row)
             if succeeded:
                 self._ensure_task_preview_panels(row)
         self._sync_terminal_poll_timer()

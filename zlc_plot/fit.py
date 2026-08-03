@@ -253,6 +253,7 @@ class FitModelSpec:
     presentation: FitPresentationSpec = field(default_factory=FitPresentationSpec)
     coordinate_relations: tuple[UnitRelation, ...] | None = None
     default_for: tuple[FitTarget, ...] = ()
+    capabilities: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         model_id = _text(self.model_id, "fit model id")
@@ -285,6 +286,9 @@ class FitModelSpec:
             or not set(defaults).issubset(targets)
         ):
             raise ValueError("default_for must be unique members of targets")
+        capabilities = frozenset(str(value).strip() for value in self.capabilities)
+        if any(not value for value in capabilities):
+            raise ValueError("fit capabilities must be non-empty text")
         if self.candidate_initializer is not None and not callable(
             self.candidate_initializer
         ):
@@ -336,6 +340,7 @@ class FitModelSpec:
         object.__setattr__(self, "formula", formula)
         object.__setattr__(self, "coordinate_relations", coordinate_relations)
         object.__setattr__(self, "default_for", defaults)
+        object.__setattr__(self, "capabilities", capabilities)
 
     @property
     def parameter_names(self) -> tuple[str, ...]:
@@ -786,7 +791,13 @@ class FitEngine:
                     "regular-image selected_indices belong inside "
                     "RegularImageFitInput"
                 )
-            return _fit_regular_radial_image(
+            if "regular_image_radial" not in spec.capabilities:
+                raise ValueError(
+                    "this model does not declare regular-image radial capability"
+                )
+            from ._fit_radial import fit_regular_image_radial
+
+            return fit_regular_image_radial(
                 spec,
                 coordinates,
                 data_revision=data_revision,
@@ -940,16 +951,6 @@ def _fit_regular_radial_image(
     cancelled: Callable[[], bool] | None,
 ) -> FitResult:
     """Fit the built-in radial Gaussian without expanding coordinate grids."""
-
-    expected = ("amplitude", "offset", "one_over_e_radius", "center_x", "center_y")
-    if (
-        model.model_id != "radial_gaussian_center"
-        or model.parameter_names != expected
-        or model.evaluator is not _radial_gaussian_center
-    ):
-        raise ValueError(
-            "RegularImageFitInput requires the built-in radial_gaussian_center model"
-        )
 
     started = time.monotonic()
 
@@ -2330,6 +2331,7 @@ def builtin_fit_models() -> tuple[FitModelSpec, ...]:
             ),
             coordinate_relations=(AXIS_0, AXIS_0),
             default_for=(FitTarget.IMAGE,),
+            capabilities=frozenset({"regular_image_radial"}),
         ),
     )
 

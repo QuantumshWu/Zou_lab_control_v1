@@ -561,7 +561,7 @@ Identity严格按成本和消费者限定：
 
 ### C6：领域E2E、性能与全仓清理（当前收敛）
 
-- C6-R1..R4 的现场反证已经由正式 Qt 快轨重新取得证据：Calibration 中间
+- C6-R1..R6 的现场反证已经由正式 Qt 快轨重新取得窄证据：Calibration 中间
   2D preview 与项目根 `tasks/calibration/<run>/` 输出、完成报告的共享
   `PlotSession`、Plot Panel 的拖动/north-west gravity，以及 selector/front
   交互均通过。它们仍属于产品合同，不得用静态 PNG 或单元测试替代。
@@ -570,13 +570,18 @@ Identity严格按成本和消费者限定：
   `SelectorScene` 叠加层；`ipympl`/原生 notebook canvas 交互链已退役。Qt
   `auto_present=False` 的 staged widget 不会先安装 worker 的最新 front，避免
   coherent batch 的旧 front 被构造阶段抢先消费。
-- C6-R1..R5 未闭合前，不得声称最终软件 GO，也不得删除外部审查台账；旧的测试通过
+- R6 选择性接入外部 `zlc_plot` 的 complete-frame renderer、bounded numeric drag、
+  Fit capability seam 与 notebook frame-serial/批量 trait 发布。大图仅在 payload
+  axis 使用局部 blit；selector、Fit、文字、axis、colorbar 不恢复过期 background，
+  也不清空仍有效的 notebook base。外部仓库的生成物、第二数据桥和动态反射 owner
+  不进入本仓。
+- C6-R1..R6 未闭合前，不得声称最终软件 GO，也不得删除外部审查台账；旧的测试通过
   只能作为回归证据，不能覆盖新的用户可见反证。
 - 已完成 tracked source 的逐文件 change-impact 扫描。旧 plot/selector/Fit/raster
   owner、Workbench 具体 leaf import、历史 Point/Presentation/CAS/软件预算机制、死
   wrapper/compat alias、tracked 空目录均为零；当前工作树只有用户保护文件
   `pulses/scan_test.json`，不读取、不修改、不纳入 Git。
-- 最终 broad current suite 需在 R1..R5 修复后重新运行。未连接的 qCMOS/Pylon/remote
+- 最终 broad current suite 需在 R1..R6 修复后重新运行。未连接的 qCMOS/Pylon/remote
   装置仍须按 `docs/REAL_HARDWARE_BRINGUP_zh.md` 在目标机器完成 E0；软件 GO
   不等同于任何未实测装置已 qualified。
 
@@ -601,6 +606,6 @@ Identity严格按成本和消费者限定：
 
 最终架构不需要第二plot/data schema、异步workflow编排器、硬件重构、persistent quarantine、软件内存预算、普通CAS/SHA、per-revision presentation对象、为Fit预设的独立进程、device backend巨表或每leaf一套lifecycle。最关键的五个跨域语义authority是：zlc_data保存实验数据事实，SignalPlane保存因果，zlc_plot保存全部绘图交互，generic Logic host保存节点骨架，Experiment保存设备composition/admission；zlc_storage、zlc_pulse、zlc_frontend与Workbench仍分别拥有§2列出的窄职责，不能被这五项吞并。
 
-C0–C6只是替换依赖顺序，不是可并存架构。当前 checkpoint 已闭合 C6-R1..R5 的
+C0–C6只是替换依赖顺序，不是可并存架构。当前 checkpoint 已闭合 C6-R1..R6 的
 旧 owner 与产品合同；最终迁移资格仍必须满足本节 §9 的全量门，真实装置资格仍只由
 runbook 的 E0/bring-up 证据决定，单元测试通过不能替代。

@@ -15,5 +15,6 @@ qCMOS + remote-sequencer readout remains unavailable and is not implied by this
 virtual tutorial.
 
 Unless `ZLC_TUTORIAL_WORKSPACE` is set explicitly, runtime artifacts go to the
-project-owned `_output/tutorials/neutral-atom/` tree; the tutorial directory
-itself remains source-only.
+project-root `tasks/`, `runs/`, and `figures/` roots selected by
+`WorkspacePaths.for_workspace`; the tutorial directory itself remains
+source-only.

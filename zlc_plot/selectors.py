@@ -170,13 +170,23 @@ def _drag_numeric_range(
     handle: DragHandle,
     origin: float,
     position: float,
-    minimum_span: float,
+    minimum_span: float | None = None,
     bounds: NumericRange | None = None,
 ) -> NumericRange:
-    """Resolve one bounded NEW/BODY/LOW/HIGH numeric-range drag."""
+    """Resolve every bounded numeric-range drag.
+
+    Data selectors do not require an artificial minimum span; display controls
+    such as color limits may still provide one explicitly.  Keeping both
+    policies in this one primitive prevents selectors and display-control
+    drags from developing different clamping behavior.
+    """
 
     if not isinstance(original, NumericRange):
         raise TypeError("original must be NumericRange")
+    if handle is DragHandle.LEFT:
+        handle = DragHandle.LOW
+    elif handle is DragHandle.RIGHT:
+        handle = DragHandle.HIGH
     if handle not in {
         DragHandle.NEW,
         DragHandle.BODY,
@@ -188,8 +198,11 @@ def _drag_numeric_range(
         raise TypeError("bounds must be NumericRange or None")
     origin = _finite(origin, "range drag origin")
     position = _finite(position, "range drag position")
-    minimum = _finite(minimum_span, "range drag minimum span")
-    if minimum <= 0.0:
+    minimum = 0.0 if minimum_span is None else _finite(
+        minimum_span,
+        "range drag minimum span",
+    )
+    if minimum < 0.0 or (minimum_span is not None and minimum == 0.0):
         raise ValueError("minimum_span must be positive")
     if bounds is not None and (bounds.span <= 0.0 or minimum > bounds.span):
         raise ValueError("bounds must contain the minimum span")
@@ -539,34 +552,82 @@ def _dragged_value(
     original = gesture.original_value
     if kind is SelectorKind.X_RANGE:
         assert isinstance(original, NumericRange)
-        if handle is DragHandle.NEW:
-            return _clamp_range(NumericRange(origin.x, point.x), x_bounds)
-        if handle in {DragHandle.LOW, DragHandle.LEFT}:
-            return _clamp_range(NumericRange(point.x, original.high), x_bounds)
-        if handle in {DragHandle.HIGH, DragHandle.RIGHT}:
-            return _clamp_range(NumericRange(original.low, point.x), x_bounds)
-        return _clamp_range(original.shifted(point.x - origin.x), x_bounds)
+        return _drag_numeric_range(
+            original,
+            handle=handle,
+            origin=origin.x,
+            position=point.x,
+            bounds=x_bounds,
+        )
     if kind is SelectorKind.AREA:
         assert isinstance(original, RectangleRange)
         if handle is DragHandle.NEW:
             return RectangleRange(
-                _clamp_range(NumericRange(origin.x, point.x), x_bounds),
-                _clamp_range(NumericRange(origin.y, point.y), y_bounds),
+                _drag_numeric_range(
+                    original.x,
+                    handle=DragHandle.NEW,
+                    origin=origin.x,
+                    position=point.x,
+                    bounds=x_bounds,
+                ),
+                _drag_numeric_range(
+                    original.y,
+                    handle=DragHandle.NEW,
+                    origin=origin.y,
+                    position=point.y,
+                    bounds=y_bounds,
+                ),
             )
         x = original.x
         y = original.y
         if handle is DragHandle.BODY:
-            x = _clamp_range(x.shifted(point.x - origin.x), x_bounds)
-            y = _clamp_range(y.shifted(point.y - origin.y), y_bounds)
+            x = _drag_numeric_range(
+                x,
+                handle=DragHandle.BODY,
+                origin=origin.x,
+                position=point.x,
+                bounds=x_bounds,
+            )
+            y = _drag_numeric_range(
+                y,
+                handle=DragHandle.BODY,
+                origin=origin.y,
+                position=point.y,
+                bounds=y_bounds,
+            )
         else:
             if handle in {DragHandle.LEFT, DragHandle.BOTTOM_LEFT, DragHandle.TOP_LEFT}:
-                x = _clamp_range(NumericRange(point.x, x.high), x_bounds)
+                x = _drag_numeric_range(
+                    x,
+                    handle=DragHandle.LOW,
+                    origin=origin.x,
+                    position=point.x,
+                    bounds=x_bounds,
+                )
             if handle in {DragHandle.RIGHT, DragHandle.BOTTOM_RIGHT, DragHandle.TOP_RIGHT}:
-                x = _clamp_range(NumericRange(x.low, point.x), x_bounds)
+                x = _drag_numeric_range(
+                    x,
+                    handle=DragHandle.HIGH,
+                    origin=origin.x,
+                    position=point.x,
+                    bounds=x_bounds,
+                )
             if handle in {DragHandle.BOTTOM, DragHandle.BOTTOM_LEFT, DragHandle.BOTTOM_RIGHT}:
-                y = _clamp_range(NumericRange(point.y, y.high), y_bounds)
+                y = _drag_numeric_range(
+                    y,
+                    handle=DragHandle.LOW,
+                    origin=origin.y,
+                    position=point.y,
+                    bounds=y_bounds,
+                )
             if handle in {DragHandle.TOP, DragHandle.TOP_LEFT, DragHandle.TOP_RIGHT}:
-                y = _clamp_range(NumericRange(y.low, point.y), y_bounds)
+                y = _drag_numeric_range(
+                    y,
+                    handle=DragHandle.HIGH,
+                    origin=origin.y,
+                    position=point.y,
+                    bounds=y_bounds,
+                )
         return RectangleRange(x, y)
     if kind is SelectorKind.CROSSHAIR:
         return CrosshairPoint(_clamp(point.x, x_bounds), _clamp(point.y, y_bounds))

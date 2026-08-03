@@ -8,6 +8,7 @@ never owns notebook input and no notebook backend is imported by this module.
 from __future__ import annotations
 
 from concurrent.futures import Future
+from contextlib import nullcontext
 import json
 import threading
 from typing import Any, Mapping
@@ -172,6 +173,7 @@ def _widget_class() -> type[Any]:
         logical_height = Int(1).tag(sync=True)
         logical_dpi = Unicode("96").tag(sync=True)
         device_pixel_ratio = Unicode("1").tag(sync=True)
+        frame_serial = Int(0).tag(sync=True)
         rgba = Bytes(b"").tag(sync=True)
         axes_json = Unicode("[]").tag(sync=True)
         scene_json = Unicode('{"groups":[]}').tag(sync=True)
@@ -201,9 +203,27 @@ _WIDGET_JS = r"""
           this._dragging = false;
           this._button = null;
           this._lastMoveSent = 0;
+          this._paintPending = false;
+          this._paintBasePending = false;
           this._bind();
-          this.listenTo(this.model, 'change:rgba change:axes_json change:scene_json', () => this._paint());
-          this._paint();
+          // The RGBA canvas is the committed base authority.  Selector
+          // scene updates only paint the transparent overlay and never clear
+          // a live/fit base frame that may still be arriving over comms.
+          this.listenTo(this.model, 'change:frame_serial', () => this._schedulePaint(true));
+          this.listenTo(this.model, 'change:scene_json', () => this._schedulePaint(false));
+          this._paint(true);
+        }
+        _schedulePaint(repaintBase) {
+          this._paintBasePending = this._paintBasePending || !!repaintBase;
+          if (this._paintPending) return;
+          this._paintPending = true;
+          const paint = () => {
+            const base = this._paintBasePending;
+            this._paintPending = false; this._paintBasePending = false;
+            this._paint(base);
+          };
+          if (window.requestAnimationFrame) window.requestAnimationFrame(paint);
+          else window.setTimeout(paint, 0);
         }
         _bytes(value) {
           if (value instanceof Uint8Array) return value;
@@ -215,17 +235,27 @@ _WIDGET_JS = r"""
           }
           return new Uint8Array(value || []);
         }
-        _paint() {
+        _paint(repaintBase) {
           const w = this.model.get('width'), h = this.model.get('height');
           const lw = this.model.get('logical_width'), lh = this.model.get('logical_height');
-          for (const canvas of [this.canvas, this.overlay]) {
-            canvas.width = w; canvas.height = h;
-            canvas.style.width = lw + 'px'; canvas.style.height = lh + 'px';
-          }
+          this.canvas.style.width = lw + 'px'; this.canvas.style.height = lh + 'px';
+          this.overlay.style.width = lw + 'px'; this.overlay.style.height = lh + 'px';
           this.el.style.width = lw + 'px'; this.el.style.height = lh + 'px';
-          const bytes = this._bytes(this.model.get('rgba'));
-          if (bytes.length === w * h * 4) {
-            this.canvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(bytes), w, h), 0, 0);
+          if (repaintBase) {
+            const bytes = this._bytes(this.model.get('rgba'));
+            // A frame serial can arrive before its binary trait.  Keep the
+            // previous complete base instead of clearing it to a blank frame.
+            if (w > 0 && h > 0 && bytes.length === w * h * 4) {
+              if (this.canvas.width !== w || this.canvas.height !== h) {
+                this.canvas.width = w; this.canvas.height = h;
+              }
+              this.canvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(bytes), w, h), 0, 0);
+            }
+            if (this.overlay.width !== this.canvas.width || this.overlay.height !== this.canvas.height) {
+              this.overlay.width = this.canvas.width; this.overlay.height = this.canvas.height;
+            }
+          } else if (this.overlay.width !== this.canvas.width || this.overlay.height !== this.canvas.height) {
+            this.overlay.width = this.canvas.width; this.overlay.height = this.canvas.height;
           }
           this._paintScene();
         }
@@ -358,23 +388,33 @@ class NotebookView:
         with self._kernel_lock:
             if self._closed:
                 return
-            if self._front is not None and front.identity.sequence < self._front.identity.sequence:
+            if self._front is not None and front.identity.sequence <= self._front.identity.sequence:
                 return
             self._front = front
             widget = self._widget
             dragging = self._gesture_front is not None
         if widget is None:
             return
-        widget.width = front.buffer.width
-        widget.height = front.buffer.height
-        widget.logical_width = front.logical_size[0]
-        widget.logical_height = front.logical_size[1]
-        widget.logical_dpi = str(front.logical_dpi)
-        widget.device_pixel_ratio = str(front.device_pixel_ratio)
-        widget.rgba = front.buffer.pixels
-        widget.axes_json = json.dumps([_axis_to_dict(axis) for axis in front.interaction.axes], separators=(",", ":"))
-        if not dragging:
-            widget.scene_json = json.dumps({"groups": []}, separators=(",", ":"))
+        hold_sync = getattr(widget, "hold_sync", None)
+        sync = hold_sync() if callable(hold_sync) else nullcontext()
+        with sync:
+            widget.width = front.buffer.width
+            widget.height = front.buffer.height
+            widget.logical_width = front.logical_size[0]
+            widget.logical_height = front.logical_size[1]
+            widget.logical_dpi = str(front.logical_dpi)
+            widget.device_pixel_ratio = str(front.device_pixel_ratio)
+            widget.rgba = front.buffer.pixels
+            widget.axes_json = json.dumps(
+                [_axis_to_dict(axis) for axis in front.interaction.axes],
+                separators=(",", ":"),
+            )
+            widget.frame_serial = int(front.identity.sequence)
+            if not dragging:
+                widget.scene_json = json.dumps(
+                    {"groups": []},
+                    separators=(",", ":"),
+                )
 
     def _on_front(self, front: RasterFront) -> None:
         self._schedule(lambda: self._publish_front(front))
@@ -437,10 +477,16 @@ class NotebookView:
         self._scene_serial = serial
         value = operation.value
         scene = getattr(value, "scene", None)
-        if self._widget is not None:
-            self._widget.scene_json = json.dumps(selector_scene_to_dict(scene), separators=(",", ":"))
         if operation.front is not None:
+            # Install the complete base before the overlay scene.  The widget
+            # coalesces both traits into one animation-frame paint, so a new
+            # selector is never composed against the previous base front.
             self._publish_front(operation.front)
+        if self._widget is not None and action not in {"release", "cancel"}:
+            self._widget.scene_json = json.dumps(
+                selector_scene_to_dict(scene),
+                separators=(",", ":"),
+            )
         if action in {"release", "cancel"}:
             self._gesture_front = None
             self._gesture_axes = None
@@ -471,9 +517,9 @@ class NotebookView:
             javascript = None
         self._widget = widget_class()
         self._widget.on_msg(self._on_widget_message)
-        self._front = self._host.wait_for_front()
+        initial_front = self._host.wait_for_front()
         self._front_release = self._host.subscribe_front(self._on_front)
-        self._publish_front(self._front)
+        self._publish_front(initial_front)
         self._output = widgets.Output(
             layout=widgets.Layout(border="0", padding="0", margin="0")
         )

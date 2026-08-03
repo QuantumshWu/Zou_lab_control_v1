@@ -70,18 +70,6 @@ class _PreparedSeries:
     label: str
 
 
-@contextmanager
-def _hidden_artists(artists: Sequence[Any]) -> Iterator[None]:
-    visibility = tuple(bool(artist.get_visible()) for artist in artists)
-    try:
-        for artist in artists:
-            artist.set_visible(False)
-        yield
-    finally:
-        for artist, visible in zip(artists, visibility, strict=True):
-            artist.set_visible(visible)
-
-
 def _display_array(value: Any) -> np.ndarray:
     raw = getattr(value, "display", value)
     return np.asarray(raw)
@@ -567,11 +555,6 @@ class MatplotlibRenderer:
         self._last_selectors = SelectorSnapshot(())
         self._fit_artists: list[Any] = []
         self._fit_slots: dict[str, Any] = {}
-        # A fit accepted while a selector gesture is using a cached blit
-        # background changes the artists beneath that background.  Remember the
-        # last complete fit front so the next presentation can recompose once
-        # and recapture a coherent gesture background.
-        self._last_fit_overlay: FitOverlay | None = None
         self._fit_source_scatter: Any | None = None
         self._fit_hidden_source_lines: tuple[tuple[Any, bool], ...] = ()
         self._fit_axis: Any | None = None
@@ -580,15 +563,7 @@ class MatplotlibRenderer:
         self._facet_threshold_artists: dict[int, tuple[Any, Any]] = {}
         self._image_overlay: ImagePointOverlay | None = None
         self._image_overlay_signature: tuple[object, ...] | None = None
-        self._figure_background: Any | None = None
-        self._axis_backgrounds: dict[int, Any] = {}
-        self._local_chrome_underlay: Any | None = None
-        self._semantic_text_background: Any | None = None
         self._selector_gesture_kind: SceneKind | None = None
-        self._selector_gesture_backgrounds: tuple[tuple[Any, Any], ...] = ()
-        self._selector_gesture_limits: tuple[
-            tuple[Any, tuple[float, float], tuple[float, float]], ...
-        ] = ()
         self._data_revision: int | None = None
         self._last_payload: Any = None
         self._last_state: DisplayState | None = None
@@ -769,7 +744,6 @@ class MatplotlibRenderer:
         self._last_selectors = SelectorSnapshot(())
         self._fit_artists.clear()
         self._fit_slots.clear()
-        self._last_fit_overlay = None
         self._fit_source_scatter = None
         self._fit_hidden_source_lines = ()
         self._fit_axis = None
@@ -778,10 +752,7 @@ class MatplotlibRenderer:
         self._facet_threshold_artists.clear()
         self._image_overlay = None
         self._image_overlay_signature = None
-        self._invalidate_layer_backgrounds()
         self._selector_gesture_kind = None
-        self._selector_gesture_backgrounds = ()
-        self._selector_gesture_limits = ()
         self._data_revision = None
         self._last_payload = None
         self._last_state = None
@@ -802,10 +773,8 @@ class MatplotlibRenderer:
         state = frame.state
         selected_effects = frame.effects
         previous_payload = self._last_payload
-        previous_state = self._last_state
         previous_data_revision = self._data_revision
-        previous_fit_overlay = self._last_fit_overlay
-        state_changed = previous_state is None or state.revision != previous_state.revision
+        state_changed = self._last_state is None or state.revision != self._last_state.revision
         payload_changed = (
             payload is not previous_payload
             or frame.data_revision != previous_data_revision
@@ -815,43 +784,6 @@ class MatplotlibRenderer:
             if isinstance(self.spec, FacetGridPlot)
             else None
         )
-        facet_presentation_unchanged = (
-            frame.facet_index == self._focused_facet_index
-            and frame.facet_focus_index == self._facet_focus_index
-            and (
-                visible_facet_count is None
-                or visible_facet_count == self._visible_facet_count
-            )
-        )
-        pure_text = (
-            selected_effects == RenderEffect.TEXT
-            and previous_state is not None
-            and state_changed
-            and not payload_changed
-            and facet_presentation_unchanged
-        )
-        if pure_text:
-            # TEXT is a complete transaction contract, not a hint.  Labels and
-            # titles mutate in place without replaying view, data, selector,
-            # fit, or point-overlay presentation work.
-            with style_context(self.style):
-                self._last_state = state
-                self._update_text_artists(payload, state)
-                if self._try_blit(semantic_text_only=True):
-                    return
-                self.draw()
-            return
-        full_draw_effects = (
-            RenderEffect.AXIS_TRANSFORM
-            | RenderEffect.CHROME
-            | RenderEffect.LAYOUT
-        )
-        if selected_effects & full_draw_effects:
-            # Axis visibility, bounds, and locators invalidate every cached
-            # pixel transform.  Discard them before mutating the axes so no
-            # nested overlay work can observe the previous presentation.
-            self._invalidate_layer_backgrounds()
-            self._selector_gesture_backgrounds = ()
         self._consume_facet_presentation(
             facet_index=frame.facet_index,
             facet_focus_index=frame.facet_focus_index,
@@ -896,7 +828,6 @@ class MatplotlibRenderer:
             )
         else:
             painted_fit = None if overview else frame.fit_overlay
-        fit_changed = painted_fit is not previous_fit_overlay
         with style_context(self.style):
             self._requested_view_limits = frame.view_limits
             self._last_payload = payload
@@ -913,49 +844,19 @@ class MatplotlibRenderer:
             if state_changed and selected_effects & RenderEffect.CHROME:
                 self._update_chrome_artists(state)
             self._apply_requested_view(self.primary_axes, frame.view_limits)
-            self._restore_selector_gesture_limits()
             self._last_selectors = painted_selectors
             self._update_selectors(self._last_selectors)
             self._set_fit_mode(isinstance(painted_fit, FitOverlay))
             self._update_fit(painted_fit)
             self._update_facet_thresholds(frame.facet_thresholds)
             self._update_image_point_overlay(payload, frame.image_overlay, state)
-            # A native selector gesture blits against a cached scene.  If a
-            # newly accepted fit changes that scene, recompose once and let the
-            # next pointer frame capture the new base; never expose stale fit
-            # pixels or a partially erased data layer.
-            if fit_changed and self._selector_gesture_kind is not None:
-                self._invalidate_layer_backgrounds()
-                self._selector_gesture_backgrounds = ()
-                self.draw()
-                return
-            partial_axes = (
-                self._image_layer_axes()
-                if not selected_effects & (full_draw_effects | RenderEffect.TEXT)
-                else ()
+            image_blitted = (
+                base_changed
+                and not bool(selected_effects & RenderEffect.LAYOUT)
+                and self._try_image_axis_blit()
             )
-            if partial_axes and self._chrome_dirty_axes:
-                local_chrome_axes = self._local_chrome_axes()
-                local_axes = set(local_chrome_axes)
-                if (
-                    self._chrome_dirty_axes
-                    and self._chrome_dirty_axes <= local_axes
-                    and self._refresh_local_chrome_backgrounds()
-                ):
-                    partial_axes = tuple(dict.fromkeys(
-                        (*partial_axes, *local_chrome_axes)
-                    ))
-                    self._chrome_dirty_axes.clear()
-            if not selected_effects & full_draw_effects and not self._chrome_dirty_axes:
-                painted = (
-                    self._try_blit(axes=partial_axes)
-                    if partial_axes
-                    else self._try_blit()
-                )
-                if painted:
-                    self._refresh_selector_gesture_background()
-                    return
-            self.draw()
+            if not image_blitted:
+                self.draw()
 
     def _capture_home_limits(self, axis: Any) -> None:
         semantic = (
@@ -1007,80 +908,85 @@ class MatplotlibRenderer:
     def _mark_axes_chrome_dirty(self, *axes: Any) -> None:
         self._chrome_dirty_axes.update(axes)
 
-    def _invalidate_layer_backgrounds(self) -> None:
-        self._figure_background = None
-        self._axis_backgrounds.clear()
-        self._local_chrome_underlay = None
-        self._semantic_text_background = None
-
-    def _capture_layer_backgrounds(self, canvas: Any) -> None:
-        self._figure_background = canvas.copy_from_bbox(self._figure.bbox)
-        self._axis_backgrounds = {
-            id(axis): canvas.copy_from_bbox(self._pixel_aligned_bbox(axis.bbox))
-            for axis in self._figure.axes
-            if axis.get_visible()
-        }
-
-    def _image_layer_axes(self) -> tuple[Any, ...]:
-        semantic = self.spec.cell if isinstance(self.spec, FacetGridPlot) else self.spec
-        if not isinstance(semantic, ImagePlot):
-            return ()
-        roles = (
-            ("facet_cell",)
-            if isinstance(self.spec, FacetGridPlot)
-            else ("image", "main", "distribution")
-        )
-        return tuple(dict.fromkeys(
-            axis
-            for role in roles
-            for axis in self._axes.get(role, ())
-            if axis.get_visible()
-        ))
-
-    def _local_chrome_axes(self) -> tuple[Any, ...]:
-        return tuple(
-            axis
-            for role in ("distribution", "colorbar")
-            for axis in self._axes.get(role, ())
-            if axis.get_visible()
-        )
-
     def draw(self) -> None:
+        """Compose one complete Agg frame from the current artist state."""
+
         with style_context(self.style):
-            canvas = self._figure.canvas
-            supports_blit = bool(getattr(canvas, "supports_blit", False))
-            self._set_dynamic_animated(supports_blit)
-            self._invalidate_layer_backgrounds()
-            semantic_text = self._semantic_text_artists()
-            local_chrome_axes = self._local_chrome_axes() if supports_blit else ()
-            if supports_blit:
-                for axis in local_chrome_axes:
-                    axis.set_animated(True)
-                try:
-                    with _hidden_artists(semantic_text):
-                        self._native_draw(canvas)
-                        self._local_chrome_underlay = canvas.copy_from_bbox(
-                            self._figure.bbox
-                        )
-                        renderer = canvas.get_renderer()
-                        for axis in local_chrome_axes:
-                            axis.set_animated(False)
-                            axis.draw(renderer)
-                        self._capture_layer_backgrounds(canvas)
-                finally:
-                    for axis in local_chrome_axes:
-                        axis.set_animated(False)
-            else:
-                self._native_draw(canvas)
-            if supports_blit:
-                if self._figure_background is not None and self._try_blit():
-                    self._chrome_dirty_axes.clear()
-                    self._refresh_selector_gesture_background()
-                    return
-                self._invalidate_layer_backgrounds()
-                self._set_dynamic_animated(False)
-                self._native_draw(canvas)
+            self._native_draw(self._figure.canvas)
             self._chrome_dirty_axes.clear()
+
+    def _try_image_axis_blit(self) -> bool:
+        """Paint image artists separately without caching an old scene.
+
+        Image data can be megapixels, so a fresh draw of the base raster is
+        still avoided when only the image payload changes.  Selector, fit,
+        labels, axes and colorbar are always composed in the same complete
+        frame; no stale background is reused for those interaction layers.
+        """
+
+        from matplotlib.image import AxesImage
+
+        canvas = self._figure.canvas
+        blit = getattr(canvas, "blit", None)
+        get_renderer = getattr(canvas, "get_renderer", None)
+        if not callable(blit) or not callable(get_renderer):
+            return False
+        image_artists = tuple(
+            artist
+            for artist in self._artists.values()
+            if isinstance(artist, AxesImage)
+            and getattr(artist, "axes", None) is not None
+        )
+        if not image_artists:
+            return False
+        axes = tuple(dict.fromkeys(artist.axes for artist in image_artists))
+        dynamic: list[Any] = list(image_artists)
+
+        def add(value: Any) -> None:
+            if isinstance(value, (tuple, list)):
+                for item in value:
+                    add(item)
+                return
+            if (
+                value is not None
+                and getattr(value, "axes", None) in axes
+                and callable(getattr(value, "draw", None))
+                and value not in dynamic
+            ):
+                dynamic.append(value)
+
+        add(self._fit_artists)
+        for values in self._selector_artists.values():
+            add(values)
+        add(self._artists.get("image:points"))
+        add(self._artists.get("image:point-labels"))
+        previous_animated = tuple(
+            (artist, bool(artist.get_animated()))
+            for artist in dynamic
+            if callable(getattr(artist, "get_animated", None))
+        )
+        try:
+            for artist, _previous in previous_animated:
+                artist.set_animated(True)
+            self._native_draw(canvas)
+            renderer = get_renderer()
+            for artist in sorted(
+                dynamic,
+                key=lambda item: float(item.get_zorder()),
+            ):
+                if artist.get_visible():
+                    artist.set_animated(False)
+                    artist.draw(renderer)
+            for axis in axes:
+                if axis.get_visible():
+                    blit(axis.bbox)
+            self._chrome_dirty_axes.clear()
+            return True
+        except Exception:
+            return False
+        finally:
+            for artist, previous in previous_animated:
+                artist.set_animated(previous)
 
     @staticmethod
     def _native_draw(canvas: Any) -> None:
@@ -1110,219 +1016,14 @@ class MatplotlibRenderer:
         begin()
         try:
             yield
-        except BaseException:
+        except Exception:
             end(False)
             raise
         else:
             end(True)
 
-    def _pixel_aligned_bbox(self, bounds: Any) -> Any:
-        from matplotlib.transforms import Bbox
-
-        x0, y0, x1, y1 = map(float, bounds.extents)
-        aligned = Bbox.from_extents(
-            math.floor(x0),
-            math.floor(y0),
-            math.ceil(x1),
-            math.ceil(y1),
-        )
-        clipped = Bbox.intersection(aligned, self._figure.bbox)
-        return (aligned if clipped is None else clipped).frozen()
-
-    def _refresh_local_chrome_backgrounds(self) -> bool:
-        """Rebuild disjoint distribution/colorbar chrome in place."""
-
-        canvas = self._figure.canvas
-        underlay = self._local_chrome_underlay
-        if (
-            underlay is None
-            or not bool(getattr(canvas, "supports_blit", False))
-        ):
-            return False
-        local_axes = self._local_chrome_axes()
-        if not local_axes:
-            return False
-        semantic_text = self._semantic_text_artists()
-        renderer = canvas.get_renderer()
-        try:
-            self._set_dynamic_animated(True)
-            with _hidden_artists(semantic_text):
-                canvas.restore_region(underlay)
-                for axis in local_axes:
-                    axis.draw(renderer)
-                self._capture_layer_backgrounds(canvas)
-        except Exception:
-            self._invalidate_layer_backgrounds()
-            return False
-        self._draw_semantic_text_artists(semantic_text)
-        self._semantic_text_background = None
-        return True
-
-    def _semantic_text_artists(self) -> tuple[Any, ...]:
-        result = [
-            artist
-            for axis in self._figure.axes
-            for artist in (axis.title, axis.xaxis.label, axis.yaxis.label)
-        ]
-        result.extend(
-            self._artists[key]
-            for key in ("figure:title", "facet:outer_x", "facet:outer_y")
-            if key in self._artists
-        )
-        return tuple(dict.fromkeys(result))
-
-    def _dynamic_artists(self) -> tuple[Any, ...]:
-        from matplotlib.artist import Artist
-        from matplotlib.colorbar import Colorbar
-
-        result: list[Any] = []
-
-        def collect(value: Any) -> None:
-            if isinstance(value, Artist):
-                if (
-                    getattr(value, "axes", None) is not None
-                    or getattr(value, "figure", None) is self._figure
-                ):
-                    result.append(value)
-            elif isinstance(value, Colorbar):
-                # A colorbar is an opaque axis-owned static composite.  Its
-                # mappable callback may replace children, so cache/repaint the
-                # entire owning axis when mapping changes rather than scanning
-                # a transient child topology every image frame.
-                return
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    collect(item)
-
-        for value in self._artists.values():
-            collect(value)
-        for values in self._selector_artists.values():
-            collect(values)
-        for values in self._facet_threshold_artists.values():
-            collect(values)
-        collect(self._fit_artists)
-        collect(self._fit_source_scatter)
-        # Axis-owned semantic text is mutated in place by the TEXT lane.  Keep
-        # it out of the cached figure background just like data and overlays;
-        # otherwise a label edit blits the new glyphs over the old ones.  Tick
-        # labels intentionally remain static because locator/tick mutations are
-        # AXIS_TRANSFORM or CHROME effects and require a complete draw.
-        for artist in self._semantic_text_artists():
-            collect(artist)
-        return tuple(dict.fromkeys(result))
-
-    def _set_dynamic_animated(self, animated: bool) -> None:
-        for artist in self._dynamic_artists():
-            artist.set_animated(animated)
-
-    def _draw_semantic_text_artists(self, artists: Sequence[Any]) -> None:
-        for artist in sorted(artists, key=lambda item: float(item.get_zorder())):
-            if not artist.get_visible():
-                continue
-            axes = getattr(artist, "axes", None)
-            if axes is not None:
-                if not axes.get_visible():
-                    continue
-                axes.draw_artist(artist)
-            else:
-                self._figure.draw_artist(artist)
-
-    def _try_blit(
-        self,
-        *,
-        axes: Sequence[Any] | None = None,
-        semantic_text_only: bool = False,
-        cache_semantic_background: bool = True,
-    ) -> bool:
-        canvas = self._figure.canvas
-        if not bool(getattr(canvas, "supports_blit", False)):
-            return False
-        semantic_text = self._semantic_text_artists()
-        try:
-            if semantic_text_only:
-                background = self._semantic_text_background
-                if background is None:
-                    return False
-                for artist in semantic_text:
-                    artist.set_animated(True)
-                canvas.restore_region(background)
-                self._draw_semantic_text_artists(semantic_text)
-                canvas.blit(self._figure.bbox)
-                return True
-            self._set_dynamic_animated(True)
-            if axes is not None:
-                from matplotlib.transforms import Bbox
-
-                selected = tuple(dict.fromkeys(
-                    axis for axis in axes if axis.get_visible()
-                ))
-                if not selected or any(
-                    id(axis) not in self._axis_backgrounds for axis in selected
-                ):
-                    return False
-                semantic_set = set(semantic_text)
-                painted_bounds = []
-                for axis in selected:
-                    canvas.restore_region(self._axis_backgrounds[id(axis)])
-                    for artist in sorted(
-                        axis.get_children(),
-                        key=lambda item: float(item.get_zorder()),
-                    ):
-                        if (
-                            artist not in semantic_set
-                            and artist.get_visible()
-                            and artist.get_animated()
-                        ):
-                            axis.draw_artist(artist)
-                    painted_bounds.append(self._pixel_aligned_bbox(axis.bbox))
-                canvas.blit(Bbox.union(painted_bounds))
-                self._semantic_text_background = None
-                return True
-            background = self._figure_background
-            if background is None:
-                return False
-            canvas.restore_region(background)
-            with _hidden_artists(semantic_text):
-                # A dynamic Axis can paint its label as a child operation.
-                # Hide all semantic text while composing the reusable data and
-                # overlay front, then add current text exactly once.
-                for artist in semantic_text:
-                    artist.set_visible(False)
-                for axes in self._figure.axes:
-                    if not axes.get_visible():
-                        continue
-                    for artist in sorted(
-                        axes.get_children(),
-                        key=lambda item: float(item.get_zorder()),
-                    ):
-                        if artist.get_visible() and artist.get_animated():
-                            axes.draw_artist(artist)
-                figure_artists = tuple(
-                    artist
-                    for artist in self._dynamic_artists()
-                    if getattr(artist, "axes", None) is None
-                    and getattr(artist, "figure", None) is self._figure
-                )
-                for artist in sorted(
-                    figure_artists,
-                    key=lambda item: float(item.get_zorder()),
-                ):
-                    if artist.get_visible() and artist.get_animated():
-                        self._figure.draw_artist(artist)
-                if cache_semantic_background:
-                    self._semantic_text_background = canvas.copy_from_bbox(
-                        self._figure.bbox
-                    )
-            self._draw_semantic_text_artists(semantic_text)
-            canvas.blit(self._figure.bbox)
-            return True
-        except Exception:
-            if cache_semantic_background:
-                self._semantic_text_background = None
-            return False
-
     def begin_selector_gesture(self, kind: SelectorKind) -> bool:
-        """Cache the painted plot beneath one selector for motion-only blits."""
+        """Start a native selector gesture with complete-frame redraws."""
 
         if not isinstance(kind, SelectorKind):
             raise TypeError("kind must be SelectorKind")
@@ -1330,11 +1031,11 @@ class MatplotlibRenderer:
         self._selector_candidate = None
         with style_context(self.style):
             self._update_selectors(self._last_selectors)
-        self._capture_selector_gesture_limits()
-        return self._refresh_selector_gesture_background()
+        self.draw()
+        return True
 
     def begin_color_limit_gesture(self, candidate: ColorLimitCandidate) -> bool:
-        """Cache one color-scale front without entering the data-selector model."""
+        """Start a native color-limit gesture with complete-frame redraws."""
 
         if not isinstance(candidate, ColorLimitCandidate):
             raise TypeError("candidate must be ColorLimitCandidate")
@@ -1342,8 +1043,8 @@ class MatplotlibRenderer:
         self._color_limit_candidate = candidate
         with style_context(self.style):
             self._update_selectors(self._last_selectors)
-        self._capture_selector_gesture_limits()
-        return self._refresh_selector_gesture_background()
+        self.draw()
+        return True
 
     def begin_external_selector_gesture(
         self,
@@ -1362,7 +1063,7 @@ class MatplotlibRenderer:
         self._selector_scene_exclusion_kind = kind
 
     def preview_selector(self, state: SelectorState) -> bool:
-        """Paint one in-progress selector without redrawing data artists."""
+        """Paint the current selector candidate as one complete frame."""
 
         if not isinstance(state, SelectorState):
             raise TypeError("state must be SelectorState")
@@ -1371,16 +1072,11 @@ class MatplotlibRenderer:
         self._selector_candidate = state
         with style_context(self.style):
             self._update_selectors(self._last_selectors)
-        if self._blit_selector_gesture():
-            return True
-        draw_idle = getattr(self._figure.canvas, "draw_idle", None)
-        if callable(draw_idle):
-            draw_idle()
-            return True
-        return False
+        self.draw()
+        return True
 
     def preview_color_limit_candidate(self, candidate: ColorLimitCandidate) -> bool:
-        """Paint one color-scale drag candidate without mutating image data."""
+        """Paint the current color-limit candidate as one complete frame."""
 
         if not isinstance(candidate, ColorLimitCandidate):
             raise TypeError("candidate must be ColorLimitCandidate")
@@ -1389,13 +1085,8 @@ class MatplotlibRenderer:
         self._color_limit_candidate = candidate
         with style_context(self.style):
             self._update_selectors(self._last_selectors)
-        if self._blit_selector_gesture():
-            return True
-        draw_idle = getattr(self._figure.canvas, "draw_idle", None)
-        if callable(draw_idle):
-            draw_idle()
-            return True
-        return False
+        self.draw()
+        return True
 
     def end_selector_gesture(self) -> None:
         was_color = self._selector_gesture_kind is SelectorSceneKind.COLOR_LIMITS
@@ -1407,104 +1098,6 @@ class MatplotlibRenderer:
             pass
         if was_color:
             self._color_limit_candidate = None
-        self._selector_gesture_backgrounds = ()
-        self._selector_gesture_limits = ()
-
-    def _capture_selector_gesture_limits(self) -> None:
-        """Freeze native gesture coordinates while live artists keep updating."""
-
-        kind = self._selector_gesture_kind
-        artists = () if kind is None else self._selector_artists.get(kind, ())
-        axes = tuple(
-            dict.fromkeys(
-                artist.axes
-                for artist in artists
-                if getattr(artist, "axes", None) is not None
-            )
-        )
-        self._selector_gesture_limits = tuple(
-            (
-                axis,
-                tuple(map(float, axis.get_xlim())),
-                tuple(map(float, axis.get_ylim())),
-            )
-            for axis in axes
-        )
-
-    def _restore_selector_gesture_limits(self) -> None:
-        for axis, x_limits, y_limits in self._selector_gesture_limits:
-            if axis not in self._figure.axes or not axis.get_visible():
-                continue
-            self._set_xlim(axis, *x_limits)
-            self._set_ylim(axis, *y_limits)
-
-    def _refresh_selector_gesture_background(self) -> bool:
-        kind = self._selector_gesture_kind
-        if kind is None:
-            return False
-        self._selector_gesture_backgrounds = ()
-        artists = self._selector_artists.get(kind, ())
-        axes = tuple(
-            dict.fromkeys(
-                artist.axes
-                for artist in artists
-                if getattr(artist, "axes", None) is not None
-            )
-        )
-        canvas = self._figure.canvas
-        if (
-            not axes
-            or not bool(getattr(canvas, "supports_blit", False))
-            or any(id(axis) not in self._axis_backgrounds for axis in axes)
-        ):
-            return False
-        visible = tuple(bool(artist.get_visible()) for artist in artists)
-        try:
-            for artist in artists:
-                artist.set_visible(False)
-            if not self._try_blit(
-                axes=axes,
-                cache_semantic_background=False,
-            ):
-                return False
-            backgrounds = tuple(
-                (axis, canvas.copy_from_bbox(axis.bbox)) for axis in axes
-            )
-        except Exception:
-            return False
-        finally:
-            for artist, was_visible in zip(artists, visible, strict=True):
-                artist.set_visible(was_visible)
-        self._selector_gesture_backgrounds = backgrounds
-        return self._blit_selector_gesture()
-
-    def _blit_selector_gesture(self) -> bool:
-        kind = self._selector_gesture_kind
-        backgrounds = self._selector_gesture_backgrounds
-        if kind is None or not backgrounds:
-            return False
-        canvas = self._figure.canvas
-        try:
-            for _axis, background in backgrounds:
-                canvas.restore_region(background)
-            for axis, _background in backgrounds:
-                for artist in sorted(
-                    self._selector_artists.get(kind, ()),
-                    key=lambda item: float(item.get_zorder()),
-                ):
-                    if artist.get_visible() and getattr(artist, "axes", None) is axis:
-                        axis.draw_artist(artist)
-            from matplotlib.transforms import Bbox
-
-            canvas.blit(Bbox.union([axis.bbox for axis, _ in backgrounds]))
-            # The cached semantic-text base would contain an earlier selector
-            # position.  A concurrent TEXT transaction must rebuild instead of
-            # restoring stale interaction pixels.
-            self._semantic_text_background = None
-            return True
-        except Exception:
-            self._selector_gesture_backgrounds = ()
-            return False
 
     def _update_plot(self, payload: Any, state: DisplayState) -> None:
         if isinstance(self.spec, CurvePlot):
@@ -4076,17 +3669,9 @@ class MatplotlibRenderer:
         return self._rgba_buffer()
 
     def save(self, path: str | Path | BytesIO, *, dpi: float | None = None, **kwargs: Any) -> None:
-        dynamic = self._dynamic_artists()
-        animated = tuple(artist.get_animated() for artist in dynamic)
-        for artist in dynamic:
-            artist.set_animated(False)
-        try:
-            with style_context(self.style):
-                self._figure.savefig(path, dpi=dpi or self.plan.dpi, **kwargs)
-        finally:
-            for artist, previous in zip(dynamic, animated):
-                artist.set_animated(previous)
-            self.draw()
+        with style_context(self.style):
+            self._figure.savefig(path, dpi=dpi or self.plan.dpi, **kwargs)
+        self.draw()
 
 
 __all__ = ["MatplotlibRenderer", "RenderFrame"]

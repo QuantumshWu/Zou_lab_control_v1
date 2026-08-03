@@ -35,7 +35,7 @@ from zlc_frontend.qt_widgets import (
     FluentPlotParameterPanel,
     ensure_qt_app,
 )
-from zlc_plot import AxisRef, ImagePlot
+from zlc_plot import AxisRef, ImagePlot, SelectorKind
 from zlc_plot import NumericRange
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
@@ -237,6 +237,10 @@ def test_calibration_report_pages_use_shared_interactive_plot_host(
             )
             _wait_until(application, operation.done)
             assert operation.exception() is None
+            assert any(
+                selector.kind is SelectorKind.AREA
+                for selector in operation.result().front.interaction.selectors
+            )
         _wait_until(
             application,
             lambda: all(

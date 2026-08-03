@@ -6,7 +6,7 @@
 
 - Branch：`codex/system-architecture-migration`。
 - 重开基线：`476d125304fc90b6ef4f5009184dd2119206fcc2`；C0规范提交：`ed6dfe21c0d99999444c099d8c644a20b44e561d`。
-- 当前checkpoint：C6-R1–R4 已按现场反证闭合；C1/C2/C3/C4/C5 仍闭合，不返回旧 M1–M7 叙事，也不重做与新证据无关的旧切片。
+- 当前checkpoint：C6-R1–R6 已按现场反证闭合；最终 C6 全量门仍待当前工作目标完成，不返回旧 M1–M7 叙事，也不重做与新证据无关的旧切片。
 - 预期worktree例外：未跟踪用户文件`pulses/scan_test.json`。永远不得读取、修改、移动、删除、stage或commit。
 - RTL、Tcl、XDC、bitstream和wire protocol仍冻结；C1/C2没有硬件改动。
 
@@ -139,12 +139,29 @@
   front，避免 coherent batch 的旧 operation 因构造阶段的 sequence 竞态被拒绝。新增
   scene round-trip/borrowed-host 合同，并复跑 Camera/Calibration 产品流。
 
+### C6-R6 当前闭合记录
+
+- Calibration 的 live preview 继续由 leaf 声明的 typed `capture_preview` 输出驱动，
+  保持 `(1,1,*frame)`、原始 dtype 与 validity；FINAL record 仍写在项目根
+  `tasks/calibration/<run>/calibration.json`，`report/` 为同目录下的普通报告，
+  raw frames 只有 `save_frames=True` 才写入。TaskConsole 仅显示通用 `ArtifactRef` 的
+  相对路径，不复制 Calibration 的存储规则。
+- Calibration report pages 使用 `DataFigureWindow`/`Qt5PlotWidget` 与 TaskConsole 相同的
+  `zlc_plot` PlotSession；selector 改变返回的 RasterFront，证明报告不是静态 PNG。
+- Panel drag/drop 仍只调用 `zlc_frontend.board_layout.pack`，释放后原子重排并恢复
+  north-west gravity；正式 Qt 快轨覆盖顺序和位置。
+- `zlc_plot` 的 renderer 采用 complete-frame compose；只有大图 image payload 使用局部
+  axis blit，selector/fit/text/axis/colorbar 不恢复过期 background。外部 zlc_plot 的
+  bounded numeric drag、Fit capability seam 与 notebook front 更新已按语义接入，未引入
+  外部生成物或第二 owner。
+
 ### C6 证据与验收
 
-- C6-R5 当前窄回归（zlc_plot core、Plot Fit、Figure archive、Qt widgets、Board、Camera/
-  Calibration flow）已通过；提交前仍需按 §9 运行最终 broad current suite。历史 C6 定向
+- C6-R6 当前窄回归（zlc_plot core、Plot Fit、Figure archive、Qt widgets、Board、Camera/
+  Calibration flow）为 `49 passed`，并完成当前 zlc_plot 模块的 `py_compile` 与
+  `git diff --check`；提交前仍需按 §9 运行最终 broad current suite。历史 C6 定向
   回归为 `90 passed`，全仓历史记录为 `831 passed, 1 skipped`，仅有既存 zmq Proactor
-  selector-thread warning。全套耗时约 126 秒；无测试失败。
+  selector-thread warning。无测试失败。
 - 本轮未读取、修改、移动、stage 或 commit 用户保护文件 `pulses/scan_test.json`；RTL、Tcl、
   XDC、bitstream、wire protocol 未改。C6 完成后才允许以新的 Git checkpoint 交接，不能把
   C6 的中间态宣称为终态。

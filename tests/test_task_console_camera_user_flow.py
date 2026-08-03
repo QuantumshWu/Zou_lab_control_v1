@@ -188,11 +188,19 @@ def _add_plot_and_bind(
     click_tab(console, console.tabs.widget(0))
     QtTest.QTest.mouseClick(card.setting_button, QtCore.Qt.LeftButton)
     until(application, lambda: card.settings_popup.isVisible())
-    until(
-        application,
-        lambda: signal in _signal_leaf_keys(card.signal_combo),
-        timeout=15.0,
-    )
+    try:
+        until(
+            application,
+            lambda: signal in _signal_leaf_keys(card.signal_combo),
+            timeout=15.0,
+        )
+    except AssertionError as error:
+        raise AssertionError(
+            f"signal did not enter plot picker: requested={signal!r}, "
+            f"available={_signal_leaf_keys(card.signal_combo)!r}, "
+            f"status={card.status.text()!r}, "
+            f"topology={tuple(console._current_signal_projection().topology)!r}"
+        ) from error
     _choose_signal_leaf(card.signal_combo, signal, application)
     assert card.config.signal == signal
     return card
@@ -590,6 +598,10 @@ def test_occupancy_start_does_not_open_panel_and_manual_binding_displays(
             timeout=25.0,
         )
         calibration_reference = _resolved_artifact(console, calibration_signal)
+        # The Logic tab exposes the owner-relative record path; the Workbench
+        # does not know Calibration's storage layout, it only renders the
+        # common ArtifactRef contract.
+        assert calibration_reference.record_path in calibration_row.publishes_label.text()
         calibration_root = (
             workspace / Path(calibration_reference.record_path)
         ).parent

@@ -2521,11 +2521,11 @@ class PlotSession:
     def adopt_native_device_pixel_ratio(self, ratio: float) -> SurfacePlan:
         """Adopt DPR already applied by an attached native canvas in place.
 
-        ipympl reports browser DPR while its model is still creating the
-        current widget view.  Replacing that widget at this point invalidates
-        its toolbar child model.  Logical geometry and axes topology do not
-        change with DPR, so the existing renderer can safely adopt the new
-        physical plan without replacing the Figure or canvas.
+        A browser/Qt adapter may report a new DPR while its view is still
+        materialising.  Replacing that widget at this point invalidates its
+        child controls.  Logical geometry and axes topology do not change with
+        DPR, so the existing renderer can safely adopt the new physical plan
+        without replacing the Figure or canvas.
         """
 
         return self._set_device_pixel_ratio(ratio, preserve_native_canvas=True)

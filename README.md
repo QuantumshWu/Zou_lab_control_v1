@@ -51,7 +51,8 @@ zlc_data/          multidimensional data, selections, reductions, and fit
 zlc_storage/       canonical encoding and durable atomic filesystem operations
 zlc_pulse/         PulseDocument, compiler, target contract, and wire protocol
 zlc_neutral_atom/  experiment domains, devices, SignalDataPlane, hosted runtime
-zlc_frontend/      figure/selector/Fit semantics, renderers, and shared Qt surfaces
+zlc_plot/          plot specs, projections, selectors, Fit, renderers, raster, and style
+zlc_frontend/      headless frontend contracts and reusable Qt surfaces
 zlc_workbench/     Qt product composition and layout only
 Zou_lab_control/   stable public API and desktop composition adapter
 fpga/              frozen pulse-streamer server/transport/deployment assets
@@ -87,18 +88,17 @@ not raw camera, sequencer, registry, or SDK objects.
 ## Outputs and saved files
 
 The composition root creates one explicit `WorkspacePaths` value from the
-selected project root. User-authored pulses and tasks live in that project;
-artifacts and operator-facing exports live under `project/_output`. Leaf
-packages never infer another root from their package path, current directory,
-home directory, or environment.
+selected project root. User-authored pulses, task layouts, run records, and
+operator-facing exports live in that project. Leaf packages never infer another
+root from their package path, current directory, home directory, or environment.
 
 | Product or action | Default location |
 |---|---|
-| Calibration record and optional report | `workspace.output_root / "calibrations"` |
-| MOT-field acquisition | `workspace.output_root / "captures"` |
-| TaskConsole figure export | `workspace.output_root / "figures/task-console"` |
-| DataFigure / FigureViewer export | `workspace.output_root / "figures/data-figure"` |
-| Pulse preview export | `workspace.output_root / "figures/pulses"` |
+| Calibration record and optional report | `workspace.tasks_root / "calibration/<run>"` |
+| MOT-field acquisition | `workspace.runs_root / "<capture>"` |
+| TaskConsole figure export | `workspace.figures_root / "task-console"` |
+| DataFigure / FigureViewer export | `workspace.figures_root / "data-figure"` |
+| Pulse preview export | `workspace.figures_root / "pulses"` |
 
 Each Calibration run folder commits the reloadable `calibration.json` record
 first.  A post-FINAL best-effort export may then add the shared-`zlc_plot`

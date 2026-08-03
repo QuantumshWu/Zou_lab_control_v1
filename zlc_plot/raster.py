@@ -62,6 +62,24 @@ EventT = TypeVar("EventT")
 _UNSET = object()
 
 
+def _axis_at_normalized(
+    front: "RasterFront",
+    x: float,
+    y: float,
+) -> AxisTransform | None:
+    """Resolve the current front's axis under a normalized pointer."""
+
+    return next(
+        (
+            axis
+            for axis in front.interaction.axes
+            if axis.bounds[0] <= x <= axis.bounds[2]
+            and axis.bounds[1] <= y <= axis.bounds[3]
+        ),
+        None,
+    )
+
+
 def _positive_integer(value: object, name: str) -> int:
     result = integer(value, name, minimum=1)
     assert result is not None
@@ -290,15 +308,6 @@ class _DispatchMode(str, Enum):
     @property
     def publishes(self) -> bool:
         return self in {_DispatchMode.PUBLISH, _DispatchMode.PRESENTATION}
-
-
-class _PresentationRollbackError(RuntimeError):
-    """Both publication and the required session rollback failed."""
-
-    def __init__(self, primary: BaseException, rollback: BaseException) -> None:
-        super().__init__("raster presentation failed and could not be rolled back")
-        self.primary = primary
-        self.rollback = rollback
 
 
 _CoalesceResolver = Callable[[tuple[Any, ...], Mapping[str, Any]], object | None]
@@ -743,8 +752,7 @@ class RasterPlotHost:
                 after_publish=after_publish,
                 on_abort=on_abort,
             )
-        except BaseException as error:
-            self._record_terminal_rollback_failure(error)
+        except Exception as error:
             completion.set_exception(error)
         else:
             completion.set_result(operation)
@@ -778,26 +786,17 @@ class RasterPlotHost:
                 assert after_publish is not None
                 after_publish()
             return RasterOperation(value, front)
-        except BaseException as error:
+        except Exception as error:
             if mode is _DispatchMode.PRESENTATION and not promoted:
                 assert on_abort is not None
                 try:
                     on_abort()
-                except BaseException as rollback:
-                    raise _PresentationRollbackError(error, rollback) from error
+                except Exception:
+                    # A failed abort must not leave a stale partial front in
+                    # the interaction path.  Recompose the current session
+                    # once, then report the original operation failure.
+                    self._require_session().redraw_surface()
             raise
-
-    def _record_terminal_rollback_failure(self, error: BaseException) -> None:
-        if not isinstance(error, _PresentationRollbackError):
-            return
-        with self._condition:
-            self._closing = True
-            pending = tuple(self._pending)
-            self._pending.clear()
-            self._condition.notify_all()
-        for task in pending:
-            if not task.completion.done():
-                task.completion.set_exception(error)
 
     def _dispatch_session(
         self,
@@ -1199,7 +1198,7 @@ class RasterPlotHost:
                 analysis = value.result().value
                 if not isinstance(analysis, Future):
                     raise TypeError("session.fit_async must return Future")
-            except BaseException as error:
+            except Exception as error:
                 if not completion.done():
                     completion.set_exception(error)
                 return
@@ -1290,15 +1289,34 @@ class RasterPlotHost:
 
         def apply() -> object:
             session = self._require_session()
+            effective_identity = identity
+            effective_axes = axes
             if identity is not None:
                 revisions = session.revisions
                 plan = session.surface_plan
+                if identity.host_id != self._host_id:
+                    raise RuntimeError(
+                        "the painted pointer front belongs to another raster host"
+                    )
+                if selected_action == "press":
+                    current_front = self.front
+                    if current_front is None:
+                        raise RuntimeError("raster host has no current pointer front")
+                    # A live frame may have been promoted after the Qt event was
+                    # sampled.  The gesture remains valid; rebase the press on
+                    # the newest complete transform instead of rejecting it.
+                    effective_identity = current_front.identity
+                    effective_axes = _axis_at_normalized(
+                        current_front,
+                        x_value,
+                        y_value,
+                    )
                 if (
-                    identity.host_id != self._host_id
-                    or int(revisions.display) != identity.display_revision
-                    or int(revisions.layout) != identity.layout_revision
-                    or str(plan.kind) != identity.kind
-                    or str(plan.preset) != identity.preset
+                    effective_identity is None
+                    or int(revisions.display) != effective_identity.display_revision
+                    or int(revisions.layout) != effective_identity.layout_revision
+                    or str(plan.kind) != effective_identity.kind
+                    or str(plan.preset) != effective_identity.preset
                 ):
                     raise RuntimeError(
                         "the painted pointer front is no longer layout-compatible"
@@ -1320,7 +1338,7 @@ class RasterPlotHost:
                 double=double,
                 step=step,
                 key=key,
-                axes_snapshot=axes,
+                axes_snapshot=effective_axes,
             )
 
         return self._dispatch_session(
@@ -1479,8 +1497,7 @@ class RasterPlotHost:
                         after_publish=task.after_publish,
                         on_abort=task.on_abort,
                     )
-                except BaseException as error:
-                    self._record_terminal_rollback_failure(error)
+                except Exception as error:
                     task.completion.set_exception(error)
                 else:
                     task.completion.set_result(operation)
