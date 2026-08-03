@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from zlc_neutral_atom.logic_node_declaration import (
-    DefaultOutputView,
     LogicNodeDeclaration,
     OutputPresentation,
     PathPresentationHint,
@@ -12,7 +11,6 @@ from zlc_neutral_atom.logic_node_declaration import (
 from .processor import (
     OCCUPANCY_LIVE_OUTPUT_DECLARATIONS,
     OCCUPANCY_PROCESSOR_DEFINITION,
-    OCCUPANCY_SITE_MAP_OUTPUT_DECLARATION,
     build_occupancy_processor_config,
     occupancy_authoring_schema,
     occupancy_input_specs,
@@ -44,9 +42,6 @@ OCCUPANCY_LOGIC_NODE = LogicNodeDeclaration(
     ),
     build_request=build_occupancy_processor_config,
     bind_request=bind_occupancy_processor_request,
-    default_views=(
-        DefaultOutputView(OCCUPANCY_SITE_MAP_OUTPUT_DECLARATION.name, "sites"),
-    ),
     input_path_presentations=(
         PathPresentationHint(
             "calibration",

@@ -10,8 +10,6 @@ from zlc_data import (
     AxisSpec,
     BlockId,
     DatasetSchema,
-    MONITOR_HISTORY,
-    PointColumn,
     PointTable,
     REPEAT,
 )
@@ -131,13 +129,11 @@ class CapturePreviewSpec:
         schema = self.dataset_edge.schema
         if (
             schema.repeat_axis.size != 1
-            or schema.point_table.row_count != 1
-            or len(schema.point_table.columns) != 1
-            or schema.point_table.columns[0].role != MONITOR_HISTORY
-            or schema.point_table.columns[0].values != (0,)
+            or schema.point_table != PointTable(1)
+            or schema.grid_topology is not None
         ):
             raise ValueError(
-                "capture preview requires single-cell (R=1, MONITOR_HISTORY=1) storage"
+                "capture preview requires canonical single-cell (R=1, P=1) storage"
             )
         if self.source_ordinals is None:
             return
@@ -168,18 +164,7 @@ class CapturePreviewSpec:
                 1,
                 (0,),
             ),
-            PointTable(
-                1,
-                (
-                    PointColumn(
-                        AxisId("live-preview.history"),
-                        "Live preview history",
-                        MONITOR_HISTORY,
-                        PointColumn.NUMERIC,
-                        (0,),
-                    ),
-                ),
-            ),
+            PointTable(1),
             None,
             contract.dataset_schema.cell_schema,
         )
@@ -709,7 +694,7 @@ def _allocate_exact_capture(
             tap = None
             try:
                 tap = session.stream.monitor()
-                preview_dataset = MonitorDataset.append_window(
+                preview_dataset = MonitorDataset.latest_cell(
                     preview_spec.block_id,
                     tap,
                     preview_spec.dataset_edge,

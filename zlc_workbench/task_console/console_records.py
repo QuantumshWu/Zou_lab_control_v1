@@ -10,8 +10,8 @@ instead of agreeing by convention.
 ``layout_record`` is the validator all three console records use (panel, logic node,
 console state): exact key set, exact field types, no silent coercion.
 
-The panel VOCABULARY below -- which kinds exist and what shape each accepts -- is derived
-from :mod:`zlc_frontend.plot_kind` rather than restated.
+The panel VOCABULARY below -- which kinds exist -- is derived from
+:mod:`zlc_plot` rather than restated.
 That is what lets ``PanelConfig`` validate its own ``kind`` here: refusing an unknown kind
 is a question about the vocabulary, not about drawing, so this record does not
 import the Matplotlib renderer.
@@ -23,8 +23,13 @@ import copy
 from typing import Mapping
 from uuid import uuid4
 
-from zlc_frontend.panel_size import DEFAULT_PANEL_SIZE, panel_size_cells
-from zlc_frontend.plot_kind import PlotKind
+from zlc_plot import (
+    DEFAULTS,
+    PlotKind,
+    PlotSpec,
+    plot_spec_from_tree,
+    plot_spec_to_tree,
+)
 from zlc_storage.canonical import canonical_text, exact_mapping, normalized_text
 
 __all__ = ["DEFAULT_UPDATE_MS", "LOGIC_KINDS", "LOGIC_NODE_CONFIG_FIELDS",
@@ -158,13 +163,15 @@ class LogicNodeConfig:
 
 
 # ------------------------------------------------------------------ panel vocabulary
-#: ``key -> label`` for current TaskConsole panels.  The complete figure
-#: vocabulary remains in :mod:`zlc_frontend.plot_kind`; this projection contains
-#: only kinds with an end-to-end typed live payload and renderer.  A
-#: ``PanelConfig`` therefore cannot persist an advertised-but-unimplemented
-#: pulse/site/grid bridge.
+#: ``key -> product label`` for the five kinds that belong on a live console.
+#: Site maps are Image plots with typed overlays; Distribution is Histogram;
+#: PulseTimeline belongs to PulseGUI rather than the live board.
 PANEL_KINDS: dict[PlotKind, str] = {
-    kind: kind.label for kind in PlotKind if kind.panel
+    PlotKind.IMAGE: "2D image",
+    PlotKind.CURVE: "1D vector",
+    PlotKind.ROLLING: "Rolling trace",
+    PlotKind.HISTOGRAM: "Distribution",
+    PlotKind.FACET_GRID: "Site grid",
 }
 
 
@@ -174,8 +181,10 @@ PANEL_KINDS: dict[PlotKind, str] = {
 #: completions use the queued owner-wake seam; the separate narrow terminal poll exists only while
 #: a Run is active and has no completion event.  Cards sharing a display beat do not thereby claim
 #: a common shot or coherence identity.
-UPDATE_INTERVALS = (100, 200, 400, 800)
-DEFAULT_UPDATE_MS = 400
+UPDATE_INTERVALS = DEFAULTS.live.refresh_intervals_ms
+DEFAULT_UPDATE_MS = DEFAULTS.live.default_refresh_interval_ms
+DEFAULT_PANEL_SIZE = DEFAULTS.layout.default_preset
+_PERSISTED_PLOT_SPEC = "plot_spec"
 
 PANEL_CONFIG_FIELDS = {
     "panel_id": str,
@@ -197,7 +206,7 @@ class PanelConfig:
         self,
         *,
         panel_id: str | None = None,
-        kind: PlotKind,
+        plot: PlotKind | PlotSpec,
         title: str = "",
         row: int = 0,
         col: int = 0,
@@ -205,14 +214,15 @@ class PanelConfig:
         signal: str = "",
         params: Mapping[str, object] | None = None,
     ):
-        if not isinstance(kind, PlotKind):
-            raise TypeError("panel kind must be PlotKind")
+        if not isinstance(plot, PlotKind) and not isinstance(plot, PlotSpec):
+            raise TypeError("panel plot must be PlotKind or PlotSpec")
+        kind = plot if isinstance(plot, PlotKind) else plot.kind
         if kind not in PANEL_KINDS:
             choices = sorted(item.value for item in PANEL_KINDS)
             raise ValueError(f"unknown panel kind {kind!r}; choose from {choices}.")
         if not isinstance(size, str):
             raise TypeError("panel size must be str")
-        panel_size_cells(size)              # validate against the limited preset list
+        DEFAULTS.layout.validate_preset(size)
         identity = (
             f"panel_{uuid4().hex}"
             if panel_id is None
@@ -233,8 +243,10 @@ class PanelConfig:
             raise TypeError("panel signal must be str")
         if params is not None and not isinstance(params, Mapping):
             raise TypeError("panel params must be a mapping or None")
+        if params is not None and _PERSISTED_PLOT_SPEC in params:
+            raise ValueError("plot_spec is an I/O field, not a runtime panel parameter")
         self.panel_id = identity
-        self.kind = kind
+        self.plot = plot
         self.title = title
         self.row = row    # pixel y of the card top-left (no column grid)
         self.col = col    # pixel x of the card top-left (no column grid)
@@ -244,6 +256,10 @@ class PanelConfig:
         # expression and then present it as one coherent source.
         self.signal = signal
         self.params = {} if params is None else dict(params)
+
+    @property
+    def kind(self) -> PlotKind:
+        return self.plot if isinstance(self.plot, PlotKind) else self.plot.kind
 
     @property
     def update_ms(self) -> int:
@@ -261,6 +277,9 @@ class PanelConfig:
         # ``row``/``col`` are the card's pixel top-left (no column grid).  They are only a SEED for
         # the gravity packer, which re-packs the whole board on load, so a layout's reading order
         # (top-to-bottom, left-to-right) is what round-trips -- exact pixels are recomputed.
+        params = dict(self.params)
+        if not isinstance(self.plot, PlotKind):
+            params[_PERSISTED_PLOT_SPEC] = plot_spec_to_tree(self.plot)
         return {
             "panel_id": self.panel_id,
             "kind": self.kind.value,
@@ -269,7 +288,7 @@ class PanelConfig:
             "col": self.col,
             "size": self.size,
             "signal": self.signal,
-            "params": dict(self.params),
+            "params": params,
         }
 
     @classmethod
@@ -284,9 +303,17 @@ class PanelConfig:
             raise ValueError("panel row and col must be non-negative")
         constructor = dict(data)
         try:
-            constructor["kind"] = PlotKind(data["kind"])
+            kind = PlotKind(data["kind"])
         except ValueError as error:
             raise ValueError(f"unknown persisted panel kind {data['kind']!r}") from error
+        params = dict(constructor.pop("params"))
+        raw_spec = params.pop(_PERSISTED_PLOT_SPEC, None)
+        plot = kind if raw_spec is None else plot_spec_from_tree(raw_spec)
+        if not isinstance(plot, PlotKind) and plot.kind is not kind:
+            raise ValueError("persisted PlotSpec kind differs from panel kind")
+        constructor.pop("kind")
+        constructor["plot"] = plot
+        constructor["params"] = params
         result = cls(**constructor)
         if result.to_dict() != data:
             raise ValueError("PanelConfig is not in current canonical form")

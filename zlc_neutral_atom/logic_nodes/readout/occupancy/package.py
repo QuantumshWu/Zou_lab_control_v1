@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from zlc_neutral_atom.artifact_dispatch import ArtifactCapability
 from zlc_neutral_atom.logic_node_package import (
     LogicNodePackage,
     UiContributionDescriptor,
@@ -14,7 +13,6 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
     CalibrationArtifactRef,
 )
 from .declaration import OCCUPANCY_LOGIC_NODE
-from .reference import OCCUPANCY_ARTIFACT_NAMESPACE, OccupancyArtifactRef
 
 
 def _bind_api(
@@ -66,33 +64,6 @@ def _close_api(api: OccupancyApi) -> tuple[Exception, ...]:
     return api.close()
 
 
-def _project_signal_presentation(node, output_name, publication, parents):
-    from .ui.view_projection import project_occupancy_signal_presentation
-
-    return project_occupancy_signal_presentation(
-        node,
-        output_name,
-        publication,
-        parents,
-    )
-
-
-def _bind_artifact_capabilities(
-    api: OccupancyApi,
-) -> tuple[ArtifactCapability, ...]:
-    return (
-        ArtifactCapability(
-            format_id=(
-                "zlc_neutral_atom.logic_nodes.readout.occupancy."
-                + OCCUPANCY_ARTIFACT_NAMESPACE
-            ),
-            source_label="occupancy",
-            reference_type=OccupancyArtifactRef,
-            project_figure=api._project_figure,
-        ),
-    )
-
-
 LOGIC_NODE_PACKAGE = LogicNodePackage(
     api_name="occupancy",
     declaration=OCCUPANCY_LOGIC_NODE,
@@ -106,7 +77,6 @@ LOGIC_NODE_PACKAGE = LogicNodePackage(
     prepare_hosted=_prepare_hosted,
     api_dependencies=("calibration",),
     resolve_artifact_reference=_resolve_artifact_reference,
-    project_signal_presentation=_project_signal_presentation,
     ui_contributions=(
         UiContributionDescriptor(
             "cell",
@@ -115,7 +85,6 @@ LOGIC_NODE_PACKAGE = LogicNodePackage(
         ),
     ),
     close_api=_close_api,
-    bind_artifact_capabilities=_bind_artifact_capabilities,
 )
 
 __all__ = ["LOGIC_NODE_PACKAGE"]

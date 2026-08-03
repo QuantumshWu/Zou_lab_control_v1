@@ -21,6 +21,7 @@ SOURCE_ROOTS = (
     "fpga",
     "Zou_lab_control",
     "zlc_data",
+    "zlc_plot",
     "zlc_frontend",
     "zlc_neutral_atom",
     "zlc_pulse",
@@ -75,9 +76,10 @@ def _sole_definition(name, node_type=ast.ClassDef):
 
 
 FORBIDDEN = {
-    "zlc_data": ("Zou_lab_control", "zlc_frontend", "zlc_neutral_atom", "zlc_pulse", "zlc_workbench"),
-    "zlc_storage": ("Zou_lab_control", "zlc_data", "zlc_frontend", "zlc_neutral_atom", "zlc_pulse", "zlc_workbench"),
-    "zlc_pulse": ("Zou_lab_control", "zlc_data", "zlc_frontend", "zlc_neutral_atom", "zlc_workbench"),
+    "zlc_data": ("Zou_lab_control", "zlc_frontend", "zlc_neutral_atom", "zlc_plot", "zlc_pulse", "zlc_workbench"),
+    "zlc_storage": ("Zou_lab_control", "zlc_data", "zlc_frontend", "zlc_neutral_atom", "zlc_plot", "zlc_pulse", "zlc_workbench"),
+    "zlc_pulse": ("Zou_lab_control", "zlc_data", "zlc_frontend", "zlc_neutral_atom", "zlc_plot", "zlc_workbench"),
+    "zlc_plot": ("Zou_lab_control", "zlc_frontend", "zlc_neutral_atom", "zlc_pulse", "zlc_storage", "zlc_workbench"),
     "zlc_frontend": ("Zou_lab_control", "zlc_neutral_atom", "zlc_pulse", "zlc_workbench"),
     "zlc_neutral_atom": ("Zou_lab_control", "zlc_frontend", "zlc_workbench"),
 }
@@ -263,36 +265,26 @@ def test_framework_and_device_owners_do_not_import_concrete_logic_nodes(
     )
 
 
-def test_task_console_consumes_but_does_not_recreate_figure_output_vocabulary():
-    """Workbench may import frontend names, but may not define a second copy."""
+def test_retired_figure_presentation_sidecar_has_no_owner_or_consumer():
+    """Selection/Fit publication is routed directly from current zlc_plot events."""
 
-    owner_path, _owner = _sole_definition("FigureOutputPresentation")
-    assert owner_path.relative_to(ROOT) == Path(
-        "zlc_frontend/figure_outputs.py"
-    )
     violations = []
-    task_console = ROOT / "zlc_workbench" / "task_console"
-    for source in sorted(task_console.rglob("*.py")):
-        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in {
-                "FitParameterMetadata",
-                "figure_output_contract_id",
-            }:
+    retired = {
+        "FigureOutputPresentation",
+        "FitParameterMetadata",
+        "figure_output_contract_id",
+        "project_signal_presentation",
+    }
+    for source in _source_files():
+        text = source.read_text(encoding="utf-8")
+        for name in retired:
+            if name in text:
                 violations.append(
-                    f"{source.relative_to(ROOT)}:{node.lineno} defines {node.name}"
-                )
-            if isinstance(node, ast.Constant) and isinstance(node.value, str) and (
-                node.value in {"area.data", "cross.data"}
-                or node.value.startswith("area.range.")
-            ):
-                violations.append(
-                    f"{source.relative_to(ROOT)}:{node.lineno} recreates "
-                    f"Figure output literal {node.value!r}"
+                    f"{source.relative_to(ROOT)} retains retired symbol {name}"
                 )
     assert not violations, (
-        "TaskConsole may consume frontend-owned constants/presentations, but must "
-        "not define or spell a second Figure output vocabulary:\n"
+        "the retired Figure presentation sidecar must not survive as a class, "
+        "callback, helper, or consumer:\n"
         + "\n".join(violations)
     )
 
@@ -402,7 +394,11 @@ def test_zlc_pulse_has_no_historical_target_importer():
 
 def test_canonical_primitive_validators_have_one_owner():
     violations = []
-    for package in FORBIDDEN:
+    # zlc_plot is deliberately below zlc_storage in neither direction: its
+    # private toolkit-neutral field validators cannot import the storage codec
+    # owner without violating the package DAG.  This guard applies only to the
+    # application/data packages that may consume zlc_storage.canonical.
+    for package in set(FORBIDDEN).difference({"zlc_plot"}):
         for path in (ROOT / package).rglob("*.py"):
             relative = path.relative_to(ROOT)
             if relative == Path("zlc_storage/canonical.py"):
@@ -415,8 +411,9 @@ def test_canonical_primitive_validators_have_one_owner():
                     continue
                 violations.append(f"{relative}:{node.lineno} defines {node.name}")
     assert not violations, (
-        "canonical primitive validators belong to zlc_storage.canonical; "
-        "domain modules must import and alias them:\n" + "\n".join(violations)
+        "canonical storage primitive validators belong to "
+        "zlc_storage.canonical; storage-consuming domain modules must import "
+        "and alias them:\n" + "\n".join(violations)
     )
 
 
@@ -504,7 +501,6 @@ def test_zlc_data_typed_byte_admission_has_one_owner():
 def test_zlc_data_codecs_delegate_leaf_invariants_to_typed_owners():
     owner_constructors = {
         "AxisId",
-        "AxisLayout",
         "AxisRoleId",
         "AxisSpec",
         "BlockId",
@@ -513,10 +509,6 @@ def test_zlc_data_codecs_delegate_leaf_invariants_to_typed_owners():
         "CoordinateRangeSelection",
         "DatasetRevision",
         "DatasetRevisionRef",
-        "FitNumericPolicy",
-        "FitParameterConstraint",
-        "FitResultBatch",
-        "FitSpec",
         "IndexRangeSelection",
         "IndexSelection",
         "ReductionSpec",
@@ -531,7 +523,6 @@ def test_zlc_data_codecs_delegate_leaf_invariants_to_typed_owners():
     }
     sources = (
         ROOT / "zlc_data/codec.py",
-        ROOT / "zlc_data/fit_codec.py",
         ROOT / "zlc_data/selection.py",
         ROOT / "zlc_data/transform_codec.py",
     )
@@ -827,16 +818,173 @@ def test_readout_family_root_does_not_eagerly_aggregate_leaf_owners():
     )
 
 
-def test_headless_api_import_does_not_load_frontend_renderer():
+def test_headless_api_import_loads_only_plot_value_modules_and_no_qt_runtime():
     code = (
         "import sys; import Zou_lab_control.api; "
-        "assert 'zlc_frontend.render' not in sys.modules; "
+        "loaded_plot = {name for name in sys.modules "
+        "if name == 'zlc_plot' or name.startswith('zlc_plot.')}; "
+        "allowed_plot = {'zlc_plot', 'zlc_plot._image_raster', "
+        "'zlc_plot._validation', 'zlc_plot.assets', 'zlc_plot.kinds', "
+        "'zlc_plot.parameters', 'zlc_plot.specs', 'zlc_plot.style'}; "
+        "assert loaded_plot <= allowed_plot, sorted(loaded_plot - allowed_plot); "
         "assert not any(name == 'matplotlib' or name.startswith('matplotlib.') "
         "or name == 'PyQt5' or name.startswith('PyQt5.') "
         "or name == 'PySide6' or name.startswith('PySide6.') "
         "for name in sys.modules)"
     )
     subprocess.run([sys.executable, "-c", code], cwd=ROOT, check=True)
+
+
+def test_task_preview_plot_seam_is_typed_and_has_no_retired_string_owner():
+    owner_path, owner = _sole_definition("TaskPreviewPlot")
+    assert owner_path.relative_to(ROOT) == Path(
+        "zlc_neutral_atom/logic_node_declaration.py"
+    )
+    annotations = {
+        statement.target.id: ast.unparse(statement.annotation)
+        for statement in owner.body
+        if isinstance(statement, ast.AnnAssign)
+        and isinstance(statement.target, ast.Name)
+    }
+    assert annotations == {
+        "output_name": "str",
+        "plot": "PlotKind | PlotSpec",
+    }
+
+    retired = (
+        "DefaultOutputView",
+        "default_views",
+        "_MOT_FIELD_DEFAULT_VIEW_PARAMS",
+    )
+    violations = []
+    for source in _source_files():
+        text = source.read_text(encoding="utf-8")
+        for token in retired:
+            if token in text:
+                violations.append(f"{source.relative_to(ROOT)} retains {token}")
+        tree = ast.parse(text, filename=str(source))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            function = node.func
+            if not isinstance(function, ast.Name) or function.id != "PlotKind":
+                continue
+            argument = node.args[0]
+            if isinstance(argument, ast.Attribute) and argument.attr == "kind":
+                violations.append(
+                    f"{source.relative_to(ROOT)}:{node.lineno} reparses a typed "
+                    "plot through PlotKind(value.kind)"
+                )
+    assert not violations, (
+        "Task previews carry PlotKind | PlotSpec directly from the declaring "
+        "Task into PanelConfig; the retired string kind/params seam must stay "
+        "deleted:\n" + "\n".join(violations)
+    )
+
+
+def test_calibration_report_is_only_a_thin_leaf_to_zlc_plot_adapter():
+    retired = (
+        Path(
+            "zlc_neutral_atom/logic_nodes/readout/calibration/projection.py"
+        ),
+        Path(
+            "zlc_neutral_atom/logic_nodes/readout/calibration/result_bundle.py"
+        ),
+        Path(
+            "zlc_neutral_atom/logic_nodes/readout/calibration/ui/workbench_jobs.py"
+        ),
+        Path("zlc_workbench/logic_node_plots.py"),
+    )
+    assert not [path for path in retired if (ROOT / path).exists()], (
+        "Calibration FINAL outputs feed one leaf-local zlc_plot adapter; do not "
+        "restore report DTOs, a second materializer, or a generic Workbench "
+        "report owner"
+    )
+
+    adapter = (
+        ROOT
+        / "zlc_neutral_atom"
+        / "logic_nodes"
+        / "readout"
+        / "calibration"
+        / "ui"
+        / "plot_report.py"
+    )
+    assert adapter.is_file(), "Calibration's optional report adapter is missing"
+    imported = _imports(adapter)
+    forbidden = {
+        name
+        for name in imported
+        if name == "matplotlib"
+        or name.startswith("matplotlib.")
+        or name in {"zlc_plot.backends", "zlc_plot.rendering", "zlc_plot.style"}
+    }
+    assert not forbidden, (
+        "Calibration maps declared outputs through the public zlc_plot facade; "
+        f"it may not own a renderer or style implementation: {sorted(forbidden)}"
+    )
+
+
+def test_plot_spec_codec_is_confined_to_task_console_layout_io():
+    codec_names = {"plot_spec_from_tree", "plot_spec_to_tree"}
+    allowed = Path("zlc_workbench/task_console/console_records.py")
+    violations = []
+    codec_calls = []
+
+    class CodecCallVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self.scope = []
+
+        def visit_ClassDef(self, node):
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+
+        def visit_FunctionDef(self, node):
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+
+        def visit_Call(self, node):
+            function = node.func
+            name = (
+                function.id
+                if isinstance(function, ast.Name)
+                else function.attr if isinstance(function, ast.Attribute) else None
+            )
+            if name in codec_names:
+                codec_calls.append(tuple(self.scope))
+            self.generic_visit(node)
+
+    roots = ("zlc_neutral_atom", "zlc_workbench/task_console")
+    for source in _source_files(roots=roots):
+        relative = source.relative_to(ROOT)
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        imports_codec = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports_codec |= any(
+                    alias.name == "zlc_plot.codec" for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom):
+                imports_codec |= node.module == "zlc_plot.codec" or (
+                    node.module == "zlc_plot"
+                    and any(alias.name in codec_names for alias in node.names)
+                )
+        if imports_codec and relative != allowed:
+            violations.append(f"{relative} imports the PlotSpec codec")
+        if relative == allowed:
+            CodecCallVisitor().visit(tree)
+
+    assert not violations, (
+        "neutral leaves and TaskConsole runtime keep typed PlotKind | PlotSpec; "
+        "only the saved-layout record may encode/decode it:\n"
+        + "\n".join(violations)
+    )
+    assert sorted(codec_calls) == [
+        ("PanelConfig", "from_dict"),
+        ("PanelConfig", "to_dict"),
+    ], "PlotSpec codec calls must remain exactly at PanelConfig layout I/O"
 
 
 def test_ordinary_artifacts_have_no_cas_or_payload_digest_owner():
@@ -998,9 +1146,8 @@ def test_current_format_names_do_not_encode_edit_counters():
 def test_persisted_ui_formats_have_no_edit_counter_or_single_role():
     """Owners are resolved by DEFINITION SITE, never by path -- see ``_sole_definition``.
 
-    The two console records are located by their current definition sites.
-    Persisted figures use the exact current ``zlc_frontend.figure_archive``
-    envelope; TaskConsole records belong to their Workbench product owner.
+    The two console records are located by their current definition sites and
+    remain owned by the TaskConsole product rather than a retired Figure owner.
     """
 
     console_state_path, console_state_node = _sole_definition("TaskConsoleState")
@@ -1030,7 +1177,7 @@ def test_persisted_ui_formats_have_no_edit_counter_or_single_role():
                 )
 
     assert not violations, (
-        "persisted UI records are current-only: FigureArchive and "
-        "TaskConsole keep a plain schema, while single-value panel roles and "
+        "persisted TaskConsole records keep a plain current schema, while "
+        "single-value panel roles and "
         "numeric edit counters stay deleted:\n" + "\n".join(violations)
     )

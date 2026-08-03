@@ -55,48 +55,30 @@ def _invoke_logic_node_ui(
 
 
 def open_figure_workbench(
-    figure_factory,
-    source,
+    snapshot,
+    spec,
     *,
     output_root,
-    intent=None,
-    point_ordinals=None,
-    preferences=None,
-    fit_preparer=None,
-    fit_executor=None,
-    fit_saver=None,
-    fit_reloader=None,
-    fit_selected_model=None,
-    fit_initial_selection=None,
+    size=None,
+    parameters=None,
+    archive_path=None,
+    metadata=None,
     open_fit=False,
-    fit_timeout_seconds=None,
-    initial_fit_result_identity=None,
 ):
-    """Resolve and display one frozen artifact without blocking the Qt owner."""
+    """Display one explicit frozen snapshot through the current plot surface."""
 
     from zlc_workbench.data_figure.app import open_figure_workbench as _open
 
-    options = {
-        "intent": intent,
-        "point_ordinals": point_ordinals,
-        "preferences": preferences,
-    }
-    for name, value in (
-        ("fit_preparer", fit_preparer),
-        ("fit_executor", fit_executor),
-        ("fit_saver", fit_saver),
-        ("fit_reloader", fit_reloader),
-        ("fit_selected_model", fit_selected_model),
-        ("fit_initial_selection", fit_initial_selection),
-        ("initial_fit_result_identity", initial_fit_result_identity),
-    ):
-        if value is not None:
-            options[name] = value
-    if open_fit:
-        options["open_fit"] = True
-    if fit_timeout_seconds is not None:
-        options["fit_timeout_seconds"] = fit_timeout_seconds
-    return _open(figure_factory, source, output_root=output_root, **options)
+    return _open(
+        snapshot,
+        spec,
+        output_root=output_root,
+        size=size,
+        parameters=parameters,
+        archive_path=archive_path,
+        metadata=metadata,
+        open_fit=open_fit,
+    )
 
 
 def open_pulse_editor(

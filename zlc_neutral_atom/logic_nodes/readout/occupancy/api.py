@@ -185,23 +185,6 @@ class OccupancyApi:
             reference,
         )
 
-    def _project_figure(
-        self,
-        reference: OccupancyArtifactRef,
-        *,
-        output: str | None,
-        materialize: bool,
-    ):
-        """Project an Occupancy artifact through its leaf presentation owner."""
-
-        from .ui.view_projection import project_occupancy_figure
-
-        return project_occupancy_figure(
-            self.load_occupancy(reference),
-            output=output,
-            materialize=materialize,
-        )
-
     def _inspect_occupancy_cell_navigation(
         self,
         reference: OccupancyArtifactRef,
@@ -231,7 +214,7 @@ class OccupancyApi:
             OccupancyCellDomain,
         ):
             raise TypeError("expected_navigation must be OccupancyCellDomain or None")
-        source = load_exact_occupancy_cell_source(
+        return load_exact_occupancy_cell_source(
             reference,
             self._occupancy_root,
             self._captures_root,
@@ -243,9 +226,6 @@ class OccupancyApi:
                 else expected_navigation.identity
             ),
         )
-        from .ui.view_projection import project_exact_occupancy_cell
-
-        return project_exact_occupancy_cell(source)
 
     def occupancy_cell_view(
         self,
@@ -253,8 +233,10 @@ class OccupancyApi:
         *,
         address: DatasetCellAddress | None = None,
     ):
-        _figure, source = self._load_occupancy_cell_source(reference, address)
-        return source.site_map
+        source = self._load_occupancy_cell_source(reference, address)
+        from .ui.plot import occupancy_cell_session
+
+        return occupancy_cell_session(source)
 
     def occupancy_cell_gui(
         self,

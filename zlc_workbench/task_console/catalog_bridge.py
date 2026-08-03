@@ -103,8 +103,8 @@ class ConsoleNodeSpec:
         return self.declaration.artifact_outputs
 
     @property
-    def default_views(self) -> tuple:
-        return self.declaration.default_views
+    def task_previews(self) -> tuple:
+        return self.declaration.task_previews
 
     @property
     def editor_fields(self) -> tuple:

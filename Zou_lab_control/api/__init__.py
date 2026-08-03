@@ -2,12 +2,10 @@
 
 from .facade import (
     CaptureArtifactRef,
-    FitResultArtifactRef,
     CaptureRequest,
     connect,
     device_manager,
     Experiment,
-    SavedFitResult,
     InstallationConfigDocument,
     PlanDescriptor,
     PreparedPulseExecution,
@@ -23,12 +21,10 @@ from ._logic_node_api import LogicNodeApis
 
 __all__ = [
     "CaptureArtifactRef",
-    "FitResultArtifactRef",
     "CaptureRequest",
     "connect",
     "device_manager",
     "Experiment",
-    "SavedFitResult",
     "InstallationConfigDocument",
     "PlanDescriptor",
     "PreparedPulseExecution",

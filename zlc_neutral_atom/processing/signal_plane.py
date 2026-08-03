@@ -414,7 +414,7 @@ class _GenerationState:
     publication: SignalPublication | None = None
     event_source: SignalEventSource | None = None
     event_output_name: str | None = None
-    bound_parent: SignalPublication | None = None
+    bound_parents: tuple[SignalPublication, ...] = ()
     last_parent_sequence: int = 0
     published_names: tuple[str, ...] | None = None
     published_schemas: Mapping[str, DatasetSchema] | None = None
@@ -564,12 +564,6 @@ class _LatestOnlyProcessorLane:
         if idle:
             self._cancelled_processor(entry)
         return idle
-
-    def detach_processor(self, node: object) -> None:
-        entry = self._processors.pop(_node_instance_id(node), None)
-        if entry is not None:
-            entry.cancel_requested = True
-            entry.pending_publication = None
 
     def active_processor_bindings(self) -> tuple[tuple[object, str], ...]:
         return tuple(
@@ -1325,8 +1319,6 @@ class SignalDataPlane:
         self,
         state: _GenerationState,
         publication: SignalPublication,
-        *,
-        exact_bound: bool = False,
     ) -> SignalValue:
         self._require_issued_publication_locked(publication)
         source_name = state.source_name
@@ -1340,9 +1332,37 @@ class SignalDataPlane:
         source = publication.value(source_name)
         if source is None:
             raise ValueError("signal parent lacks the frozen route source")
-        if exact_bound and publication is not state.bound_parent:
-            raise ValueError("event result publication differs from its bound parent")
         return source
+
+    def _require_route_parents_locked(
+        self,
+        state: _GenerationState,
+        publications: tuple[SignalPublication, ...],
+        *,
+        exact_bound: bool = False,
+    ) -> tuple[SignalValue, ...]:
+        parents = tuple(publications)
+        if not parents or any(
+            not isinstance(parent, SignalPublication) for parent in parents
+        ):
+            raise TypeError("derived result requires exact parent publications")
+        if len({id(parent) for parent in parents}) != len(parents):
+            raise ValueError("derived result parent publications must be unique")
+        sequences = tuple(parent.event_ref.sequence for parent in parents)
+        if sequences != tuple(sorted(sequences)):
+            raise ValueError("derived result parents must follow source event order")
+        values = tuple(
+            self._require_route_parent_locked(state, parent) for parent in parents
+        )
+        if exact_bound and (
+            len(parents) != len(state.bound_parents)
+            or any(
+                parent is not bound
+                for parent, bound in zip(parents, state.bound_parents, strict=True)
+            )
+        ):
+            raise ValueError("event result publications differ from their bound parents")
+        return values
 
     def _validate_generation_values_locked(
         self,
@@ -1395,8 +1415,8 @@ class SignalDataPlane:
             raise RuntimeError("signal generation is no longer active")
         if state.terminal:
             raise RuntimeError("signal generation has already published terminal")
-        if len(parents) > 1:
-            raise ValueError("current signal routes accept at most one exact parent")
+        if len({id(parent) for parent in parents}) != len(parents):
+            raise ValueError("signal publication parents must be unique")
         for parent in parents:
             self._require_issued_publication_locked(parent)
         frozen = MappingProxyType(
@@ -1771,14 +1791,13 @@ class SignalDataPlane:
         self,
         owner_id: str,
         generation: StreamGenerationId,
-        source_publication: SignalPublication,
+        source_publications: tuple[SignalPublication, ...],
         values: Mapping[str, DerivedSignalOutput],
     ) -> bool:
         identity = canonical_text(owner_id, "derived route owner_id")
         if not isinstance(generation, StreamGenerationId):
             raise TypeError("derived generation must be StreamGenerationId")
-        if not isinstance(source_publication, SignalPublication):
-            raise TypeError("derived result requires its exact parent publication")
+        parents = tuple(source_publications)
         with self._lock:
             state = self._states.get(identity)
             if (
@@ -1788,12 +1807,13 @@ class SignalDataPlane:
                 or state.kind != "continuous"
             ):
                 return False
-            self._require_route_parent_locked(state, source_publication)
-            if source_publication.event_ref.sequence <= state.last_parent_sequence:
+            self._require_route_parents_locked(state, parents)
+            latest_sequence = parents[-1].event_ref.sequence
+            if latest_sequence <= state.last_parent_sequence:
                 return False
         frozen = self._derived_values(
             state,
-            source_publication,
+            parents[-1],
             values,
             transient=True,
         )
@@ -1804,27 +1824,27 @@ class SignalDataPlane:
                 or state.generation != generation
             ):
                 return False
-            self._require_route_parent_locked(state, source_publication)
-            if source_publication.event_ref.sequence <= state.last_parent_sequence:
+            self._require_route_parents_locked(state, parents)
+            latest_sequence = parents[-1].event_ref.sequence
+            if latest_sequence <= state.last_parent_sequence:
                 return False
             self._publish_locked(
                 state,
                 frozen,
-                parents=(source_publication,),
+                parents=parents,
             )
-            state.last_parent_sequence = source_publication.event_ref.sequence
+            state.last_parent_sequence = latest_sequence
             return True
 
     def fail_continuous_derived(
         self,
         owner_id: str,
         generation: StreamGenerationId,
-        source_publication: SignalPublication,
+        source_publications: tuple[SignalPublication, ...],
         error: Exception,
     ) -> bool:
         identity = canonical_text(owner_id, "derived route owner_id")
-        if not isinstance(source_publication, SignalPublication):
-            raise TypeError("derived failure requires its exact parent publication")
+        parents = tuple(source_publications)
         if not isinstance(error, Exception):
             raise TypeError("derived failure must be an Exception")
         with self._lock:
@@ -1836,10 +1856,11 @@ class SignalDataPlane:
                 or state.kind != "continuous"
             ):
                 return False
-            self._require_route_parent_locked(state, source_publication)
-            if source_publication.event_ref.sequence <= state.last_parent_sequence:
+            self._require_route_parents_locked(state, parents)
+            latest_sequence = parents[-1].event_ref.sequence
+            if latest_sequence <= state.last_parent_sequence:
                 return False
-            state.last_parent_sequence = source_publication.event_ref.sequence
+            state.last_parent_sequence = latest_sequence
             state.failure = f"{type(error).__name__}: {error}"
             self._membership_changed = True
             return True
@@ -1848,13 +1869,12 @@ class SignalDataPlane:
         self,
         owner_id: str,
         generation: StreamGenerationId,
-        source_publication: SignalPublication,
+        source_publications: tuple[SignalPublication, ...],
     ) -> bool:
         """Whether one active route has not published this exact parent yet."""
 
         identity = canonical_text(owner_id, "derived route owner_id")
-        if not isinstance(source_publication, SignalPublication):
-            raise TypeError("derived route parent must be SignalPublication")
+        parents = tuple(source_publications)
         with self._lock:
             state = self._states.get(identity)
             if (
@@ -1864,15 +1884,15 @@ class SignalDataPlane:
                 or state.generation != generation
             ):
                 return False
-            self._require_route_parent_locked(state, source_publication)
-            return source_publication.event_ref.sequence > state.last_parent_sequence
+            self._require_route_parents_locked(state, parents)
+            return parents[-1].event_ref.sequence > state.last_parent_sequence
 
     def bind_event_derived(
         self,
         owner_id: str,
         *,
         source_name: str,
-        source_publication: SignalPublication,
+        source_publications: tuple[SignalPublication, ...],
         output_names,
     ) -> StreamGenerationId:
         identity = canonical_text(owner_id, "event result owner_id")
@@ -1881,22 +1901,27 @@ class SignalDataPlane:
             canonical_text(name, "event result output name")
             for name in output_names
         )
-        if not isinstance(source_publication, SignalPublication):
-            raise TypeError("event result binding requires its exact parent")
-        if source_publication.value(source_name) is None:
+        parents = tuple(source_publications)
+        if not parents or any(
+            not isinstance(parent, SignalPublication) for parent in parents
+        ):
+            raise TypeError("event result binding requires exact parents")
+        if any(parent.value(source_name) is None for parent in parents):
             raise ValueError("event result parent lacks its selected signal")
         self._withdraw_owner(identity)
         with self._lock:
             if self._closed:
                 raise RuntimeError("signal data plane is closed")
-            self._require_issued_publication_locked(source_publication)
+            for parent in parents:
+                self._require_issued_publication_locked(parent)
+            primary = parents[-1]
             source_state = self._state_for_signal_locked(source_name)
             if (
                 source_state is None
                 or source_state.publication is None
                 or source_state.owner_id
-                != source_publication.event_ref.stream_id.value
-                or source_state.generation != source_publication.event_ref.generation
+                != primary.event_ref.stream_id.value
+                or source_state.generation != primary.event_ref.generation
             ):
                 raise RuntimeError("event result source has no exact publication")
             state = self._install_state_locked(
@@ -1906,21 +1931,21 @@ class SignalDataPlane:
                 bare_names={name: name for name in names},
                 source_name=source_name,
             )
-            state.bound_parent = source_publication
+            self._require_route_parents_locked(state, parents)
+            state.bound_parents = parents
             return state.generation
 
     def publish_event_derived(
         self,
         owner_id: str,
         generation: StreamGenerationId,
-        source_publication: SignalPublication,
+        source_publications: tuple[SignalPublication, ...],
         values: Mapping[str, DerivedSignalOutput],
     ) -> Mapping[str, SignalValue] | None:
         identity = canonical_text(owner_id, "event result owner_id")
         if not isinstance(generation, StreamGenerationId):
             raise TypeError("event result generation must be StreamGenerationId")
-        if not isinstance(source_publication, SignalPublication):
-            raise TypeError("event result requires its exact parent publication")
+        parents = tuple(source_publications)
         with self._lock:
             state = self._states.get(identity)
             if (
@@ -1931,16 +1956,16 @@ class SignalDataPlane:
             ):
                 return None
             source_name = state.source_name
-            self._require_route_parent_locked(
+            self._require_route_parents_locked(
                 state,
-                source_publication,
+                parents,
                 exact_bound=True,
             )
         if source_name is None:
             raise RuntimeError("event result generation lost its source")
         frozen = self._derived_values(
             state,
-            source_publication,
+            parents[-1],
             values,
             transient=True,
         )
@@ -1951,15 +1976,15 @@ class SignalDataPlane:
                 or state.generation != generation
             ):
                 return None
-            self._require_route_parent_locked(
+            self._require_route_parents_locked(
                 state,
-                source_publication,
+                parents,
                 exact_bound=True,
             )
             publication = self._publish_locked(
                 state,
                 frozen,
-                parents=(source_publication,),
+                parents=parents,
                 terminal=True,
             )
         return publication.signals
@@ -2023,8 +2048,11 @@ class SignalDataPlane:
         slots = []
         for state in states:
             if state.kind == "processor" and state.node is not None:
+                # Routing retirement and execution retirement are distinct.
+                # Keep a cancelled entry lane-owned until its prepare/work
+                # Future completes so the node receives exactly one terminal
+                # acknowledgement from ``_cancelled_processor``.
                 self._lane.cancel_processor(state.node)
-                self._lane.detach_processor(state.node)
             if state.slot is not None:
                 slots.append(state.slot)
         errors = []

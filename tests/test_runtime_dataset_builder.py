@@ -10,7 +10,6 @@ import pytest
 from zlc_data.axis import (
     AxisId,
     AxisSpec,
-    MONITOR_HISTORY,
     REPEAT,
     SCAN_POINT,
     SPATIAL_X,
@@ -107,22 +106,10 @@ def dataset_schema(
     )
 
 
-def monitor_history_schema(source_schema: DatasetSchema, history_slots: int) -> DatasetSchema:
-    history = axis("monitor.history", MONITOR_HISTORY, history_slots)
+def monitor_latest_schema(source_schema: DatasetSchema) -> DatasetSchema:
     return DatasetSchema(
         axis("repeat", REPEAT, 1),
-        PointTable(
-            history_slots,
-            (
-                PointColumn(
-                    history.axis_id,
-                    history.name,
-                    history.role,
-                    PointColumn.NUMERIC,
-                    history.coordinates,
-                ),
-            ),
-        ),
+        PointTable(1),
         None,
         source_schema.cell_schema,
     )
@@ -619,15 +606,15 @@ def test_keyed_monitor_gap_at_nonzero_offset_clears_every_stale_cell():
     builder.close()
 
 
-def test_append_window_owns_newest_first_order_not_producer_join_keys():
+def test_latest_cell_replaces_the_front_without_exposing_source_join_keys():
     source_schema = dataset_schema(points=2)
-    window_schema = monitor_history_schema(source_schema, 3)
+    latest_schema = monitor_latest_schema(source_schema)
     stream, producer, payload_contract = source(source_schema)
     tap = stream.monitor()
-    window = MonitorDataset.append_window(
-        BlockId("history"),
+    latest = MonitorDataset.latest_cell(
+        BlockId("latest"),
         tap,
-        dataset_edge(payload_contract, window_schema, exact=False),
+        dataset_edge(payload_contract, latest_schema, exact=False),
     )
 
     for sequence, number in enumerate((1, 2, 3, 4)):
@@ -637,64 +624,60 @@ def test_append_window_owns_newest_first_order_not_producer_join_keys():
             DatasetCellAddress(0, sequence % 2),
             sequence,
         )
-        window.ingest_next()
+        latest.ingest_next()
 
-    snapshot = window.materialize()
-    assert snapshot.block.values.shape == (1, 3, 2, 3)
-    assert snapshot.block.values[0, :, 0, 0].tolist() == [4, 3, 2]
-    assert [reference.sequence for reference in snapshot.event_refs] == [3, 2, 1]
+    snapshot = latest.materialize()
+    assert snapshot.block.values.shape == (1, 1, 2, 3)
+    assert snapshot.block.values[0, 0, 0, 0] == 4
+    assert tuple(reference.sequence for reference in snapshot.event_refs) == (3,)
     assert snapshot.head == snapshot.event_refs[0]
+    assert snapshot.ref.revision.value == 4
     assert snapshot.coverage.complete
     assert snapshot.coverage.missed_events == 0
-    window.close()
+    latest.close()
 
 
-def test_append_window_gap_recovers_after_loss_rolls_out_of_visible_history():
+def test_latest_cell_accounts_for_a_gap_and_clears_current_gap_on_contiguous_ingest():
     source_schema = dataset_schema(points=2)
-    window_schema = monitor_history_schema(source_schema, 3)
+    latest_schema = monitor_latest_schema(source_schema)
     stream, producer, payload_contract = source(source_schema)
     tap = stream.monitor()
-    window = MonitorDataset.append_window(
+    latest = MonitorDataset.latest_cell(
         BlockId("gap-recovery"),
         tap,
-        dataset_edge(payload_contract, window_schema, exact=False),
+        dataset_edge(payload_contract, latest_schema, exact=False),
     )
 
     emit(producer, value(1), DatasetCellAddress(0, 0), 0)
-    window.ingest_next()
+    latest.ingest_next()
     emit(producer, value(2), DatasetCellAddress(0, 1), 1)
     emit(producer, value(3), DatasetCellAddress(0, 0), 2)
-    window.ingest_latest()
-    with_gap = window.materialize()
+    latest.ingest_latest()
+    with_gap = latest.materialize()
     assert with_gap.coverage.missed_events == 1
     assert with_gap.coverage.current_gap
     assert not with_gap.coverage.complete
+    assert with_gap.block.values[0, 0, 0, 0] == 3
 
-    for sequence, number in enumerate((4, 5, 6), start=3):
-        emit(
-            producer,
-            value(number),
-            DatasetCellAddress(0, sequence % 2),
-            sequence,
-        )
-        window.ingest_next()
-    recovered = window.materialize()
-    assert recovered.block.values[0, :, 0, 0].tolist() == [6, 5, 4]
+    emit(producer, value(4), DatasetCellAddress(0, 1), 3)
+    latest.ingest_next()
+    recovered = latest.materialize()
+    assert recovered.block.values[0, 0, 0, 0] == 4
     assert recovered.coverage.complete
     assert not recovered.coverage.current_gap
     assert recovered.coverage.missed_events == 1
-    window.close()
+    latest.close()
 
 
-def test_append_window_preserves_every_data_axis_and_component_validity():
+def test_latest_cell_preserves_every_data_axis_dtype_and_component_validity():
     source_schema = dataset_schema(points=1, component_validity=True)
-    window_schema = monitor_history_schema(source_schema, 2)
+    latest_schema = monitor_latest_schema(source_schema)
     stream, producer, payload_contract = source(source_schema)
     tap = stream.monitor()
-    window = MonitorDataset.append_window(
-        BlockId("multidimensional-history"),
+    latest = MonitorDataset.latest_cell(
+        BlockId("multidimensional-latest"),
         tap,
-        dataset_edge(payload_contract, window_schema, exact=False),
+        dataset_edge(payload_contract, latest_schema, exact=False),
     )
     x_axis = source_schema.cell_schema.data_axes[1]
     masks = (
@@ -709,39 +692,71 @@ def test_append_window_preserves_every_data_axis_and_component_validity():
             DatasetCellAddress(0, 0),
             sequence,
         )
-        window.ingest_next()
+        latest.ingest_next()
 
-    snapshot = window.materialize()
-    assert snapshot.block.values.shape == (1, 2, 2, 3)
-    assert snapshot.block.values[0, :, 0, 0].tolist() == [3, 2]
+    snapshot = latest.materialize()
+    assert snapshot.block.values.shape == (1, 1, 2, 3)
+    assert snapshot.block.values.dtype == np.dtype("<u2")
+    assert snapshot.block.values[0, 0, 0, 0] == 3
     assert snapshot.block.validity.axis_ids == tuple(
         axis.axis_id for axis in source_schema.cell_schema.data_axes
     )
-    assert snapshot.block.validity.mask.shape == (1, 2, 2, 3)
+    assert snapshot.block.validity.mask.shape == (1, 1, 2, 3)
     np.testing.assert_array_equal(
         snapshot.block.validity.mask[0, 0],
         np.broadcast_to(masks[2].mask, (2, 3)),
     )
-    np.testing.assert_array_equal(
-        snapshot.block.validity.mask[0, 1],
-        np.broadcast_to(masks[1].mask, (2, 3)),
-    )
-    window.close()
+    latest.close()
 
 
-def test_append_window_rejects_scan_axes_relabelled_as_history():
+def test_latest_cell_rejects_noncanonical_point_storage():
     schema = dataset_schema(points=2)
     stream, _producer, payload_contract = source(schema)
     tap = stream.monitor()
 
-    with pytest.raises(Exception, match="MONITOR_HISTORY"):
-        MonitorDataset.append_window(
-            BlockId("not-history"),
+    with pytest.raises(Exception, match="single-cell"):
+        MonitorDataset.latest_cell(
+            BlockId("not-latest"),
             tap,
             dataset_edge(payload_contract, schema, exact=False),
         )
 
     tap.close()
+
+
+def test_latest_cell_replacement_is_invisible_until_matching_envelope_commits():
+    source_schema = dataset_schema(points=1)
+    latest_schema = monitor_latest_schema(source_schema)
+    stream, producer, payload_contract = source(source_schema)
+    latest = MonitorDataset.latest_cell(
+        BlockId("atomic-latest"),
+        stream.monitor(),
+        dataset_edge(payload_contract, latest_schema, exact=False),
+    )
+    first = value(1)
+    emit(producer, first, DatasetCellAddress(0, 0), 0)
+    latest.ingest_next()
+    before = latest.freeze_current()
+
+    replacement_value = value(9)
+    replacement = latest.prepare_latest_cell_replacement(replacement_value)
+    staged = latest.freeze_current()
+    assert staged.ref == before.ref
+    assert staged.block.values[0, 0, 0, 0] == 1
+
+    envelope = emit(
+        producer,
+        replacement_value,
+        DatasetCellAddress(0, 0),
+        1,
+    )
+    latest.commit_latest_cell_replacement(replacement, envelope)
+    committed = latest.freeze_current()
+    assert committed.ref.revision.value == before.ref.revision.value + 1
+    assert committed.block.values[0, 0, 0, 0] == 9
+    assert committed.event_refs == (envelope.ref,)
+    assert committed.head == envelope.ref
+    latest.close()
 
 
 def test_exact_delivery_cannot_cross_source_authority_even_when_ids_match():

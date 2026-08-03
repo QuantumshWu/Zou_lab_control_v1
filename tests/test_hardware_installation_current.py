@@ -470,7 +470,7 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
     camera_ref = runtime.device_catalog.require("camera").ref
     authority = dict(composition.camera_signal_association_authorities)["camera"]
     prepared = prepare_live_camera_measurement(
-        CameraMeasurementRequest(camera_ref, repeat=0, history_cycles=8),
+        CameraMeasurementRequest(camera_ref, repeat=0),
         monitor_port=runtime.camera_monitor_port(camera_ref),
         start_run=runtime.start,
         association_authority=authority,
@@ -658,7 +658,7 @@ def test_real_camera_association_rejects_an_undrained_pre_fire_frame() -> None:
     camera_ref = runtime.device_catalog.require("camera").ref
     authority = dict(composition.camera_signal_association_authorities)["camera"]
     prepared = prepare_live_camera_measurement(
-        CameraMeasurementRequest(camera_ref, repeat=0, history_cycles=8),
+        CameraMeasurementRequest(camera_ref, repeat=0),
         monitor_port=runtime.camera_monitor_port(camera_ref),
         start_run=runtime.start,
         association_authority=authority,

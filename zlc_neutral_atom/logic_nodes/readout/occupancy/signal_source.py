@@ -424,9 +424,9 @@ class OccupancySignalProcessor:
             frame_schema=self._frame_schema,
             contract=self._contract,
             classify=self._classify,
-            expected_source_stream_id=self._source_binding.stream_id,
+            expected_source_stream_id=self._source_binding.event_stream_id,
             expected_source_stream_generation=(
-                self._source_binding.stream_generation
+                self._source_binding.event_stream_generation
             ),
         )
 

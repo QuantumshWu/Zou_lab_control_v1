@@ -84,7 +84,6 @@ def task_console_ports(experiment):
                 )
             )
 
-        presenter = package.project_signal_presentation
         if isinstance(declaration.definition, ProcessorDefinition):
             attachments.append(
                 project_processor_declaration(
@@ -94,7 +93,6 @@ def task_console_ports(experiment):
                         lambda request, owner=package.prepare_hosted,
                         current_api=api: owner(current_api, request, None)
                     ),
-                    project_signal_presentation=presenter,
                     dynamic_choices=dynamic_choices,
                     resolve_artifact_reference=resolve_artifact,
                     path_roots=path_roots,
@@ -125,7 +123,6 @@ def task_console_ports(experiment):
                 start_prepared=start_prepared,
                 editor_builder=editor_builder,
                 path_roots=path_roots,
-                project_signal_presentation=presenter,
             )
         )
 
@@ -135,182 +132,6 @@ def task_console_ports(experiment):
         tasks_root=workspace.tasks_root,
         output_root=workspace.output_root,
     )
-
-
-def open_fit_capable_figure_gui(
-    experiment,
-    display_source,
-    fit_source,
-    *,
-    intent,
-    point_ordinals,
-    preferences,
-    artifact_output,
-    selected_model,
-    initial_fit_spec,
-    initial_selection,
-    open_fit,
-    timeout_seconds,
-    initial_fit_result_identity,
-    direct_fit_single_panel,
-):
-    """Compose the one Figure-owned Fit host from application-owned ports."""
-
-    experiment = _require_experiment(experiment)
-    artifact_operations = experiment._artifact_operations
-    services_owner = experiment._services
-
-    from Zou_lab_control.api._application_services import (
-        fit_service_guard,
-        service_guard,
-    )
-    from Zou_lab_control.api._dataset_sources import project_final_dataset_source
-    from Zou_lab_control.api._figure_projection import data_figure_for_services
-    from zlc_data import FitResultBatch, FitSpec
-    from zlc_neutral_atom.artifacts import execute_fit
-
-    def source_schema():
-        with service_guard(services_owner):
-            return project_final_dataset_source(
-                artifact_operations,
-                fit_source,
-                materialize=False,
-            ).schema
-
-    def prepare_fit(
-        visible_figure,
-        authority_selection,
-        histogram_projection,
-    ):
-        schema = source_schema()
-        seed_spec = initial_fit_spec
-        if (
-            seed_spec is not None
-            and seed_spec.committed_transform.source_schema_fingerprint
-            != schema.fingerprint
-        ):
-            raise ValueError("initial FitSpec belongs to another source schema")
-        from zlc_frontend import DataFigure, prepare_fit_authoring_options
-
-        if not isinstance(visible_figure, DataFigure):
-            raise TypeError("Figure Fit requires its exact visible DataFigure")
-        layer = visible_figure.document.layers[0]
-        visible_schema = visible_figure.datasets.resolve(layer.dataset_id).block.schema
-        if visible_schema.fingerprint != schema.fingerprint:
-            raise ValueError("visible Figure belongs to another Fit source schema")
-        options = prepare_fit_authoring_options(
-            visible_figure,
-            authority_selection,
-            seed_spec=seed_spec,
-            histogram_projection=histogram_projection,
-        )
-        if not options:
-            raise ValueError(
-                "the displayed named axes and selection have no compatible Fit model"
-            )
-        if selected_model is not None and selected_model not in {
-            option.spec.model_id for option in options
-        }:
-            raise ValueError(
-                f"Fit model {selected_model!r} is not compatible with this panel"
-            )
-        return tuple(options)
-
-    def execute_fit(spec, cancel_check, deadline_monotonic):
-        if not isinstance(spec, FitSpec):
-            raise TypeError("Figure Fit execution requires FitSpec")
-        with fit_service_guard(services_owner) as services:
-
-            def combined_cancel_check() -> bool:
-                with services.operation_lock:
-                    closing = services.state != "OPEN"
-                return closing or bool(cancel_check())
-
-            return execute_fit(
-                artifact_operations,
-                fit_source,
-                spec,
-                cancel_check=combined_cancel_check,
-                deadline_monotonic=deadline_monotonic,
-            )
-
-    def save_fit_result(result):
-        if not isinstance(result, FitResultBatch):
-            raise TypeError("Fit save requires FitResultBatch")
-        return experiment.save_fit(fit_source, result)
-
-    def reload_fit_result(reference):
-        admitted = experiment.load_fit(reference)
-        if admitted.source_artifact_ref != fit_source:
-            raise ValueError("saved Fit reopened against another source artifact")
-        return admitted.result
-
-    if direct_fit_single_panel and display_source != fit_source:
-        raise ValueError(
-            "direct Fit single-panel display requires its exact source artifact"
-        )
-
-    def figure_factory(source, *, intent, point_ordinals, preferences):
-        if direct_fit_single_panel and source != fit_source:
-            raise ValueError("direct Fit Figure loader received another source")
-        with service_guard(services_owner) as services:
-            figure, figure_intent = data_figure_for_services(
-                services,
-                artifact_operations,
-                source,
-                intent=intent,
-                point_ordinals=point_ordinals,
-                preferences=preferences,
-                artifact_output=(
-                    None if direct_fit_single_panel else artifact_output
-                ),
-            )
-        if not direct_fit_single_panel:
-            return figure, figure_intent
-        from zlc_frontend.fit_projection import (
-            evaluated_figure_panels,
-            panel_focus_address,
-        )
-
-        panels = evaluated_figure_panels(figure.evaluated)
-        if len(panels) <= 1:
-            return figure, figure_intent
-        layer, cell, series_group = panels[0]
-        focused = figure.focused_typed_panel(
-            0,
-            expected_address=panel_focus_address(layer, cell, series_group),
-            expected_intent=figure.document.layers[0].view.intent,
-        )
-        from zlc_frontend.plot_panel import figure_intent_from_view
-
-        return focused, figure_intent_from_view(
-            focused.document.layers[0].view,
-            title=figure_intent.title,
-            value_label=figure_intent.value_label,
-        )
-
-    def compose():
-        from Zou_lab_control.workbench import open_figure_workbench
-
-        return open_figure_workbench(
-            figure_factory,
-            display_source,
-            output_root=experiment._workspace_paths().output_root,
-            intent=intent,
-            point_ordinals=point_ordinals,
-            preferences=preferences,
-            fit_preparer=prepare_fit,
-            fit_executor=execute_fit,
-            fit_saver=save_fit_result,
-            fit_reloader=reload_fit_result,
-            fit_selected_model=selected_model,
-            fit_initial_selection=initial_selection,
-            open_fit=open_fit,
-            fit_timeout_seconds=timeout_seconds,
-            initial_fit_result_identity=initial_fit_result_identity,
-        )
-
-    return experiment._open_workbench_handle(None, compose)
 
 
 def standalone_pulse_connection_factory(workspace):

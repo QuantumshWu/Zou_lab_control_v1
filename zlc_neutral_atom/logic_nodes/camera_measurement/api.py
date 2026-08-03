@@ -13,7 +13,6 @@ from collections.abc import Callable
 from .definition import (
     DEFAULT_CAMERA_FRAMES_PER_CYCLE,
     DEFAULT_CAMERA_MEASUREMENT_REPEAT,
-    DEFAULT_CAMERA_MONITOR_HISTORY_CYCLES,
     CameraMeasurementRequest,
 )
 from .finite import PreparedFiniteCameraMeasurement
@@ -44,7 +43,6 @@ class CameraMeasurementApi:
         *,
         camera_role: str | None = None,
         repeat: int = DEFAULT_CAMERA_MEASUREMENT_REPEAT,
-        history_cycles: int = DEFAULT_CAMERA_MONITOR_HISTORY_CYCLES,
         frames_per_cycle: int = DEFAULT_CAMERA_FRAMES_PER_CYCLE,
         exposure: float | None = None,
     ) -> CameraMeasurementRequest:
@@ -53,7 +51,6 @@ class CameraMeasurementApi:
         return CameraMeasurementRequest(
             camera_ref=self._resolve_camera_ref(camera_role),
             repeat=repeat,
-            history_cycles=history_cycles,
             frames_per_cycle=frames_per_cycle,
             exposure_seconds=exposure,
         )

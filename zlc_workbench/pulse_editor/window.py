@@ -9,6 +9,7 @@ behind :class:`PulseEditorController`.
 
 from __future__ import annotations
 
+from concurrent.futures import CancelledError, Future, TimeoutError
 from dataclasses import replace as dataclass_replace
 import os
 from pathlib import Path
@@ -32,8 +33,6 @@ from zlc_frontend.qt_widgets import (
     FluentStatusDot,
     FluentTabWidget,
     QtOwnerWake,
-    RasterPixelRatioObserver,
-    SinglePanelHost,
     ensure_qt_app,
     fluent_confirm,
     fluent_message,
@@ -45,6 +44,7 @@ from zlc_frontend.qt_widgets import (
     wait_for_owner_retirement,
     window_pad,
 )
+from zlc_plot import PulseTimelinePlot, Qt5PlotWidget, RasterPlotHost
 from zlc_neutral_atom.runtime.run import RunState
 from zlc_pulse import (
     DestructivePulseTargetEditError,
@@ -59,6 +59,7 @@ from .controller import (
     PulseFileUpdate,
     PulseOwnerUpdate,
     PulseEditorProjection,
+    PulsePreviewPlot,
     PulsePreviewUpdate,
     PulseRuntimeUpdate,
     PulseScanProgressUpdate,
@@ -122,13 +123,16 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._last_scan_workspace = None
         self._last_scan_progress_key = None
         self._last_preview_key = None
-        self._last_preview_notice = ""
         self._owner_cycle_active = False
         self._owner_cycle_pending = False
-        self._shown_preview_key: tuple[int, int, int] | None = None
-        self._preview_surface_pixel_ratio = 1.0
-        self._pending_preview_origin = None
-        self._pending_preview_revision: int | None = None
+        self._shown_preview_key: tuple[int, int, bool] | None = None
+        self.preview_host: RasterPlotHost | None = None
+        self.preview_widget: Qt5PlotWidget | None = None
+        self._preview_host_unsubscribe: Callable[[], None] | None = None
+        self._preview_spec: PulseTimelinePlot | None = None
+        self._preview_plot: PulsePreviewPlot | None = None
+        self._preview_size: str | None = None
+        self._preview_operations: dict[Future, str | None] = {}
         self._close_decided = False
         self._close_requested = False
         self._owner_retiring = False
@@ -144,13 +148,6 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         initial_preview = controller.preview_update()
         self._build_ui(initial_editor, initial_runtime)
         self._wire_ui()
-        self._preview_pixel_ratio_observer = RasterPixelRatioObserver(
-            self,
-            self._apply_preview_pixel_ratio,
-        )
-        self._preview_surface_pixel_ratio = (
-            self._preview_pixel_ratio_observer.current_ratio
-        )
 
         self._wake = QtOwnerWake(self)
         self._wake.bind(self._owner_cycle)
@@ -228,21 +225,6 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self.tabs.addTab(self.target_view, "Target")
         root.addWidget(self.tabs, 1)
 
-        self.preview_host = SinglePanelHost(
-            "pulse",
-            group="pulse-preview",
-            empty_text="Open Preview to render the pulse plot.",
-            parent=self.preview_view,
-        )
-        # The host already has its final QObject owner, but it is deliberately
-        # not visible until one complete raster front has been admitted.  A
-        # parented child that is neither laid out nor hidden is shown by Qt at
-        # its default geometry when the Preview page first becomes visible;
-        # QtRasterBoard then paints its empty black surface over the page until
-        # the worker finishes.  Keep the stable host parked behind the existing
-        # placeholder instead of exposing that incomplete composition.
-        self.preview_host.hide()
-
     def _wire_ui(self) -> None:
         view = self.schedule_view
         view.documentNameEdited.connect(self._edit_document_name)
@@ -283,15 +265,12 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             )
         )
         self.preview_view.selectorsToggled.connect(
-            self.preview_host.set_selectors_enabled
+            self._set_preview_interaction
         )
         self.preview_view.sizeActivated.connect(
-            lambda size: self._invoke_preview(
-                self._controller.set_preview_size, size
-            )
+            self._set_preview_size
         )
         self.preview_view.saveFigureRequested.connect(self._save_preview)
-        self.preview_host.viewCommitted.connect(self._preview_view_committed)
 
         self.scan_view.repeatsChanged.connect(
             self._edit_scan_sweep_count
@@ -650,9 +629,8 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
 
     def _tab_changed(self, index: int) -> None:
         if self.tabs.widget(index) is self.preview_view:
-            self._preview_pixel_ratio_observer.refresh(force=True)
             self.preview_view.reset_preview_size_pin()
-            self._invoke_preview(self._controller.reset_preview_size)
+            self._apply_recommended_preview_size()
             self._invoke_preview(self._controller.request_preview)
         self._sync_runtime_watchers()
 
@@ -683,30 +661,6 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             self._message(str(error))
             return
         self._apply_editor_projection(self._controller.editor_projection())
-
-    def _apply_preview_pixel_ratio(self, ratio: float) -> None:
-        """Keep the worker raster at one source pixel per physical screen pixel."""
-
-        if self._owner_retiring or self._permanently_closed:
-            return
-        changed = ratio != self._preview_surface_pixel_ratio
-        if changed:
-            self._preview_surface_pixel_ratio = ratio
-            self.preview_host.clear()
-            self.preview_host.hide()
-            self.preview_view.show_placeholder("Rendering preview for this display…")
-            self._shown_preview_key = None
-            self._pending_preview_origin = None
-            self._pending_preview_revision = None
-        if self.tabs.currentWidget() is not self.preview_view:
-            # DPR is presentation state, not editor state.  Screen binding may
-            # complete just after launch while Edit is visible; defer both the
-            # command and render wake until Preview has an actual consumer.
-            return
-        self._invoke_preview(
-            self._controller.set_preview_pixel_ratio,
-            ratio,
-        )
 
     def _run_from_edit(self) -> None:
         document = self._controller.current_document
@@ -836,6 +790,10 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             self._invoke_worker(self._controller.open_path, Path(path))
 
     def _save_preview(self) -> None:
+        host = self.preview_host
+        if host is None or self.preview_widget is None:
+            self._message("Open Preview and wait for the pulse plot before exporting.")
+            return
         document = self._controller.current_document
         suggested = _pulse_figure_dir(self._output_root) / (
             f"{_safe_file_stem(document.name)}.png"
@@ -848,40 +806,137 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         )
         if not path:
             return
-        action = getattr(self._controller, "save_preview", None)
-        if action is None:
-            self._message("Pulse preview export is unavailable.")
-            return
-        self._invoke_worker(action, Path(path))
-
-    def _preview_view_committed(self, commit) -> None:
-        visible = self.preview_host.visible_interaction_origin()
-        origin = getattr(commit, "origin", None)
-        if visible is None or origin != visible:
-            if origin is not None:
-                self.preview_host.discard_pending_interaction(origin)
-            return
-        viewport = getattr(commit, "viewport", None)
-        if viewport is None:
-            self.preview_host.discard_pending_interaction(origin)
-            return
-        x_limits = (
-            None
-            if viewport.x_limits == viewport.home_x_limits
-            else viewport.x_limits
-        )
-        self._pending_preview_origin = origin
-        self._pending_preview_revision = int(viewport.display_revision)
         try:
-            self._controller.commit_preview_view(
-                x_limits,
-                presentation_revision=viewport.display_revision,
+            target = Path(path).expanduser().resolve()
+            if not target.suffix:
+                target = target.with_suffix(".png")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            future = host.save(target)
+        except BaseException as error:
+            self._message(str(error))
+            return
+        self._track_preview_operation(
+            future,
+            success=f"Saved figure: {target.name}",
+        )
+
+    def _set_preview_interaction(self, enabled: bool) -> None:
+        widget = self.preview_widget
+        if widget is None:
+            return
+        try:
+            widget.set_interaction_enabled(bool(enabled))
+        except BaseException as error:
+            self._message(str(error))
+
+    def _set_preview_size(self, size: str) -> None:
+        normalized = str(size)
+        if normalized == self._preview_size:
+            return
+        host = self.preview_host
+        if host is None:
+            return
+        try:
+            future = host.set_size(normalized)
+        except BaseException as error:
+            self._message(str(error))
+            return
+        self._preview_size = normalized
+        self._track_preview_operation(future)
+
+    def _apply_recommended_preview_size(self) -> None:
+        plot = self._preview_plot
+        if plot is None or self.preview_view.preview_size_pinned:
+            return
+        self.preview_view.set_preview_size(plot.recommended_size, pinned=False)
+        self._set_preview_size(plot.recommended_size)
+
+    def _track_preview_operation(
+        self,
+        future: Future,
+        *,
+        success: str | None = None,
+    ) -> None:
+        self._preview_operations[future] = success
+
+        def completed(_future: Future) -> None:
+            if not self._permanently_closed:
+                self._wake.request_owner_wake()
+
+        future.add_done_callback(completed)
+
+    def _drain_preview_operations(self) -> None:
+        completed = tuple(
+            future for future in self._preview_operations if future.done()
+        )
+        for future in completed:
+            success = self._preview_operations.pop(future)
+            try:
+                future.result()
+            except CancelledError:
+                continue
+            except BaseException as error:
+                self._shown_preview_key = None
+                diagnostic = f"Preview unavailable:\n{type(error).__name__}: {error}"
+                self.preview_view.set_status(diagnostic)
+                self.preview_view.preview_status.setToolTip(diagnostic)
+            else:
+                if success:
+                    self.preview_view.set_status(success)
+
+    def _preview_surface_changed(self) -> None:
+        widget = self.preview_widget
+        if widget is None:
+            return
+        front = widget.presented_front
+        if front is None:
+            return
+        self.preview_view.mount_content(
+            widget,
+            logical_size=front.logical_size,
+            wheel_target=widget,
+        )
+
+    def _mount_preview_if_ready(self) -> None:
+        if self.preview_widget is not None or self._permanently_closed:
+            return
+        host = self.preview_host
+        if host is None:
+            return
+        front = host.front
+        if front is None:
+            try:
+                front = host.wait_for_front(timeout=0.0)
+            except TimeoutError:
+                QtCore.QTimer.singleShot(10, self._mount_preview_if_ready)
+                return
+            except BaseException as error:
+                diagnostic = f"Preview unavailable:\n{type(error).__name__}: {error}"
+                self.preview_view.set_status(diagnostic)
+                self.preview_view.preview_status.setToolTip(diagnostic)
+                return
+        try:
+            widget = Qt5PlotWidget(host, parent=self.preview_view)
+            widget.set_interaction_enabled(
+                self.preview_view.preview_selectors_switch.isChecked()
+            )
+            widget.errorOccurred.connect(self._message)
+            widget.surfaceChanged.connect(
+                lambda _identity: self._preview_surface_changed()
             )
         except BaseException as error:
-            self.preview_host.discard_pending_interaction(origin)
-            self._pending_preview_origin = None
-            self._pending_preview_revision = None
-            self._message(str(error))
+            diagnostic = f"Preview unavailable:\n{type(error).__name__}: {error}"
+            self.preview_view.set_status(diagnostic)
+            self.preview_view.preview_status.setToolTip(diagnostic)
+            return
+        unsubscribe, self._preview_host_unsubscribe = (
+            self._preview_host_unsubscribe,
+            None,
+        )
+        if unsubscribe is not None:
+            unsubscribe()
+        self.preview_widget = widget
+        self._preview_surface_changed()
 
     # ------------------------------------------------------------------
     # worker/runtime publications
@@ -900,29 +955,30 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._owner_cycle_active = True
         try:
             publication = self._controller.pump()
-            if publication is None:
-                return
-            if not isinstance(publication, PulseOwnerUpdate):
-                raise TypeError("Pulse owner published an invalid update")
-            runtime = publication.runtime
-            if runtime is not None:
-                self._apply_runtime_update(runtime)
-            if publication.editor is not None:
-                self._apply_editor_projection(publication.editor)
-            elif publication.scan_workspace is not None:
-                self._apply_scan_workspace_value(
-                    publication.scan_workspace,
-                    self._last_scan_workspace,
-                )
-                self._last_scan_workspace = publication.scan_workspace
-            if publication.file is not None:
-                self._apply_file_update(publication.file)
-            if publication.preview is not None:
-                self._present_preview_update(publication.preview)
-            if publication.scan_progress is not None:
-                self._present_scan_progress(publication.scan_progress)
-            if runtime is not None:
-                self._finish_close_if_ready(runtime)
+            if publication is not None:
+                if not isinstance(publication, PulseOwnerUpdate):
+                    raise TypeError("Pulse owner published an invalid update")
+                runtime = publication.runtime
+                if runtime is not None:
+                    self._apply_runtime_update(runtime)
+                if publication.editor is not None:
+                    self._apply_editor_projection(publication.editor)
+                elif publication.scan_workspace is not None:
+                    self._apply_scan_workspace_value(
+                        publication.scan_workspace,
+                        self._last_scan_workspace,
+                    )
+                    self._last_scan_workspace = publication.scan_workspace
+                if publication.file is not None:
+                    self._apply_file_update(publication.file)
+                if publication.preview is not None:
+                    self._present_preview_update(publication.preview)
+                if publication.scan_progress is not None:
+                    self._present_scan_progress(publication.scan_progress)
+                if runtime is not None:
+                    self._finish_close_if_ready(runtime)
+            self._drain_preview_operations()
+            self._mount_preview_if_ready()
         finally:
             self._owner_cycle_active = False
             if self._owner_cycle_pending:
@@ -1209,22 +1265,18 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
 
     def _present_preview_update(self, update: PulsePreviewUpdate) -> None:
         key = (
-            update.preview_revision,
-            update.preview_generation,
             update.preview_error,
-            update.preview_notice,
             None
-            if update.rendered_preview is None
+            if update.plot is None
             else (
-                update.rendered_preview.document_generation,
-                update.rendered_preview.editor_revision,
-                update.rendered_preview.presentation_revision,
+                update.plot.document_generation,
+                update.plot.editor_revision,
+                update.plot.include_off_rows,
             ),
         )
         if key != self._last_preview_key:
             self._apply_preview(update)
             self._last_preview_key = key
-        self._last_preview_notice = update.preview_notice
 
     def _sync_runtime_watchers(self) -> None:
         """Arm periodic Run observations only while they have a consumer."""
@@ -1347,7 +1399,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             lowered = workspace.diagnostic.lower()
             if "error" in lowered or "failed" in lowered:
                 self._message(workspace.diagnostic)
-            elif not self._last_preview_notice:
+            elif self._preview_plot is None:
                 self.preview_view.set_status(workspace.diagnostic)
 
     def _apply_file_and_run_state(
@@ -1486,105 +1538,84 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         ):
             self._message("Offline: editing only, no backend calls.")
 
-    def _settle_pending_preview_through(
-        self,
-        presentation_revision: int,
-        *,
-        failed: bool,
-    ) -> None:
-        """Resolve only the pending view intent reached by this worker answer.
-
-        Discard may synchronously promote the mailbox's queued human intent.
-        Clear this window-side receipt only if that re-entrant callback did not
-        replace it with a newer exact command.
-        """
-
-        pending_revision = self._pending_preview_revision
-        if (
-            pending_revision is None
-            or int(presentation_revision) < pending_revision
-        ):
-            return
-        origin = self._pending_preview_origin
-        if failed and origin is not None:
-            self.preview_host.discard_pending_interaction(
-                origin
-            )
-        if (
-            self._pending_preview_origin != origin
-            or self._pending_preview_revision != pending_revision
-        ):
-            return
-        self._pending_preview_origin = None
-        self._pending_preview_revision = None
-
     def _apply_preview(
         self,
         snapshot: PulsePreviewUpdate,
     ) -> None:
-        notice = snapshot.preview_notice
-        rendered = snapshot.rendered_preview
-        if rendered is None:
-            if notice:
-                self.preview_view.set_status(notice)
-            elif snapshot.preview_error:
-                if self._pending_preview_origin is not None:
-                    self.preview_host.discard_pending_interaction(
-                        self._pending_preview_origin
-                    )
-                    self._pending_preview_origin = None
-                    self._pending_preview_revision = None
+        projected = snapshot.plot
+        if projected is None:
+            if snapshot.preview_error:
                 diagnostic = f"Preview unavailable:\n{snapshot.preview_error}"
                 self.preview_view.set_status(diagnostic)
                 self.preview_view.preview_status.setToolTip(diagnostic)
             return
-        if rendered.pixel_ratio != self._preview_surface_pixel_ratio:
-            return
         key = (
-            rendered.document_generation,
-            rendered.editor_revision,
-            rendered.presentation_revision,
+            projected.document_generation,
+            projected.editor_revision,
+            projected.include_off_rows,
         )
         if key == self._shown_preview_key:
-            if notice:
-                self.preview_view.set_status(notice)
             return
-        try:
-            logical_size = self.preview_host.present_panel(
-                rendered.raster,
-                rendered.payload,
-                pixel_ratio=rendered.pixel_ratio,
-            )
-        except BaseException as error:
-            self._settle_pending_preview_through(
-                rendered.presentation_revision,
-                failed=True,
-            )
-            diagnostic = notice or f"Preview unavailable:\n{error}"
-            self.preview_view.set_status(diagnostic)
-            self.preview_view.preview_status.setToolTip(diagnostic)
-            return
-        self._settle_pending_preview_through(
-            rendered.presentation_revision,
-            failed=False,
-        )
-        self._shown_preview_key = key
-        self.preview_view.mount_content(
-            self.preview_host,
-            logical_size=logical_size,
-            wheel_target=self.preview_host.board,
-        )
-        self.preview_view.set_status(notice or rendered.status)
+        self._preview_plot = projected
+        self.preview_view.set_status(projected.status)
+        self.preview_view.preview_status.setToolTip(projected.status)
         if not self.preview_view.preview_size_pinned:
-            self.preview_view.set_preview_size(rendered.size, pinned=False)
+            self.preview_view.set_preview_size(
+                projected.recommended_size,
+                pinned=False,
+            )
+
+        host = self.preview_host
+        if host is None:
+            size = (
+                self.preview_view.preview_size
+                if self.preview_view.preview_size_pinned
+                else projected.recommended_size
+            )
+            host = RasterPlotHost.from_plot(
+                projected.data,
+                projected.spec,
+                size=size,
+            )
+            self.preview_host = host
+            self._preview_spec = projected.spec
+            self._preview_size = size
+            self._preview_host_unsubscribe = host.subscribe_front(
+                lambda _front: self._wake.request_owner_wake()
+            )
+            self.preview_view.show_placeholder("Rendering preview…")
+            QtCore.QTimer.singleShot(0, self._mount_preview_if_ready)
+        else:
+            if projected.spec != self._preview_spec:
+                self._track_preview_operation(host.replace_spec(projected.spec))
+                self._preview_spec = projected.spec
+            if not self.preview_view.preview_size_pinned:
+                self._set_preview_size(projected.recommended_size)
+            self._track_preview_operation(host.update_data(projected.data))
+        self._shown_preview_key = key
 
     # ------------------------------------------------------------------
     # lifecycle / launcher contract
     # ------------------------------------------------------------------
 
+    def _close_preview_surface(self) -> None:
+        unsubscribe, self._preview_host_unsubscribe = (
+            self._preview_host_unsubscribe,
+            None,
+        )
+        if unsubscribe is not None:
+            unsubscribe()
+        widget, self.preview_widget = self.preview_widget, None
+        if widget is not None:
+            widget.close_adapter()
+        host, self.preview_host = self.preview_host, None
+        if host is not None:
+            host.close()
+        self._preview_operations.clear()
+
     @property
     def worker_idle(self) -> bool:
-        return self._controller.worker_idle
+        return self._controller.worker_idle and not self._preview_operations
 
     @property
     def current_document(self):
@@ -1615,7 +1646,6 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         update = self._controller.runtime_update()
         self._apply_runtime_update(update)
         if update.close_complete and self._window is not None:
-            self._preview_pixel_ratio_observer.detach()
             # ``request_close`` is also a public notebook/test entry point; a
             # synchronously completed controller close has no later worker wake
             # on which ``_owner_cycle`` could hide the wrapper.
@@ -1659,7 +1689,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         if self._permanently_closed:
             return
         self._permanently_closed = True
-        self._preview_pixel_ratio_observer.detach()
+        self._close_preview_surface()
         window = self._window
         self._window = None
         if window is None:
@@ -1672,11 +1702,6 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
 
     def _attach_window(self, window) -> None:
         self._window = window
-        # ``wire`` runs before show, so the native QWindow/screen may not exist
-        # until the next owner turn.  Bind then and re-render Preview at the
-        # actual per-monitor DPR; the initial controller frame is only a
-        # provisional logical-pixel result.
-        self._preview_pixel_ratio_observer.schedule_bind()
 
 
 def launch_pulse_editor_window(

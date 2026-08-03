@@ -150,7 +150,7 @@ ConsoleNodeFactory = Callable[
 
 @dataclass(frozen=True, slots=True)
 class ConsoleCapabilityAttachment:
-    """One explicit Definition -> presenter/lifecycle connection.
+    """One explicit Definition -> lifecycle connection.
 
     ``spec`` contains only UI projection of owner declarations.  ``create_node``
     is an ephemeral composition adapter; it is never stored in the Definition
@@ -160,20 +160,12 @@ class ConsoleCapabilityAttachment:
 
     spec: ConsoleNodeSpec
     create_node: ConsoleNodeFactory
-    project_signal_presentation: Callable[
-        [object, str, SignalPublication, tuple[SignalPublication, ...]],
-        object | None,
-    ] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.spec, ConsoleNodeSpec):
             raise TypeError("spec must be ConsoleNodeSpec")
         if not callable(self.create_node):
             raise TypeError("create_node must be callable")
-        if self.project_signal_presentation is not None and not callable(
-            self.project_signal_presentation
-        ):
-            raise TypeError("project_signal_presentation must be callable or None")
 
     @property
     def key(self):

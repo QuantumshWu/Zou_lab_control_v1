@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from zlc_frontend.panel_size import PANEL_SIZES
 from zlc_frontend.qt_widgets import (
     ACCENT,
     FluentButton,
@@ -16,6 +15,7 @@ from zlc_frontend.qt_widgets import (
     FluentSwitch,
     signals_blocked,
 )
+from zlc_plot import DEFAULTS
 
 from ._layout import px
 
@@ -71,7 +71,7 @@ class PulsePreviewView(QtWidgets.QWidget):
 
         self.preview_size_label = FluentLabel("Size")
         self.preview_size_combo = FluentComboBox()
-        self.preview_size_combo.addItems(list(PANEL_SIZES))
+        self.preview_size_combo.addItems(list(DEFAULTS.layout.size_names))
         self.preview_size_combo.setCurrentText("2x2")
         self.preview_size_combo.setFixedSize(px(80, minimum=66), control_h)
         self.preview_size_combo.setToolTip(

@@ -1,23 +1,10 @@
-"""Formal saved-figure viewer shell.
-
-The left pane preserves the established File/Plot/Measurement/Device/Flow/Raw
-layout.  The right pane embeds the same DataFigure interaction owner used by
-typed notebook figures; this module owns neither a second renderer nor a fake
-live-data graph.
-
-A file open is the one whole-generation replacement boundary in this window.
-It is decoded and validated on the shared raster worker, then a complete
-candidate pane is built on the Qt owner before the previous valid pane and Info
-projection are replaced.  Failed candidates therefore leave the visible figure
-untouched.  Ordinary selector, Setting/Edit, viewport, and label changes remain
-inside the stable DataFigure pane and never reload the archive or rebuild this
-window.
-"""
+"""Saved-Figure browser that embeds the sole DataFigure/zlc_plot surface."""
 
 from __future__ import annotations
 
 from concurrent.futures import CancelledError, Future
 from pathlib import Path
+from weakref import ref
 
 from PyQt5 import QtCore, QtWidgets
 
@@ -25,46 +12,44 @@ from zlc_frontend.qt_widgets import (
     FigureInfoPane,
     FluentFrame,
     FluentLabel,
-    QtOwnerWake,
-    RASTER_WORK_EXECUTOR,
     WINDOW_SCREEN_FRACTION,
     ensure_qt_app,
     screen_fit_window_size,
     set_fluent_scale,
     window_pad,
 )
+from zlc_workbench.data_figure.archive_io import (
+    LoadedFigureArchive,
+    load_figure_archive,
+)
+from zlc_workbench.window_runtime import submit_compute
 
-from .info_projection import project_figure_info
+from .info_projection import FigureInfoProjection, project_figure_info
 
 
 _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
-_ARCHIVE_SUFFIX = ".npz"
 
 
 def _archive_path(path: Path) -> Path:
-    """Resolve a committed user choice to the exact data archive path."""
-
     suffix = path.suffix.lower()
-    if suffix == _ARCHIVE_SUFFIX:
+    if suffix == ".npz":
         return path
     if suffix in _IMAGE_SUFFIXES:
-        return path.with_suffix(_ARCHIVE_SUFFIX)
+        return path.with_suffix(".npz")
     raise ValueError(
         f"saved figure must be .npz or an image with a same-stem .npz, got {path}"
     )
 
 
-def _load_archive(path: Path):
-    """Decode and project one archive entirely on the shared worker lane."""
-
-    from zlc_workbench.data_figure.archive_io import load_figure_archive
-
+def _load_and_project(path: Path) -> tuple[LoadedFigureArchive, FigureInfoProjection]:
     archive = load_figure_archive(path)
     return archive, project_figure_info(archive)
 
 
 class FigureViewer(QtWidgets.QWidget):
-    """Saved-figure browser with one current DataFigure pane."""
+    """File/Info shell; rendering, interaction and Fit stay in DataFigure."""
+
+    _loadFinished = QtCore.pyqtSignal(object)
 
     def __init__(
         self,
@@ -82,329 +67,227 @@ class FigureViewer(QtWidgets.QWidget):
         if not self._output_root.is_absolute():
             raise ValueError("FigureViewer output_root must be absolute")
         self._output_root = self._output_root.resolve()
+        if not self._output_root.is_dir():
+            raise FileNotFoundError(f"FigureViewer output_root does not exist: {self._output_root}")
         self.window_ratio = float(window_ratio)
         self._current_path: Path | None = None
-        self.archive = None
+        self.archive: LoadedFigureArchive | None = None
         self.figure_pane: QtWidgets.QWidget | None = None
-        self._candidate_load: tuple[int, object, tuple, QtWidgets.QWidget] | None = None
-        self._retiring_panes: list[QtWidgets.QWidget] = []
+        self._retiring_panes: set[QtWidgets.QWidget] = set()
+        self._candidate: tuple[
+            int,
+            LoadedFigureArchive,
+            FigureInfoProjection,
+            QtWidgets.QWidget,
+        ] | None = None
         self._load_revision = 0
         self._active_load: tuple[int, Path, Future] | None = None
         self._pending_load: tuple[int, Path] | None = None
         self._closing = False
         self._closed = False
+        self._retirement_timer = QtCore.QTimer(self)
+        self._retirement_timer.setInterval(25)
+        self._retirement_timer.timeout.connect(self._reap_retiring_panes)
 
+        self.setObjectName("figureViewer")
         self.setStyleSheet("background: transparent;")
         self.setFixedSize(screen_fit_window_size(self.window_ratio))
-
         root = QtWidgets.QHBoxLayout(self)
         root.setContentsMargins(0, window_pad(1), 0, window_pad(1))
         root.setSpacing(window_pad(0.5))
         self.info_pane = FigureInfoPane(
-            label_names=(
-                "schema_fingerprint",
-                "coordinate_frame",
-            ),
+            label_names=("point columns", "grid topology"),
             parent=self,
         )
         self.info_pane.pathCommitted.connect(self._commit_path)
         root.addWidget(self.info_pane, 0)
 
-        holder = QtWidgets.QWidget(self)
-        holder.setStyleSheet("background: transparent;")
-        holder.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding,
-            QtWidgets.QSizePolicy.Expanding,
-        )
-        self._pane_host = holder
-        self._pane_holder = QtWidgets.QVBoxLayout(holder)
-        self._pane_holder.setContentsMargins(0, 0, window_pad(1), 0)
-        self._pane_holder.setSpacing(0)
-        self._placeholder = self._build_placeholder(holder)
-        self._pane_holder.addWidget(self._placeholder)
+        holder = FluentFrame(self, bordered=False)
+        holder.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self._pane_layout = QtWidgets.QVBoxLayout(holder)
+        self._pane_layout.setContentsMargins(0, 0, window_pad(1), 0)
+        self._pane_layout.setSpacing(0)
+        self._placeholder = FluentLabel("Open a saved figure to begin", holder)
+        self._placeholder.setAlignment(QtCore.Qt.AlignCenter)
+        self._pane_layout.addWidget(self._placeholder, 1)
         root.addWidget(holder, 1)
 
-        self._wake = QtOwnerWake(self)
-        self._wake.bind(self._owner_cycle)
-        self._retirement_timer = QtCore.QTimer(self)
-        self._retirement_timer.setInterval(50)
-        self._retirement_timer.timeout.connect(self._reap_retiring_panes)
-
+        self._loadFinished.connect(self._accept_load_completion, QtCore.Qt.QueuedConnection)
         if path is not None:
             self.open_path(path)
-
-    # ---------------------------------------------------------------- layout
-    def _build_placeholder(self, parent) -> QtWidgets.QWidget:
-        frame = FluentFrame(parent=parent)
-        layout = QtWidgets.QVBoxLayout(frame)
-        layout.addStretch(1)
-        label = FluentLabel("Open a saved figure to begin", frame)
-        label.setAlignment(QtCore.Qt.AlignCenter)
-        layout.addWidget(label)
-        layout.addStretch(1)
-        return frame
-
-    # -------------------------------------------------------------- public API
-    def window(self):
-        return getattr(self, "_zlc_window", None)
 
     @property
     def worker_idle(self) -> bool:
         return (
             self._active_load is None
             and self._pending_load is None
-            and self._candidate_load is None
+            and self._candidate is None
+            and not self._retiring_panes
         )
 
     def open_path(self, path: str | Path) -> None:
-        """Commit one programmatic path exactly like Browse/editingFinished."""
-
         text = str(path).strip()
-        if not text:
-            return
-        self.info_pane.path_edit.setText(text)
-        self._commit_path(text)
+        if text:
+            self.info_pane.path_edit.setText(text)
+            self._commit_path(text)
 
     @QtCore.pyqtSlot(str)
     def _commit_path(self, text: str) -> None:
         if self._closing:
             return
-        raw = str(text).strip()
-        if not raw:
-            return
         try:
-            path = _archive_path(Path(raw))
+            path = _archive_path(Path(str(text).strip())).expanduser().resolve()
         except BaseException as error:
             self.info_pane.status.show_message(
                 f"{type(error).__name__}: {error}", severity="error"
             )
             return
-        candidate = self._candidate_load
-        if candidate is not None:
-            candidate_path = Path(candidate[1].path)
-            if path == candidate_path:
-                return
-            self._candidate_load = None
-            self._retire_pane(candidate[3])
-        if (
-            path == self._current_path
-            and self._active_load is None
-            and self._pending_load is None
-        ):
+        if path == self._current_path and self._active_load is None and self._pending_load is None:
             return
-        if self._active_load is not None and path == self._active_load[1]:
-            if self._pending_load is None:
-                return
-        if self._pending_load is not None and path == self._pending_load[1]:
-            return
+        if self._candidate is not None:
+            self._retire_pane(self._candidate[3])
+            self._candidate = None
         self._load_revision += 1
         self._pending_load = (self._load_revision, path)
-        self.info_pane.status.show_message(
-            f"Loading {path}", severity="task"
-        )
+        self.info_pane.status.show_message(f"Loading {path}", severity="task")
         self._start_pending_load()
 
     def _start_pending_load(self) -> None:
-        if self._active_load is not None or self._pending_load is None or self._closing:
+        if self._closing or self._active_load is not None or self._pending_load is None:
             return
         revision, path = self._pending_load
         self._pending_load = None
-        try:
-            future = RASTER_WORK_EXECUTOR.submit(_load_archive, path)
-        except BaseException as error:
-            self.info_pane.status.show_message(
-                f"{type(error).__name__}: {error}", severity="error"
-            )
-            return
+        future = submit_compute(_load_and_project, path)
         self._active_load = (revision, path, future)
-        future.add_done_callback(lambda _done: self._wake.request_owner_wake())
+        viewer_ref = ref(self)
 
-    @QtCore.pyqtSlot()
-    def _owner_cycle(self) -> None:
+        def completed(done: Future, rev: int = revision, selected: Path = path) -> None:
+            viewer = viewer_ref()
+            if viewer is None:
+                return
+            try:
+                viewer._loadFinished.emit((rev, selected, done))
+            except RuntimeError:
+                return
+
+        future.add_done_callback(completed)
+
+    @QtCore.pyqtSlot(object)
+    def _accept_load_completion(self, completion: object) -> None:
+        revision, path, future = completion
         active = self._active_load
-        if active is not None and active[2].done():
-            revision, path, future = active
+        if active is not None and active[2] is future:
             self._active_load = None
+        try:
+            result = future.result()
+            if self._closing or revision != self._load_revision:
+                return
+            if not isinstance(result, tuple) or len(result) != 2:
+                raise TypeError("Figure archive loader returned another result")
+            archive, info = result
+            if not isinstance(archive, LoadedFigureArchive):
+                raise TypeError("Figure archive loader returned another archive type")
+            self._accept_archive(revision, archive, info)
+        except CancelledError:
+            if not self._closing:
+                self.info_pane.status.show_message(f"Load cancelled: {path}", severity="warning")
+        except BaseException as error:
             if not self._closing and revision == self._load_revision:
-                try:
-                    loaded = future.result()
-                    if not isinstance(loaded, tuple) or len(loaded) != 2:
-                        raise TypeError("Figure archive worker returned invalid values")
-                    archive, info = loaded
-                    self._accept_archive(revision, archive, info)
-                except CancelledError:
-                    self.info_pane.status.show_message(
-                        f"Load cancelled: {path}",
-                        severity="warning",
-                    )
-                except BaseException as error:
-                    # Full error text is retained by FluentStatusStrip's tooltip.
-                    self.info_pane.status.show_message(
-                        f"{type(error).__name__}: {error}", severity="error"
-                    )
-            else:
-                # Always observe a completed future, including stale generations.
-                try:
-                    future.result()
-                except BaseException:
-                    pass
+                self.info_pane.status.show_message(
+                    f"{type(error).__name__}: {error}", severity="error"
+                )
+        finally:
             self._start_pending_load()
-        self._finish_close_if_ready()
+            self._finish_close_if_ready()
 
-    def _accept_archive(self, revision: int, archive, info: tuple) -> None:
-        """Build a hidden candidate; its admitted first front commits the generation."""
-
+    def _accept_archive(
+        self,
+        revision: int,
+        archive: LoadedFigureArchive,
+        info: FigureInfoProjection,
+    ) -> None:
         from zlc_workbench.data_figure.app import create_data_figure_pane
-        from zlc_frontend.figure import ViewIntent
 
         value = archive.archive
-        figure_intent = value.figure_intent
-        if not isinstance(info, tuple) or len(info) != 5:
-            raise TypeError("Figure info worker returned invalid values")
-        is_grid = figure_intent.faceted
-        local_fit = bool(
-            not is_grid
-            and figure_intent.view_intent in (ViewIntent.CURVE, ViewIntent.IMAGE)
-        )
-        local_fit_options = (
-            {
-                "local_fit": True,
-                "local_fit_archive_path": archive.path,
-                "local_fit_archive_metadata": value.metadata,
-            }
-            if local_fit
-            else {}
-        )
-        display_options = (
-            {"initial_grid_display": value.display}
-            if is_grid
-            else {"initial_display": value.display}
-        )
         candidate = create_data_figure_pane(
-            value.figure,
-            figure_intent,
+            value.snapshot,
+            value.spec,
             output_root=self._output_root,
-            initial_fit_result_identity=(
-                f"figure-archive:{archive.path}"
-                if value.figure.has_fit_overlays
-                else None
-            ),
+            size=value.size,
+            parameters=value.parameters,
+            archive_path=archive.path,
+            metadata=value.metadata,
             embedded=True,
-            size_name=value.size_name,
-            **display_options,
-            **local_fit_options,
+            parent=self,
         )
-        if not isinstance(candidate, QtWidgets.QWidget):
-            raise TypeError("create_data_figure_pane must return a QWidget")
-        candidate.setParent(self._pane_host)
         candidate.hide()
-        ready = getattr(candidate, "initialReady", None)
-        failed = getattr(candidate, "initialFailed", None)
-        if ready is None or failed is None:
-            candidate.shutdown()
-            raise TypeError(
-                "DataFigure pane must expose initialReady and initialFailed"
-            )
-
-        self._candidate_load = (revision, archive, info, candidate)
-        ready.connect(
+        self._candidate = (revision, archive, info, candidate)
+        candidate.initialReady.connect(
             lambda pane=candidate: self._commit_candidate(pane),
             QtCore.Qt.QueuedConnection,
         )
-        failed.connect(
+        candidate.initialFailed.connect(
             lambda detail, pane=candidate: self._reject_candidate(pane, detail),
             QtCore.Qt.QueuedConnection,
         )
-        saved = getattr(candidate, "fitSaved", None)
-        if saved is None:
-            candidate.shutdown()
-            raise TypeError("DataFigure pane must expose fitSaved")
-        saved.connect(
-            lambda handle, pane=candidate: self._accept_fit_save(pane, handle),
+        candidate.archiveSaved.connect(
+            lambda loaded, pane=candidate: self._accept_archive_save(pane, loaded),
             QtCore.Qt.QueuedConnection,
         )
-        self.info_pane.status.show_message(
-            f"Rendering {archive.path}",
-            severity="task",
-        )
+        self.info_pane.status.show_message(f"Rendering {archive.path}", severity="task")
 
     def _commit_candidate(self, candidate: QtWidgets.QWidget) -> None:
-        pending = self._candidate_load
+        pending = self._candidate
         if pending is None or pending[3] is not candidate:
             return
         revision, archive, info, _pane = pending
-        self._candidate_load = None
+        self._candidate = None
         if self._closing or revision != self._load_revision:
             self._retire_pane(candidate)
             return
-
         previous = self.figure_pane
         if self._placeholder is not None:
-            self._pane_holder.removeWidget(self._placeholder)
+            self._pane_layout.removeWidget(self._placeholder)
             self._placeholder.hide()
             self._placeholder.deleteLater()
             self._placeholder = None
-        self._pane_holder.addWidget(candidate)
-        # The hidden candidate already belongs to this composition root; the
-        # generation commit is the only point that publishes it.
+        self._pane_layout.addWidget(candidate, 1)
         candidate.show()
         self.figure_pane = candidate
         if previous is not None:
             self._retire_pane(previous)
-
-        self.archive = archive
-        self._current_path = Path(archive.path)
-        self.info_pane.path_edit.setText(str(self._current_path))
-        (
-            plot_rows,
-            measurement_rows,
-            device_rows,
-            flow_graph,
-            raw_text,
-        ) = info
-        self.info_pane.replace_info(
-            plot_rows=plot_rows,
-            measurement_rows=measurement_rows,
-            device_rows=device_rows,
-            flow_graph=flow_graph,
-            raw_text=raw_text,
-        )
-        self.info_pane.status.show_message(
-            f"Loaded {self._current_path}"
-        )
-
-    def _accept_fit_save(self, pane: QtWidgets.QWidget, handle: object) -> None:
-        """Refresh archive identity after the current pane saves a local Fit."""
-
-        if self._closing or self.figure_pane is not pane:
-            return
-        from zlc_workbench.data_figure.archive_io import LoadedFigureArchive
-
-        if not isinstance(handle, LoadedFigureArchive):
-            # FigureViewer only injects local archive persistence.  A durable
-            # Capture/Scan artifact belongs to the application composition root.
-            self.info_pane.status.show_message(
-                "Fit save returned no Figure archive",
-                severity="error",
-            )
-            return
-        archive = handle
-        if self._current_path is None or archive.path != self._current_path.resolve():
-            self.info_pane.status.show_message(
-                "Fit save returned another Figure archive path",
-                severity="error",
-            )
-            return
         self.archive = archive
         self._current_path = archive.path
         self.info_pane.path_edit.setText(str(archive.path))
-        (
-            plot_rows,
-            measurement_rows,
-            device_rows,
-            flow_graph,
-            raw_text,
-        ) = project_figure_info(archive)
+        self._install_info(info)
+        self.info_pane.status.show_message(f"Loaded {archive.path}")
+
+    def _reject_candidate(self, candidate: QtWidgets.QWidget, detail: str) -> None:
+        if self._candidate is None or self._candidate[3] is not candidate:
+            return
+        self._candidate = None
+        self._retire_pane(candidate)
+        if not self._closing:
+            self.info_pane.status.show_message(
+                f"Figure render failed: {detail}", severity="error"
+            )
+
+    def _accept_archive_save(self, pane: QtWidgets.QWidget, loaded: object) -> None:
+        if self._closing or self.figure_pane is not pane:
+            return
+        if not isinstance(loaded, LoadedFigureArchive):
+            self.info_pane.status.show_message("Figure save returned another archive type", severity="error")
+            return
+        self.archive = loaded
+        self._current_path = loaded.path
+        self.info_pane.path_edit.setText(str(loaded.path))
+        self._install_info(project_figure_info(loaded))
+        self.info_pane.status.show_message(f"Saved {loaded.path}")
+
+    def _install_info(self, info: FigureInfoProjection) -> None:
+        if not isinstance(info, tuple) or len(info) != 5:
+            raise TypeError("Figure info projection has another type")
+        plot_rows, measurement_rows, device_rows, flow_graph, raw_text = info
         self.info_pane.replace_info(
             plot_rows=plot_rows,
             measurement_rows=measurement_rows,
@@ -412,47 +295,29 @@ class FigureViewer(QtWidgets.QWidget):
             flow_graph=flow_graph,
             raw_text=raw_text,
         )
-        self.info_pane.status.show_message(
-            f"Saved fitted figure {archive.path}"
-        )
 
-    def _reject_candidate(
-        self,
-        candidate: QtWidgets.QWidget,
-        detail: str,
-    ) -> None:
-        pending = self._candidate_load
-        if pending is None or pending[3] is not candidate:
-            return
-        revision, _archive, _info, _pane = pending
-        self._candidate_load = None
-        self._retire_pane(candidate)
-        if not self._closing and revision == self._load_revision:
-            self.info_pane.status.show_message(
-                f"Figure render failed: {detail}",
-                severity="error",
-            )
-
-    # ------------------------------------------------------------ pane lifetime
-    def _retire_pane(self, pane: QtWidgets.QWidget) -> None:
-        self._pane_holder.removeWidget(pane)
+    def _retire_pane(self, pane: QtWidgets.QWidget) -> bool:
+        self._pane_layout.removeWidget(pane)
         pane.hide()
-        shutdown = getattr(pane, "shutdown", None)
-        if callable(shutdown):
-            shutdown()
-        self._retiring_panes.append(pane)
-        if not self._retirement_timer.isActive():
-            self._retirement_timer.start()
+        teardown = getattr(pane, "teardown", None)
+        stopped = True if not callable(teardown) else bool(teardown())
+        if stopped:
+            self._retiring_panes.discard(pane)
+            pane.deleteLater()
+        else:
+            self._retiring_panes.add(pane)
+            if not self._retirement_timer.isActive():
+                self._retirement_timer.start()
+        return stopped
 
+    @QtCore.pyqtSlot()
     def _reap_retiring_panes(self) -> None:
-        pending = []
-        for pane in self._retiring_panes:
-            if bool(getattr(pane, "closed", True)):
-                pane.deleteLater()
-            else:
-                pending.append(pane)
-        self._retiring_panes = pending
-        if not pending:
+        for pane in tuple(self._retiring_panes):
+            if not bool(getattr(pane, "closed", False)):
+                continue
+            self._retiring_panes.discard(pane)
+            pane.deleteLater()
+        if not self._retiring_panes:
             self._retirement_timer.stop()
         self._finish_close_if_ready()
 
@@ -462,40 +327,31 @@ class FigureViewer(QtWidgets.QWidget):
         if not self._closing:
             self._closing = True
             self._pending_load = None
-            active = self._active_load
-            if active is not None:
-                active[2].cancel()
-            pane = self.figure_pane
-            self.figure_pane = None
-            if pane is not None:
-                self._retire_pane(pane)
-            candidate = self._candidate_load
-            self._candidate_load = None
-            if candidate is not None:
-                self._retire_pane(candidate[3])
-        self._finish_close_if_ready()
+            if self._active_load is not None:
+                self._active_load[2].cancel()
+            if self._candidate is not None:
+                self._retire_pane(self._candidate[3])
+                self._candidate = None
+            if self.figure_pane is not None:
+                self._retire_pane(self.figure_pane)
+                self.figure_pane = None
+        self._reap_retiring_panes()
         return self._closed
 
     def _finish_close_if_ready(self) -> None:
         if (
             not self._closing
+            or self._closed
             or self._active_load is not None
             or self._retiring_panes
-            or self._closed
         ):
             return
         self._retirement_timer.stop()
-        self._wake.detach()
         self.archive = None
         self._closed = True
-        window = self.window()
+        window = getattr(self, "_zlc_window", None)
         if window is not None:
             QtCore.QTimer.singleShot(0, window.close)
 
-    # ---------------------------------------------------------------- sizing
-    def sizeHint(self) -> QtCore.QSize:  # noqa: N802 - Qt API name
-        try:
-            return screen_fit_window_size(self.window_ratio)
-        except Exception:
-            return super().sizeHint()
+
 __all__ = ["FigureViewer"]

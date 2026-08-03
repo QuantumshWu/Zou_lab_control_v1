@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -58,6 +59,7 @@ def _run_isolated(script: str, workspace: Path) -> dict[str, object]:
         cwd=ROOT,
         text=True,
         capture_output=True,
+        env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
         timeout=60,
         check=False,
     )
@@ -82,17 +84,22 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
     result = _run_isolated(
         """
         from dataclasses import replace
+        from io import BytesIO
         import json
         from pathlib import Path
         import sys
+        import time
 
         import numpy as np
+        from PyQt5 import QtWidgets
         from Zou_lab_control.api import WorkspacePaths, connect
+        from zlc_frontend.qt_widgets import ensure_qt_app
         from zlc_neutral_atom.logic_nodes.readout.occupancy.artifact import (
             load_occupancy_artifact,
         )
         from zlc_pulse import RepeatRegion, load_pulse_document
         from zlc_storage import decode
+        from zlc_neutral_atom.runtime.dataset import DatasetCellAddress
 
         workspace = Path(sys.argv[1])
         experiment = connect(
@@ -152,6 +159,53 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
             occupancy_ref = experiment.nodes.occupancy.detect(detection_request)
             resolved = experiment.nodes.occupancy.load_occupancy(occupancy_ref)
             artifact = resolved.artifact
+            cell_session = experiment.nodes.occupancy.occupancy_cell_view(
+                occupancy_ref,
+                address=DatasetCellAddress(0, 0),
+            )
+            try:
+                image_stream = BytesIO()
+                cell_session.save(image_stream, format="png")
+                cell_overlay = cell_session.image_overlay
+                cell_plot = {
+                    "kind": cell_session.surface_plan.kind,
+                    "overlay_count": cell_overlay.count,
+                    "status_values": sorted(
+                        {status.value for status in cell_overlay.statuses}
+                    ),
+                    "png_bytes": len(image_stream.getvalue()),
+                }
+            finally:
+                cell_session.close()
+            application = ensure_qt_app()
+            cell_window = experiment.nodes.occupancy.occupancy_cell_gui(
+                occupancy_ref,
+                address=DatasetCellAddress(0, 0),
+            )
+            deadline = time.monotonic() + 15.0
+            while not cell_window.raster_ready and time.monotonic() < deadline:
+                application.processEvents()
+                time.sleep(0.005)
+            cell_window.show()
+            application.processEvents()
+            grabbed = cell_window.grab()
+            cell_gui = {
+                "raster_ready": cell_window.raster_ready,
+                "grab_valid": not grabbed.isNull(),
+                "plot_host_count": int(
+                    cell_window.findChild(
+                        QtWidgets.QWidget,
+                        "occupancyCellPlot",
+                    )
+                    is not None
+                ),
+            }
+            cell_window.shutdown()
+            deadline = time.monotonic() + 15.0
+            while not cell_window.permanently_closed and time.monotonic() < deadline:
+                application.processEvents()
+                time.sleep(0.005)
+            cell_gui["closed"] = cell_window.permanently_closed
             validity = artifact.counts.validity
             invalid = ~validity.mask
             result = {
@@ -191,6 +245,8 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
                 "invalid_occupied_fillers_are_false": bool(
                     not np.any(artifact.occupied.values[invalid])
                 ),
+                "cell_plot": cell_plot,
+                "cell_gui": cell_gui,
             }
         finally:
             experiment.close()
@@ -267,6 +323,30 @@ def test_committed_detection_preserves_r_p_site_and_binds_both_artifacts(tmp_pat
     assert result["validity_dtype"] == "bool"
     assert result["invalid_count_fillers_are_zero"] is True
     assert result["invalid_occupied_fillers_are_false"] is True
+    assert result["cell_plot"]["kind"] == "image"
+    assert result["cell_plot"]["overlay_count"] == 35
+    assert set(result["cell_plot"]["status_values"]) <= {
+        "empty",
+        "occupied",
+        "invalid",
+    }
+    assert result["cell_plot"]["png_bytes"] > 1000
+    assert result["cell_gui"] == {
+        "closed": True,
+        "grab_valid": True,
+        "plot_host_count": 1,
+        "raster_ready": True,
+    }
+
+
+def test_occupancy_publishes_only_signals_without_leaf_presentation_sidecars():
+    from zlc_neutral_atom.logic_nodes.readout.occupancy.package import (
+        LOGIC_NODE_PACKAGE,
+    )
+
+    assert LOGIC_NODE_PACKAGE.declaration.task_previews == ()
+    assert not hasattr(LOGIC_NODE_PACKAGE, "project_signal_presentation")
+    assert getattr(LOGIC_NODE_PACKAGE, "bind_artifact_capabilities", None) is None
 
 
 def _direct_output_artifact():

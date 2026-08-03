@@ -165,10 +165,6 @@ class PreparedOccupancyProcessor:
     def selected_model_kind(self) -> ReadoutModelKind:
         return self._selected_model_kind
 
-    @property
-    def site_map(self):
-        return self._calibration.artifact.site_map
-
     def signal_value_schema(self, output_name: str) -> ValueSchema:
         """Return one declared per-event output schema before starting the worker."""
 
@@ -199,10 +195,6 @@ class PreparedOccupancyProcessor:
                 "Occupancy Processor requires Camera delivery coverage"
             )
         source_binding = self._request.camera_output_binding
-        if source.ref.stream_generation != source_binding.stream_generation:
-            raise ValueError(
-                "Camera snapshot belongs to another live stream generation"
-            )
         if source.block.schema.cell_schema != source_binding.frame_schema:
             raise ValueError("Camera snapshot differs from its bound frame schema")
         evaluation = _evaluate_occupancy_processor(

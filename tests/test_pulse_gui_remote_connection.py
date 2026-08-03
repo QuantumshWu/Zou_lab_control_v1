@@ -427,8 +427,8 @@ def _run_c47_input_projection_gui(workspace: Path) -> None:
         _until(
             application,
             lambda: (
-                controller.preview_update().rendered_preview is not None
-                and controller.preview_update().rendered_preview.editor_revision
+                controller.preview_update().plot is not None
+                and controller.preview_update().plot.editor_revision
                 == controller.current_editor_revision
             ),
         )

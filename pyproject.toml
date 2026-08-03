@@ -8,7 +8,10 @@ version = "0.1.0"
 description = "Jupyter plotting frontend and neutral-atom control helpers for Zou lab experiments."
 requires-python = ">=3.10"
 dependencies = [
+    "matplotlib",
     "numpy",
+    "Pillow",
+    "scipy",
 ]
 
 [project.optional-dependencies]
@@ -49,11 +52,11 @@ docs = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["Zou_lab_control*", "zlc_data*", "zlc_storage*", "zlc_pulse*", "zlc_neutral_atom*", "zlc_frontend*", "zlc_workbench*", "fpga*"]
+include = ["Zou_lab_control*", "zlc_data*", "zlc_storage*", "zlc_pulse*", "zlc_neutral_atom*", "zlc_frontend*", "zlc_workbench*", "zlc_plot*", "fpga*"]
 
 [tool.setuptools.package-data]
 "zlc_pulse" = ["assets/*.json"]
-"zlc_frontend" = ["assets/*.ttf"]
+"zlc_plot" = ["assets/*.ttf", "py.typed"]
 "fpga" = ["board_config/*.json"]
 
 [tool.pytest.ini_options]

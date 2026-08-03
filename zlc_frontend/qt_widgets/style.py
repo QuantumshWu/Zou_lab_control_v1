@@ -7,17 +7,6 @@ domain-specific QPainter surfaces composed by Workbench windows.
 
 from __future__ import annotations
 
-from ..selector_visual import (
-    SELECTOR_ALPHA,
-    SELECTOR_COLOR,
-    SELECTOR_DOT_PX,
-    SELECTOR_FONT_FAMILY,
-    SELECTOR_FONT_PX,
-    SELECTOR_HANDLE_PX,
-    SELECTOR_LINE_PX,
-)
-
-
 ACCENT = "#77AADD"
 HOVER = "#004578"
 BG = "#F3F3F3"
@@ -39,14 +28,6 @@ SURFACE = "#FFFFFF"
 
 MUTED_LABEL_STYLE = f"color: {GREY}; background: transparent; border: none;"
 
-# Selector overlay art is imported from the backend-neutral Figure owner.
-# qt_widgets converts those design units into QPainter primitives but owns no
-# second colour/alpha/point-size declaration.
-# QFont's pixel size is its em size, not the painted line height.  These map to
-# 22 px / 19 px QFontMetrics line heights, matching Matplotlib's painted
-# 7.5 pt / 6.5 pt text in the established 210 dpi panel raster.  Feeding those
-# painted heights back into ``QFont.setPixelSize`` made Qt's lines 30/26 px and
-# overflowed the same fixed FigureSpec/Divider bottom margin.
 RADIUS = 4
 CARD_TITLE_PX = 32
 CARD_PAD = 10

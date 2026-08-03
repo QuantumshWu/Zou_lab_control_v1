@@ -17,24 +17,7 @@ from zlc_neutral_atom.installation_config import (
     InstallationConfigDocument,
     load_installation_config,
 )
-from zlc_data import (
-    AxisSourceRef,
-    CommittedTransform,
-    FitNumericPolicy,
-    FitParameterConstraint,
-    FitResultBatch,
-    FitSpec,
-    HistogramSpec,
-    Selection,
-)
-from zlc_data.fit import fit_spec_for
-from zlc_neutral_atom.artifacts import (
-    FitResultArtifactRef,
-    SavedFitResult,
-    execute_fit,
-    load_fit_result,
-    write_fit_result,
-)
+from zlc_data import OwnedSnapshot
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.capture.application import (
     CaptureRequest,
@@ -61,7 +44,6 @@ from zlc_pulse import (
 )
 from zlc_storage import canonical_text as _text
 from zlc_storage import durable_makedirs
-from zlc_storage import positive_real as _positive_real
 
 from ._readout_core import ReadoutFacade
 from ._application_services import (
@@ -69,44 +51,14 @@ from ._application_services import (
     ExperimentServices as _ExperimentServices,
     WorkspacePaths,
     application_start_run as _application_start_run,
-    fit_service_guard as _fit_service_guard,
     resolve_role as _resolve_role,
     service_guard as _service_guard,
     wait_for_close_attempt as _wait_for_close_attempt,
 )
-from ._figure_projection import (
-    data_figure_for_services as _data_figure_for_services,
-    project_figure as _project_figure,
-)
-from ._dataset_sources import (
-    project_final_dataset_source as _project_final_dataset_source,
-)
 from ._logic_node_api import compose_logic_node_apis
 
 if TYPE_CHECKING:
-    from zlc_frontend import DataFigure
-    from zlc_frontend.figure import FigureDocument, ViewIntent, ViewPreferences
-
-
-_DEFAULT_FIT_GUI_TIMEOUT_SECONDS = 30.0
-
-
-def _fit_selection_authority(
-    transform: CommittedTransform,
-    *,
-    context: str,
-) -> Selection | None:
-    operations = tuple(transform.spec.operations)
-    if not operations:
-        return None
-    if len(operations) == 1 and isinstance(operations[0], Selection):
-        return operations[0]
-    if isinstance(operations[-1], HistogramSpec):
-        return None
-    raise ValueError(
-        f"{context} supports only identity or one range-preserving "
-        "Selection transform"
-    )
+    from zlc_plot import PlotSpec
 
 
 class _ResourceCleanupError(RuntimeError):
@@ -397,277 +349,37 @@ class Experiment:
     def inspect(self, request: CaptureRequest) -> PlanDescriptor:
         return self.readout.prepare_capture(request).descriptor
 
-    def fit(
-        self,
-        source: object,
-        spec: FitSpec | None = None,
-        *,
-        model: str | None = None,
-        committed_transform: CommittedTransform | None = None,
-        independent_sources: tuple[AxisSourceRef, ...] | None = None,
-        batch_sources: tuple[AxisSourceRef, ...] | None = None,
-        constraints: tuple[FitParameterConstraint, ...] = (),
-        numeric_policy: FitNumericPolicy | None = None,
-    ) -> FitResultBatch:
-        """Fit one owner-admitted FINAL Dataset artifact without hidden reduction."""
-
-        if not self._artifact_operations.can_project_dataset(source):
-            raise TypeError("source must be a composed FINAL Dataset artifact")
-        if (spec is None) == (model is None):
-            raise ValueError("provide exactly one of spec or model")
-        with _fit_service_guard(self._services) as services:
-            def closing_cancel_check() -> bool:
-                with services.operation_lock:
-                    return services.state != "OPEN"
-
-            if spec is None:
-                assert model is not None
-                if independent_sources is None:
-                    raise ValueError(
-                        "model convenience Fit requires explicit independent_sources"
-                    )
-                schema = _project_final_dataset_source(
-                    self._artifact_operations,
-                    source,
-                    materialize=False,
-                ).schema
-                spec = fit_spec_for(
-                    schema,
-                    model,
-                    committed_transform=committed_transform,
-                    independent_sources=tuple(independent_sources),
-                    batch_sources=(
-                        () if batch_sources is None else tuple(batch_sources)
-                    ),
-                    constraints=constraints,
-                    numeric_policy=(
-                        FitNumericPolicy()
-                        if numeric_policy is None
-                        else numeric_policy
-                    ),
-                )
-                del schema
-            elif any(
-                value is not None
-                for value in (
-                    committed_transform,
-                    independent_sources,
-                    batch_sources,
-                    numeric_policy,
-                )
-            ) or constraints:
-                raise ValueError(
-                    "spec cannot be combined with model convenience arguments"
-                )
-            return execute_fit(
-                self._artifact_operations,
-                source,
-                spec,
-                cancel_check=closing_cancel_check,
-            )
-
-    def save_fit(
-        self,
-        source: object,
-        result: FitResultBatch,
-        *,
-        label: str | None = None,
-    ) -> FitResultArtifactRef:
-        """Persist one already-computed Fit result beneath this project."""
-
-        with _fit_service_guard(self._services) as services:
-            return write_fit_result(
-                services.workspace_paths.output_root / "fits",
-                self._artifact_operations,
-                source,
-                result,
-                label=label,
-            )
-
-    def load_fit(
-        self,
-        reference: FitResultArtifactRef,
-    ) -> SavedFitResult:
-        with _service_guard(self._services) as services:
-            return load_fit_result(
-                services.workspace_paths.output_root / "fits",
-                reference,
-                artifacts=self._artifact_operations,
-            )
-
-    def _open_fit_capable_figure_gui(
-        self,
-        display_source,
-        fit_source: object,
-        *,
-        intent,
-        point_ordinals: tuple[int, ...] | None,
-        preferences,
-        artifact_output: str | None,
-        selected_model: str | None = None,
-        initial_fit_spec: FitSpec | None = None,
-        initial_selection: Selection | None = None,
-        open_fit: bool = False,
-        timeout_seconds: float = _DEFAULT_FIT_GUI_TIMEOUT_SECONDS,
-        initial_fit_result_identity: str | None = None,
-        direct_fit_single_panel: bool = False,
-    ):
-        """Validate one Figure request and delegate its Qt composition lazily."""
-
-        if not self._artifact_operations.can_project_dataset(fit_source):
-            raise TypeError("fit_source must be a composed FINAL Dataset artifact")
-        timeout = _positive_real(timeout_seconds, "timeout_seconds")
-        chosen_model = (
-            None if selected_model is None else _text(selected_model, "model")
-        )
-        if initial_fit_spec is not None and not isinstance(
-            initial_fit_spec,
-            FitSpec,
-        ):
-            raise TypeError("initial_fit_spec must be FitSpec or None")
-        if initial_fit_spec is not None:
-            if chosen_model is None:
-                chosen_model = initial_fit_spec.model_id
-            elif chosen_model != initial_fit_spec.model_id:
-                raise ValueError("selected model differs from the initial FitSpec")
-        from Zou_lab_control.workbench._composition import (
-            open_fit_capable_figure_gui,
-        )
-
-        return open_fit_capable_figure_gui(
-            self,
-            display_source,
-            fit_source,
-            intent=intent,
-            point_ordinals=point_ordinals,
-            preferences=preferences,
-            artifact_output=artifact_output,
-            selected_model=chosen_model,
-            initial_fit_spec=initial_fit_spec,
-            initial_selection=initial_selection,
-            open_fit=open_fit,
-            timeout_seconds=timeout,
-            initial_fit_result_identity=initial_fit_result_identity,
-            direct_fit_single_panel=direct_fit_single_panel,
-        )
-
-    def fit_gui(
-        self,
-        source: object,
-        *,
-        model: str | None = None,
-        committed_transform: CommittedTransform | None = None,
-        timeout_seconds: float = _DEFAULT_FIT_GUI_TIMEOUT_SECONDS,
-    ):
-        """Open the same DataFigure host with its Fit tab selected."""
-
-        if not self._artifact_operations.can_project_dataset(source):
-            raise TypeError("source must be a composed FINAL Dataset artifact")
-        initial_selection = None
-        if committed_transform is not None:
-            if not isinstance(committed_transform, CommittedTransform):
-                raise TypeError(
-                    "committed_transform must be CommittedTransform or None"
-                )
-            initial_selection = _fit_selection_authority(
-                committed_transform,
-                context="fit_gui",
-            )
-        return self._open_fit_capable_figure_gui(
-            source,
-            source,
-            intent=None,
-            point_ordinals=None,
-            preferences=None,
-            artifact_output=None,
-            selected_model=model,
-            initial_selection=initial_selection,
-            open_fit=True,
-            timeout_seconds=timeout_seconds,
-            direct_fit_single_panel=True,
-        )
-
-    def figure_document(
-        self,
-        source: object,
-        *,
-        intent: "ViewIntent | None" = None,
-        point_ordinals: tuple[int, ...] | None = None,
-        preferences: "ViewPreferences | None" = None,
-        output: str | None = None,
-    ) -> "FigureDocument":
-        """Project one committed source into a renderer-free document.
-
-        A multi-output artifact may expose an owner-defined ``output`` name;
-        ordinary Dataset artifacts and Fit results reject that argument.
-        """
-
-        with _service_guard(self._services) as services:
-            document, _datasets, _figure_intent, _fit = _project_figure(
-                services,
-                self._artifact_operations,
-                source,
-                intent=intent,
-                point_ordinals=point_ordinals,
-                preferences=preferences,
-                artifact_output=output,
-                materialize=False,
-            )
-        return document
-
-    def figure(
-        self,
-        source: object,
-        *,
-        intent: "ViewIntent | None" = None,
-        point_ordinals: tuple[int, ...] | None = None,
-        preferences: "ViewPreferences | None" = None,
-        output: str | None = None,
-    ) -> "DataFigure":
-        """Resolve one frozen source and return its optional-render DataFigure."""
-
-        with _service_guard(self._services) as services:
-            figure, _figure_intent = _data_figure_for_services(
-                services,
-                self._artifact_operations,
-                source,
-                intent=intent,
-                point_ordinals=point_ordinals,
-                preferences=preferences,
-                artifact_output=output,
-            )
-            return figure
-
     def figure_gui(
         self,
-        source: object | str | Path | None = None,
+        snapshot: OwnedSnapshot | str | Path | None = None,
         *,
-        intent: "ViewIntent | None" = None,
-        point_ordinals: tuple[int, ...] | None = None,
-        preferences: "ViewPreferences | None" = None,
-        output: str | None = None,
+        spec: "PlotSpec | None" = None,
+        size: str | None = None,
+        parameters: Mapping[str, object] | None = None,
+        archive_path: str | Path | None = None,
+        metadata: Mapping[str, object] | None = None,
+        open_fit: bool = False,
     ):
-        """Open the saved-figure browser or show one typed frozen source.
+        """Open the viewer, or one explicit snapshot through ``zlc_plot``."""
 
-        ``None`` opens the session-independent FigureViewer.  A filesystem path
-        opens that viewer and commits the selected current archive; typed
-        artifact/result inputs retain their existing interactive dispatch.
-        """
-
-        if source is None or isinstance(source, (str, Path)):
+        if not isinstance(open_fit, bool):
+            raise TypeError("open_fit must be bool")
+        if snapshot is None or isinstance(snapshot, (str, Path)):
             supplied_overrides = tuple(
                 name
                 for name, value in (
-                    ("intent", intent),
-                    ("point_ordinals", point_ordinals),
-                    ("preferences", preferences),
-                    ("output", output),
+                    ("spec", spec),
+                    ("size", size),
+                    ("parameters", parameters),
+                    ("archive_path", archive_path),
+                    ("metadata", metadata),
+                    ("open_fit", True if open_fit else None),
                 )
                 if value is not None
             )
             if supplied_overrides:
                 raise ValueError(
-                    "saved FigureViewer does not accept typed-source view overrides: "
+                    "saved FigureViewer does not accept snapshot options: "
                     + ", ".join(supplied_overrides)
                 )
             from zlc_workbench.figure_viewer.app import open_figure_viewer
@@ -675,68 +387,31 @@ class Experiment:
             with _service_guard(self._services) as services:
                 output_root = services.workspace_paths.output_root
             return open_figure_viewer(
-                path=source,
+                path=snapshot,
                 output_root=output_root,
             )
 
-        if isinstance(source, FitResultArtifactRef):
-            source = self.load_fit(source)
+        if not isinstance(snapshot, OwnedSnapshot):
+            raise TypeError("snapshot must be OwnedSnapshot, path, or None")
+        if spec is None:
+            raise ValueError("snapshot Figure requires explicit PlotSpec")
+        from zlc_plot import PlotSpec as CurrentPlotSpec
 
-        if self._artifact_operations.can_project_dataset(source):
-            return self._open_fit_capable_figure_gui(
-                source,
-                source,
-                intent=intent,
-                point_ordinals=point_ordinals,
-                preferences=preferences,
-                artifact_output=output,
-            )
-
-        if isinstance(source, SavedFitResult):
-            result = source.result
-            transform = result.spec.committed_transform
-            initial_authority_selection = _fit_selection_authority(
-                transform,
-                context="Fit result analysis",
-            )
-            identity = source.reference.record_path
-            fit_source = source.source_artifact_ref
-            return self._open_fit_capable_figure_gui(
-                source,
-                fit_source,
-                intent=intent,
-                point_ordinals=point_ordinals,
-                preferences=preferences,
-                artifact_output=output,
-                selected_model=result.spec.model_id,
-                initial_fit_spec=result.spec,
-                initial_selection=initial_authority_selection,
-                initial_fit_result_identity=identity,
-            )
-
+        if not isinstance(spec, CurrentPlotSpec):
+            raise TypeError("spec must be PlotSpec")
         from Zou_lab_control.workbench import open_figure_workbench
         with _service_guard(self._services) as services:
             output_root = services.workspace_paths.output_root
 
-        def figure_factory(current_source, *, intent, point_ordinals, preferences):
-            with _service_guard(self._services) as services:
-                return _data_figure_for_services(
-                    services,
-                    self._artifact_operations,
-                    current_source,
-                    intent=intent,
-                    point_ordinals=point_ordinals,
-                    preferences=preferences,
-                    artifact_output=output,
-                )
-
         return open_figure_workbench(
-            figure_factory,
-            source,
+            snapshot,
+            spec,
             output_root=output_root,
-            intent=intent,
-            point_ordinals=point_ordinals,
-            preferences=preferences,
+            size=size,
+            parameters=parameters,
+            archive_path=archive_path,
+            metadata=metadata,
+            open_fit=open_fit,
         )
 
     def close(self) -> None:
@@ -1064,12 +739,10 @@ def device_manager(
 __all__ = [
     "AppliedPulseSnapshot",
     "CaptureArtifactRef",
-    "FitResultArtifactRef",
     "CaptureRequest",
     "connect",
     "device_manager",
     "Experiment",
-    "SavedFitResult",
     "InstallationConfigDocument",
     "PlanDescriptor",
     "PreparedPulseExecution",

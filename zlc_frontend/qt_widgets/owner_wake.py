@@ -9,13 +9,18 @@ from typing import Callable
 
 from PyQt5 import QtCore, QtWidgets
 
-from ..render import detached_render_fault
 from .fluent import release_window
 
 
-RASTER_WORK_EXECUTOR = ThreadPoolExecutor(
+def _detached_callback_fault(error: BaseException) -> RuntimeError:
+    """Keep only a small diagnostic instead of a failed callback traceback."""
+
+    return RuntimeError(f"{type(error).__name__}: {error}")
+
+
+_DEFAULT_WORK_EXECUTOR = ThreadPoolExecutor(
     max_workers=1,
-    thread_name_prefix="zlc-raster-work",
+    thread_name_prefix="zlc-frontend-work",
 )
 
 
@@ -82,7 +87,7 @@ class QtOwnerWake(QtCore.QObject):
             if callback is not None:
                 callback()
         except BaseException as error:
-            self._fault = detached_render_fault(error)
+            self._fault = _detached_callback_fault(error)
         finally:
             with self._pending_lock:
                 self._dispatching = False
@@ -147,7 +152,7 @@ class SerialWorkerWindow(QtWidgets.QWidget):
             raise TypeError("executor must implement concurrent.futures.Executor")
         if worker_release is not None and not callable(worker_release):
             raise TypeError("worker_release must be callable or None")
-        self._executor = RASTER_WORK_EXECUTOR if executor is None else executor
+        self._executor = _DEFAULT_WORK_EXECUTOR if executor is None else executor
         self._worker_release = worker_release
         self._worker_release_pending = False
         self._future: Future | None = None
@@ -333,7 +338,6 @@ def error_summary(error: BaseException) -> str:
 __all__ = [
     "error_summary",
     "QtOwnerWake",
-    "RASTER_WORK_EXECUTOR",
     "SerialWorkerWindow",
     "wait_for_owner_retirement",
 ]

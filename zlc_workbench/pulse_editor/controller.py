@@ -9,13 +9,11 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
-import math
-import os
 from pathlib import Path
-import tempfile
 import threading
 from typing import Callable, Protocol
-from uuid import uuid4
+
+from zlc_plot import PulseTimelineData, PulseTimelinePlot
 
 from zlc_neutral_atom.devices.sequencer.application import (
     AppliedPulseSnapshot,
@@ -71,7 +69,8 @@ from zlc_pulse.authoring import clear_port as clear_document_port
 from zlc_pulse.authoring import clear_pulse_schedule
 from .preview_projection import (
     pulse_preview_status,
-    pulse_timeline_render_kwargs,
+    pulse_timeline_plot,
+    recommended_pulse_size,
 )
 from .scan_workspace import (
     ScanCandidateResult,
@@ -145,49 +144,39 @@ class OwnedPulseConnection:
 
 
 @dataclass(frozen=True)
-class RenderedPulsePreview:
-    """One worker-rendered front bound to an exact document and view revision."""
+class PulsePreviewPlot:
+    """One exact Pulse timeline projected into the public plotting API."""
 
     document_generation: int
     editor_revision: int
-    presentation_revision: int
+    include_off_rows: bool
     timeline: PulseTimelineDocument
-    raster: object
-    payload: object
-    size: str
+    data: PulseTimelineData
+    spec: PulseTimelinePlot
+    recommended_size: str
     status: str
-    pixel_ratio: float
 
     def __post_init__(self) -> None:
-        from zlc_frontend.render import PulsePanelPayload, RasterBuffer
-
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value < 0
             for value in (
                 self.document_generation,
                 self.editor_revision,
-                self.presentation_revision,
             )
         ):
             raise ValueError("preview revisions must be non-negative integers")
         if not isinstance(self.timeline, PulseTimelineDocument):
             raise TypeError("preview timeline must be PulseTimelineDocument")
-        if not isinstance(self.raster, RasterBuffer):
-            raise TypeError("preview raster must be RasterBuffer")
-        if not isinstance(self.payload, PulsePanelPayload):
-            raise TypeError("preview payload must be PulsePanelPayload")
-        if self.payload.document_input.document_revision != self.editor_revision:
-            raise ValueError("preview payload belongs to another editor revision")
-        if self.payload.viewport.display_revision != self.presentation_revision:
-            raise ValueError("preview payload belongs to another presentation revision")
-        if not isinstance(self.size, str) or not self.size:
-            raise ValueError("preview size must be non-empty text")
+        if type(self.include_off_rows) is not bool:
+            raise TypeError("preview include_off_rows must be bool")
+        if not isinstance(self.data, PulseTimelineData):
+            raise TypeError("preview data must be PulseTimelineData")
+        if not isinstance(self.spec, PulseTimelinePlot):
+            raise TypeError("preview spec must be PulseTimelinePlot")
+        if not isinstance(self.recommended_size, str) or not self.recommended_size:
+            raise ValueError("preview recommended_size must be non-empty text")
         if not isinstance(self.status, str):
             raise TypeError("preview status must be text")
-        ratio = float(self.pixel_ratio)
-        if not math.isfinite(ratio) or ratio <= 0:
-            raise ValueError("preview pixel_ratio must be finite and positive")
-        object.__setattr__(self, "pixel_ratio", ratio)
 
 
 def _cancel_and_wait_detached_run(handle: RunHandle) -> RunSnapshot:
@@ -290,13 +279,10 @@ class PulseFileUpdate:
 
 @dataclass(frozen=True)
 class PulsePreviewUpdate:
-    """One immutable Preview worker front and its presentation facts."""
+    """One immutable Pulse-to-plot projection publication."""
 
-    preview_revision: int | None
-    preview_generation: int | None
-    rendered_preview: RenderedPulsePreview | None
+    plot: PulsePreviewPlot | None
     preview_error: str
-    preview_notice: str
 
 
 @dataclass(frozen=True)
@@ -424,19 +410,9 @@ class PulseEditorController:
         self._operation_generation = 0
         self._preview_inflight = None
         self._preview_requested = None
-        self._preview_revision: int | None = None
-        self._preview_generation: int | None = None
-        self._preview: PulseTimelineDocument | None = None
-        self._rendered_preview: RenderedPulsePreview | None = None
+        self._preview_plot: PulsePreviewPlot | None = None
         self._preview_error = ""
-        self._preview_notice = ""
-        self._preview_export_inflight = False
-        self._preview_document_namespace = f"pulse-editor-{uuid4().hex}"
         self._preview_include_off = False
-        self._preview_size: str | None = None
-        self._preview_pixel_ratio = 1.0
-        self._preview_x_limits: tuple[float, float] | None = None
-        self._preview_presentation_revision = 0
         self._scan_operation_generation = 0
         self._scan_busy_operation: str | None = None
         self._scan_diagnostic = ""
@@ -601,11 +577,8 @@ class PulseEditorController:
         """Return only the immutable Preview publication."""
 
         return PulsePreviewUpdate(
-            preview_revision=self._preview_revision,
-            preview_generation=self._preview_generation,
-            rendered_preview=self._rendered_preview,
+            plot=self._preview_plot,
             preview_error=self._preview_error,
-            preview_notice=self._preview_notice,
         )
 
     def runtime_update(self) -> PulseRuntimeUpdate:
@@ -621,11 +594,7 @@ class PulseEditorController:
             scan_progress=self._scan_progress,
             held_scan_point=self._held_scan_snapshot(),
             diagnostic=self._diagnostic,
-            file_busy=(
-                self._save_inflight
-                or self._load_inflight
-                or self._preview_export_inflight
-            ),
+            file_busy=(self._save_inflight or self._load_inflight),
             run_busy=self._run_busy(),
             close_requested=self._close_requested,
             close_complete=self._close_complete,
@@ -684,11 +653,8 @@ class PulseEditorController:
         it must not chain a render for every intermediate editor revision.
         """
 
-        self._preview = None
-        self._rendered_preview = None
+        self._preview_plot = None
         self._preview_error = ""
-        self._preview_revision = None
-        self._preview_generation = None
 
     def _invalidate_scan_workspace_projection(self) -> None:
         self._scan_workspace_cache_key = None
@@ -1233,208 +1199,64 @@ class PulseEditorController:
             "save", token, lambda: session.save(path, overwrite=overwrite)
         )
 
-    def save_preview(self, path: str | Path) -> None:
-        """Export the same frozen drawing as Preview, at the formal 600-DPI setting."""
-
-        self._require_not_closing()
-        if self._preview_export_inflight:
-            raise RuntimeError("a Pulse preview export is already active")
-        target = Path(path).expanduser().resolve()
-        if not target.suffix:
-            target = target.with_suffix(".png")
-        revision = self._editor.revision
-        document = self._editor.document
-        generation = self._editor_generation
-        include_off = self._preview_include_off
-        size = self._preview_size
-        self._preview_export_inflight = True
-        self._preview_notice = ""
-
-        def export() -> Path:
-            from zlc_frontend.matplotlib_render import render_pulse_timeline_png
-
-            timeline = project_pulse_preview(document)
-            kwargs = pulse_timeline_render_kwargs(
-                timeline,
-                include_off_rows=include_off,
-                size=size,
-            )
-            image = render_pulse_timeline_png(**kwargs, export=True)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary_name: str | None = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="wb",
-                    dir=target.parent,
-                    delete=False,
-                ) as stream:
-                    temporary_name = stream.name
-                    stream.write(image)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary_name, target)
-                temporary_name = None
-            finally:
-                if temporary_name is not None:
-                    try:
-                        Path(temporary_name).unlink()
-                    except FileNotFoundError:
-                        pass
-            return target
-
-        self._submit(
-            "save-preview",
-            (generation, revision, target),
-            export,
-        )
-
     def set_preview_include_off(self, include: bool) -> None:
         if type(include) is not bool:
             raise TypeError("include-off preview state must be bool")
-        if include == self._preview_include_off and self._preview_size is None:
+        if include == self._preview_include_off:
             return
         self._preview_include_off = include
-        # This is the formal UI's established behaviour: changing the row set
-        # returns Size to its content-derived default, while preserving the
-        # current time viewport.
-        self._preview_size = None
-        self._preview_presentation_revision += 1
-        self.request_preview()
-
-    def set_preview_size(self, size: str) -> None:
-        from zlc_frontend.panel_size import PANEL_SIZES
-
-        normalized = str(size)
-        if normalized not in PANEL_SIZES:
-            raise ValueError(f"unknown pulse preview size {normalized!r}")
-        if normalized == self._preview_size:
-            return
-        self._preview_size = normalized
-        self._preview_presentation_revision += 1
-        self.request_preview()
-
-    def reset_preview_size(self) -> None:
-        """Clear the formal Preview tab's transient manual size selection."""
-
-        if self._preview_size is None:
-            return
-        self._preview_size = None
-        self._preview_presentation_revision += 1
-        self.request_preview()
-
-    def set_preview_pixel_ratio(self, ratio: int | float) -> None:
-        if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
-            raise TypeError("preview pixel ratio must be numeric")
-        normalized = float(ratio)
-        if not math.isfinite(normalized) or normalized <= 0:
-            raise ValueError("preview pixel ratio must be finite and positive")
-        if normalized == self._preview_pixel_ratio:
-            return
-        self._preview_pixel_ratio = normalized
-        self._preview_presentation_revision += 1
-        self.request_preview()
-
-    def commit_preview_view(
-        self,
-        x_limits: tuple[float, float] | None,
-        *,
-        presentation_revision: int,
-    ) -> None:
-        if (
-            isinstance(presentation_revision, bool)
-            or not isinstance(presentation_revision, int)
-            or presentation_revision <= self._preview_presentation_revision
-        ):
-            raise ValueError("preview presentation revision must advance monotonically")
-        normalized = None
-        if x_limits is not None:
-            values = tuple(float(value) for value in x_limits)
-            if (
-                len(values) != 2
-                or not all(math.isfinite(value) for value in values)
-                or values[1] <= values[0]
-            ):
-                raise ValueError("preview x limits must be one finite increasing pair")
-            normalized = values
-        self._preview_x_limits = normalized
-        self._preview_presentation_revision = presentation_revision
         self.request_preview()
 
     def request_preview(self) -> None:
         if self._close_requested:
             return
-        self._preview_notice = ""
         revision = self._editor.revision
         document = self._editor.document
         document_generation = self._editor_generation
-        presentation_revision = self._preview_presentation_revision
-        token = (document_generation, revision, presentation_revision)
+        include_off = self._preview_include_off
+        token = (document_generation, revision, include_off)
+        current_plot = self._preview_plot
+        if current_plot is not None and (
+            current_plot.document_generation,
+            current_plot.editor_revision,
+            current_plot.include_off_rows,
+        ) == token:
+            return
         self._preview_requested = token
-        rendered = self._rendered_preview
-        # A presentation-only request (live pan/zoom, DPR, size, row filter)
-        # must not erase the last completed front.  The worker is intentionally
-        # latest-only, but a continuously moving pointer can advance faster
-        # than Agg; clearing here made every completed intermediate revision
-        # invisible until motion stopped.  A changed DOCUMENT identity remains
-        # strict and clears immediately.
-        if rendered is None or (
-            rendered.document_generation,
-            rendered.editor_revision,
+        if current_plot is None or (
+            current_plot.document_generation,
+            current_plot.editor_revision,
         ) != (document_generation, revision):
-            self._preview = None
-            self._rendered_preview = None
+            self._preview_plot = None
             self._preview_error = ""
         if self._preview_inflight is not None:
             return
         self._preview_inflight = token
 
-        include_off = self._preview_include_off
-        size = self._preview_size
-        pixel_ratio = self._preview_pixel_ratio
-        x_limits = self._preview_x_limits
-        document_id = f"{self._preview_document_namespace}-g{document_generation}"
-
-        def render_preview() -> RenderedPulsePreview:
-            from zlc_frontend.matplotlib_render import render_pulse_timeline_panel
-            from zlc_frontend.render import DocumentInputIdentity
-
+        def project_preview() -> PulsePreviewPlot:
             timeline = project_pulse_preview(document)
-            kwargs = pulse_timeline_render_kwargs(
+            data, spec = pulse_timeline_plot(
                 timeline,
                 include_off_rows=include_off,
-                size=size,
             )
-            effective_size = str(kwargs["size"])
-            document_input = DocumentInputIdentity(
-                document_id,
-                revision,
-                timeline.fingerprint,
-            )
-            raster, payload = render_pulse_timeline_panel(
-                **kwargs,
-                document_input=document_input,
-                display_revision=presentation_revision,
-                pixel_ratio=pixel_ratio,
-                x_limits=x_limits,
-            )
-            return RenderedPulsePreview(
+            return PulsePreviewPlot(
                 document_generation=document_generation,
                 editor_revision=revision,
-                presentation_revision=presentation_revision,
+                include_off_rows=include_off,
                 timeline=timeline,
-                raster=raster,
-                payload=payload,
-                size=effective_size,
+                data=data,
+                spec=spec,
+                recommended_size=recommended_pulse_size(
+                    timeline,
+                    include_off_rows=include_off,
+                ),
                 status=pulse_preview_status(
                     timeline,
                     include_off_rows=include_off,
                 ),
-                pixel_ratio=pixel_ratio,
             )
 
-        self._submit(
-            "preview", token, render_preview
-        )
+        self._submit("preview", token, project_preview)
 
     def connect(self, mode: str, endpoint: str = "") -> bool:
         """Begin a connection transition.
@@ -2128,52 +1950,25 @@ class PulseEditorController:
                 current = (
                     self._editor_generation,
                     self._editor.revision,
-                    self._preview_presentation_revision,
+                    self._preview_include_off,
                 )
-                same_document = token[:2] == current[:2]
-                if same_document and not self._close_requested:
+                if token == current and not self._close_requested:
                     try:
-                        rendered = future.result()
-                        if not isinstance(rendered, RenderedPulsePreview):
+                        projected = future.result()
+                        if not isinstance(projected, PulsePreviewPlot):
                             raise TypeError(
                                 "preview worker returned the wrong result type"
                             )
                     except BaseException as error:
-                        # Only the latest requested presentation may replace a
-                        # healthy front with an error.  An older presentation
-                        # can fail while a newer coalesced request is already
-                        # waiting; surfacing that obsolete failure would make
-                        # a live drag flicker unavailable.
-                        if token == current:
-                            self._preview = None
-                            self._rendered_preview = None
-                            self._preview_revision = token[1]
-                            self._preview_generation = token[0]
-                            self._preview_error = (
-                                f"{type(error).__name__}: {error}"
-                            )
-                            changes.preview = True
-                    else:
-                        shown = self._rendered_preview
-                        shown_revision = (
-                            -1
-                            if shown is None
-                            or (
-                                shown.document_generation,
-                                shown.editor_revision,
-                            ) != token[:2]
-                            else shown.presentation_revision
+                        self._preview_plot = None
+                        self._preview_error = (
+                            f"{type(error).__name__}: {error}"
                         )
-                        if token[2] > shown_revision:
-                            # Same immutable document, monotonic presentation:
-                            # publish the completed intermediate frame now and
-                            # immediately continue toward _preview_requested.
-                            self._rendered_preview = rendered
-                            self._preview = rendered.timeline
-                            self._preview_revision = token[1]
-                            self._preview_generation = token[0]
-                            self._preview_error = ""
-                            changes.preview = True
+                        changes.preview = True
+                    else:
+                        self._preview_plot = projected
+                        self._preview_error = ""
+                        changes.preview = True
                 if self._preview_requested != token and not self._close_requested:
                     self.request_preview()
                 continue
@@ -2236,19 +2031,6 @@ class PulseEditorController:
                     if token == (self._editor_generation, self._editor):
                         self._diagnostic = f"Saved {saved}"
                         changes.file = True
-                continue
-            if kind == "save-preview":
-                self._preview_export_inflight = False
-                changes.runtime = True
-                changes.preview = True
-                try:
-                    saved = future.result()
-                except BaseException as error:
-                    self._diagnostic = (
-                        f"Save figure failed: {type(error).__name__}: {error}"
-                    )
-                else:
-                    self._preview_notice = f"Saved figure: {saved.name}"
                 continue
             if kind == "connect":
                 self._connect_inflight = False
@@ -2776,6 +2558,6 @@ __all__ = [
     "PulseRuntimeUpdate",
     "PulseScanProgressUpdate",
     "PulseRunFacade",
-    "RenderedPulsePreview",
+    "PulsePreviewPlot",
     "parse_remote_endpoint",
 ]

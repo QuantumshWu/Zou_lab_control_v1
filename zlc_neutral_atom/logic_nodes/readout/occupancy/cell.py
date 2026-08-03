@@ -16,7 +16,6 @@ from zlc_data import (
     ComponentValidity,
     DatasetRevisionRef,
     DatasetSchema,
-    OwnedSnapshot,
     SPATIAL_X,
     SPATIAL_Y,
     Value,
@@ -158,7 +157,6 @@ class ExactOccupancyCellSource:
     logical_point: tuple[int, ...]
     image: Value
     occupied: Value
-    occupied_snapshot: OwnedSnapshot
     frame_metadata: CameraFrameMetadata
 
     def __post_init__(self) -> None:
@@ -184,13 +182,6 @@ class ExactOccupancyCellSource:
             self.occupied.schema != self.domain.occupancy_schema.cell_schema
         ):
             raise ValueError("occupied must match the admitted SITE cell schema")
-        if not isinstance(self.occupied_snapshot, OwnedSnapshot) or (
-            self.occupied_snapshot.ref != self.domain.occupancy_ref
-            or self.occupied_snapshot.block.schema != self.domain.occupancy_schema
-        ):
-            raise ValueError(
-                "occupied_snapshot must match the admitted Occupancy Dataset"
-            )
         if not isinstance(self.frame_metadata, CameraFrameMetadata):
             raise TypeError("frame_metadata must be CameraFrameMetadata")
         object.__setattr__(self, "logical_point", logical)
@@ -348,7 +339,6 @@ def load_exact_occupancy_cell_source(
         logical_point,
         sample.image,
         occupied,
-        OwnedSnapshot(domain.occupancy_ref, artifact.occupied),
         sample.metadata,
     )
 

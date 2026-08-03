@@ -13,6 +13,7 @@ import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import numpy as np
 from PyQt5 import QtCore, QtWidgets
 
 from zlc_frontend.qt_widgets import ensure_qt_app
@@ -25,6 +26,9 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     calibration_analysis_authoring_schema,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import CalibrationArtifactRef
+from zlc_neutral_atom.logic_nodes.readout.calibration.outputs import (
+    calibration_final_outputs,
+)
 from zlc_neutral_atom.logic_nodes.readout.occupancy.reference import OccupancyArtifactRef
 from zlc_neutral_atom.runtime.run import RunId, RunSnapshot, RunState
 
@@ -75,6 +79,48 @@ def _close(application, window) -> None:
 def _calibration_record_count(workspace: Path) -> int:
     root = workspace / "_output" / "calibrations"
     return 0 if not root.exists() else len(tuple(root.glob("*/calibration.json")))
+
+
+def test_calibration_outputs_preserve_repeat_point_and_site_domains(
+    calibration_product,
+) -> None:
+    _experiment, reference, computation, _workspace = calibration_product
+    outputs = calibration_final_outputs(computation, reference)
+    assert tuple(outputs) == (
+        "site_map",
+        "fidelity_site",
+        "fidelity_threshold",
+        "fidelity_centers",
+        "readout_samples",
+        "aggregate_fidelity",
+        "global_fidelity",
+    )
+
+    samples = outputs["readout_samples"].snapshot
+    report = computation.report
+    model_report = report.model(computation.artifact.default_model_kind)
+    repeat_count = 1 + max(context[0][1] for context in report.group_contexts)
+    point_count = len(report.group_contexts) // repeat_count
+    site_axis = computation.artifact.site_map.site_axis
+    assert samples.block.schema.repeat_axis.axis_id == report.group_contexts[0][0][0]
+    assert samples.block.schema.repeat_axis.size == repeat_count
+    assert samples.block.schema.point_table.row_count == point_count
+    assert samples.block.schema.cell_schema.data_axes == (site_axis,)
+    assert samples.block.values.shape == (repeat_count, point_count, site_axis.size)
+    np.testing.assert_array_equal(
+        samples.block.values,
+        model_report.short_signals.reshape(samples.block.values.shape),
+    )
+
+    # Runtime thresholds are the artifact authority used by Occupancy.
+    selected = computation.artifact.select_model()
+    thresholds = outputs[
+        "fidelity_threshold"
+    ].snapshot
+    np.testing.assert_array_equal(
+        thresholds.block.values.reshape((-1,)),
+        selected.thresholds,
+    )
 
 
 def test_calibration_owner_presenter_and_public_imports_remain_headless() -> None:
@@ -269,12 +315,24 @@ def test_exact_saved_calibration_reopens_for_new_revision_without_mutation(
         assert reference.target_ref in window._authority.text()
         assert "editing" in window._authority.text()
         assert _calibration_record_count(workspace) == before
-        previous_boards = window._boards
-        previous_bundle = window._bundle
-        assert previous_boards and previous_bundle is not None
-        assert window._present_bundle(previous_bundle)
-        assert all(not board.has_front for board in previous_boards)
-        assert all(window._tabs.indexOf(board) < 0 for board in previous_boards)
+        assert window.report_outputs is not None
+        assert tuple(window.report_outputs) == (
+            "site_map",
+            "fidelity_site",
+            "fidelity_threshold",
+            "fidelity_centers",
+            "readout_samples",
+            "aggregate_fidelity",
+            "global_fidelity",
+        )
+        assert tuple(window._plot_hosts) == (
+            "site_map",
+            "fidelity",
+            "distribution",
+        )
+        assert window.raster_ready
+        assert window._status.text() == "CALIBRATION READY"
+        assert window._diagnostic.text() == ""
         assert window._form is not None
         window._form.widget_for("split_seed").setValue(7)
         assert window._status.text() == "FINAL CALIBRATION · EDITOR CHANGED"

@@ -3,21 +3,29 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from numbers import Real
 
 import numpy as np
 
 from ._arrays import canonical_dtype
 from .axis import REPEAT, AxisId, AxisSpec
-from .fit_contract import FitBatchStatus, FitResultBatch
-from .schema import DatasetSchema, GridTopology, PointColumn, PointTable, ValueSchema
+from .schema import DatasetSchema, PointTable, ValueSchema
 from .selection import Selection
 from .transform import DataTransformSpec, apply_transform, commit_transform
-from .validity import CellValidity, DatasetComponentValidity, ValidityContract
+from .validity import (
+    INVALID,
+    VALID,
+    CellValidity,
+    ComponentValidity,
+    DatasetComponentValidity,
+    Invalid,
+    Valid,
+    ValidityContract,
+)
 from .value import (
     DataBlock,
     DatasetRevisionRef,
     OwnedSnapshot,
+    Value,
     expand_dataset_validity,
 )
 
@@ -25,8 +33,9 @@ __all__ = [
     "materialize_component_dataset",
     "materialize_dataset_acceptance_mask",
     "materialize_dataset_selection",
-    "materialize_fit_parameter_snapshots",
+    "materialize_derived_dataset",
     "materialize_scalar_dataset",
+    "materialize_value_dataset",
 ]
 
 
@@ -60,6 +69,36 @@ def _single_cell_schema(cell_schema: ValueSchema) -> DatasetSchema:
     )
 
 
+def materialize_derived_dataset(
+    source_ref: DatasetRevisionRef,
+    values: object,
+    *,
+    schema: DatasetSchema,
+    validity: Valid | Invalid | CellValidity | DatasetComponentValidity,
+    reference_for: Callable[[DatasetSchema], DatasetRevisionRef],
+) -> OwnedSnapshot:
+    """Materialize one typed derived Dataset without interpreting its domain.
+
+    The caller owns the physical layout semantics.  This data-owned boundary
+    only validates the canonical Dataset carrier and derives a distinct block
+    reference at the exact source revision.
+    """
+
+    if not isinstance(schema, DatasetSchema):
+        raise TypeError("derived dataset schema must be DatasetSchema")
+    ref = _derived_reference(source_ref, schema, reference_for)
+    return OwnedSnapshot(
+        ref,
+        DataBlock(
+            ref.block_id,
+            ref.revision,
+            np.asarray(values),
+            validity,
+            schema,
+        ),
+    )
+
+
 def materialize_scalar_dataset(
     source_ref: DatasetRevisionRef,
     value: object,
@@ -90,6 +129,46 @@ def materialize_scalar_dataset(
             ref.revision,
             array.reshape(schema.physical_shape),
             CellValidity(np.asarray([[valid]], dtype=np.bool_)),
+            schema,
+        ),
+    )
+
+
+def materialize_value_dataset(
+    source_ref: DatasetRevisionRef,
+    value: Value,
+    *,
+    reference_for: Callable[[DatasetSchema], DatasetRevisionRef],
+) -> OwnedSnapshot:
+    """Place one typed :class:`Value` in the canonical single-cell carrier.
+
+    Cross selectors return the value that is painted, not renderer coordinates.
+    This data-owned boundary preserves its dtype, trailing axes and named
+    component validity while adding only the required ``R=1, P=1`` carrier.
+    """
+
+    if not isinstance(value, Value):
+        raise TypeError("single-cell dataset materialization requires Value")
+    schema = _single_cell_schema(value.schema)
+    ref = _derived_reference(source_ref, schema, reference_for)
+    if isinstance(value.validity, Valid):
+        validity = VALID
+    elif isinstance(value.validity, Invalid):
+        validity = INVALID
+    elif isinstance(value.validity, ComponentValidity):
+        validity = DatasetComponentValidity(
+            value.validity.axis_ids,
+            value.validity.mask.reshape(1, 1, *value.validity.mask.shape),
+        )
+    else:  # the closed Value validity vocabulary is enforced by Value itself
+        raise TypeError("Value contains another validity representation")
+    return OwnedSnapshot(
+        ref,
+        DataBlock(
+            ref.block_id,
+            ref.revision,
+            value.values.reshape(schema.physical_shape),
+            validity,
             schema,
         ),
     )
@@ -241,192 +320,3 @@ def materialize_dataset_selection(
             transformed.schema,
         ),
     )
-
-
-def _fit_parameter_dataset_layout(
-    result: FitResultBatch,
-) -> tuple[AxisSpec, PointTable, GridTopology | None, np.ndarray | None]:
-    """Project a sparse Fit batch layout into one exact R/P row table."""
-
-    axes = result.batch_axis_specs
-    repeat_positions = tuple(
-        index for index, axis in enumerate(axes) if axis.role == REPEAT
-    )
-    if len(repeat_positions) > 1:
-        raise ValueError("fit result repeats the repeat axis")
-    layout = result.batch_layout
-    if repeat_positions:
-        repeat_position = repeat_positions[0]
-        repeat_axis = axes[repeat_position]
-        row_axes = tuple(
-            axis for index, axis in enumerate(axes) if index != repeat_position
-        )
-        rows: dict[tuple[int, ...], int] = {}
-        by_repeat: list[set[tuple[int, ...]]] = [
-            set() for _ in range(repeat_axis.size)
-        ]
-        for storage_index in range(layout.storage_size):
-            multi = layout.multi_index(storage_index)
-            repeat_index = multi[repeat_position]
-            point_multi = tuple(
-                value for index, value in enumerate(multi) if index != repeat_position
-            )
-            key = (repeat_index, *point_multi)
-            if key in rows:
-                raise ValueError("fit batch layout contains a duplicate cell")
-            rows[key] = storage_index
-            by_repeat[repeat_index].add(point_multi)
-        point_membership = by_repeat[0]
-        if any(membership != point_membership for membership in by_repeat[1:]):
-            raise ValueError(
-                "fit batch has repeat-dependent point membership"
-            )
-        point_mapping = tuple(sorted(point_membership))
-        order = np.fromiter(
-            (
-                rows[(repeat_index, *point_multi)]
-                for repeat_index in range(repeat_axis.size)
-                for point_multi in point_mapping
-            ),
-            dtype=np.intp,
-            count=repeat_axis.size * len(point_mapping),
-        )
-        if np.array_equal(order, np.arange(order.size, dtype=np.intp)):
-            order = None
-    else:
-        row_axes = axes
-        used_ids = {axis.axis_id.value for axis in row_axes}
-        repeat_id = "fit-result-repeat"
-        suffix = 2
-        while repeat_id in used_ids:
-            repeat_id = f"fit-result-repeat-{suffix}"
-            suffix += 1
-        repeat_axis = AxisSpec(AxisId(repeat_id), "repeat", REPEAT, 1, (0,))
-        point_mapping = tuple(
-            layout.multi_index(storage_index)
-            for storage_index in range(layout.storage_size)
-        )
-        order = None
-    if not point_mapping:
-        raise ValueError("Fit result contains no materializable batch cells")
-    columns = tuple(
-        _point_column_for_axis(
-            axis,
-            tuple(axis.coordinate_at(multi[position]) for multi in point_mapping),
-        )
-        for position, axis in enumerate(row_axes)
-    )
-    point_table = PointTable(len(point_mapping), columns)
-    topology = _fit_batch_topology(row_axes, point_mapping)
-    return repeat_axis, point_table, topology, order
-
-
-def _point_column_for_axis(
-    axis: AxisSpec,
-    values: tuple[object, ...],
-) -> PointColumn:
-    value_kind = (
-        PointColumn.NUMERIC
-        if all(
-            value is None
-            or (not isinstance(value, bool) and isinstance(value, Real))
-            for value in values
-        )
-        else PointColumn.TEXT
-    )
-    return PointColumn(
-        axis.axis_id,
-        axis.name,
-        axis.role,
-        value_kind,
-        values,
-        axis.unit,
-        axis.coordinate_frame,
-    )
-
-
-def _fit_batch_topology(
-    axes: tuple[AxisSpec, ...],
-    mapping: tuple[tuple[int, ...], ...],
-) -> GridTopology | None:
-    if not axes:
-        return None
-    domains = tuple(
-        tuple(axis.coordinate_at(index) for index in range(axis.size))
-        for axis in axes
-    )
-    if any(
-        any(value is None for value in domain) or len(set(domain)) != len(domain)
-        for domain in domains
-    ):
-        return None
-    return GridTopology(
-        tuple(axis.axis_id for axis in axes),
-        domains,
-        mapping,
-    )
-
-
-def materialize_fit_parameter_snapshots(
-    result: FitResultBatch,
-    *,
-    reference_for: Callable[[str, DatasetSchema], DatasetRevisionRef],
-) -> dict[str, OwnedSnapshot]:
-    """Materialize every Fit parameter as a scalar Dataset over its batches."""
-
-    if not isinstance(result, FitResultBatch):
-        raise TypeError("fit result must be FitResultBatch")
-    if not callable(reference_for):
-        raise TypeError("fit parameter reference_for must be callable")
-    repeat_axis, point_table, topology, order = _fit_parameter_dataset_layout(result)
-    validity_rows = np.fromiter(
-        (status is FitBatchStatus.CONVERGED for status in result.statuses),
-        dtype=np.bool_,
-        count=len(result.statuses),
-    )
-    if order is not None:
-        validity_rows = validity_rows[order]
-    physical_shape = (repeat_axis.size, point_table.row_count)
-    validity = CellValidity(validity_rows.reshape(physical_shape))
-    output: dict[str, OwnedSnapshot] = {}
-    identities: set[tuple[object, object]] = set()
-    for parameter_index, (parameter, unit) in enumerate(
-        zip(result.parameter_definitions, result.parameter_units, strict=True)
-    ):
-        schema = DatasetSchema(
-            repeat_axis,
-            point_table,
-            topology,
-            ValueSchema.scalar(np.dtype("<f8"), unit),
-        )
-        ref = reference_for(parameter.name, schema)
-        if not isinstance(ref, DatasetRevisionRef):
-            raise TypeError("reference_for must return DatasetRevisionRef")
-        if ref.block_id == result.source_ref.block_id:
-            raise ValueError("a Fit parameter cannot reuse its source BlockId")
-        if ref.revision != result.source_ref.revision:
-            raise ValueError("a Fit parameter must retain its source revision")
-        if ref.schema_fingerprint != schema.fingerprint:
-            raise ValueError("Fit parameter reference schema differs from data")
-        identity = (ref.block_id, ref.stream_generation)
-        if identity in identities:
-            raise ValueError("Fit parameters must have distinct dataset identities")
-        identities.add(identity)
-        parameter_values = np.asarray(
-            result.parameter_values[:, parameter_index],
-            dtype="<f8",
-        )
-        values = (
-            parameter_values if order is None else parameter_values[order]
-        ).reshape(*physical_shape, 1)
-        output[parameter.name] = OwnedSnapshot(
-            ref,
-            DataBlock(
-                ref.block_id,
-                ref.revision,
-                values,
-                validity,
-                schema,
-            ),
-        )
-    return output

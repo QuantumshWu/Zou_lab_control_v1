@@ -94,18 +94,20 @@ home directory, or environment.
 
 | Product or action | Default location |
 |---|---|
-| Calibration task result bundle | `workspace.output_root / "calibrations"` |
+| Calibration record and optional report | `workspace.output_root / "calibrations"` |
 | MOT-field acquisition | `workspace.output_root / "captures"` |
 | TaskConsole figure export | `workspace.output_root / "figures/task-console"` |
 | DataFigure / FigureViewer export | `workspace.output_root / "figures/data-figure"` |
 | Pulse preview export | `workspace.output_root / "figures/pulses"` |
 
-Each Calibration run folder publishes `calibration.json` last, after its
-original-dtype arrays. It may also contain a human-readable `report/` and
-explicitly requested raw `frames/`. `CalibrationArtifactRef` names that record
-directly; there is no hidden repository, pointer file, CAS, or second manifest.
-MOT reuses the generic Capture artifact and derives its typed FINAL outputs
-statelessly from that capture.
+Each Calibration run folder commits the reloadable `calibration.json` record
+first.  A post-FINAL best-effort export may then add the shared-`zlc_plot`
+`report/*.png` pages and, only when `save_frames` was explicitly selected,
+original-dtype `source_frames.npy` plus `source_frame_validity.npy`.
+`CalibrationArtifactRef` names the record directly; there is no hidden
+repository, pointer file, result-bundle manifest, or CAS. MOT reuses the generic
+Capture artifact and derives its typed FINAL outputs statelessly from that
+capture.
 
 Measurements and processors publish typed live/FINAL signals to the Logic
 tree; they do not silently create arbitrary files.  Save/Export is an explicit

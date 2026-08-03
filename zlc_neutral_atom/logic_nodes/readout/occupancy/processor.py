@@ -25,11 +25,8 @@ from zlc_data import (
     ComponentValidity,
     DataBlock,
     DatasetComponentValidity,
-    DatasetRevisionRef,
     DatasetSchema,
-    IndexSelection,
     OwnedSnapshot,
-    Selection,
     StreamGenerationId,
     ValidityContract,
     Value,
@@ -47,7 +44,6 @@ from zlc_neutral_atom.input_spec import ArtifactInputSpec, DatasetInputSpec
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     ReadoutModel,
     ResolvedCalibration,
-    SiteMap,
     apply_readout_model,
 )
 from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
@@ -111,11 +107,6 @@ def occupancy_artifact_output_name(output: str | None) -> str:
             f"{_COUNTS_OUTPUT_DECLARATION.name!r}"
         )
     return selected
-OCCUPANCY_EXACT_SCAN_OUTPUT_DECLARATIONS = (
-    _COUNTS_OUTPUT_DECLARATION,
-    _OCCUPIED_OUTPUT_DECLARATION,
-)
-OCCUPANCY_SITE_MAP_OUTPUT_DECLARATION = _OCCUPIED_OUTPUT_DECLARATION
 _OCCUPANCY_CONFIG_FORMAT = (
     "zlc_neutral_atom.logic_nodes.readout.occupancy.processor-config"
 )
@@ -770,18 +761,9 @@ def occupancy_rate_snapshot(occupied: OwnedSnapshot) -> OwnedSnapshot:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class OccupancyProcessorEvaluation:
-    """Atomic neutral result for one immutable Camera source revision."""
+    """Atomic typed outputs for one immutable Camera source revision."""
 
     outputs: Mapping[str, LiveDatasetOutput]
-    background_value: Value
-    background_ref: DatasetRevisionRef
-    occupied_value: Value
-    occupied_ref: DatasetRevisionRef
-    selection: Selection
-    logical_point: tuple[int, ...]
-    site_map: SiteMap
-    calibration_ref: CalibrationArtifactRef
-    model_kind: ReadoutModelKind
 
     def __post_init__(self) -> None:
         if not isinstance(self.outputs, Mapping):
@@ -795,57 +777,12 @@ class OccupancyProcessorEvaluation:
             for name, output in outputs.items()
         ):
             raise ValueError("Occupancy outputs must be counts, occupied, and rate")
-        if not isinstance(self.background_value, Value) or not isinstance(
-            self.occupied_value,
-            Value,
-        ):
-            raise TypeError("background_value and occupied_value must be Value")
-        if not isinstance(self.background_ref, DatasetRevisionRef) or not isinstance(
-            self.occupied_ref,
-            DatasetRevisionRef,
-        ):
-            raise TypeError("background_ref and occupied_ref must be DatasetRevisionRef")
-        if not isinstance(self.selection, Selection):
-            raise TypeError("selection must be Selection")
-        logical = tuple(self.logical_point)
-        if any(type(index) is not int or index < 0 for index in logical):
-            raise ValueError("logical_point must contain non-negative integers")
-        if not isinstance(self.site_map, SiteMap) or (
-            self.occupied_value.schema.data_axes != (self.site_map.site_axis,)
-        ):
-            raise ValueError("occupied cell differs from the calibration SiteMap")
-        site_validity = self.occupied_value.validity
-        if not isinstance(site_validity, ComponentValidity) or (
-            site_validity.axis_ids != (self.site_map.site_axis.axis_id,)
-        ):
-            raise ValueError("occupied cell validity must name exactly the SITE axis")
-        if np.any(site_validity.mask & ~self.site_map.validity.mask):
-            raise ValueError("occupied cell admits a calibration-invalid site")
-        if not isinstance(self.calibration_ref, CalibrationArtifactRef) or not isinstance(
-            self.model_kind,
-            ReadoutModelKind,
-        ):
-            raise TypeError("calibration_ref/model_kind have another type")
         snapshots = tuple(output.snapshot for output in outputs.values())
-        if len(
-            {
-                *(snapshot.ref.revision for snapshot in snapshots),
-                self.background_ref.revision,
-                self.occupied_ref.revision,
-            }
-        ) != 1:
+        if len({snapshot.ref.revision for snapshot in snapshots}) != 1:
             raise ValueError("Occupancy outputs do not share one revision")
-        if len({snapshot.ref.stream_generation for snapshot in snapshots}) != 1 or (
-            outputs["occupied"].snapshot.ref != self.occupied_ref
-        ):
-            raise ValueError("Occupancy outputs do not share one generation/cell")
-        # Camera and Occupancy are different streams.  Their generations must
-        # not be used as a same-shot join key; the exact Camera ref/event plus
-        # frozen calibration below is that proof.  The three derived sibling
-        # outputs do, however, form one generation-owned transaction (checked
-        # above).
+        if len({snapshot.ref.stream_generation for snapshot in snapshots}) != 1:
+            raise ValueError("Occupancy outputs do not share one generation")
         object.__setattr__(self, "outputs", MappingProxyType(outputs))
-        object.__setattr__(self, "logical_point", logical)
 
 
 def _evaluate_occupancy_processor(
@@ -877,16 +814,6 @@ def _evaluate_occupancy_processor(
         source_schema.point_table.row_count != 1
     ):
         raise ValueError("Occupancy requires a public Camera frame with R=1 and P=1")
-    point_index = 0
-    logical_point = (
-        source_schema.grid_topology.row_to_cell[point_index]
-        if source_schema.grid_topology is not None
-        else (point_index,)
-    )
-    selection = Selection(
-        (IndexSelection(source_schema.repeat_axis.axis_id, 0),)
-    )
-    reference = calibration.reference
     outputs = {
         declaration.name: LiveDatasetOutput(
             declaration,
@@ -899,18 +826,7 @@ def _evaluate_occupancy_processor(
             strict=True,
         )
     }
-    return OccupancyProcessorEvaluation(
-        outputs,
-        dataset_cell_value(source.block, 0, point_index),
-        source.ref,
-        dataset_cell_value(occupied.block, 0, point_index),
-        occupied.ref,
-        selection,
-        logical_point,
-        calibration.artifact.site_map,
-        reference,
-        model.kind,
-    )
+    return OccupancyProcessorEvaluation(outputs)
 
 
 __all__ = [
@@ -919,11 +835,9 @@ __all__ = [
     "OCCUPANCY_RATE_BLOCK_ID",
     "OCCUPANCY_PROCESSOR_DEFINITION",
     "OCCUPANCY_PROCESSOR_KEY",
-    "OCCUPANCY_EXACT_SCAN_OUTPUT_DECLARATIONS",
     "OCCUPANCY_CAMERA_INPUT_SPEC",
     "OCCUPANCY_CALIBRATION_INPUT_SPEC",
     "OCCUPANCY_LIVE_OUTPUT_DECLARATIONS",
-    "OCCUPANCY_SITE_MAP_OUTPUT_DECLARATION",
     "OccupancyArtifact",
     "OccupancyProcessorConfig",
     "OccupancyProcessorEvaluation",

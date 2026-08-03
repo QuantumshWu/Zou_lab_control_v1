@@ -70,8 +70,8 @@ class LogicNodeEditor(QtWidgets.QWidget):
         # no-eval form).  Every node, including Camera, is driven by its real
         # FormSpec; no camera-only controls are injected by this editor.
         # Acquisition knobs are NOT injected here: a definition declares its own
-        # physical parameters (for example a monitor's history depth), and the
-        # editor renders exactly that form.  Deadlines remain internal Port/Run
+        # physical parameters, and the editor renders exactly that form.
+        # Deadlines remain internal Port/Run
         # mechanics, never generic Measurement inputs invented by the UI.
         self.form = LogicNodeParameterPanel(
             [spec] if spec is not None else [],

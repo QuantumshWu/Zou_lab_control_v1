@@ -9,7 +9,6 @@ from zlc_neutral_atom.input_spec import DatasetInputSpec
 from zlc_neutral_atom.processing.hosted_processor import (
     HostedProcessor,
 )
-from zlc_neutral_atom.processing.signal_plane import SignalPublication
 from zlc_neutral_atom.runtime.hosted_run import HostedRun
 from zlc_workbench.task_console.capability import (
     ConsoleCapabilityAttachment,
@@ -25,11 +24,6 @@ def run_attachment(
     bind_request: Callable[[object, BoundNodeInputs], object],
     prepare: Callable[[object, object | None], object],
     start_prepared: Callable[[object, object, object], object]
-    | None = None,
-    project_signal_presentation: Callable[
-        [object, str, SignalPublication, tuple[SignalPublication, ...]],
-        object | None,
-    ]
     | None = None,
     resolve_artifact_reference: Callable[[object], object] | None = None,
 ) -> ConsoleCapabilityAttachment:
@@ -168,11 +162,7 @@ def run_attachment(
         return node
 
     start_prepared_owner = start_prepared
-    return ConsoleCapabilityAttachment(
-        spec,
-        create_node,
-        project_signal_presentation,
-    )
+    return ConsoleCapabilityAttachment(spec, create_node)
 
 
 def processor_attachment(
@@ -180,11 +170,6 @@ def processor_attachment(
     *,
     bind_request: Callable[[object, BoundNodeInputs], object],
     prepare: Callable[[object], object],
-    project_signal_presentation: Callable[
-        [object, str, SignalPublication, tuple[SignalPublication, ...]],
-        object | None,
-    ]
-    | None = None,
     resolve_artifact_reference: Callable[[object], object] | None = None,
 ) -> ConsoleCapabilityAttachment:
     """Attach a source-driven Processor to the host's internal live lane."""
@@ -193,11 +178,6 @@ def processor_attachment(
         raise TypeError("bind_request must be callable")
     if not callable(prepare):
         raise TypeError("prepare must be callable")
-    if project_signal_presentation is not None and not callable(
-        project_signal_presentation
-    ):
-        raise TypeError("project_signal_presentation must be callable or None")
-
     def materialize_publication(result, source):
         outputs = getattr(result, "outputs", None)
         if not isinstance(outputs, Mapping):
@@ -238,11 +218,7 @@ def processor_attachment(
             request_owner_wake=host.request_owner_wake,
         )
 
-    return ConsoleCapabilityAttachment(
-        spec,
-        create_node,
-        project_signal_presentation,
-    )
+    return ConsoleCapabilityAttachment(spec, create_node)
 
 
 __all__ = ["processor_attachment", "run_attachment"]

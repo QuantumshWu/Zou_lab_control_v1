@@ -9,42 +9,24 @@ from __future__ import annotations
 import ast
 import pathlib
 
-import numpy as np
 import pytest
 
-from zlc_data import (
-    MONITOR_HISTORY,
-    REPEAT,
-    AxisId,
-    AxisSpec,
-    BlockId,
-    DataBlock,
-    DatasetRevision,
-    DatasetSchema,
-    OwnedSnapshot,
-    PointColumn,
-    PointTable,
-    StreamGenerationId,
-    VALID,
-    ValueSchema,
-)
-from zlc_frontend.plot_kind import PlotKind
-from zlc_frontend.plot_panel import plot_panel_input
+from zlc_plot import PlotKind, RollingPlot
 from zlc_workbench.task_console.console_records import (
     DEFAULT_UPDATE_MS,
     PANEL_KINDS,
     UPDATE_INTERVALS,
     PanelConfig,
 )
+from zlc_workbench.task_console.console_state import TaskConsoleState
 
 
 KINDS = (
     PlotKind.IMAGE,
-    PlotKind.SITE_MAP,
     PlotKind.CURVE,
     PlotKind.ROLLING,
     PlotKind.HISTOGRAM,
-    PlotKind.GRID,
+    PlotKind.FACET_GRID,
 )
 DEFAULT = {
     "panel_id": "panel-test",
@@ -57,53 +39,9 @@ DEFAULT = {
 }
 
 
-def _scalar_snapshot(*, rolling: bool) -> OwnedSnapshot:
-    repeat = AxisSpec(AxisId("test.repeat"), "repeat", REPEAT, 1, (0,))
-    history = (
-        AxisSpec(
-            AxisId("test.monitor-history"),
-            "history",
-            MONITOR_HISTORY,
-            2,
-            (0, 1),
-        ),
-    ) if rolling else ()
-    schema = DatasetSchema(
-        repeat,
-        (
-            PointTable(
-                history[0].size,
-                (
-                    PointColumn(
-                        history[0].axis_id,
-                        history[0].name,
-                        history[0].role,
-                        PointColumn.NUMERIC,
-                        history[0].coordinates,
-                        history[0].unit,
-                        history[0].coordinate_frame,
-                    ),
-                ),
-            )
-            if history
-            else PointTable(1)
-        ),
-        None,
-        ValueSchema.scalar(np.dtype("<f8")),
-    )
-    block = DataBlock(
-        BlockId("test-rolling" if rolling else "test-scalar"),
-        DatasetRevision(0),
-        np.zeros(schema.physical_shape, dtype="<f8"),
-        VALID,
-        schema,
-    )
-    return OwnedSnapshot(block.ref(StreamGenerationId("test-generation")), block)
-
-
 def test_a_fresh_panel_is_unbound_for_every_kind() -> None:
     for kind in KINDS:
-        assert PanelConfig(panel_id="panel-test", kind=kind).to_dict() == {
+        assert PanelConfig(panel_id="panel-test", plot=kind).to_dict() == {
             "kind": kind.value,
             **DEFAULT,
         }
@@ -112,10 +50,10 @@ def test_a_fresh_panel_is_unbound_for_every_kind() -> None:
 @pytest.mark.parametrize(
     "kwargs, expected",
     [
-        ({"kind": PlotKind.CURVE, "signal": "cam/frame"}, {"signal": "cam/frame"}),
+        ({"plot": PlotKind.CURVE, "signal": "cam/frame"}, {"signal": "cam/frame"}),
         (
             {
-                "kind": PlotKind.CURVE,
+                "plot": PlotKind.CURVE,
                 "title": "T",
                 "row": 7,
                 "col": 9,
@@ -132,16 +70,44 @@ def test_construction_keeps_the_declared_single_binding(kwargs, expected) -> Non
 
 
 def test_refresh_interval_is_exact_and_invalid_values_fail_closed() -> None:
-    assert PanelConfig(kind=PlotKind.CURVE).update_ms == DEFAULT_UPDATE_MS
-    assert PanelConfig(kind=PlotKind.CURVE, params={"update_ms": 200}).update_ms == 200
+    assert PanelConfig(plot=PlotKind.CURVE).update_ms == DEFAULT_UPDATE_MS
+    assert PanelConfig(plot=PlotKind.CURVE, params={"update_ms": 200}).update_ms == 200
     for invalid in (999, 0, True, "200"):
         with pytest.raises(ValueError):
-            PanelConfig(kind=PlotKind.CURVE, params={"update_ms": invalid}).update_ms
+            PanelConfig(plot=PlotKind.CURVE, params={"update_ms": invalid}).update_ms
 
 
 def test_the_record_round_trips_through_its_codec() -> None:
-    payload = PanelConfig(kind=PlotKind.CURVE, signal="cam/frame").to_dict()
+    payload = PanelConfig(plot=PlotKind.CURVE, signal="cam/frame").to_dict()
     assert PanelConfig.from_dict(payload).to_dict() == payload
+
+
+def test_exact_plot_spec_is_typed_in_memory_and_encoded_only_at_io() -> None:
+    config = PanelConfig(plot=RollingPlot(), signal="cam/frame")
+    assert config.plot == RollingPlot()
+    assert "plot_spec" not in config.params
+    payload = config.to_dict()
+    assert "plot_spec" in payload["params"]
+    restored = PanelConfig.from_dict(payload)
+    assert restored.plot == config.plot
+    assert "plot_spec" not in restored.params
+
+
+def test_console_runtime_copies_typed_plot_without_a_layout_codec_round_trip(
+    monkeypatch,
+) -> None:
+    config = PanelConfig(plot=RollingPlot(), signal="cam/frame")
+
+    def fail_codec(*_args, **_kwargs):
+        raise AssertionError("layout codec entered the in-memory console path")
+
+    monkeypatch.setattr(PanelConfig, "to_dict", fail_codec)
+    monkeypatch.setattr(PanelConfig, "from_dict", fail_codec)
+    state = TaskConsoleState(panels=(config,))
+
+    assert state.panels[0] is not config
+    assert state.panels[0].plot == RollingPlot()
+    assert "plot_spec" not in state.panels[0].params
 
 
 @pytest.mark.parametrize(
@@ -158,7 +124,7 @@ def test_the_record_round_trips_through_its_codec() -> None:
     ],
 )
 def test_invalid_or_obsolete_records_fail_closed(mutate, error) -> None:
-    payload = PanelConfig(kind=PlotKind.CURVE, signal="cam/frame").to_dict()
+    payload = PanelConfig(plot=PlotKind.CURVE, signal="cam/frame").to_dict()
     mutate(payload)
     with pytest.raises(error):
         PanelConfig.from_dict(payload)
@@ -166,24 +132,13 @@ def test_invalid_or_obsolete_records_fail_closed(mutate, error) -> None:
 
 def test_negative_positions_are_never_silently_rewritten() -> None:
     with pytest.raises(ValueError):
-        PanelConfig(kind=PlotKind.CURVE, row=-5)
+        PanelConfig(plot=PlotKind.CURVE, row=-5)
 
 
 def test_only_end_to_end_live_renderers_are_addable() -> None:
     assert tuple(PANEL_KINDS) == KINDS
-    for kind in (PlotKind.METER, PlotKind.PULSE):
-        with pytest.raises(ValueError):
-            PanelConfig(kind=kind)
-
-
-def test_meter_and_monitor_are_distinct_frontend_contracts() -> None:
-    scalar = _scalar_snapshot(rolling=False)
-    history = _scalar_snapshot(rolling=True)
-
-    assert plot_panel_input(PlotKind.METER, scalar).snapshot is scalar
-    assert plot_panel_input(PlotKind.ROLLING, history).snapshot is history
-    with pytest.raises(ValueError, match="use Meter for a scalar dataset"):
-        plot_panel_input(PlotKind.ROLLING, scalar)
+    with pytest.raises(ValueError):
+        PanelConfig(plot=PlotKind.PULSE_TIMELINE)
 
 
 def test_the_record_module_reaches_for_no_toolkit_and_no_renderer() -> None:

@@ -10,8 +10,7 @@ artifacts; persisted identity remains the DefinitionKey and owner codecs.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
-from types import MappingProxyType
+from dataclasses import dataclass
 
 from zlc_neutral_atom.authoring import AuthoringChoice, AuthoringSchema
 from zlc_neutral_atom.artifact_output import ArtifactOutputDeclaration
@@ -27,6 +26,8 @@ from zlc_neutral_atom.input_spec import (
     require_input_specs,
 )
 from zlc_neutral_atom.node_input import BoundNodeInputs
+from zlc_plot.kinds import PlotKind
+from zlc_plot.specs import PlotSpec
 from zlc_storage import canonical_text
 
 
@@ -120,19 +121,16 @@ class ArtifactOutputPresentation:
 
 
 @dataclass(frozen=True, slots=True)
-class DefaultOutputView:
-    """Optional node-owned initial view hint consumed by generic frontends."""
+class TaskPreviewPlot:
+    """One Task-owned output and its typed optional live preview."""
 
     output_name: str
-    kind: str
-    params: Mapping[str, object] = field(default_factory=dict)
+    plot: PlotKind | PlotSpec
 
     def __post_init__(self) -> None:
-        canonical_text(self.output_name, "default output view name")
-        canonical_text(self.kind, "default output view kind")
-        if not isinstance(self.params, Mapping):
-            raise TypeError("default output view params must be a mapping")
-        object.__setattr__(self, "params", MappingProxyType(dict(self.params)))
+        canonical_text(self.output_name, "task preview output name")
+        if not isinstance(self.plot, PlotKind) and not isinstance(self.plot, PlotSpec):
+            raise TypeError("task preview plot must be PlotKind or PlotSpec")
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +146,7 @@ class LogicNodeDeclaration:
     bind_request: Callable[[object, BoundNodeInputs], object] | None
     artifact_outputs: tuple[ArtifactOutputPresentation, ...] = ()
     resolve_outputs: Callable[[object], tuple[OutputPresentation, ...]] | None = None
-    default_views: tuple[DefaultOutputView, ...] = ()
+    task_previews: tuple[TaskPreviewPlot, ...] = ()
     path_presentations: tuple[PathPresentationHint, ...] = ()
     input_path_presentations: tuple[PathPresentationHint, ...] = ()
     resolve_dynamic_choices: (
@@ -204,14 +202,18 @@ class LogicNodeDeclaration:
             raise TypeError("resolve_outputs must be callable or None")
         if dynamic is not None and outputs:
             raise ValueError("static and request-owned outputs are mutually exclusive")
-        views = tuple(self.default_views)
-        if any(not isinstance(value, DefaultOutputView) for value in views):
-            raise TypeError("default_views must contain DefaultOutputView values")
-        if dynamic is not None and views:
-            raise ValueError("request-owned outputs cannot declare static default views")
-        if dynamic is None and any(view.output_name not in names for view in views):
-            raise ValueError("default view names an undeclared output")
-        object.__setattr__(self, "default_views", views)
+        previews = tuple(self.task_previews)
+        if any(not isinstance(value, TaskPreviewPlot) for value in previews):
+            raise TypeError("task_previews must contain TaskPreviewPlot values")
+        if previews and type(self.definition) is not TaskDefinition:
+            raise ValueError("only Task definitions may declare automatic previews")
+        if dynamic is not None and previews:
+            raise ValueError("request-owned outputs cannot declare static previews")
+        if dynamic is None and any(
+            preview.output_name not in names for preview in previews
+        ):
+            raise ValueError("task preview names an undeclared output")
+        object.__setattr__(self, "task_previews", previews)
         authoring_fields = {
             field.key: field for field in self.authoring_schema.fields
         }
@@ -293,9 +295,9 @@ class LogicNodeDeclaration:
 
 __all__ = [
     "ArtifactOutputPresentation",
-    "DefaultOutputView",
     "DynamicChoicePresentation",
     "LogicNodeDeclaration",
     "OutputPresentation",
     "PathPresentationHint",
+    "TaskPreviewPlot",
 ]

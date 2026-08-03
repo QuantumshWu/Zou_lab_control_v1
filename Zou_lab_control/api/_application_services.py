@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Protocol, runtime_checkable
 
-from zlc_data import FitCancelled, StreamGenerationId
+from zlc_data import StreamGenerationId
 from zlc_neutral_atom.devices.sequencer.application import PulseApplicationOwner
 from zlc_neutral_atom.installation import DeviceCatalogView
 from zlc_neutral_atom.installation_config import InstallationConfigDocument
@@ -205,24 +205,6 @@ def application_operation_guard(
                 services.operation_thread_counts[thread_id] = thread_count - 1
             if services.active_operations == 0:
                 services.operations_drained.set()
-
-
-@contextmanager
-def fit_service_guard(
-    services: ExperimentServices,
-) -> Iterator[ExperimentServices]:
-    """Keep the Experiment alive for one long Fit without serializing figures."""
-
-    completed = False
-    with application_operation_guard(services):
-        try:
-            yield services
-            completed = True
-        finally:
-            with services.operation_lock:
-                remained_open = services.state == "OPEN"
-    if completed and not remained_open:
-        raise FitCancelled("Experiment began closing during Fit execution")
 
 
 def open_workbench_handle(
@@ -565,7 +547,6 @@ __all__ = [
     "WorkbenchHandle",
     "application_operation_guard",
     "application_start_run",
-    "fit_service_guard",
     "open_workbench_handle",
     "resolve_role",
     "service_guard",

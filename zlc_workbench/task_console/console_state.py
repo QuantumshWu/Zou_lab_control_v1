@@ -46,13 +46,9 @@ class TaskConsoleState:
         self.name = name
         self.interval_ms = interval_ms
         self.panels = [
-            PanelConfig.from_dict(
-                copy.deepcopy(
-                    panel.to_dict()
-                    if isinstance(panel, PanelConfig)
-                    else panel
-                )
-            )
+            copy.deepcopy(panel)
+            if isinstance(panel, PanelConfig)
+            else PanelConfig.from_dict(copy.deepcopy(panel))
             for panel in (panels or [])
         ]
         panel_ids = tuple(panel.panel_id for panel in self.panels)
@@ -62,13 +58,9 @@ class TaskConsoleState:
         # plot panels so a layout restores the whole dashboard -- nodes always come
         # back STOPPED (the layout records what to build, not a running thread).
         self.logic = [
-            LogicNodeConfig.from_dict(
-                copy.deepcopy(
-                    node.to_dict()
-                    if isinstance(node, LogicNodeConfig)
-                    else node
-                )
-            )
+            copy.deepcopy(node)
+            if isinstance(node, LogicNodeConfig)
+            else LogicNodeConfig.from_dict(copy.deepcopy(node))
             for node in (logic or [])
         ]
         node_ids = tuple(node.node_id for node in self.logic)

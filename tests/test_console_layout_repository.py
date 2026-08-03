@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from zlc_neutral_atom.catalog import DefinitionKey, definition_key_to_tree
-from zlc_frontend.plot_kind import PlotKind
+from zlc_plot import PlotKind
 from zlc_workbench.task_console.console_records import (
     CONSOLE_STATE_SCHEMA,
     LogicNodeConfig,
@@ -37,7 +37,7 @@ def _state() -> TaskConsoleState:
         panels=[
             PanelConfig(
                 panel_id="panel-main",
-                kind=PlotKind.CURVE,
+                plot=PlotKind.CURVE,
                 signal="cam/frame",
             )
         ],

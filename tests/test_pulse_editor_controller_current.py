@@ -287,50 +287,45 @@ def test_preview_completion_publishes_only_preview_surface():
         _pump_until(controller, lambda value: value.runtime_update().close_complete)
 
 
-def test_preview_worker_uses_document_identity_and_latest_presentation_revision():
+def test_preview_worker_publishes_latest_typed_plot_projection_only():
     controller = _controller()
     try:
         controller.request_preview()
         _pump_until(
             controller,
-            lambda value: value.preview_update().rendered_preview is not None,
+            lambda value: value.preview_update().plot is not None,
         )
-        first = controller.preview_update().rendered_preview
+        first = controller.preview_update().plot
         assert first is not None
-        assert first.payload.document_input.document_revision == 0
-        assert first.payload.document_input.content_digest == first.timeline.fingerprint
-        assert first.presentation_revision == 0
-        assert not hasattr(first.payload, "evaluated_input")
+        assert first.editor_revision == 0
+        assert not first.include_off_rows
+        assert first.spec.labels.title == first.timeline.title
+        assert not hasattr(first, "raster")
+        assert not hasattr(first, "payload")
 
         controller.set_preview_include_off(True)
         _pump_until(
             controller,
-            lambda value: value.preview_update().rendered_preview is not None
-            and value.preview_update().rendered_preview.presentation_revision == 1,
+            lambda value: value.preview_update().plot is not None
+            and value.preview_update().plot.include_off_rows,
         )
-        second = controller.preview_update().rendered_preview
+        second = controller.preview_update().plot
         assert second is not None
         assert second.timeline is not first.timeline
         assert second.timeline.fingerprint == first.timeline.fingerprint
         assert "all channels" in second.status
-        assert len(second.payload.row_keys) >= len(first.payload.row_keys)
+        assert len(second.data.channels) >= len(first.data.channels)
+        assert second.recommended_size
 
-        viewport = second.payload.viewport
-        low, high = viewport.home_x_limits
-        span = high - low
-        controller.commit_preview_view(
-            (low + 0.2 * span, high - 0.2 * span),
-            presentation_revision=2,
-        )
+        controller.set_preview_include_off(False)
         _pump_until(
             controller,
-            lambda value: value.preview_update().rendered_preview is not None
-            and value.preview_update().rendered_preview.presentation_revision == 2,
+            lambda value: value.preview_update().plot is not None
+            and not value.preview_update().plot.include_off_rows,
         )
-        third = controller.preview_update().rendered_preview
+        third = controller.preview_update().plot
         assert third is not None
-        assert third.payload.viewport.x_limits != third.payload.viewport.home_x_limits
-        assert third.payload.document_input == second.payload.document_input
+        assert third.data == first.data
     finally:
         controller.request_close()
         _pump_until(controller, lambda value: value.runtime_update().close_complete)
@@ -377,33 +372,6 @@ def test_editor_file_state_distinguishes_loaded_from_saved(tmp_path: Path):
     assert loaded.file_state == "loaded"
     loaded.replace_document(loaded.document)
     assert loaded.file_state == "loaded"
-
-
-def test_preview_manual_size_is_transient_and_reset_on_reentry():
-    controller = _controller()
-    try:
-        controller.set_preview_size("4x4")
-        _pump_until(
-            controller,
-            lambda value: value.preview_update().rendered_preview is not None
-            and value.preview_update().rendered_preview.size == "4x4",
-        )
-        pinned = controller.preview_update().rendered_preview
-        assert pinned is not None
-
-        controller.reset_preview_size()
-        _pump_until(
-            controller,
-            lambda value: value.preview_update().rendered_preview is not None
-            and value.preview_update().rendered_preview.presentation_revision
-            > pinned.presentation_revision,
-        )
-        automatic = controller.preview_update().rendered_preview
-        assert automatic is not None
-        assert automatic.size != "4x4"
-    finally:
-        controller.request_close()
-        _pump_until(controller, lambda value: value.runtime_update().close_complete)
 
 
 def test_borrowed_experiment_retirement_detaches_before_runtime_timer_poll():

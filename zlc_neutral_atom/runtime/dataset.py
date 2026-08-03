@@ -29,9 +29,7 @@ from zlc_data import (
     DatasetSchema,
     Invalid,
     OwnedSnapshot,
-    MONITOR_HISTORY,
     PointTable,
-    READOUT_EVENT,
     StreamGenerationId,
     REPEAT,
     Valid,
@@ -245,50 +243,6 @@ class DatasetCellKeyContract:
         if key.point_ordinal >= self.point_table.row_count:
             raise IndexError("join key point ordinal is outside PointTable")
         return DatasetCellAddress(key.repeat_index, key.point_ordinal)
-
-
-def _append_window_geometry(point_table: PointTable) -> tuple[int, int]:
-    """Validate the explicit history/event row contract used by append windows."""
-
-    columns = point_table.columns
-    if len(columns) not in (1, 2) or columns[0].role != MONITOR_HISTORY:
-        raise DatasetError(
-            "append_window requires MONITOR_HISTORY rows, optionally paired "
-            "with one READOUT_EVENT column"
-        )
-    if len(columns) == 2 and columns[1].role != READOUT_EVENT:
-        raise DatasetError(
-            "append_window's second point column must be READOUT_EVENT"
-        )
-    history = columns[0].values
-    if len(columns) == 1:
-        if history != tuple(range(point_table.row_count)):
-            raise DatasetError(
-                "append_window MONITOR_HISTORY values must be authored slot ordinals"
-            )
-        return point_table.row_count, 1
-
-    group_size = 0
-    while group_size < len(history) and history[group_size] == 0:
-        group_size += 1
-    if group_size == 0 or point_table.row_count % group_size:
-        raise DatasetError("append_window history/event rows are not rectangular groups")
-    history_slots = point_table.row_count // group_size
-    expected_history = tuple(
-        slot for slot in range(history_slots) for _event in range(group_size)
-    )
-    event_template = columns[1].values[:group_size]
-    expected_events = event_template * history_slots
-    if (
-        history != expected_history
-        or any(value is None for value in event_template)
-        or len(set(event_template)) != group_size
-        or columns[1].values != expected_events
-    ):
-        raise DatasetError(
-            "append_window rows must be ordered history-slot by readout-event"
-        )
-    return history_slots, group_size
 
 
 _DATASET_CELL_SCHEDULE_TOKEN = object()
@@ -1392,8 +1346,8 @@ class ExactDatasetPreviewReader:
 
 
 @dataclass(frozen=True, slots=True, eq=False)
-class _AppendWindowReplacement(Generic[PayloadT]):
-    """Fully written append-window shadow awaiting one authoritative envelope."""
+class _LatestCellReplacement(Generic[PayloadT]):
+    """Fully written latest-cell shadow awaiting one authoritative envelope."""
 
     payload: PayloadT
     base_revision: int
@@ -1420,14 +1374,24 @@ class MonitorDataset(Generic[PayloadT]):
         return cls(block_id, source, edge)
 
     @classmethod
-    def append_window(
+    def latest_cell(
         cls,
         block_id: BlockId,
         source: MonitorTap[PayloadT],
         edge: FrozenDatasetEdge[PayloadT],
     ) -> "MonitorDataset[PayloadT]":
         if edge.cell_schedule is not None:
-            raise DatasetError("append_window requires a schedule-free dataset edge")
+            raise DatasetError("latest_cell requires a schedule-free dataset edge")
+        schema = edge.schema
+        if (
+            schema.repeat_axis.size != 1
+            or schema.point_table != PointTable(1)
+            or schema.grid_topology is not None
+        ):
+            raise DatasetError(
+                "latest_cell requires canonical single-cell storage "
+                "(R=1, P=1, no point columns or grid topology)"
+            )
         return cls(block_id, source, edge)
 
     def __init__(
@@ -1450,16 +1414,16 @@ class MonitorDataset(Generic[PayloadT]):
         self._cycle_schedule = edge.cell_schedule
         if self._cycle_schedule is None:
             edge.validate_payload_stream(self._source)
-            if self.schema.repeat_axis.size != 1:
-                raise DatasetError("append_window requires a single repeat storage row")
-            (
-                self._append_history_slots,
-                self._append_group_size,
-            ) = _append_window_geometry(self.schema.point_table)
+            if (
+                self.schema.repeat_axis.size != 1
+                or self.schema.point_table != PointTable(1)
+                or self.schema.grid_topology is not None
+            ):
+                raise DatasetError(
+                    "schedule-free MonitorDataset requires latest-cell geometry"
+                )
         else:
             edge.validate_stream(self._source)
-            self._append_history_slots = 0
-            self._append_group_size = 0
         self.stream_id = self._source.stream_id
         self.generation = self._source.generation
         total_cells = self.schema.repeat_axis.size * self.schema.point_table.row_count
@@ -1478,18 +1442,9 @@ class MonitorDataset(Generic[PayloadT]):
             self._revision = 0
             self._last_sequence: int | None = None
             self._missed_events = 0
+            self._current_gap = False
             self._head: EventRef | None = None
-            self._next_slot = 0
-            self._count = 0
-            self._append_group: list[
-                tuple[
-                    Envelope[PayloadT],
-                    Value,
-                    np.ndarray | bool,
-                    object | None,
-                ]
-            ] = []
-            self._append_replacement: _AppendWindowReplacement[PayloadT] | None = None
+            self._latest_replacement: _LatestCellReplacement[PayloadT] | None = None
             self._aborted = False
         except BaseException:
             source.close()
@@ -1507,9 +1462,9 @@ class MonitorDataset(Generic[PayloadT]):
     def ingest_next(self, timeout: float | None = None) -> DatasetRevisionRef:
         with self._consume_lock:
             with self._lock:
-                if self._append_replacement is not None:
+                if self._latest_replacement is not None:
                     raise DatasetError(
-                        "ordinary monitor ingest cannot consume a staged append replacement"
+                        "ordinary monitor ingest cannot consume a staged latest-cell replacement"
                     )
             update = self._monitor._next_for(self, timeout)
             return self._ingest(update)
@@ -1525,7 +1480,7 @@ class MonitorDataset(Generic[PayloadT]):
         ``expected_event_ref`` binds the materialized head to the producer's
         already accepted exact envelope; it is checked before and after the
         atomic write.  ``account_skipped_events=False`` is legal only for a
-        single-cell append view whose omitted events were explicitly selected
+        single-cell latest view whose omitted events were explicitly selected
         out by that same producer.
         """
 
@@ -1538,16 +1493,13 @@ class MonitorDataset(Generic[PayloadT]):
             raise TypeError("expected_event_ref must be EventRef or None")
         with self._consume_lock:
             with self._lock:
-                if self._append_replacement is not None:
+                if self._latest_replacement is not None:
                     raise DatasetError(
-                        "ordinary monitor ingest cannot consume a staged append replacement"
+                        "ordinary monitor ingest cannot consume a staged latest-cell replacement"
                     )
-                if not account_skipped_events and (
-                    self._cycle_schedule is not None
-                    or self._append_group_size != 1
-                ):
+                if not account_skipped_events and self._cycle_schedule is not None:
                     raise DatasetError(
-                        "intentional source selection requires a scalar append window"
+                        "intentional source selection requires a latest-cell monitor"
                     )
             update = self._monitor._latest_for(self)
             if (
@@ -1569,11 +1521,11 @@ class MonitorDataset(Generic[PayloadT]):
                         )
             return revision
 
-    def prepare_append_replacement(
+    def prepare_latest_cell_replacement(
         self,
         payload: PayloadT,
-    ) -> _AppendWindowReplacement[PayloadT]:
-        """Write every fallible part of one fresh append window before publish.
+    ) -> _LatestCellReplacement[PayloadT]:
+        """Write every fallible part of one latest cell before stream publish.
 
         The returned private token is not a stream event.  Until a matching
         authoritative envelope is committed, the existing materialization and
@@ -1585,14 +1537,10 @@ class MonitorDataset(Generic[PayloadT]):
                 self._ensure_writable_locked()
                 if self._cycle_schedule is not None:
                     raise DatasetError(
-                        "prepare_append_replacement requires an append window"
+                        "prepare_latest_cell_replacement requires latest-cell storage"
                     )
-                if self._append_group_size != 1:
-                    raise DatasetError(
-                        "append replacement does not apply to grouped readout windows"
-                    )
-                if self._append_replacement is not None:
-                    raise DatasetError("append replacement is already pending")
+                if self._latest_replacement is not None:
+                    raise DatasetError("latest-cell replacement is already pending")
 
                 contract = self.edge.payload_contract
                 owned_payload = contract.snapshot(payload)
@@ -1620,7 +1568,7 @@ class MonitorDataset(Generic[PayloadT]):
                     validity,
                 )
                 cell_metadata[0] = metadata
-                replacement = _AppendWindowReplacement(
+                replacement = _LatestCellReplacement(
                     owned_payload,
                     self._revision,
                     0 if self._last_sequence is None else self._last_sequence + 1,
@@ -1630,25 +1578,25 @@ class MonitorDataset(Generic[PayloadT]):
                     cell_metadata,
                     event_refs,
                 )
-                self._append_replacement = replacement
+                self._latest_replacement = replacement
                 return replacement
 
-    def abort_append_replacement(
+    def abort_latest_cell_replacement(
         self,
-        replacement: _AppendWindowReplacement[PayloadT],
+        replacement: _LatestCellReplacement[PayloadT],
     ) -> None:
-        """Discard exactly one unpublished replacement without touching history."""
+        """Discard one unpublished replacement without touching the current cell."""
 
         with self._consume_lock:
             with self._lock:
                 self._ensure_writable_locked()
-                if self._append_replacement is not replacement:
-                    raise DatasetError("append replacement token is not pending")
-                self._append_replacement = None
+                if self._latest_replacement is not replacement:
+                    raise DatasetError("latest-cell replacement token is not pending")
+                self._latest_replacement = None
 
-    def commit_append_replacement(
+    def commit_latest_cell_replacement(
         self,
-        replacement: _AppendWindowReplacement[PayloadT],
+        replacement: _LatestCellReplacement[PayloadT],
         envelope: Envelope[PayloadT],
         *,
         timeout: float | None = 0.0,
@@ -1662,38 +1610,38 @@ class MonitorDataset(Generic[PayloadT]):
         """
 
         if not isinstance(envelope, Envelope):
-            raise TypeError("append replacement envelope must be Envelope")
+            raise TypeError("latest-cell replacement envelope must be Envelope")
         with self._consume_lock:
             with self._lock:
                 self._ensure_writable_locked()
-                if self._append_replacement is not replacement:
-                    raise DatasetError("append replacement token is not pending")
+                if self._latest_replacement is not replacement:
+                    raise DatasetError("latest-cell replacement token is not pending")
             try:
                 update = self._monitor._next_for(self, timeout)
                 with self._lock:
                     self._ensure_writable_locked()
-                    if self._append_replacement is not replacement:
-                        raise DatasetError("append replacement changed during commit")
+                    if self._latest_replacement is not replacement:
+                        raise DatasetError("latest-cell replacement changed during commit")
                     if update.envelope is not envelope:
                         raise DatasetError(
-                            "append replacement consumed another stream envelope"
+                            "latest-cell replacement consumed another stream envelope"
                         )
                     self._validate_envelope_identity_locked(envelope)
                     if envelope.payload is not replacement.payload:
                         raise DatasetError(
-                            "append replacement published another owned payload"
+                            "latest-cell replacement published another owned payload"
                         )
                     if envelope.sequence != replacement.expected_sequence:
                         raise DatasetError(
-                            "append replacement sequence differs from its staged watermark"
+                            "latest-cell replacement sequence differs from its staged watermark"
                         )
                     if update.missed != 0:
                         raise DatasetError(
-                            "append replacement requires ordered monitor delivery"
+                            "latest-cell replacement requires ordered monitor delivery"
                         )
                     if self._revision != replacement.base_revision:
                         raise DatasetError(
-                            "append replacement base revision changed before commit"
+                            "latest-cell replacement base revision changed before commit"
                         )
 
                     replacement.event_refs[0] = envelope.ref
@@ -1702,18 +1650,16 @@ class MonitorDataset(Generic[PayloadT]):
                     self._validity = replacement.validity
                     self._cell_metadata = replacement.cell_metadata
                     self._event_refs = replacement.event_refs
-                    history_slots = self._append_history_slots
-                    self._next_slot = 1 % history_slots
-                    self._count = 1
                     self._missed_events = 0
+                    self._current_gap = False
                     self._last_sequence = envelope.sequence
                     self._head = envelope.ref
                     self._revision += 1
-                    self._append_replacement = None
+                    self._latest_replacement = None
             except BaseException:
                 with self._lock:
-                    if self._append_replacement is replacement:
-                        self._append_replacement = None
+                    if self._latest_replacement is replacement:
+                        self._latest_replacement = None
                 raise
 
     def _ingest(
@@ -1725,6 +1671,23 @@ class MonitorDataset(Generic[PayloadT]):
         envelope = update.envelope
         value, metadata = _project_payload(self.edge, envelope.payload)
         validity_mask = _value_validity_mask(self.schema, value.validity)
+        latest_state = None
+        if self._cycle_schedule is None:
+            values = np.zeros(
+                self.schema.physical_shape,
+                dtype=self.schema.cell_schema.dtype,
+            )
+            written = np.zeros(self.schema.physical_shape[:2], dtype=bool)
+            validity = _new_validity_storage(self.schema)
+            _write_cell(
+                (0, 0),
+                value,
+                validity_mask,
+                values,
+                written,
+                validity,
+            )
+            latest_state = (values, written, validity)
         with self._lock:
             self._ensure_writable_locked()
             self._validate_envelope_identity_locked(envelope)
@@ -1737,69 +1700,17 @@ class MonitorDataset(Generic[PayloadT]):
                 )
             sequence_gap = envelope.sequence - expected_sequence
             if self._cycle_schedule is None:
-                if self._append_group_size > 1:
-                    if sequence_gap > 0 or update.missed > 0:
-                        self._append_group.clear()
-                        self._missed_events += max(update.missed, sequence_gap)
-                        self._last_sequence = envelope.sequence
-                        raise DatasetError(
-                            "grouped monitor lost an event; READOUT_EVENT phase is unknown"
-                        )
-                    self._append_group.append(
-                        (envelope, value, validity_mask, metadata)
-                    )
-                    self._last_sequence = envelope.sequence
-                    if len(self._append_group) < self._append_group_size:
-                        return self._ref_locked(self._revision)
-                    if len(self._append_group) != self._append_group_size:
-                        raise DatasetError(
-                            "grouped monitor accumulated too many readout events"
-                        )
-                    next_slot = self._next_slot
-                    for event_index, (
-                        grouped_envelope,
-                        grouped_value,
-                        grouped_validity,
-                        grouped_metadata,
-                    ) in enumerate(self._append_group):
-                        point_index = (
-                            next_slot * self._append_group_size + event_index
-                        )
-                        cell = (0, point_index)
-                        _write_cell(
-                            cell,
-                            grouped_value,
-                            grouped_validity,
-                            self._values,
-                            self._written,
-                            self._validity,
-                        )
-                        self._cell_metadata[point_index] = grouped_metadata
-                        self._event_refs[point_index] = grouped_envelope.ref
-                    self._append_group.clear()
-                    self._next_slot = (
-                        next_slot + 1
-                    ) % self._append_history_slots
-                    self._count = min(
-                        self._count + 1,
-                        self._append_history_slots,
-                    )
-                    self._head = envelope.ref
-                    self._revision += 1
-                    return self._ref_locked(self._revision)
-                values = self._values
-                written = self._written
-                validity = self._validity
-                cell_metadata = self._cell_metadata
-                event_refs = self._event_refs
-                next_slot = self._next_slot
-                count = self._count
-                missed_events = self._missed_events + (
+                assert latest_state is not None
+                values, written, validity = latest_state
+                cell_metadata = [metadata]
+                event_refs = [envelope.ref]
+                missed_now = (
                     max(update.missed, sequence_gap)
                     if account_skipped_events
                     else 0
                 )
-                cell = (0, next_slot)
+                missed_events = self._missed_events + missed_now
+                current_gap = missed_now > 0
             else:
                 offset = envelope.sequence % len(self._cycle_schedule)
                 expected_address = self._cycle_schedule.cell_at(offset)
@@ -1824,21 +1735,24 @@ class MonitorDataset(Generic[PayloadT]):
                     update.missed,
                     sequence_gap,
                 )
-            _write_cell(
-                cell,
-                value,
-                validity_mask,
-                values,
-                written,
-                validity,
-            )
-            flat_cell = cell[0] * self.schema.point_table.row_count + cell[1]
-            cell_metadata[flat_cell] = metadata
-            event_refs[flat_cell] = envelope.ref
+                _write_cell(
+                    cell,
+                    value,
+                    validity_mask,
+                    values,
+                    written,
+                    validity,
+                )
+                flat_cell = cell[0] * self.schema.point_table.row_count + cell[1]
+                cell_metadata[flat_cell] = metadata
+                event_refs[flat_cell] = envelope.ref
             if self._cycle_schedule is None:
-                history_slots = self._append_history_slots
-                self._next_slot = (next_slot + 1) % history_slots
-                self._count = min(count + 1, history_slots)
+                self._values = values
+                self._written = written
+                self._validity = validity
+                self._cell_metadata = cell_metadata
+                self._event_refs = event_refs
+                self._current_gap = current_gap
             self._missed_events = missed_events
             self._last_sequence = envelope.sequence
             self._head = envelope.ref
@@ -1858,25 +1772,11 @@ class MonitorDataset(Generic[PayloadT]):
 
         with self._lock:
             selected = self._select_current_ref_locked(ref)
-            if self._cycle_schedule is None:
-                order = self._append_order_locked()
-                canonical = tuple(range(self.schema.point_table.row_count))
-                if order == canonical:
-                    values = self._values
-                    written = self._written
-                    validity = self._validity
-                else:
-                    values = self._values[:, order, ...]
-                    written = self._written[:, order]
-                    validity = self._validity[:, order, ...]
-                metadata = tuple(self._cell_metadata[index] for index in order)
-                event_refs = tuple(self._event_refs[index] for index in order)
-            else:
-                values = self._values
-                written = self._written
-                validity = self._validity
-                metadata = tuple(self._cell_metadata)
-                event_refs = tuple(self._event_refs)
+            values = self._values
+            written = self._written
+            validity = self._validity
+            metadata = tuple(self._cell_metadata)
+            event_refs = tuple(self._event_refs)
             block = DataBlock(
                 block_id=self.block_id,
                 revision=selected.revision,
@@ -1886,7 +1786,7 @@ class MonitorDataset(Generic[PayloadT]):
             )
             return MonitorDatasetSnapshot(
                 snapshot=OwnedSnapshot(selected, block),
-                coverage=self._coverage_locked(written, event_refs),
+                coverage=self._coverage_locked(written),
                 cell_metadata=metadata,
                 event_refs=event_refs,
                 head=self._head,
@@ -1895,8 +1795,7 @@ class MonitorDataset(Generic[PayloadT]):
     def close(self) -> None:
         with self._lock:
             self._aborted = True
-            self._append_group.clear()
-            self._append_replacement = None
+            self._latest_replacement = None
         self._monitor.close()
 
     def __enter__(self) -> "MonitorDataset":
@@ -1910,22 +1809,6 @@ class MonitorDataset(Generic[PayloadT]):
         )
         return False
 
-    def _append_order_locked(self) -> tuple[int, ...]:
-        history_slots = self._append_history_slots
-        used = tuple(
-            (self._next_slot - 1 - age) % history_slots
-            for age in range(self._count)
-        )
-        used_set = set(used)
-        slots = used + tuple(
-            slot for slot in range(history_slots) if slot not in used_set
-        )
-        return tuple(
-            slot * self._append_group_size + event_index
-            for slot in slots
-            for event_index in range(self._append_group_size)
-        )
-
     def _clear_locked(self) -> None:
         self._values.fill(0)
         self._written.fill(False)
@@ -1936,21 +1819,14 @@ class MonitorDataset(Generic[PayloadT]):
     def _coverage_locked(
         self,
         written: np.ndarray,
-        event_refs: tuple[EventRef | None, ...],
     ) -> MonitorCoverage:
-        current_gap = False
-        if self._cycle_schedule is None:
-            retained = tuple(reference for reference in event_refs if reference is not None)
-            retained = tuple(sorted(retained, key=lambda reference: reference.sequence))
-            current_gap = any(
-                newer.sequence != older.sequence + 1
-                for older, newer in zip(retained, retained[1:])
-            )
         return MonitorCoverage(
             written_cells=int(np.count_nonzero(written)),
             total_cells=int(written.size),
             missed_events=self._missed_events,
-            current_gap=current_gap,
+            current_gap=(
+                self._current_gap if self._cycle_schedule is None else False
+            ),
         )
 
     def _ensure_writable_locked(self) -> None:

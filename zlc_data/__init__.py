@@ -3,7 +3,6 @@
 from .axis import (
     COMPONENT,
     HISTOGRAM_BIN,
-    MONITOR_HISTORY,
     READOUT_EVENT,
     REPEAT,
     SCALAR,
@@ -19,19 +18,6 @@ from .axis import (
     AxisSpec,
     CoordinateFrameId,
     CoordinateScalar,
-)
-from .fit import (
-    FitBatchStatus,
-    FitCancelled,
-    FitDeadlineExceeded,
-    FitModelDefinition,
-    FitNumericPolicy,
-    FitParameterConstraint,
-    FitParameterDefinition,
-    FitParameterDomain,
-    FitResultBatch,
-    FitSpec,
-    ParameterUnitRelation,
 )
 from .schema import (
     DatasetSchema,
@@ -78,6 +64,11 @@ from .value import (
     Value,
     ValuePayloadContract,
 )
+from .snapshot_projection import (
+    materialize_derived_dataset,
+    materialize_scalar_dataset,
+    materialize_value_dataset,
+)
 
 __all__ = [
     "AxisId",
@@ -98,16 +89,6 @@ __all__ = [
     "DatasetRevision",
     "DatasetRevisionRef",
     "DatasetSchema",
-    "FitBatchStatus",
-    "FitCancelled",
-    "FitDeadlineExceeded",
-    "FitModelDefinition",
-    "FitNumericPolicy",
-    "FitParameterConstraint",
-    "FitParameterDefinition",
-    "FitParameterDomain",
-    "FitResultBatch",
-    "FitSpec",
     "GridTopology",
     "HISTOGRAM_BIN",
     "HISTOGRAM_BIN_AXIS_ID",
@@ -116,10 +97,8 @@ __all__ = [
     "IndexRangeSelection",
     "IndexSelection",
     "Invalid",
-    "MONITOR_HISTORY",
     "MissingPolicy",
     "OwnedSnapshot",
-    "ParameterUnitRelation",
     "PointColumn",
     "PointTable",
     "READOUT_EVENT",
@@ -144,4 +123,7 @@ __all__ = [
     "Value",
     "ValuePayloadContract",
     "ValueSchema",
+    "materialize_derived_dataset",
+    "materialize_value_dataset",
+    "materialize_scalar_dataset",
 ]

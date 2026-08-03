@@ -1,7 +1,5 @@
-"""Interactive DataFigure Workbench application.
+"""Standalone archive and Qt shell for the single :mod:`zlc_plot` runtime.
 
-Import the explicit ``fit_contract``, ``local_fit``, ``worker_jobs``,
-``window``, or ``app`` leaf that owns the required responsibility.  Headless
-Figure presentation contracts live in :mod:`zlc_frontend.data_figure_presentation`;
-the package root stays Qt-free.
+The package root remains Qt-free.  Use :mod:`.archive_io` for persisted frozen
+snapshots and :mod:`.app` for the formal product entry.
 """

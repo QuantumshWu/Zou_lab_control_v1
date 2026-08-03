@@ -13,9 +13,10 @@ from collections.abc import Sequence
 from PyQt5 import QtGui, QtWidgets
 
 from .console_records import PanelConfig
-from zlc_frontend import board_layout as _layout
+import zlc_frontend.board_layout as _layout
 from zlc_frontend.qt_widgets import CARD_PAD, CARD_TITLE_PX, SURFACE, scaled_px
-from zlc_frontend.render_style import panel_display_size
+from zlc_plot import DEFAULTS, PlotKind
+from zlc_plot.layout import resolve_surface
 
 
 GRID_UNIT = 8
@@ -25,13 +26,19 @@ GAP = GRID_UNIT
 def card_size(size: str) -> tuple[int, int]:
     """Convert one declared panel-size preset to its exact card pixels."""
 
-    # FigureSpec owns the complete logical panel size, including its fixed
-    # margins.  Wider presets share those margins rather than repeating a
-    # whole 1x2 card, so multiplying a nominal cell stretches the Qt surface
-    # beyond the worker raster (1x4 is 816 px, not two 480 px plots).  The
-    # board packer already accepts arbitrary rectangles; the card therefore
-    # wraps the exact authored panel width and nothing else.
-    panel_width, panel_height = panel_display_size(size)
+    # zlc_plot's shared layout/style resolution owns the complete logical
+    # surface size, including its fixed margins.  Wider presets share those
+    # margins rather than repeating a whole 1x2 card, so multiplying a nominal
+    # cell stretches the Qt surface beyond the worker raster (1x4 is 816 px,
+    # not two 480 px plots).  The board packer already accepts arbitrary
+    # rectangles; the card therefore wraps the exact resolved width and
+    # nothing else.
+    panel_width, panel_height = resolve_surface(
+        size,
+        PlotKind.CURVE,
+        layout=DEFAULTS.layout,
+        style=DEFAULTS.style,
+    ).logical_size
     width = panel_width + 2 * CARD_PAD
     height = (
         scaled_px(CARD_TITLE_PX)

@@ -51,10 +51,11 @@ class _LiveView:
         self.terminal = True
 
 
-def _start_one_live_frame(exp, *, exposure):
+def _start_one_live_cycle(exp, *, exposure, frames_per_cycle: int = 1):
     request = exp.nodes.camera_measurement.camera_measurement_request(
         camera_role="mot_camera",
         exposure=exposure,
+        frames_per_cycle=frames_per_cycle,
     )
     prepared = exp.nodes.camera_measurement.prepare_camera_measurement(request)
     assert isinstance(prepared, PreparedLiveCameraMeasurement)
@@ -71,12 +72,19 @@ def _start_one_live_frame(exp, *, exposure):
     assert view.failure is None
     assert view.dataset is not None
     frozen = view.dataset.freeze_current()
-    assert frozen.coverage.written_cells >= 1
+    assert frozen.coverage.written_cells == frozen.coverage.total_cells == 1
     outputs = prepared.live_dataset_outputs(frozen)
-    frame = outputs["frame_0"].snapshot
-    assert frame.block.schema.physical_shape[:2] == (1, 1)
-    assert frame.block.schema.cell_schema == frozen.snapshot.block.schema.cell_schema
-    assert frame.block.values.dtype == frozen.snapshot.block.values.dtype
+    assert tuple(outputs) == tuple(
+        f"frame_{index}" for index in range(frames_per_cycle)
+    )
+    for output in outputs.values():
+        frame = output.snapshot
+        assert frame.block.schema.physical_shape[:2] == (1, 1)
+        assert frame.block.schema.point_table.columns == ()
+        assert frame.block.schema.cell_schema.data_axes == (
+            frozen.snapshot.block.schema.cell_schema.data_axes[1:]
+        )
+        assert frame.block.values.dtype == frozen.snapshot.block.values.dtype
     handle.cancel("exposure test complete")
     terminal = handle.wait(5.0)
     assert terminal.state.terminal, terminal
@@ -88,10 +96,10 @@ def test_live_camera_applies_and_restores_requested_exposure(tmp_path) -> None:
         "virtual",
         workspace=_workspace(tmp_path / "workspace"),
     ) as exp:
-        _start_one_live_frame(exp, exposure=0.013)
+        _start_one_live_cycle(exp, exposure=0.013, frames_per_cycle=3)
         # A second baseline run executes the endpoint's unchanged-working-point
         # check.  It can succeed only if cleanup restored the installed exposure.
-        _start_one_live_frame(exp, exposure=None)
+        _start_one_live_cycle(exp, exposure=None)
 
 
 def _run_finite_camera(exp, *, exposure, pulse_request):

@@ -12,7 +12,6 @@ from ._arrays import canonical_dtype
 from .axis import (
     _POINT_ORDINAL_AXIS_ID,
     HISTOGRAM_BIN,
-    MONITOR_HISTORY,
     READOUT_EVENT,
     SCAN_POINT,
     SITE,
@@ -53,7 +52,6 @@ _POINT_ROLES = frozenset(
     {
         SCAN_POINT,
         READOUT_EVENT,
-        MONITOR_HISTORY,
         SPATIAL_X,
         SPATIAL_Y,
         SPECTRAL,

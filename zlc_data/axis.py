@@ -72,7 +72,6 @@ class CoordinateFrameId:
 REPEAT = AxisRoleId("repeat")
 SCAN_POINT = AxisRoleId("scan-point")
 READOUT_EVENT = AxisRoleId("readout-event")
-MONITOR_HISTORY = AxisRoleId("monitor-history")
 SPATIAL_X = AxisRoleId("spatial-x")
 SPATIAL_Y = AxisRoleId("spatial-y")
 SPECTRAL = AxisRoleId("spectral")

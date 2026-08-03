@@ -13,7 +13,6 @@ from zlc_neutral_atom.logic_node_declaration import (
     LogicNodeDeclaration,
     PathPresentationHint,
 )
-from zlc_neutral_atom.processing.signal_plane import SignalPublication
 from .input_binding import ResolvedArtifactInput, project_input_fields
 from zlc_workbench.task_console.attachment_builders import (
     processor_attachment,
@@ -165,11 +164,6 @@ def project_run_declaration(
     editor_builder: Callable[[object], tuple[object, Callable[..., object]]]
     | None = None,
     path_roots=None,
-    project_signal_presentation: Callable[
-        [object, str, SignalPublication, tuple[SignalPublication, ...]],
-        object | None,
-    ]
-    | None = None,
 ):
     """Build the common finite-run attachment for one declaration."""
 
@@ -189,7 +183,6 @@ def project_run_declaration(
         bind_request=request_binder,
         prepare=prepare,
         start_prepared=start_prepared,
-        project_signal_presentation=project_signal_presentation,
         resolve_artifact_reference=_artifact_resolver(
             declaration,
             resolve_artifact_reference=resolve_artifact_reference,
@@ -202,11 +195,6 @@ def project_processor_declaration(
     *,
     prepare: Callable[[object], object],
     bind_request: Callable[[object, object], object] | None = None,
-    project_signal_presentation: Callable[
-        [object, str, SignalPublication, tuple[SignalPublication, ...]],
-        object | None,
-    ]
-    | None = None,
     dynamic_choices: tuple[DynamicChoicePresentation, ...] = (),
     resolve_artifact_reference: Callable[[ResolvedArtifactInput], object]
     | None = None,
@@ -219,10 +207,6 @@ def project_processor_declaration(
     request_binder = declaration.bind_request if bind_request is None else bind_request
     if not callable(request_binder):
         raise TypeError("Processor declaration requires one request binder")
-    if project_signal_presentation is not None and not callable(
-        project_signal_presentation
-    ):
-        raise TypeError("project_signal_presentation must be callable or None")
     spec = project_declaration_spec(
         declaration,
         dynamic_choices=dynamic_choices,
@@ -232,7 +216,6 @@ def project_processor_declaration(
         spec,
         bind_request=request_binder,
         prepare=prepare,
-        project_signal_presentation=project_signal_presentation,
         resolve_artifact_reference=_artifact_resolver(
             declaration,
             resolve_artifact_reference=resolve_artifact_reference,

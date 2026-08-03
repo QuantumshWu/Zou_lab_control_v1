@@ -1,253 +1,258 @@
-"""Runtime-DPR Qt surfaces for immutable calibration PlotReports."""
+"""Calibration workflow windows over the shared :mod:`zlc_plot` surface."""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from concurrent.futures import CancelledError, Future
-import math
+import threading
 
-from zlc_frontend import PlotReportDocument
-from zlc_frontend.encoded_raster import EncodedRasterDocument
+from PyQt5 import QtCore, QtWidgets
+
 from zlc_frontend.qt_widgets import (
-    FrozenRasterWindow,
-    RasterPixelRatioObserver,
+    FluentButton,
+    FluentLabel,
+    FluentScrollArea,
+    FluentTabWidget,
+    GREY,
+    SerialWorkerWindow,
     error_summary,
 )
-from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
-    CalibrationArtifactRef,
-)
-from .workbench_jobs import (
-    _load_calibration_report_document,
-    _render_calibration_report,
-)
+from zlc_neutral_atom.dataset_output import FinalDatasetOutput
+from zlc_plot import Qt5PlotWidget, RasterPlotHost
+
+from ..reference import CalibrationArtifactRef
+from .plot_report import calibration_plot_hosts, calibration_report_outputs
 
 
-class CalibrationReportSurfaceWindow(FrozenRasterWindow):
-    """Own one immutable report document and its replaceable screen raster.
+def _require_not_cancelled(cancelled: threading.Event) -> None:
+    if cancelled.is_set():
+        raise CancelledError()
 
-    Loading/projecting calibration physics is intentionally outside the
-    runtime-surface loop.  A DPR change retires the painted PNG immediately,
-    then submits only ``PlotReportDocument -> EncodedRasterDocument`` on the
-    shared raster worker.  At most one render is active; repeated screen
-    changes collapse to the newest authored surface revision.
-    """
 
-    def __init__(self, **window_options) -> None:
-        self._report_document: PlotReportDocument | None = None
-        self._report_document_revision = 0
-        self._report_admitted_document_revision: int | None = None
-        self._report_surface_revision = 0
-        self._report_render_requested = False
-        self._report_render_reason: str | None = None
-        self._report_render_active: tuple[
-            PlotReportDocument,
-            int,
-            int,
-            str,
-        ] | None = None
-        super().__init__(None, **window_options)
-        self._report_surface_observer = RasterPixelRatioObserver(
-            self,
-            self._apply_report_surface_pixel_ratio,
+def load_calibration_report_outputs(
+    loader: Callable,
+    reference: CalibrationArtifactRef,
+    cancelled: threading.Event,
+) -> tuple[dict[str, FinalDatasetOutput], str]:
+    """Load domain facts and materialize only the declared FINAL outputs."""
+
+    if not callable(loader):
+        raise TypeError("loader must be callable")
+    if not isinstance(reference, CalibrationArtifactRef):
+        raise TypeError("reference must be CalibrationArtifactRef")
+    _require_not_cancelled(cancelled)
+    computation = loader(reference)
+    _require_not_cancelled(cancelled)
+    outputs, summary = calibration_report_outputs(computation, reference)
+    _require_not_cancelled(cancelled)
+    return outputs, summary
+
+
+class CalibrationReportSurfaceWindow(SerialWorkerWindow):
+    """Thin Calibration shell around the leaf's shared-plot adapter."""
+
+    _plotFutureReady = QtCore.pyqtSignal(object)
+
+    def __init__(
+        self,
+        *,
+        window_title: str,
+        mode_text: str,
+        loading_summary: str,
+        object_prefix: str,
+        subject: str,
+    ) -> None:
+        super().__init__()
+        self._prefix = str(object_prefix)
+        self._subject = str(subject).upper()
+        self._report_outputs: dict[str, FinalDatasetOutput] | None = None
+        self._plot_hosts: dict[str, RasterPlotHost] = {}
+        self._plot_widgets: dict[str, Qt5PlotWidget] = {}
+        self._plot_futures: set[Future] = set()
+
+        self.setWindowTitle(str(window_title))
+        self._mode = FluentLabel(str(mode_text), self)
+        self._mode.setObjectName(f"{self._prefix}Mode")
+        self._status = FluentLabel(f"BUILDING {self._subject}", self)
+        self._status.setObjectName(f"{self._prefix}Status")
+        self._summary = FluentLabel(str(loading_summary), self)
+        self._summary.setObjectName(f"{self._prefix}Summary")
+        self._summary.setWordWrap(True)
+        self._tabs = FluentTabWidget(self)
+        self._tabs.setObjectName(f"{self._prefix}Tabs")
+        self._placeholder = FluentLabel(
+            f"Building {self._subject.lower()}…",
+            self._tabs,
         )
-        self._report_surface_pixel_ratio = (
-            self._report_surface_observer.current_ratio
+        self._placeholder.setAlignment(QtCore.Qt.AlignCenter)
+        self._placeholder.setMinimumSize(320, 240)
+        self._tabs.addTab(self._placeholder, "Loading")
+        self._diagnostic = FluentLabel("", self)
+        self._diagnostic.setObjectName(f"{self._prefix}Diagnostic")
+        self._diagnostic.setWordWrap(True)
+        self._diagnostic.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self._close_button = FluentButton("Close", self, color=GREY)
+        self._close_button.setObjectName(f"close{self._subject.title()}Button")
+
+        self._controls = QtWidgets.QHBoxLayout()
+        self._controls.addStretch(1)
+        self._controls.addWidget(self._close_button)
+        self._layout = QtWidgets.QVBoxLayout(self)
+        self._layout.addWidget(self._mode)
+        self._layout.addWidget(self._status)
+        self._layout.addWidget(self._summary)
+        self._layout.addWidget(self._tabs, 1)
+        self._layout.addWidget(self._diagnostic)
+        self._layout.addLayout(self._controls)
+        self._close_button.clicked.connect(self.shutdown)
+        self._plotFutureReady.connect(
+            self._accept_plot_future,
+            type=QtCore.Qt.QueuedConnection,
         )
 
     @property
-    def report_document(self) -> PlotReportDocument | None:
-        return self._report_document
+    def report_outputs(self) -> Mapping[str, FinalDatasetOutput] | None:
+        return self._report_outputs
 
     @property
-    def report_surface_revision(self) -> int:
-        return self._report_surface_revision
-
-    @property
-    def worker_idle(self) -> bool:
-        return (
-            super().worker_idle
-            and not self._report_render_requested
-            and self._report_render_active is None
+    def raster_ready(self) -> bool:
+        return not self._plot_futures and bool(self._plot_widgets) and all(
+            widget.presented_front is not None
+            for widget in self._plot_widgets.values()
         )
 
-    def _apply_report_surface_pixel_ratio(self, ratio: float) -> None:
-        if self._closing:
+    def _track_plot_future(self, future: object) -> None:
+        if not isinstance(future, Future):
+            raise TypeError("Calibration plot operation must return Future")
+        self._plot_futures.add(future)
+
+        def completed(done: Future) -> None:
+            try:
+                self._plotFutureReady.emit(done)
+            except RuntimeError:
+                return
+
+        future.add_done_callback(completed)
+
+    @QtCore.pyqtSlot(object)
+    def _accept_plot_future(self, future: object) -> None:
+        if not isinstance(future, Future):
             return
-        if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
-            raise TypeError("report surface pixel ratio must be real")
-        normalized = float(ratio)
-        if not math.isfinite(normalized) or normalized <= 0.0:
-            raise ValueError("report surface pixel ratio must be finite and positive")
-        if normalized == self._report_surface_pixel_ratio:
+        tracked = future in self._plot_futures
+        self._plot_futures.discard(future)
+        if not tracked or self._closing:
+            try:
+                future.result()
+            except BaseException:
+                pass
             return
-        self._report_surface_pixel_ratio = normalized
-        self._report_surface_revision += 1
-        # The old bitmap belongs to another physical surface.  Clear it before
-        # queuing work so no event turn can continue presenting stale pixels.
-        self._clear_bundle()
-        if self._report_document is not None:
-            self._report_render_requested = True
-            reason = (
-                "surface"
-                if self._report_admitted_document_revision
-                == self._report_document_revision
-                else "document"
-            )
-            if reason == "document" or self._report_render_reason is None:
-                self._report_render_reason = reason
-        self._start_report_render_if_ready()
-
-    def _install_report_document(self, document: PlotReportDocument) -> None:
-        if not isinstance(document, PlotReportDocument):
-            raise TypeError("calibration report projection must be PlotReportDocument")
-        self._report_document = document
-        self._report_document_revision += 1
-        self._report_admitted_document_revision = None
-        self._clear_bundle()
-        self._report_render_requested = True
-        self._report_render_reason = "document"
-        self._start_report_render_if_ready()
-
-    def _discard_report_document(self) -> None:
-        """Retire a report whose artifact authority has been superseded."""
-
-        self._report_document = None
-        self._report_document_revision += 1
-        self._report_admitted_document_revision = None
-        self._report_render_requested = False
-        self._report_render_reason = None
-        self._clear_bundle()
-
-    def _start_report_render_if_ready(self) -> None:
-        if (
-            self._closing
-            or self._future is not None
-            or not self._report_render_requested
-            or self._report_document is None
-        ):
-            return
-        document = self._report_document
-        reason = self._report_render_reason
-        if reason not in {"document", "surface"}:
-            raise RuntimeError("report render request has no authored reason")
-        key = (
-            document,
-            self._report_document_revision,
-            self._report_surface_revision,
-            reason,
-        )
-        self._report_render_requested = False
-        self._report_render_reason = None
-        self._report_render_active = key
-        self._report_render_started(self._report_surface_revision, reason)
-        if not self._submit_future(
-            _render_calibration_report,
-            document,
-            self._report_surface_pixel_ratio,
-            self._cancelled,
-        ):
-            self._report_render_active = None
+        try:
+            future.result()
+        except CancelledError:
+            self._status.setText(f"{self._subject} DISPLAY CANCELLED")
+        except BaseException as error:
+            self._status.setText(f"{self._subject} DISPLAY FAILED")
+            self._diagnostic.setText(error_summary(error))
 
     def _worker_submit_failed(self, error: BaseException) -> None:
-        active = self._report_render_active
-        if active is not None:
-            self._report_render_active = None
-            self._report_render_failed(error, reason=active[3])
-            return
-        super()._worker_submit_failed(error)
-
-    def _accept_finished_future(self, future: Future) -> None:
-        active = self._report_render_active
-        if active is None:
-            super()._accept_finished_future(future)
-            return
-        self._report_render_active = None
-        document, document_revision, surface_revision, reason = active
-        current = (
-            document is self._report_document
-            and document_revision == self._report_document_revision
-            and surface_revision == self._report_surface_revision
-        )
-        try:
-            bundle = future.result()
-            if not isinstance(bundle, EncodedRasterDocument):
-                raise TypeError("report worker returned an invalid raster")
-        except CancelledError:
-            if not self._closing and current:
-                self._report_render_failed(
-                    RuntimeError("report rendering was cancelled"),
-                    reason=reason,
-                )
-        except BaseException as error:
-            if not self._closing and current:
-                self._report_render_failed(error, reason=reason)
-        else:
-            if not self._closing and current:
-                displayed = self._present_bundle(bundle)
-                if displayed:
-                    self._report_admitted_document_revision = document_revision
-                self._report_render_succeeded(
-                    bundle,
-                    displayed=displayed,
-                    reason=reason,
-                )
-        if not current and self._report_document is not None:
-            self._report_render_requested = True
-            pending_reason = (
-                "surface"
-                if self._report_admitted_document_revision
-                == self._report_document_revision
-                else "document"
-            )
-            if (
-                pending_reason == "document"
-                or self._report_render_reason is None
-            ):
-                self._report_render_reason = pending_reason
-
-    def _after_worker_completion(self) -> None:
-        self._start_report_render_if_ready()
-
-    def _report_render_started(
-        self,
-        surface_revision: int,
-        reason: str,
-    ) -> None:
-        self._status.setText(f"BUILDING REPORT SURFACE r{surface_revision}")
-        self._diagnostic.setText("")
-
-    def _report_render_succeeded(
-        self,
-        bundle: EncodedRasterDocument,
-        *,
-        displayed: bool,
-        reason: str,
-    ) -> None:
-        if not displayed:
-            self._status.setText("REPORT DISPLAY FAILED")
-
-    def _report_render_failed(self, error: BaseException, *, reason: str) -> None:
-        self._status.setText("REPORT DISPLAY FAILED")
-        self._summary.setText("The immutable calibration report remains valid")
+        self._status.setText(f"{self._subject} FAILED")
         self._diagnostic.setText(error_summary(error))
 
+    def _worker_release_failed(self, error: BaseException) -> None:
+        self._status.setText("CLOSE FAILED")
+        self._diagnostic.setText(error_summary(error))
+
+    def _retire_plot_pages(self) -> None:
+        self._plot_futures.clear()
+        widgets, self._plot_widgets = self._plot_widgets, {}
+        hosts, self._plot_hosts = self._plot_hosts, {}
+        for widget in widgets.values():
+            try:
+                widget.close_adapter()
+            except RuntimeError:
+                pass
+        while self._tabs.count():
+            page = self._tabs.widget(0)
+            self._tabs.removeTab(0)
+            page.hide()
+            page.deleteLater()
+        for host in hosts.values():
+            host.close()
+        self._placeholder = None
+
+    @QtCore.pyqtSlot(str)
+    def _plot_error(self, message: str) -> None:
+        self._diagnostic.setText(str(message))
+
+    def _install_report_outputs(
+        self,
+        outputs: Mapping[str, FinalDatasetOutput],
+        summary: str,
+    ) -> None:
+        values = dict(outputs)
+        if any(not isinstance(value, FinalDatasetOutput) for value in values.values()):
+            raise TypeError("report outputs must contain FinalDatasetOutput values")
+        if not isinstance(summary, str):
+            raise TypeError("report summary must be str")
+        self._retire_plot_pages()
+        entries, operations = calibration_plot_hosts(values)
+        if not isinstance(entries, dict) or any(
+            not isinstance(key, str)
+            or not isinstance(value, tuple)
+            or len(value) != 2
+            or not isinstance(value[0], str)
+            or not isinstance(value[1], RasterPlotHost)
+            for key, value in entries.items()
+        ):
+            raise TypeError("plot host factory returned another contract")
+        self._plot_hosts = {
+            key: host for key, (_title, host) in entries.items()
+        }
+        try:
+            for key, (title, host) in entries.items():
+                scroll = FluentScrollArea(self._tabs)
+                scroll.setWidgetResizable(False)
+                scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+                scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+                widget = Qt5PlotWidget(host, scroll)
+                widget.setObjectName(f"{self._prefix}Plot_{key}")
+                widget.errorOccurred.connect(self._plot_error)
+                scroll.setWidget(widget)
+                self._tabs.addTab(scroll, title)
+                self._plot_widgets[key] = widget
+            for operation in operations:
+                self._track_plot_future(operation)
+        except BaseException:
+            self._retire_plot_pages()
+            raise
+        self._report_outputs = values
+        self._tabs.tabBar().setVisible(len(entries) > 1)
+        self._summary.setText(summary)
+        self._diagnostic.setText("")
+
+    def _discard_report_outputs(self) -> None:
+        self._report_outputs = None
+        self._retire_plot_pages()
+
     def _before_worker_shutdown(self) -> None:
-        self._report_surface_observer.detach()
-        self._report_document = None
-        self._report_admitted_document_revision = None
-        self._report_render_requested = False
-        self._report_render_reason = None
-        super()._before_worker_shutdown()
+        self._status.setText("CLOSING")
+        self._close_button.setEnabled(False)
+        self._report_outputs = None
+        self._retire_plot_pages()
 
 
 class CalibrationReportWindow(CalibrationReportSurfaceWindow):
-    """Load one FINAL calibration document once and display it at live DPR."""
+    """Load one FINAL calibration and display its declared output plots."""
 
-    def __init__(self, computation_loader, reference: CalibrationArtifactRef) -> None:
+    def __init__(
+        self,
+        computation_loader,
+        reference: CalibrationArtifactRef,
+    ) -> None:
         if not callable(computation_loader):
             raise TypeError("computation_loader must be callable")
         if not isinstance(reference, CalibrationArtifactRef):
             raise TypeError("reference must be CalibrationArtifactRef")
-        self._report_load_active = True
         super().__init__(
             window_title="Calibration Report",
             mode_text="FROZEN CALIBRATION REPORT · DISPLAY ONLY",
@@ -255,37 +260,37 @@ class CalibrationReportWindow(CalibrationReportSurfaceWindow):
             object_prefix="calibrationReport",
             subject="report",
         )
-        if not self._submit_future(
-            _load_calibration_report_document,
+        self._submit_future(
+            load_calibration_report_outputs,
             computation_loader,
             reference,
             self._cancelled,
-        ):
-            self._report_load_active = False
+        )
 
     def _accept_finished_future(self, future: Future) -> None:
-        if not self._report_load_active:
-            super()._accept_finished_future(future)
-            return
-        self._report_load_active = False
         try:
-            document = future.result()
-            if not isinstance(document, PlotReportDocument):
-                raise TypeError("report loader returned an invalid document")
+            outputs, summary = future.result()
         except CancelledError:
             if not self._closing:
                 self._status.setText("REPORT CANCELLED")
         except BaseException as error:
             if not self._closing:
                 self._status.setText("REPORT FAILED")
-                self._summary.setText("No report document was admitted")
+                self._summary.setText("No report was admitted")
                 self._diagnostic.setText(error_summary(error))
         else:
             if not self._closing:
-                self._install_report_document(document)
+                try:
+                    self._install_report_outputs(outputs, summary)
+                except BaseException as error:
+                    self._status.setText("REPORT DISPLAY FAILED")
+                    self._diagnostic.setText(error_summary(error))
+                else:
+                    self._status.setText("READY")
 
 
 __all__ = [
     "CalibrationReportSurfaceWindow",
     "CalibrationReportWindow",
+    "load_calibration_report_outputs",
 ]

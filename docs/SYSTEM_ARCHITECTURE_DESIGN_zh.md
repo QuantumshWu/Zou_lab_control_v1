@@ -226,6 +226,8 @@ neutral 的 SignalPlane 只拥有 `SignalPublication/SignalFront` 与 exact pare
 
 同一board所连接的continuous signals仍由SignalPlane提升一个coherent `SignalFront`。Workbench先把该front中的全部panel更新准备完成，再原子present完整board；某个plot投影失败只成为该attachment的nonfatal错误并保留上一完整board，不能杀死GUI tick，也不能让其它panel跨shot推进。Standalone Figure没有SignalPublication，因此可以selector/Fit/export，但不得伪造derived signal。
 
+`RasterFront.source_revisions`是renderer实际画入当前front的有序source revision事实，不由Workbench根据“最近提交”猜测。每个Panel只保留三类小关联：仍pending的worker请求、最新已完成但尚待Qt接纳的worker front、以及当前可交互presented front（Rolling则为当前window内实际画出的revisions）；失败、supersede、过期成功、spec/source-generation替换和surface退役都必须同步释放其余关联。该集合必须有界于pending加可见窗口，不能成为per-revision presentation archive，也不能靠定时清理掩盖生命周期泄漏。
+
 ### 4.3 Selector
 
 Cross/Area/interval/threshold/color-limit与PulseTimeline selection全部由 `zlc_plot.PlotSession` 的同一interaction engine、Divider/data-box coordinate transform和overlay painter实现；Curve、Image、Histogram与FacetGrid cell不得各写一套。press到release固定同一data revision和geometry；resize/DPR使该gesture取消并重新compose，不能用新geometry解释旧raster。drag overlay走persistent artist/blit或轻量Qt front，不能每个pointer event重画base，也不发布hover。
@@ -409,7 +411,7 @@ qCMOS 正式资格使用现有硬件能力，并明确区分“路径语义资�
 
 绘图全栈唯一入口是 `zlc_plot.PlotSpec -> PlotSession -> Qt5PlotWidget/RasterFront/export`。TaskConsole、Calibration、Occupancy、DataFigure、FigureViewer、Edit snapshot与Pulse preview都使用这条入口；它们不能手写composer、projection、Divider、style、selector、Fit、raster或export。公开kind闭集严格沿用接纳源：`CURVE | IMAGE | HISTOGRAM | ROLLING | FACET_GRID | PULSE_TIMELINE`。SiteMap是Image加typed overlays，Distribution是Histogram的双高斯/threshold模式；Meter不是正式plot kind。Histogram必须显式声明sample axes；Rolling使用plot-private revision history而非Dataset R；两者都服从§3.5的物理维覆盖合同。
 
-FacetGrid复用普通cell session，不拥有第二renderer、Fit或form。Saved Fit Grid只增加typed facet address与导航，所有cell raster/selector/refit/export仍走同一PlotSession。Calibration report的overview、SiteMap与Distribution也只是同一API的headless/Qt消费者，因此与TaskConsole同spec、style、size/DPR语义；leaf不能再建立report composer。
+FacetGrid复用普通cell session，不拥有第二renderer、Fit或form。Saved Fit Grid只增加typed facet address与导航，所有cell raster/selector/refit/export仍走同一PlotSession。Calibration report的overview、SiteMap与Distribution也只是同一API的headless/Qt消费者，因此与TaskConsole同spec、style、size/DPR语义。Calibration可在自己的lazy `ui/**`保留一个薄adapter，只把已经声明并物化的FINAL Dataset/annotation映射成现有`PlotInput + PlotSpec`，且Qt与headless export共用这一个映射；它不得定义report Dataset/schema/DTO、第二materializer、renderer、style、Fit engine或通用Workbench report manager。
 
 `zlc_plot`独占persistent Matplotlib artists、blit、image decimation、Divider/固定data box、coordinate mapper、font/color/style、logical size、DPR与raster worker。resize/DPR改变时旧front不stretch作为最终画面，而是同revision重compose；pointer drag、selector更新与Fit overlay优先更新既有artists/overlay，不重画base。canonical Figure字体资产只在`zlc_plot/assets`保存一份`Helvetica Light`并随package发布；Qt shell字体和QSS token仍由zlc_frontend统一使用Segoe UI。Calibration/leaf不得局部换font/style。
 
@@ -445,7 +447,7 @@ Device Manager只编辑该graph：按domain分组、Add device、每卡独立rol
 
 ### 6.7 Logic Node、Task takeover 与 Edit
 
-Logic Node同样使用固定namespace与一个discovered leaf descriptor。descriptor只含identity/kind/title、AuthoringSchema、typed inputs/outputs、actual claims、一个真正必要时才存在的domain bind/execute seam、optional task preview与可选UI contribution。generic host私有完成build/start/evaluate投影，并生成form、public`exp.nodes.*`API、start/stop/run、publish、persistence和error projection；不再保留两级callback package、per-leaf API/Prepared/Bound forwarding zoo或中央concrete import。
+Logic Node同样使用固定namespace与一个discovered leaf descriptor。descriptor只含identity/kind/title、AuthoringSchema、typed inputs/outputs、actual claims、一个真正必要时才存在的domain bind/execute seam、optional task preview与可选UI contribution。Task preview直接携`PlotKind | PlotSpec`，只允许Task声明；运行时始终传typed value，codec只存在于TaskConsole layout文件I/O，不能恢复string kind/params接缝。generic host私有完成build/start/evaluate投影，并生成form、public`exp.nodes.*`API、start/stop/run、publish、persistence和error projection；不再保留两级callback package、per-leaf API/Prepared/Bound forwarding zoo或中央concrete import。
 
 普通leaf没有专用TaskConsole form/presenter/binding。只有declaration + zlc_plot无法表达的真实交互才允许leaf-local lazy`ui/**`；baseline仅有PulseScan scan-table/slot editor、Calibration creation/report workflow与Occupancy exact-cell navigator。它们仍复用frontend form和zlc_plot，不得导入Workbench或自画Figure；“字段较多”不构成custom UI理由。
 
@@ -458,7 +460,7 @@ Logic Edit和Plot Edit是同一producer-owned typed draft/controller的两个视
 ### 6.8 关键领域纵切
 
 - Camera Measurement：一个节点选择qCMOS或MOT Camera；live固定`(1,1,*frame_shape)`，finite的每个`frame_i`从progress到FINAL固定`(K,1,*frame_shape)`，未完成cycle只由validity表示；history不进shape，uint8/uint16原dtype保留，同cycle多帧为atomic siblings。
-- Calibration：内建readout task，不是plugin。capture与calibrate是两个linked flat Runs，显式`save_frames`；live与saved frames走同一算法。成功后Experiment只保存可见可改的`current_calibration_ref`默认指针；artifact/report写入§7的task目录。报告只消费zlc_plot PlotSession；SiteMap物理事实与Calibration artifact仍属neutral。
+- Calibration：内建readout task，不是plugin。capture与calibrate是两个linked flat Runs，显式`save_frames`；live与saved frames走同一算法。成功后Experiment只保存可见可改的`current_calibration_ref`默认指针；artifact/report写入§7的task目录。报告只消费普通FINAL outputs和zlc_plot PlotSession；SiteMap物理事实与Calibration artifact仍属neutral。默认runtime model的`readout_samples`严格是`(source R, non-event context P, SITE)`，SITE不搬进P；当前CalibrationReport只保留context axis identity/index order而不保留source coordinate scalars，因此该输出使用bare PointTable authored rows，绝不能在UI按context index伪造物理coordinate columns。
 - Occupancy：request冻结显式CalibrationArtifactRef，current ref只作一次预填。它消费same-shot frame/calibration facts并原子发布typed siblings；不会自动开panel。
 - MOT Field：Ready→Running→multiple live→FINAL可观察；point rows保持authored order，标量shape为`(R,P,1)`，真实7×7×7只在GridTopology表达，accumulator不得O(N²)复制。
 - PulseScan：消费任意已经运行且有FormalAssociationCapability的y signal；不绑Camera。sweep count形成R，Pulse RepeatRegion不改变R，P来自冻结PointTable，非grid trajectory保持普通rows。
@@ -515,6 +517,7 @@ Identity严格按成本和消费者限定：
 
 - 按C0固定manifest导入tracked核心、font与必要package metadata；`qt_controls.py`文件本身和`Qt5ParameterPanel`导出均不进入本仓。
 - 实现一个私有readonly Dataset adapter、物理维覆盖检查及`default_plot_spec/axis_choices`。对接纳源public surface只做必要修订：`HistogramPlot.samples`、移除`RollingPlot.x`并改为session-private revision history、`PlotSession.replace_spec()`、现有`SelectionData/FitSelection`增加ordered `source_revisions`、`fit_all_facets`与`FacetFitBatchResult`；不增加public axis-selection/history Dataset/DTO/lane/registry。
+- `RasterFront`冻结实际画入的ordered source revisions；Workbench的revision→publication关联严格有界于pending/latest-worker/presented-window并在所有terminal/supersede/retire路径释放。Task preview在declaration到PanelConfig之间全程保持typed`PlotKind | PlotSpec`，只有layout I/O可codec。
 - 在同一未提交cut迁移TaskConsole、Calibration、Occupancy、DataFigure、FigureViewer、Edit、Pulse preview与public facade；Camera monitor改为每publication只发布最新`(1,1,*frame)`，同cut删除`MONITOR_HISTORY` Dataset role、camera request/API/default/authoring中的`history_cycles`、capture-preview history point-column路径和`MonitorDataset.append_window`环形分支。`MonitorDataset`本身保留为通用stream materializer，并压成`keyed_cycle + latest_cell`两条真实模式；`latest_cell`继续唯一承担payload/metadata校验、ordered ingest、revision/event_ref/head、gap accounting、atomic replacement与snapshot publication，不能把这些职责移入Camera leaf或GUI。随后删除全部旧frontend plot/projection/selector/Fit/render/raster/style/layout、zlc_data Fit closure、Workbench/leaf专用composer及相关测试。任何旧plot import、history-in-P/`history_cycles`或第二runtime尚存都表示C1未完成。
 - 用Camera→live Image→Area→第二Image→Fit、Histogram Distribution、Calibration report、FacetGrid batch Fit、FigureViewer与Pulse preview的正式快轨证明后才commit，并报告固定口径净删除。
 

@@ -14,7 +14,6 @@ from zlc_storage.canonical import (
 )
 
 from .axis import AxisId, AxisRoleId, AxisSourceRef, AxisSpec, CoordinateFrameId
-from .layout import AxisLayout, AxisLayoutMode
 from .schema import (
     DatasetSchema,
     GridTopology,
@@ -414,89 +413,6 @@ def dataset_schema_from_tree(tree: Any) -> DatasetSchema:
     if _encode(dataset_schema_to_tree(schema)) != _encode(tree):
         raise ValueError("DatasetSchema tree is typed but non-canonical")
     return schema
-
-
-def axis_layout_to_tree(layout: AxisLayout) -> dict[str, Any]:
-    """Project any zlc_data axis layout using its single canonical field model."""
-
-    if not isinstance(layout, AxisLayout):
-        raise TypeError("layout must be AxisLayout")
-    if layout.mode is AxisLayoutMode.PRODUCT:
-        assert layout.factors is not None
-        return {
-            "logical_shape": list(layout.logical_shape),
-            "mode": layout.mode.value,
-            "storage_size": layout.storage_size,
-            "factors": [axis_layout_to_tree(factor) for factor in layout.factors],
-        }
-    return {
-        "logical_shape": list(layout.logical_shape),
-        "mode": layout.mode.value,
-        "storage_size": layout.storage_size,
-        "storage_to_multi": None
-        if layout.storage_to_multi is None
-        else [list(index) for index in layout.storage_to_multi],
-    }
-
-
-def axis_layout_from_tree(tree: Any) -> AxisLayout:
-    """Reconstruct a generic axis layout from its exact owner-defined fields."""
-
-    if isinstance(tree, dict) and tree.get("mode") == AxisLayoutMode.PRODUCT.value:
-        if set(tree) != {"logical_shape", "mode", "storage_size", "factors"}:
-            raise ValueError("invalid PRODUCT AxisLayout field set")
-        factors = tree["factors"]
-        shape = tree["logical_shape"]
-        if not isinstance(factors, list) or not isinstance(shape, list):
-            raise ValueError("PRODUCT AxisLayout factors/shape must be lists")
-        decoded_factors = tuple(axis_layout_from_tree(item) for item in factors)
-        layout = AxisLayout.product(*decoded_factors)
-        if layout.mode is not AxisLayoutMode.PRODUCT:
-            raise ValueError("PRODUCT AxisLayout has a non-canonical factorization")
-        declared = AxisLayout(
-            tuple(shape),
-            AxisLayoutMode.PRODUCT,
-            tree["storage_size"],
-            factors=decoded_factors,
-        )
-        if declared != layout:
-            raise ValueError("PRODUCT AxisLayout fields are non-canonical")
-        if _encode(axis_layout_to_tree(layout)) != _encode(tree):
-            raise ValueError("PRODUCT AxisLayout tree is non-canonical")
-        return layout
-    shape, mode, storage_size, mapping = _axis_layout_fields(tree)
-    layout = AxisLayout(shape, mode, storage_size, mapping)
-    if _encode(axis_layout_to_tree(layout)) != _encode(tree):
-        raise ValueError("AxisLayout tree is non-canonical")
-    return layout
-
-
-def _axis_layout_fields(
-    tree: Any,
-) -> tuple[tuple[int, ...], AxisLayoutMode, int, tuple[tuple[int, ...], ...] | None]:
-    if not isinstance(tree, dict) or set(tree) != {
-        "logical_shape",
-        "mode",
-        "storage_size",
-        "storage_to_multi",
-    }:
-        raise ValueError("invalid AxisLayout field set")
-    shape_data = tree["logical_shape"]
-    mapping_data = tree["storage_to_multi"]
-    if not isinstance(shape_data, list):
-        raise ValueError("axis layout logical_shape must be a list")
-    if mapping_data is not None and not isinstance(mapping_data, list):
-        raise ValueError("axis layout storage_to_multi must be a list or null")
-    if mapping_data is not None and any(not isinstance(item, list) for item in mapping_data):
-        raise ValueError("axis layout multi-indices must be lists")
-    return (
-        tuple(shape_data),
-        AxisLayoutMode(tree["mode"]),
-        tree["storage_size"],
-        None
-        if mapping_data is None
-        else tuple(tuple(item) for item in mapping_data),
-    )
 
 
 def value_schema_fingerprint(schema: ValueSchema) -> str:

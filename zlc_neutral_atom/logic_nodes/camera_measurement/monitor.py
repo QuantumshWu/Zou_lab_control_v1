@@ -1,33 +1,41 @@
 """Continuous application branch of Camera Measurement.
 
-The monitor owns acquisition and a declared newest-first frame history.  Figure
-selection, ROI projection, fitting, and other display analysis deliberately do
-not live here: they are independent per-panel view branches over this raw data.
+The monitor publishes one atomic latest camera cycle.  Figure selection, ROI
+projection, fitting, and other display analysis deliberately do not live here:
+they are independent per-panel view branches over the public frame outputs.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import threading
 import uuid
 from typing import Callable, Protocol
+
+import numpy as np
 
 from zlc_data import (
     AxisId,
     AxisSpec,
     BlockId,
+    ComponentValidity,
     DatasetSchema,
-    MONITOR_HISTORY,
-    PointColumn,
     PointTable,
     READOUT_EVENT,
     REPEAT,
+    Valid,
+    ValidityContract,
+    ValidityMode,
+    Value,
+    ValuePayloadContract,
     ValueSchema,
 )
+from zlc_data.value import expand_component_validity
 from zlc_neutral_atom.devices.camera.contract import (
     CameraAcquisitionMode,
-    CameraDatasetEventAdapter,
+    CameraFrameMetadata,
     CameraSample,
+    CameraSampleContract,
 )
 from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
     CAMERA_MEASUREMENT_KEY,
@@ -76,19 +84,178 @@ from zlc_neutral_atom.runtime.signal_source import (
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionProducer,
     AcquisitionStream,
+    EventRef,
     StreamError,
     StreamId,
 )
 
 
 _MONITOR_REPEAT_AXIS_ID = AxisId("camera-monitor.repeat")
-_MONITOR_HISTORY_AXIS_ID = AxisId("camera-monitor.history")
 _MONITOR_READOUT_EVENT_AXIS_ID = AxisId("camera-monitor.readout-event")
 
 
 @dataclass(frozen=True)
+class _CameraCyclePayload:
+    value: Value
+    metadata: tuple[CameraFrameMetadata, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.value, Value):
+            raise TypeError("camera cycle value must be Value")
+        metadata = tuple(self.metadata)
+        if any(not isinstance(item, CameraFrameMetadata) for item in metadata):
+            raise TypeError("camera cycle metadata must contain CameraFrameMetadata")
+        object.__setattr__(self, "metadata", metadata)
+
+
+@dataclass(frozen=True)
+class _CameraCycleMetadataContract:
+    frame_count: int
+
+    def snapshot(
+        self,
+        payload: _CameraCyclePayload,
+    ) -> tuple[CameraFrameMetadata, ...]:
+        if not isinstance(payload, _CameraCyclePayload):
+            raise TypeError("camera cycle metadata requires _CameraCyclePayload")
+        self.validate(payload.metadata)
+        return payload.metadata
+
+    def validate(self, metadata: object) -> None:
+        if not isinstance(metadata, tuple) or len(metadata) != self.frame_count:
+            raise ValueError("camera cycle metadata cardinality differs")
+        if any(not isinstance(item, CameraFrameMetadata) for item in metadata):
+            raise TypeError("camera cycle metadata contains an invalid frame")
+        if any(not np.isfinite(item.captured_at) for item in metadata):
+            raise ValueError("camera cycle captured_at values must be finite")
+
+
+@dataclass(frozen=True)
+class _CameraCycleContract:
+    frame_contract: CameraSampleContract
+    value_schema: ValueSchema
+    metadata_contract: _CameraCycleMetadataContract
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.frame_contract, CameraSampleContract):
+            raise TypeError("frame_contract must be CameraSampleContract")
+        if not isinstance(self.value_schema, ValueSchema):
+            raise TypeError("value_schema must be ValueSchema")
+        if not isinstance(self.metadata_contract, _CameraCycleMetadataContract):
+            raise TypeError("metadata_contract has an invalid type")
+
+    def snapshot(self, payload: _CameraCyclePayload) -> _CameraCyclePayload:
+        self.validate(payload)
+        return payload
+
+    def validate(self, payload: _CameraCyclePayload) -> None:
+        if not isinstance(payload, _CameraCyclePayload):
+            raise TypeError("camera cycle contract requires _CameraCyclePayload")
+        ValuePayloadContract(self.value_schema).validate(payload.value)
+        self.metadata_contract.validate(payload.metadata)
+
+
+@dataclass(frozen=True)
+class _CameraCycleDatasetEventAdapter:
+    payload_contract: _CameraCycleContract
+
+    @property
+    def value_schema(self) -> ValueSchema:
+        return self.payload_contract.value_schema
+
+    @property
+    def metadata_contract(self) -> _CameraCycleMetadataContract:
+        return self.payload_contract.metadata_contract
+
+    def value(self, payload: _CameraCyclePayload) -> Value:
+        return payload.value
+
+
+def _camera_cycle_edge(
+    frame_contract: CameraSampleContract,
+    frames_per_cycle: int,
+) -> tuple[FrozenDatasetEdge[_CameraCyclePayload], _CameraCycleContract]:
+    event_axis = AxisSpec(
+        _MONITOR_READOUT_EVENT_AXIS_ID,
+        "readout event within latest camera cycle",
+        READOUT_EVENT,
+        frames_per_cycle,
+        tuple(range(frames_per_cycle)),
+    )
+    frame_schema = frame_contract.value_schema
+    frame_component_ids = frame_schema.validity_contract.component_axis_ids
+    cycle_schema = ValueSchema(
+        (event_axis, *frame_schema.data_axes),
+        ValidityContract.components(event_axis.axis_id, *frame_component_ids),
+        frame_schema.dtype,
+        frame_schema.value_unit,
+    )
+    contract = _CameraCycleContract(
+        frame_contract,
+        cycle_schema,
+        _CameraCycleMetadataContract(frames_per_cycle),
+    )
+    dataset_schema = DatasetSchema(
+        AxisSpec(
+            _MONITOR_REPEAT_AXIS_ID,
+            "monitor repeat",
+            REPEAT,
+            1,
+            (0,),
+        ),
+        PointTable(1),
+        None,
+        cycle_schema,
+    )
+    return (
+        FrozenDatasetEdge(
+            dataset_schema,
+            _CameraCycleDatasetEventAdapter(contract),
+        ),
+        contract,
+    )
+
+
+def _camera_cycle_payload(
+    samples: tuple[CameraSample, ...],
+    contract: _CameraCycleContract,
+) -> _CameraCyclePayload:
+    if len(samples) != contract.metadata_contract.frame_count:
+        raise ValueError("camera cycle sample cardinality differs")
+    for sample in samples:
+        contract.frame_contract.validate(sample)
+    frame_schema = contract.frame_contract.value_schema
+    values = np.stack(tuple(sample.image.values for sample in samples), axis=0)
+    if frame_schema.validity_contract.mode is ValidityMode.VALUE:
+        validity = np.asarray(
+            tuple(isinstance(sample.image.validity, Valid) for sample in samples),
+            dtype=np.bool_,
+        )
+    else:
+        validity = np.stack(
+            tuple(
+                expand_component_validity(sample.image.validity, frame_schema)
+                for sample in samples
+            ),
+            axis=0,
+        )
+    cycle_value = Value(
+        values,
+        ComponentValidity(
+            contract.value_schema.validity_contract.component_axis_ids,
+            validity,
+        ),
+        contract.value_schema,
+    )
+    return _CameraCyclePayload(
+        cycle_value,
+        tuple(sample.metadata for sample in samples),
+    )
+
+
+@dataclass(frozen=True)
 class CameraMonitorViewSpec:
-    """One admitted rolling raw-frame window with declared cycle cardinality."""
+    """One admitted latest-cycle cell with declared frame cardinality."""
 
     block_id: BlockId
     dataset_edge: FrozenDatasetEdge[CameraSample]
@@ -126,41 +293,50 @@ class CameraMonitorViewPort(Protocol):
 
 
 class CameraMonitorLiveDataset:
-    """Narrow raw-history owner presented to a live view."""
+    """Narrow latest-cycle owner presented to a live view."""
 
-    def __init__(self, raw: MonitorDataset[CameraSample]) -> None:
+    def __init__(self, raw: MonitorDataset[_CameraCyclePayload]) -> None:
         if not isinstance(raw, MonitorDataset):
             raise TypeError("raw must be MonitorDataset")
         self.raw = raw
         self._closed = False
         self._lock = threading.RLock()
 
-    def ingest_next(
+    def publish_latest(
         self,
-        checkpoint: Callable[[], None] | None = None,
-    ) -> bool:
-        if checkpoint is not None and not callable(checkpoint):
-            raise TypeError("checkpoint must be callable or None")
+        payload: _CameraCyclePayload,
+        producer: AcquisitionProducer[_CameraCyclePayload],
+        *,
+        direct_parent_refs: tuple[EventRef, ...],
+    ) -> None:
+        """Atomically replace the visible cycle after all fallible work succeeds."""
+
+        if not isinstance(payload, _CameraCyclePayload):
+            raise TypeError("camera latest publication requires _CameraCyclePayload")
+        if not isinstance(producer, AcquisitionProducer):
+            raise TypeError("camera latest publication requires AcquisitionProducer")
         with self._lock:
             self._ensure_open()
-            if checkpoint is not None:
-                checkpoint()
-            before = self.raw.revision
-            after = self.raw.ingest_next(timeout=0.0)
-            return after.revision.value > before.value
+            replacement = self.raw.prepare_latest_cell_replacement(payload)
+            try:
+                envelope = producer.emit(
+                    payload,
+                    captured_at=payload.metadata[-1].captured_at,
+                    direct_parent_refs=direct_parent_refs,
+                )
+            except BaseException:
+                self.raw.abort_latest_cell_replacement(replacement)
+                raise
+            self.raw.commit_latest_cell_replacement(
+                replacement,
+                envelope,
+                timeout=0.0,
+            )
 
     def freeze_current(self) -> MonitorDatasetSnapshot:
         with self._lock:
             self._ensure_open()
             return self.raw.freeze_current()
-
-    def finish(self) -> None:
-        with self._lock:
-            self._ensure_open()
-
-    def fail(self, error: StreamError) -> None:
-        if not isinstance(error, StreamError):
-            raise TypeError("error must be StreamError")
 
     def close(self) -> None:
         with self._lock:
@@ -181,10 +357,14 @@ class _CameraMonitorTransaction:
     dataset: CameraMonitorLiveDataset
     stream: AcquisitionStream[CameraSample]
     producer: AcquisitionProducer[CameraSample]
+    cycle_producer: AcquisitionProducer[_CameraCyclePayload]
+    cycle_contract: _CameraCycleContract
     session_id: str
     buffer_frame_count: int
     operation_deadline_seconds: float
     association_source: CameraAssociatedSignalEventSource | None = None
+    pending_samples: list[CameraSample] = field(default_factory=list)
+    pending_refs: list[EventRef] = field(default_factory=list)
     prepare_attempted: bool = False
     view_notifications_enabled: bool = True
 
@@ -257,12 +437,32 @@ class _CameraMonitorTransaction:
             payload = response.payload
             capability.payload_contract.validate(payload)
             metadata = payload.metadata
-            self.producer.emit(
+            envelope = self.producer.emit(
                 payload,
                 captured_at=metadata.captured_at,
             )
-            if self.dataset.ingest_next(context.checkpoint):
+            self.pending_samples.append(payload)
+            self.pending_refs.append(envelope.ref)
+            frame_count = self.cycle_contract.metadata_contract.frame_count
+            if len(self.pending_samples) == frame_count:
+                context.checkpoint()
+                self._publish_cycle()
+                self.pending_samples.clear()
+                self.pending_refs.clear()
                 self._notify_view_updated()
+            elif len(self.pending_samples) > frame_count:
+                raise RuntimeError("camera monitor accumulated an oversized cycle")
+
+    def _publish_cycle(self) -> None:
+        cycle = _camera_cycle_payload(
+            tuple(self.pending_samples),
+            self.cycle_contract,
+        )
+        self.dataset.publish_latest(
+            cycle,
+            self.cycle_producer,
+            direct_parent_refs=tuple(self.pending_refs),
+        )
 
     def _notify_view_updated(self) -> None:
         if not self.view_notifications_enabled:
@@ -289,24 +489,19 @@ class _CameraMonitorTransaction:
         software_errors: list[BaseException] = []
         cancelled = isinstance(primary, CancellationRequested)
         stream_failure = StreamError(safe_error_summary(primary)) if primary else None
+        self.pending_samples.clear()
+        self.pending_refs.clear()
         if self.association_source is not None:
             self.association_source.mark_association_stopped()
-        try:
-            if primary is None or cancelled:
-                self.producer.finish()
-            else:
-                assert stream_failure is not None
-                self.producer.fail(stream_failure)
-        except BaseException as error:
-            software_errors.append(error)
-        try:
-            if primary is None or cancelled:
-                self.dataset.finish()
-            else:
-                assert stream_failure is not None
-                self.dataset.fail(stream_failure)
-        except BaseException as error:
-            software_errors.append(error)
+        for producer in (self.producer, self.cycle_producer):
+            try:
+                if primary is None or cancelled:
+                    producer.finish()
+                else:
+                    assert stream_failure is not None
+                    producer.fail(stream_failure)
+            except BaseException as error:
+                software_errors.append(error)
         device_cleanup = (
             (lambda: self.port.cleanup(context, self.session_id))
             if self.prepare_attempted
@@ -354,6 +549,10 @@ class PreparedLiveCameraMeasurement:
 
     __slots__ = (
         "_edge",
+        "_cycle_contract",
+        "_cycle_stream",
+        "_cycle_producer",
+        "_frame_schema",
         "_lock",
         "_active_output_bindings",
         "_port",
@@ -387,55 +586,20 @@ class PreparedLiveCameraMeasurement:
             raise ValueError(
                 "camera monitor capability source differs from requested role"
             )
-        history_values = tuple(
-            history
-            for history in range(request.history_cycles)
-            for _event in range(request.frames_per_cycle)
+        self._edge, self._cycle_contract = _camera_cycle_edge(
+            capability.payload_contract,
+            request.frames_per_cycle,
         )
-        event_values = tuple(
-            event
-            for _history in range(request.history_cycles)
-            for event in range(request.frames_per_cycle)
-        )
-        schema = DatasetSchema(
-            AxisSpec(
-                _MONITOR_REPEAT_AXIS_ID,
-                "monitor storage repeat",
-                REPEAT,
-                1,
-                (0,),
-            ),
-            PointTable(
-                len(history_values),
-                (
-                    PointColumn(
-                        _MONITOR_HISTORY_AXIS_ID,
-                        "newest-first monitor history",
-                        MONITOR_HISTORY,
-                        PointColumn.NUMERIC,
-                        history_values,
-                    ),
-                    PointColumn(
-                        _MONITOR_READOUT_EVENT_AXIS_ID,
-                        "readout event within monitor cycle",
-                        READOUT_EVENT,
-                        PointColumn.NUMERIC,
-                        event_values,
-                    ),
-                ),
-            ),
-            None,
-            capability.payload_contract.value_schema,
-        )
-        self._edge = FrozenDatasetEdge(
-            schema,
-            CameraDatasetEventAdapter(capability.payload_contract),
-        )
+        self._frame_schema = capability.payload_contract.value_schema
         self._request = request
         self._port = port
         self._stream, self._producer = AcquisitionStream.create(
             StreamId(f"camera-monitor:{request.camera_ref.role}"),
             capability.payload_contract,
+        )
+        self._cycle_stream, self._cycle_producer = AcquisitionStream.create(
+            StreamId(f"camera-monitor-cycle:{request.camera_ref.role}"),
+            self._cycle_contract,
         )
         self._signal_source = camera_signal_event_source(
             self._stream,
@@ -539,6 +703,9 @@ class PreparedLiveCameraMeasurement:
             view,
             self._stream,
             self._producer,
+            self._cycle_stream,
+            self._cycle_producer,
+            self._cycle_contract,
             (
                 self._signal_source
                 if isinstance(
@@ -562,6 +729,10 @@ class PreparedLiveCameraMeasurement:
             except BaseException:
                 pass
             try:
+                self._cycle_producer.fail(StreamError(safe_error_summary(error)))
+            except BaseException:
+                pass
+            try:
                 view.fail(safe_error_summary(error))
             except BaseException:
                 pass
@@ -575,7 +746,7 @@ class PreparedLiveCameraMeasurement:
 
     def _activate_output_bindings(self, port: BoundCameraMonitorPort) -> None:
         capability = port.capability
-        if capability.payload_contract.value_schema != self._edge.schema.cell_schema:
+        if capability.payload_contract.value_schema != self._frame_schema:
             raise RuntimeError(
                 "configured Camera working point changed the declared frame schema"
             )
@@ -588,8 +759,8 @@ class PreparedLiveCameraMeasurement:
                 capability_evidence=capability.camera_capability_evidence,
                 binding_stamp=capability.binding_stamp,
                 frame_schema=capability.payload_contract.value_schema,
-                stream_id=self._stream.stream_id,
-                stream_generation=self._stream.generation,
+                event_stream_id=self._stream.stream_id,
+                event_stream_generation=self._stream.generation,
             )
             for index, output in enumerate(self._request.output_declarations)
         }
@@ -657,6 +828,9 @@ def _compile_camera_monitor_plan(
     view: CameraMonitorViewPort,
     stream: AcquisitionStream[CameraSample],
     producer: AcquisitionProducer[CameraSample],
+    cycle_stream: AcquisitionStream[_CameraCyclePayload],
+    cycle_producer: AcquisitionProducer[_CameraCyclePayload],
+    cycle_contract: _CameraCycleContract,
     association_source: CameraAssociatedSignalEventSource | None,
     *,
     activate_output_bindings: Callable[[BoundCameraMonitorPort], None],
@@ -693,8 +867,8 @@ def _compile_camera_monitor_plan(
                     exposure,
                 )
             activate_output_bindings(active_port)
-            tap = stream.monitor()
-            raw_dataset = MonitorDataset.append_window(
+            tap = cycle_stream.monitor()
+            raw_dataset = MonitorDataset.latest_cell(
                 spec.block_id,
                 tap,
                 spec.dataset_edge,
@@ -707,8 +881,10 @@ def _compile_camera_monitor_plan(
                 dataset,
                 stream,
                 producer,
+                cycle_producer,
+                cycle_contract,
                 uuid.uuid4().hex,
-                request.history_cycles * request.frames_per_cycle,
+                request.frames_per_cycle,
                 active_port.capability.max_blocking_call_seconds,
                 association_source,
             )
@@ -735,6 +911,10 @@ def _compile_camera_monitor_plan(
                     pass
             try:
                 producer.fail(StreamError(safe_error_summary(error)))
+            except BaseException:
+                pass
+            try:
+                cycle_producer.fail(StreamError(safe_error_summary(error)))
             except BaseException:
                 pass
             raise

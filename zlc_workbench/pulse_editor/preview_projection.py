@@ -1,25 +1,36 @@
-"""Pure projection from the pulse-owned timeline to the existing renderer API.
+"""Pure Pulse-domain projection into the public :mod:`zlc_plot` vocabulary.
 
-This seam contains no Qt, Matplotlib, compiler, or authoring logic.  It merely
-selects visible rows and translates the renderer-neutral, exact timeline into
-the plain-data arguments consumed by the single pulse drawing implementation.
+Pulse authoring owns the exact timeline.  ``zlc_plot`` owns every drawing,
+layout, selector, raster and export decision.  This module is the deliberately
+small seam between those owners: it selects visible Pulse rows and constructs
+the immutable plot input/spec consumed by every presentation backend.
 """
 
 from __future__ import annotations
 
-from zlc_frontend.plot_layout import optimal_pulse_size
+from zlc_plot import (
+    DEFAULTS,
+    PlotLabels,
+    PulseAnalogTrace,
+    PulseBlock,
+    PulseChannel,
+    PulseDacScanSegment,
+    PulseRepeatMarker,
+    PulseScanRegion,
+    PulseTimelineData,
+    PulseTimelinePlot,
+)
 from zlc_pulse import PORT_DAC, PORT_DIGITAL, PulseTimelineDocument
 
 from .repeat_presentation import pulse_repeat_presentation
 
 
-def pulse_timeline_render_kwargs(
+def pulse_timeline_plot(
     timeline: PulseTimelineDocument,
     *,
     include_off_rows: bool,
-    size: str | None = None,
-) -> dict[str, object]:
-    """Return the one plain-data rendering projection for screen and export."""
+) -> tuple[PulseTimelineData, PulseTimelinePlot]:
+    """Project one exact Pulse timeline into the sole plotting API."""
 
     if not isinstance(timeline, PulseTimelineDocument):
         raise TypeError("timeline must be PulseTimelineDocument")
@@ -32,40 +43,33 @@ def pulse_timeline_render_kwargs(
     )
     tick_seconds = 1.0 / timeline.clock_hz
 
-    pulses = []
-    for row in digital:
-        for segment in row.segments:
-            if segment.start_value == 0:
-                continue
-            start = segment.start_tick * tick_seconds
-            stop = segment.stop_tick * tick_seconds
-            pulses.append(
-                {
-                    "channel": row.row_id,
-                    "start": start,
-                    "stop": stop,
-                    "duration": stop - start,
-                    "value": True,
-                    # The formal source sequence never assigned per-edge names;
-                    # period names remain represented by the period cards.
-                    "name": "",
-                }
-            )
-
-    analog_traces = []
-    for row in analog:
-        starts = [segment.start_tick * tick_seconds for segment in row.segments]
-        starts.append(row.segments[-1].stop_tick * tick_seconds)
-        analog_traces.append(
-            {
-                "name": row.row_id,
-                "label": row.label,
-                "min": row.value_range[0],
-                "max": row.value_range[1],
-                "starts": starts,
-                "values": [segment.start_value for segment in row.segments],
-            }
+    blocks = tuple(
+        PulseBlock(
+            channel_id=row.row_id,
+            start=segment.start_tick * tick_seconds,
+            stop=segment.stop_tick * tick_seconds,
         )
+        for row in digital
+        for segment in row.segments
+        if segment.start_value != 0
+    )
+    analog_traces = tuple(
+        PulseAnalogTrace(
+            name=row.row_id,
+            label=row.label,
+            minimum=row.value_range[0],
+            maximum=row.value_range[1],
+            starts=tuple(
+                [
+                    segment.start_tick * tick_seconds
+                    for segment in row.segments
+                ]
+                + [row.segments[-1].stop_tick * tick_seconds]
+            ),
+            values=tuple(segment.start_value for segment in row.segments),
+        )
+        for row in analog
+    )
 
     repeat_summary, repeat_index_spans, periods = _timeline_repeat_presentation(
         timeline
@@ -82,8 +86,13 @@ def pulse_timeline_render_kwargs(
             else periods[end_index].stop_tick
         )
         repeat_markers.append(
-            (start_tick * tick_seconds, stop_tick * tick_seconds, label)
+            PulseRepeatMarker(
+                start_tick * tick_seconds,
+                stop_tick * tick_seconds,
+                label,
+            )
         )
+
     scan_regions = []
     scan_dac_segments = []
     for annotation in timeline.annotations:
@@ -91,33 +100,65 @@ def pulse_timeline_render_kwargs(
         stop = annotation.stop_tick * tick_seconds
         if annotation.kind == "scan-duration":
             scan_regions.append(
-                {"start": start, "stop": stop, "number": annotation.number}
+                PulseScanRegion(start, stop, annotation.number)
             )
         elif annotation.kind == "scan-dac":
             scan_dac_segments.append(
-                {
-                    "trace_name": annotation.row_id,
-                    "start": start,
-                    "stop": stop,
-                    "value": annotation.value,
-                    "number": annotation.number,
-                }
+                PulseDacScanSegment(
+                    annotation.row_id,
+                    start,
+                    stop,
+                    annotation.value,
+                    annotation.number,
+                )
             )
 
-    effective_size = size or optimal_pulse_size(len(digital), len(periods))
-    return {
-        "pulses": pulses,
-        "channels": [row.row_id for row in digital],
-        "channel_labels": {row.row_id: row.label for row in digital},
-        "total_duration": timeline.logical_duration_ticks * tick_seconds,
-        "title": timeline.title,
-        "repeat_markers": repeat_markers,
-        "repeat_notation": repeat_summary,
-        "size": effective_size,
-        "analog_traces": analog_traces,
-        "scan_regions": scan_regions,
-        "scan_dac_segments": scan_dac_segments,
-    }
+    data = PulseTimelineData(
+        channels=tuple(PulseChannel(row.row_id, row.label) for row in digital),
+        blocks=blocks,
+        scan_regions=tuple(scan_regions),
+        time_unit="s",
+        total_duration=timeline.logical_duration_ticks * tick_seconds,
+        analog_traces=analog_traces,
+        repeat_markers=tuple(repeat_markers),
+        repeat_notation=repeat_summary,
+        scan_dac_segments=tuple(scan_dac_segments),
+    )
+    return data, PulseTimelinePlot(labels=PlotLabels(title=timeline.title))
+
+
+def recommended_pulse_size(
+    timeline: PulseTimelineDocument,
+    *,
+    include_off_rows: bool,
+) -> str:
+    """Choose the smallest declared zlc_plot preset that keeps rows legible."""
+
+    if not isinstance(timeline, PulseTimelineDocument):
+        raise TypeError("timeline must be PulseTimelineDocument")
+    if type(include_off_rows) is not bool:
+        raise TypeError("include_off_rows must be bool")
+    digital, analog = _preview_rows(
+        timeline,
+        include_off_rows=include_off_rows,
+    )
+    _summary, _spans, periods = _timeline_repeat_presentation(timeline)
+    layout = DEFAULTS.layout
+    row_count = max(1, len(digital) + len(analog))
+    period_count = max(1, len(periods))
+    ordered = sorted(
+        layout.presets,
+        key=lambda preset: preset.rows * preset.columns,
+    )
+    for preset in ordered:
+        if (
+            preset.rows * layout.panel_unit.height
+            >= row_count * layout.pulse_row_min_px
+            and preset.columns * layout.panel_unit.width
+            >= period_count * layout.pulse_period_min_px
+        ):
+            return preset.name
+    return ordered[-1].name
 
 
 def pulse_repeat_summary(timeline: PulseTimelineDocument) -> str:
@@ -163,9 +204,8 @@ def _preview_rows(
     if include_off_rows:
         return all_digital, all_analog
     active_digital = tuple(row for row in all_digital if row.active)
-    # The formal preview has always retained one digital baseline as a spatial
-    # reference when the entire TTL table is off.  This is a display fallback,
-    # never a mutation or claim that the channel is physically active.
+    # Preserve the formal preview's one digital spatial reference when every
+    # TTL row is off.  It is a display row only, never an authored state change.
     digital = active_digital or all_digital[:1]
     return digital, tuple(row for row in all_analog if row.active)
 
@@ -215,5 +255,6 @@ def _timeline_repeat_presentation(
 __all__ = [
     "pulse_preview_status",
     "pulse_repeat_summary",
-    "pulse_timeline_render_kwargs",
+    "pulse_timeline_plot",
+    "recommended_pulse_size",
 ]

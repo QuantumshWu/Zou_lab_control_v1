@@ -5,15 +5,16 @@ from __future__ import annotations
 from zlc_neutral_atom.authoring import AuthoringChoice
 from zlc_neutral_atom.logic_node_declaration import (
     ArtifactOutputPresentation,
-    DefaultOutputView,
     DynamicChoicePresentation,
     LogicNodeDeclaration,
     OutputPresentation,
     PathPresentationHint,
+    TaskPreviewPlot,
 )
 from zlc_neutral_atom.node_input import bind_no_node_inputs
+from zlc_plot.kinds import PlotKind
 
-from .projection import (
+from .outputs import (
     CALIBRATION_ARTIFACT_OUTPUT_DECLARATION,
     CALIBRATION_FINAL_OUTPUT_DECLARATIONS,
 )
@@ -27,7 +28,10 @@ from .task import (
 
 
 _LIVE_REFERENCE = CALIBRATION_LIVE_OUTPUT_DECLARATIONS[0]
-_FINAL = CALIBRATION_FINAL_OUTPUT_DECLARATIONS
+_FINAL = {
+    declaration.name: declaration
+    for declaration in CALIBRATION_FINAL_OUTPUT_DECLARATIONS
+}
 
 
 def _calibration_camera_choices(
@@ -64,37 +68,43 @@ CALIBRATION_LOGIC_NODE = LogicNodeDeclaration(
             "exact capture frame while Calibration is running",
         ),
         OutputPresentation(
-            _FINAL[0],
+            _FINAL["site_map"],
             "site map",
             "Counts",
             "reference-average image with calibrated site geometry",
         ),
         OutputPresentation(
-            _FINAL[1],
+            _FINAL["fidelity_site"],
             "site fidelity",
             "Readout fidelity",
             "held-out balanced fidelity for each canonical site",
         ),
         OutputPresentation(
-            _FINAL[2],
+            _FINAL["fidelity_threshold"],
             "site threshold",
             "Readout threshold",
             "trained per-site threshold",
         ),
         OutputPresentation(
-            _FINAL[3],
+            _FINAL["fidelity_centers"],
             "site centres",
             "Site centre",
             "calibrated x/y centre for each canonical site",
         ),
         OutputPresentation(
-            _FINAL[4],
+            _FINAL["readout_samples"],
+            "readout samples",
+            "Readout signal",
+            "raw per-repeat/per-context samples for each canonical site",
+        ),
+        OutputPresentation(
+            _FINAL["aggregate_fidelity"],
             "aggregate fidelity",
             "Aggregate fidelity",
             "held-out balanced fidelity using per-site thresholds",
         ),
         OutputPresentation(
-            _FINAL[5],
+            _FINAL["global_fidelity"],
             "global fidelity",
             "Global fidelity",
             "held-out balanced fidelity using one shared threshold",
@@ -109,9 +119,9 @@ CALIBRATION_LOGIC_NODE = LogicNodeDeclaration(
             "FINAL Calibration artifact",
         ),
     ),
-    default_views=(
-        DefaultOutputView(_LIVE_REFERENCE.name, "2d"),
-        DefaultOutputView(_FINAL[0].name, "sites"),
+    task_previews=(
+        TaskPreviewPlot(_LIVE_REFERENCE.name, PlotKind.IMAGE),
+        TaskPreviewPlot(_FINAL["site_map"].name, PlotKind.IMAGE),
     ),
     path_presentations=(
         PathPresentationHint(

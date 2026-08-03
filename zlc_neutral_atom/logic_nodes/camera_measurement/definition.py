@@ -6,8 +6,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from zlc_data import (
-    MONITOR_HISTORY,
     READOUT_EVENT,
+    AxisSpec,
     BlockId,
     CellValidity,
     DataBlock,
@@ -17,6 +17,8 @@ from zlc_data import (
     OwnedSnapshot,
     PointColumn,
     PointTable,
+    ValidityContract,
+    ValueSchema,
 )
 from zlc_data.codec import dataset_revision_ref_to_tree
 from zlc_neutral_atom.installation import DeviceRef
@@ -54,7 +56,6 @@ from zlc_neutral_atom.authoring import (
 DEFAULT_CAMERA_MEASUREMENT_ROLE = "camera"
 DEFAULT_CAMERA_MEASUREMENT_REPEAT = 0
 DEFAULT_CAMERA_FRAMES_PER_CYCLE = 1
-DEFAULT_CAMERA_MONITOR_HISTORY_CYCLES = 8
 MINIMUM_CAMERA_MEASUREMENT_REPEAT = 0
 MINIMUM_CAMERA_FRAMES_PER_CYCLE = 1
 CAMERA_FRAME_OUTPUT_CONTRACT_ID = (
@@ -398,78 +399,50 @@ def project_camera_monitor_outputs(
     source: MonitorDatasetSnapshot,
     request: "CameraMeasurementRequest",
 ) -> dict[str, LiveDatasetOutput]:
-    """Publish the newest atomic monitor cycle as declared ``frame_i`` values.
+    """Publish one latest atomic Camera cycle as declared ``frame_i`` values.
 
-    ``MONITOR_HISTORY`` is private rolling-storage geometry, not a physical
-    point axis of a public Camera signal.  The frozen monitor orders that axis
-    newest-first, so every output selects history index zero together with its
-    declared ``READOUT_EVENT`` index.  The resulting public signal therefore
-    retains the universal ``(R=1, P=1, *data_shape)`` contract regardless of
-    the configured history capacity.
+    The monitor owns one physical Dataset cell.  Its private value begins with
+    the declared ``READOUT_EVENT`` component axis, while every public output
+    removes that component and retains the canonical
+    ``(R=1, P=1, *frame_shape)`` contract in the camera's native dtype.
     """
 
     if not isinstance(source, MonitorDatasetSnapshot):
         raise TypeError("source must be MonitorDatasetSnapshot")
     source_schema = source.snapshot.block.schema
-    history_columns = tuple(
-        column
-        for column in source_schema.point_table.columns
-        if column.role == MONITOR_HISTORY
-    )
-    event_columns = tuple(
-        column
-        for column in source_schema.point_table.columns
-        if column.role == READOUT_EVENT
-    )
-    if len(history_columns) != 1:
-        raise ValueError("Camera monitor must contain one MONITOR_HISTORY column")
-    if len(event_columns) != 1:
-        raise ValueError("Camera monitor must contain one READOUT_EVENT column")
-    if any(
-        column.role not in {MONITOR_HISTORY, READOUT_EVENT}
-        for column in source_schema.point_table.columns
+    if (
+        source_schema.repeat_axis.size != 1
+        or source_schema.point_table != PointTable(1)
+        or source_schema.grid_topology is not None
     ):
-        raise ValueError("Camera monitor contains an unsupported point column")
-    history_column = history_columns[0]
-    event_column = event_columns[0]
-    if set(event_column.values) != set(range(request.frames_per_cycle)):
+        raise ValueError("Camera monitor source must be one canonical latest cell")
+    data_axes = source_schema.cell_schema.data_axes
+    if not data_axes or data_axes[0].role != READOUT_EVENT:
+        raise ValueError("Camera monitor value must begin with READOUT_EVENT")
+    event_axis = data_axes[0]
+    if (
+        event_axis.size != request.frames_per_cycle
+        or event_axis.coordinates != tuple(range(request.frames_per_cycle))
+    ):
         raise ValueError(
-            "Camera monitor READOUT_EVENT rows differ from frames_per_cycle"
+            "Camera monitor READOUT_EVENT components differ from frames_per_cycle"
         )
 
     projected: dict[str, LiveDatasetOutput] = {}
     for declaration in request.output_declarations:
         output_name = declaration.name
         event_index = camera_frame_output_index(output_name)
-        point_ordinal = _unique_camera_point_ordinal(
-            source_schema,
-            history=(history_column, 0),
-            readout_event=(event_column, event_index),
-        )
-        snapshot = _materialize_camera_frame(
+        snapshot = _materialize_camera_monitor_frame(
             source.snapshot,
-            event_column,
+            event_axis,
             event_index,
-            point_ordinal,
         )
         output_schema = snapshot.block.schema
         if output_schema.point_table != PointTable(1):
             raise RuntimeError("Camera monitor storage axes leaked into a public frame")
-        selected_refs = tuple(
-            source.event_refs[
-                repeat_index * source_schema.point_table.row_count
-                + point_ordinal
-            ]
-            for repeat_index in range(output_schema.repeat_axis.size)
-        )
-        total = (
-            output_schema.repeat_axis.size
-            * output_schema.point_table.row_count
-        )
-        if len(selected_refs) != total:
-            raise RuntimeError("Camera monitor projection lost output cells")
+        total = output_schema.repeat_axis.size * output_schema.point_table.row_count
         coverage = MonitorCoverage(
-            written_cells=sum(ref is not None for ref in selected_refs),
+            written_cells=source.coverage.written_cells,
             total_cells=total,
             missed_events=source.coverage.missed_events,
             current_gap=source.coverage.current_gap,
@@ -480,6 +453,64 @@ def project_camera_monitor_outputs(
             coverage,
         )
     return projected
+
+
+def _materialize_camera_monitor_frame(
+    source: OwnedSnapshot,
+    event_axis: AxisSpec,
+    event_index: int,
+) -> OwnedSnapshot:
+    """Select one private cycle component without copying or changing dtype."""
+
+    cycle_schema = source.block.schema.cell_schema
+    if cycle_schema.data_axes[0] != event_axis:
+        raise ValueError("Camera monitor event axis differs from its cycle schema")
+    component_ids = cycle_schema.validity_contract.component_axis_ids
+    if not component_ids or component_ids[0] != event_axis.axis_id:
+        raise ValueError("Camera monitor cycle validity must begin with READOUT_EVENT")
+    frame_component_ids = component_ids[1:]
+    frame_validity = (
+        ValidityContract.value()
+        if not frame_component_ids
+        else ValidityContract.components(*frame_component_ids)
+    )
+    frame_schema = ValueSchema(
+        cycle_schema.data_axes[1:],
+        frame_validity,
+        cycle_schema.dtype,
+        cycle_schema.value_unit,
+    )
+    source_validity = source.block.validity
+    if not isinstance(source_validity, DatasetComponentValidity):
+        raise TypeError("Camera monitor cycle requires component validity")
+    selected_mask = source_validity.mask[:, :, event_index, ...]
+    selected_validity = (
+        CellValidity(selected_mask)
+        if not frame_component_ids
+        else DatasetComponentValidity(frame_component_ids, selected_mask)
+    )
+    output_schema = DatasetSchema(
+        source.block.schema.repeat_axis,
+        PointTable(1),
+        None,
+        frame_schema,
+    )
+    ref = _camera_frame_ref(
+        source,
+        event_axis.axis_id.value,
+        event_index,
+        output_schema,
+    )
+    return OwnedSnapshot(
+        ref,
+        DataBlock(
+            ref.block_id,
+            ref.revision,
+            source.block.values[:, :, event_index, ...],
+            selected_validity,
+            output_schema,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -493,7 +524,6 @@ class CameraMeasurementRequest:
 
     camera_ref: DeviceRef
     repeat: int = DEFAULT_CAMERA_MEASUREMENT_REPEAT
-    history_cycles: int = DEFAULT_CAMERA_MONITOR_HISTORY_CYCLES
     frames_per_cycle: int = DEFAULT_CAMERA_FRAMES_PER_CYCLE
     exposure_seconds: float | None = None
 
@@ -504,11 +534,6 @@ class CameraMeasurementRequest:
             raise TypeError("repeat must be an integer")
         if self.repeat < MINIMUM_CAMERA_MEASUREMENT_REPEAT:
             raise ValueError("repeat must be non-negative")
-        object.__setattr__(
-            self,
-            "history_cycles",
-            positive_integer(self.history_cycles, "history_cycles"),
-        )
         object.__setattr__(
             self,
             "frames_per_cycle",
@@ -587,7 +612,6 @@ __all__ = [
     "DEFAULT_CAMERA_FRAMES_PER_CYCLE",
     "DEFAULT_CAMERA_MEASUREMENT_REPEAT",
     "DEFAULT_CAMERA_MEASUREMENT_ROLE",
-    "DEFAULT_CAMERA_MONITOR_HISTORY_CYCLES",
     "MINIMUM_CAMERA_FRAMES_PER_CYCLE",
     "MINIMUM_CAMERA_MEASUREMENT_REPEAT",
     "camera_measurement_authoring_schema",

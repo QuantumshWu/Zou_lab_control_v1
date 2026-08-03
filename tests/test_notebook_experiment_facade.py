@@ -16,17 +16,6 @@ import pytest
 import Zou_lab_control.api as zlc
 import Zou_lab_control.api.facade as facade_impl
 import Zou_lab_control.api._readout_core as readout_core_impl
-from zlc_data import (
-    AxisSourceRef,
-    FitCancelled,
-    FitNumericPolicy,
-    SPATIAL_X,
-    SPATIAL_Y,
-)
-from zlc_data.fit_codec import encode_fit_result_batch
-from zlc_neutral_atom.artifacts import (
-    FitResultArtifactRef,
-)
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
@@ -70,7 +59,7 @@ def _assert_direct_output_root_writable(root: Path) -> None:
     probe.unlink()
 
 
-def _case_capture_and_fit(root: Path) -> None:
+def _case_capture(root: Path) -> None:
     with _connect(root) as exp:
         request = exp.readout.capture_request(IMAGING_PULSE)
         assert request.camera_ref == exp.device_catalog["camera"].ref
@@ -108,49 +97,6 @@ def _case_capture_and_fit(root: Path) -> None:
         convenience_reference = exp.readout.capture(IMAGING_PULSE)
         convenience_capture = exp.readout.load_capture(convenience_reference)
         assert convenience_capture.pulse_evidence is not None
-        fit_schema = convenience_capture.frame_source.schema
-        fit_axes = {axis.role: axis for axis in fit_schema.cell_schema.data_axes}
-        batch_sources = (
-            *(
-                (AxisSourceRef.tensor(fit_schema.repeat_axis.axis_id),)
-                if fit_schema.repeat_axis.size > 1
-                else ()
-            ),
-            *(
-                (AxisSourceRef.point_rows(),)
-                if fit_schema.point_table.row_count > 1
-                else ()
-            ),
-        )
-        result = exp.fit(
-            convenience_reference,
-            model="radial_gaussian_center",
-            independent_sources=(
-                AxisSourceRef.tensor(fit_axes[SPATIAL_X].axis_id),
-                AxisSourceRef.tensor(fit_axes[SPATIAL_Y].axis_id),
-            ),
-            batch_sources=batch_sources,
-            numeric_policy=FitNumericPolicy(
-                max_evaluations=500,
-            ),
-        )
-        assert tuple(axis.role for axis in result.fit_axis_specs) == (
-            SPATIAL_X,
-            SPATIAL_Y,
-        )
-        assert result.spec.batch_sources == batch_sources
-        assert result.batch_layout.storage_size == (
-            fit_schema.repeat_axis.size * fit_schema.point_table.row_count
-        )
-
-        fit_ref = exp.save_fit(convenience_reference, result)
-        assert isinstance(fit_ref, FitResultArtifactRef)
-        admitted = exp.load_fit(fit_ref)
-        assert admitted.reference == fit_ref
-        assert admitted.source_artifact_ref == convenience_reference
-        assert encode_fit_result_batch(admitted.result) == encode_fit_result_batch(
-            result
-        )
 
 
 def _case_public_authority_and_validation(root: Path) -> None:
@@ -415,94 +361,6 @@ def _case_close_race(root: Path, surface: str) -> None:
     assert backend_calls == []
 
 
-def _case_fit_close_drain(root: Path) -> None:
-    exp = _connect(root)
-    services = exp._services
-    entered = threading.Barrier(3)
-    close_started = threading.Barrier(3)
-    releases = (threading.Event(), threading.Event())
-    fit_failures: list[BaseException] = []
-    close_failures: list[BaseException] = []
-
-    def fit_worker(index: int) -> None:
-        try:
-            with facade_impl._fit_service_guard(services):
-                entered.wait(timeout=2.0)
-                assert releases[index].wait(2.0)
-        except BaseException as error:
-            fit_failures.append(error)
-
-    def close_worker() -> None:
-        try:
-            close_started.wait(timeout=2.0)
-            exp.close()
-        except BaseException as error:
-            close_failures.append(error)
-
-    fit_threads = tuple(
-        threading.Thread(target=fit_worker, args=(index,), daemon=False)
-        for index in range(2)
-    )
-    for thread in fit_threads:
-        thread.start()
-    entered.wait(timeout=2.0)
-
-    close_threads = tuple(
-        threading.Thread(target=close_worker, daemon=False) for _ in range(2)
-    )
-    for thread in close_threads:
-        thread.start()
-    close_started.wait(timeout=2.0)
-
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        with services.operation_lock:
-            if services.state == "CLOSING":
-                break
-        time.sleep(0.005)
-    else:
-        raise AssertionError("concurrent close did not enter CLOSING")
-
-    def attempt_late_fit() -> None:
-        with facade_impl._fit_service_guard(services):
-            raise AssertionError("Fit entered after Experiment began closing")
-
-    _expect(RuntimeError, "closing or closed", attempt_late_fit)
-    assert all(thread.is_alive() for thread in close_threads)
-
-    releases[0].set()
-    fit_threads[0].join(2.0)
-    assert not fit_threads[0].is_alive()
-    assert all(thread.is_alive() for thread in close_threads)
-
-    releases[1].set()
-    for thread in (*fit_threads[1:], *close_threads):
-        thread.join(2.0)
-        assert not thread.is_alive()
-    assert close_failures == []
-    assert len(fit_failures) == 2
-    assert all(isinstance(error, FitCancelled) for error in fit_failures)
-    assert services.state == "CLOSED"
-    _assert_direct_output_root_writable(root)
-
-
-def _case_fit_reentrant_close(root: Path) -> None:
-    exp = _connect(root)
-    services = exp._services
-    with facade_impl._fit_service_guard(services):
-        _expect(
-            RuntimeError,
-            "cannot close reentrantly",
-            exp.close,
-        )
-        with services.operation_lock:
-            assert services.state == "OPEN"
-    assert services.state == "OPEN"
-    exp.close()
-    assert services.state == "CLOSED"
-    _assert_direct_output_root_writable(root)
-
-
 def _case_failed_public_root(root: Path) -> None:
     def reject_public_root(*_args, **_kwargs):
         raise RuntimeError("public root construction failed")
@@ -520,7 +378,7 @@ def _case_failed_public_root(root: Path) -> None:
 def _run_case(case: str, root_text: str) -> None:
     root = Path(root_text)
     cases = {
-        "capture-and-fit": lambda: _case_capture_and_fit(root),
+        "capture": lambda: _case_capture(root),
         "public-authority": lambda: _case_public_authority_and_validation(root),
         "concurrent-close-owner": lambda: _case_concurrent_close_owner(root),
         "concurrent-gui-owner": lambda: _case_concurrent_gui_owner_keeps_pumping(root),
@@ -528,8 +386,6 @@ def _run_case(case: str, root_text: str) -> None:
         "runtime-close-retry": lambda: _case_runtime_close_retry_preserves_handles(root),
         "close-race-capture": lambda: _case_close_race(root, "capture"),
         "close-race-pulse": lambda: _case_close_race(root, "pulse"),
-        "fit-close-drain": lambda: _case_fit_close_drain(root),
-        "fit-reentrant-close": lambda: _case_fit_reentrant_close(root),
         "failed-public-root": lambda: _case_failed_public_root(root),
     }
     cases[case]()
@@ -556,7 +412,7 @@ def _run_isolated(case: str, root: Path) -> subprocess.CompletedProcess[str]:
 @pytest.mark.parametrize(
     "case",
     (
-        "capture-and-fit",
+        "capture",
         "public-authority",
         "concurrent-close-owner",
         "concurrent-gui-owner",
@@ -564,8 +420,6 @@ def _run_isolated(case: str, root: Path) -> subprocess.CompletedProcess[str]:
         "runtime-close-retry",
         "close-race-capture",
         "close-race-pulse",
-        "fit-close-drain",
-        "fit-reentrant-close",
         "failed-public-root",
     ),
 )

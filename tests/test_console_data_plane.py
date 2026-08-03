@@ -206,7 +206,7 @@ def test_derived_route_stores_an_owned_event_capability_not_selector_metadata() 
         assert plane.publish_continuous_derived(
             "figure/area",
             generation,
-            parent,
+            (parent,),
             {"panel/area": DerivedSignalOutput(output.snapshot)},
         )
         assert plane.signal_event_binding("panel/area") == (
@@ -320,6 +320,7 @@ class _GatedProcessorNode:
         )
         self.failure: Exception | None = None
         self.cancelled = False
+        self.ready = False
 
     def signal_key(self, name: str) -> str:
         return f"{self.instance_id}/{name}"
@@ -331,9 +332,8 @@ class _GatedProcessorNode:
         if source.name != self._source_name:
             raise ValueError("wrong test source")
 
-    @staticmethod
-    def processor_application_ready(_application) -> None:
-        return None
+    def processor_application_ready(self, _application) -> None:
+        self.ready = True
 
     @staticmethod
     def processor_work_started(_source) -> None:
@@ -375,6 +375,28 @@ def _wait_for_signal_revision(
             return front
         time.sleep(0.005)
     raise AssertionError(f"{name} revision {revision} did not reach the data front")
+
+
+def _wait_for_processor_ready(
+    plane: SignalDataPlane,
+    processor: _GatedProcessorNode,
+) -> None:
+    deadline = time.monotonic() + 2.0
+    while not processor.ready and time.monotonic() < deadline:
+        plane.freeze()
+        time.sleep(0.005)
+    assert processor.ready
+
+
+def _wait_for_processor_cancelled(
+    plane: SignalDataPlane,
+    processor: _GatedProcessorNode,
+) -> None:
+    deadline = time.monotonic() + 2.0
+    while not processor.cancelled and time.monotonic() < deadline:
+        plane.freeze()
+        time.sleep(0.005)
+    assert processor.cancelled
 
 
 def test_unchanged_sources_reuse_their_exact_publication_and_front() -> None:
@@ -542,14 +564,45 @@ def test_source_retirement_removes_the_complete_publication_closure() -> None:
         initial_publication=publication,
     )
     try:
+        _wait_for_processor_ready(plane, processor)
         retired = plane.retire(source_node)
         assert retired == frozenset(
             {"camera/frame", "camera/frame_aux", "occupancy/occupied"}
         )
         assert plane.freeze().names() == ()
         gate.set()
-        time.sleep(0.01)
+        _wait_for_processor_cancelled(plane, processor)
         assert plane.freeze().names() == ()
+    finally:
+        gate.set()
+        plane.close()
+
+
+def test_explicit_processor_cancel_waits_for_inflight_work_acknowledgement() -> None:
+    plane, _state, _source_node, _source_slot, first = _live_source_plane()
+    gate = threading.Event()
+    processor = _GatedProcessorNode(
+        plane,
+        instance_id="occupancy",
+        source_name="camera/frame",
+        declared_outputs=("occupied",),
+        gates={1: gate},
+    )
+    publication = first.publication("camera/frame")
+    assert publication is not None
+    plane.attach_latest_only_processor(
+        processor,
+        source_name="camera/frame",
+        initial_publication=publication,
+    )
+    try:
+        _wait_for_processor_ready(plane, processor)
+        assert not plane.cancel_latest_only_processor(processor)
+        assert plane.freeze().value("occupancy/occupied") is None
+        assert not processor.cancelled
+        gate.set()
+        _wait_for_processor_cancelled(plane, processor)
+        assert plane.freeze().value("occupancy/occupied") is None
     finally:
         gate.set()
         plane.close()

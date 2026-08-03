@@ -76,14 +76,14 @@ def _bind_api(
         calibration,
         **kwargs,
     ):
-        from .ui.workbench_jobs import render_calibration_plot_report
+        from .ui.plot_report import export_calibration_plot_pages
 
         return write_calibration_post_final_exports(
             source,
             calibration,
             captures_root=captures_root,
             calibrations_root=calibrations_root,
-            render_report=render_calibration_plot_report,
+            export_plots=export_calibration_plot_pages,
             **kwargs,
         )
 
@@ -123,17 +123,6 @@ def _bind_api(
     )
 
 
-def _project_signal_presentation(node, output_name, publication, parents):
-    from .ui.workbench_jobs import project_calibration_signal_presentation
-
-    return project_calibration_signal_presentation(
-        node,
-        output_name,
-        publication,
-        parents,
-    )
-
-
 def _prepare_hosted(api, request, event_source):
     if event_source is not None:
         raise ValueError("Calibration has no event-associated input")
@@ -170,7 +159,6 @@ LOGIC_NODE_PACKAGE = LogicNodePackage(
     availability=_availability,
     dynamic_choice_fact="readout_camera_roles",
     start_prepared=start_calibration_task_command,
-    project_signal_presentation=_project_signal_presentation,
     ui_contributions=(
         UiContributionDescriptor(
             "create",

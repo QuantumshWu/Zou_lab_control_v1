@@ -1,8 +1,8 @@
 """Physical binding for one running Camera Measurement frame output.
 
 The Camera domain owns this value because only it can join the selected public
-``frame_i`` output to the endpoint-read working point and the exact live stream
-generation that publishes it.  Downstream processors may require this typed
+``frame_i`` output to the endpoint-read working point and the exact Camera
+event stream that supplies it.  Downstream processors may require this typed
 binding; a GUI or generic signal router must never reconstruct camera physics
 from a signal name or ndarray shape.
 """
@@ -32,9 +32,9 @@ class CameraFrameOutputBinding:
     """Immutable physical identity of one active ``frame_i`` signal.
 
     ``capability_evidence`` is captured after any requested camera
-    reconfiguration has completed and been read back.  ``stream_generation``
-    prevents the same schema from being silently rebound to a restarted Camera
-    Measurement.
+    reconfiguration has completed and been read back.  ``event_stream_*``
+    names the Camera event cursor consumed by reactive processors.  It is not
+    the generation of the separately materialized Dataset publication.
     """
 
     output: DatasetOutputDeclaration
@@ -43,8 +43,8 @@ class CameraFrameOutputBinding:
     capability_evidence: CameraCapabilityEvidence
     binding_stamp: DeviceBindingStamp
     frame_schema: ValueSchema
-    stream_id: StreamId
-    stream_generation: StreamGenerationId
+    event_stream_id: StreamId
+    event_stream_generation: StreamGenerationId
 
     def __post_init__(self) -> None:
         if not isinstance(self.output, DatasetOutputDeclaration):
@@ -85,9 +85,9 @@ class CameraFrameOutputBinding:
             count_unit=facts.count_unit,
             frame_schema=self.frame_schema,
         )
-        if not isinstance(self.stream_id, StreamId):
-            raise TypeError("stream_id must be StreamId")
-        if not isinstance(self.stream_generation, StreamGenerationId):
-            raise TypeError("stream_generation must be StreamGenerationId")
+        if not isinstance(self.event_stream_id, StreamId):
+            raise TypeError("event_stream_id must be StreamId")
+        if not isinstance(self.event_stream_generation, StreamGenerationId):
+            raise TypeError("event_stream_generation must be StreamGenerationId")
 
 __all__ = ["CameraFrameOutputBinding"]

@@ -12,17 +12,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Protocol
 
-from zlc_data import AxisSourceRef, DatasetSchema
-from zlc_data.codec import axis_source_ref_to_tree
+from zlc_data import DatasetSchema
 from zlc_neutral_atom.capture.artifact import CaptureArtifact
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
 from zlc_neutral_atom.dataset_output import FinalDatasetOutput
 from zlc_neutral_atom.logic_node_declaration import (
-    DefaultOutputView,
     DynamicChoicePresentation,
     LogicNodeDeclaration,
     OutputPresentation,
     PathPresentationHint,
+    TaskPreviewPlot,
 )
 from zlc_neutral_atom.node_input import bind_no_node_inputs
 from zlc_neutral_atom.authoring import (
@@ -67,22 +66,19 @@ from zlc_storage import (
     normalized_text,
     positive_real,
 )
+from zlc_plot.kinds import AxisRef
+from zlc_plot.specs import FacetGridPlot, ImagePlot
 
 
 DEFAULT_MOT_FIELD_PULSE_PATH = "mot_field_template.json"
 
-_MOT_FIELD_GRID_SOURCES = tuple(
-    axis_source_ref_to_tree(AxisSourceRef.grid_dimension(axis_id))
-    for axis_id in _MOT_SCAN_COORDINATE_IDS
+_MOT_FIELD_GRID_AXES = tuple(
+    AxisRef.point_dimension(axis_id.value) for axis_id in _MOT_SCAN_COORDINATE_IDS
 )
-_MOT_FIELD_DEFAULT_VIEW_PARAMS = {
-    "view_preferences": {
-        "intent": "IMAGE",
-        "image_x_source": _MOT_FIELD_GRID_SOURCES[0],
-        "image_y_source": _MOT_FIELD_GRID_SOURCES[1],
-        "facet_sources": [_MOT_FIELD_GRID_SOURCES[2]],
-    },
-}
+_MOT_FIELD_PREVIEW_PLOT = FacetGridPlot(
+    _MOT_FIELD_GRID_AXES[2],
+    ImagePlot(_MOT_FIELD_GRID_AXES[0], _MOT_FIELD_GRID_AXES[1]),
+)
 
 
 @dataclass(frozen=True)
@@ -320,9 +316,9 @@ MOT_FIELD_LOGIC_NODE = LogicNodeDeclaration(
     ),
     build_request=build_mot_field_intent_from_authoring,
     bind_request=bind_no_node_inputs,
-    default_views=(
-        DefaultOutputView("grid", "grid", _MOT_FIELD_DEFAULT_VIEW_PARAMS),
-        DefaultOutputView("mot_field", "grid", _MOT_FIELD_DEFAULT_VIEW_PARAMS),
+    task_previews=(
+        TaskPreviewPlot("grid", _MOT_FIELD_PREVIEW_PLOT),
+        TaskPreviewPlot("mot_field", _MOT_FIELD_PREVIEW_PLOT),
     ),
     path_presentations=(
         PathPresentationHint(

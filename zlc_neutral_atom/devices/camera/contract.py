@@ -1459,12 +1459,12 @@ class CameraAdapter(Protocol):
         ``frames=None`` and ``source_group_sizes=None`` means a hardware-paced
         monitor.  ``buffer_frame_count`` is the physical driver-ring geometry
         for this arm, not a software retention policy.  For a finite capture it
-        must equal ``frames`` exactly; for a monitor it is the declared
-        ``history_cycles * frames_per_cycle``.  A finite capture also receives
-        the ordered, frozen frame groups derived from the measurement cell
-        schedule; adapters must validate that the groups exactly cover
-        ``frames``.  Trigger transport may verify this contract but never
-        defines it.
+        must equal ``frames`` exactly; for a monitor it is one complete
+        source-authored frame group (``frames_per_cycle``).  A finite capture
+        also receives the ordered, frozen frame groups derived from the
+        measurement cell schedule; adapters must validate that the groups
+        exactly cover ``frames``.  Trigger transport may verify this contract
+        but never defines it.
         """
 
         ...

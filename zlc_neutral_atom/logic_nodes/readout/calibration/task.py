@@ -10,8 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import threading
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Mapping, Protocol
+from typing import TYPE_CHECKING, Callable, Mapping, Protocol
 
 import numpy as np
 
@@ -63,7 +62,6 @@ from zlc_pulse import PulseExecutionForm
 
 if TYPE_CHECKING:
     from .analysis import CalibrationComputation
-    from .projection import CalibrationSiteMapContext
 
 CALIBRATION_THRESHOLD_METHODS = tuple(item.value for item in ThresholdMethod)
 CALIBRATION_LIVE_OUTPUT_DECLARATIONS = (
@@ -88,15 +86,14 @@ def write_calibration_post_final_exports(
     *,
     captures_root: Path,
     calibrations_root: Path,
+    export_plots: Callable,
     save_frames: bool,
     expected_camera_role: str | None = None,
-    render_report: Callable | None = None,
 ) -> None:
     """Write optional frames and a human report beside the committed record."""
 
     from zlc_neutral_atom.capture.artifact import load_capture_artifact
-    from .projection import project_calibration_report
-    from .result_bundle import write_calibration_result_bundle
+    from .outputs import calibration_final_outputs
     from .repository import load_calibration_computation
 
     if not isinstance(source, CaptureArtifactRef):
@@ -109,8 +106,8 @@ def write_calibration_post_final_exports(
         raise ValueError("calibrations_root must be an absolute Path")
     if type(save_frames) is not bool:
         raise TypeError("save_frames must be bool")
-    if not callable(render_report):
-        raise TypeError("render_report must be callable")
+    if not callable(export_plots):
+        raise TypeError("export_plots must be callable")
     camera_role = (
         None
         if expected_camera_role is None
@@ -156,12 +153,9 @@ def write_calibration_post_final_exports(
             run_directory / "source_frame_validity.npy",
             np.asarray(snapshot.block.validity.mask),
         )
-    write_calibration_result_bundle(
+    export_plots(
         run_directory / "report",
-        project_calibration_report(computation, calibration),
-        calibration,
-        source,
-        render_report=render_report,
+        calibration_final_outputs(computation, calibration),
     )
 
 
@@ -678,7 +672,7 @@ class PreparedCalibrationTask:
 
         reference = self._require_own_success(result)
         computation = self._dependencies.load_calibration_computation(reference)
-        from .projection import calibration_final_outputs
+        from .outputs import calibration_final_outputs
 
         outputs = calibration_final_outputs(computation, reference)
         with self._lock:
@@ -698,22 +692,10 @@ class PreparedCalibrationTask:
         return outputs
 
     def post_final_warning(self) -> str | None:
-        """Operator-bundle failure after the calibration artifact committed."""
+        """Optional frame/report export failure after artifact commit."""
 
         with self._lock:
             return self._post_final_warning
-
-    def site_map_context(
-        self,
-        result: CalibrationArtifactRef,
-    ) -> CalibrationSiteMapContext:
-        """Return this command's closed physical SiteMap presentation context."""
-
-        reference = self._require_own_success(result)
-        computation = self._dependencies.load_calibration_computation(reference)
-        from .projection import calibration_site_map_context
-
-        return calibration_site_map_context(computation, reference)
 
     def completion_summary(self, result: CalibrationArtifactRef) -> str:
         """Report the FINAL record without claiming its optional report succeeded."""
