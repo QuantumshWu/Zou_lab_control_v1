@@ -20,7 +20,6 @@ from zlc_neutral_atom.capture.application import (
     CAPTURE_READOUT_EVENT_AXIS_ID,
     CaptureRequest,
 )
-from zlc_neutral_atom.catalog import DefinitionKey, TaskDefinition
 from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.devices.camera.contract import CameraPhysicalFacts
 from zlc_pulse import (
@@ -61,15 +60,6 @@ _READOUT = "readout_probe_duration"
 _REFERENCE_AFTER = "reference_probe_duration_after"
 _EVENT_PARAMETER_IDS = (_REFERENCE_BEFORE, _READOUT, _REFERENCE_AFTER)
 DEFAULT_CALIBRATION_PULSE_PATH = "imaging_template.json"
-SITEMAP_CALIBRATION_TASK_KEY = DefinitionKey(
-    "zlc_neutral_atom.logic_nodes.readout.calibration",
-    "calibrate-readout",
-)
-SITEMAP_CALIBRATION_TASK_DEFINITION = TaskDefinition(
-    SITEMAP_CALIBRATION_TASK_KEY,
-    "Calibrate readout",
-    "zlc_neutral_atom.SitemapCalibrationRequest",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,7 +220,8 @@ class SitemapAcquisitionProfile:
     """Installed Calibration geometry, trigger wiring, and live pulse target."""
 
     readout_binding: ReadoutBindingKey
-    sequencer_role: str
+    camera_instance_id: str
+    sequencer_instance_id: str
     camera_facts: CameraPhysicalFacts
     geometry: ReadoutGridGeometry
     maximum_site_residual_px: float
@@ -240,7 +231,14 @@ class SitemapAcquisitionProfile:
     def __post_init__(self) -> None:
         if not isinstance(self.readout_binding, ReadoutBindingKey):
             raise TypeError("readout_binding must be ReadoutBindingKey")
-        sequencer_role = canonical_text(self.sequencer_role, "sequencer_role")
+        camera_instance_id = canonical_text(
+            self.camera_instance_id,
+            "camera_instance_id",
+        )
+        sequencer_instance_id = canonical_text(
+            self.sequencer_instance_id,
+            "sequencer_instance_id",
+        )
         if not isinstance(self.camera_facts, CameraPhysicalFacts):
             raise TypeError("camera_facts must be CameraPhysicalFacts")
         if not isinstance(self.geometry, ReadoutGridGeometry):
@@ -279,7 +277,8 @@ class SitemapAcquisitionProfile:
             raise ValueError(
                 "sitemap geometry differs from the frozen camera spatial identity"
             )
-        object.__setattr__(self, "sequencer_role", sequencer_role)
+        object.__setattr__(self, "camera_instance_id", camera_instance_id)
+        object.__setattr__(self, "sequencer_instance_id", sequencer_instance_id)
         object.__setattr__(self, "maximum_site_residual_px", maximum_residual)
         object.__setattr__(self, "trigger_channel", trigger)
 
@@ -438,10 +437,10 @@ def build_sitemap_calibration_request(
         raise TypeError("camera_ref must be DeviceRef")
     if not isinstance(sequencer_ref, DeviceRef):
         raise TypeError("sequencer_ref must be DeviceRef")
-    if camera_ref.role != profile.readout_binding.value:
-        raise ValueError("camera_ref differs from the sitemap readout binding")
-    if sequencer_ref.role != profile.sequencer_role:
-        raise ValueError("sequencer_ref differs from the sitemap sequencer role")
+    if camera_ref.instance_id != profile.camera_instance_id:
+        raise ValueError("camera_ref differs from the sitemap camera instance")
+    if sequencer_ref.instance_id != profile.sequencer_instance_id:
+        raise ValueError("sequencer_ref differs from the sitemap sequencer instance")
     repeats = positive_integer(repeat_groups, "repeat_groups")
     if not isinstance(pulse_document, PulseDocument):
         raise TypeError("pulse_document must be PulseDocument")
@@ -492,8 +491,6 @@ def load_sitemap_pulse(pulses_root: Path) -> PulseDocument:
 __all__ = [
     "DEFAULT_CALIBRATION_PULSE_PATH",
     "ReadoutGridGeometry",
-    "SITEMAP_CALIBRATION_TASK_DEFINITION",
-    "SITEMAP_CALIBRATION_TASK_KEY",
     "SitemapAcquisitionProfile",
     "SitemapCalibrationRequest",
     "build_sitemap_analysis_request",

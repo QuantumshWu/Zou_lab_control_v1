@@ -7,16 +7,24 @@ dispatch, persistence codec, or request constructor.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import math
-from typing import Mapping
 
 from zlc_storage import canonical_text
 
 
-_KINDS = frozenset(
-    {"text", "int", "float", "number", "choice", "bool", "axis_range", "path"}
-)
+_KINDS = frozenset({
+    "text",
+    "int",
+    "float",
+    "number",
+    "choice",
+    "bool",
+    "axis_range",
+    "path",
+    "structured",
+})
 MINIMUM_POSITIVE_FLOAT = math.nextafter(0.0, math.inf)
 
 
@@ -33,6 +41,26 @@ def _scalar(value: object, field: str) -> None:
         raise TypeError(f"{field} must be an immutable scalar") from error
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError(f"{field} must be finite")
+
+
+def _structured_copy(value: object, field: str) -> object:
+    """Copy one JSON-like custom-editor value without domain interpretation."""
+
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{field} contains a non-finite number")
+        return value
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for key, child in value.items():
+            canonical = canonical_text(key, f"{field} key")
+            result[canonical] = _structured_copy(child, field)
+        return result
+    if isinstance(value, (tuple, list)):
+        return [_structured_copy(child, field) for child in value]
+    raise TypeError(f"{field} must contain only JSON-like values")
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +171,8 @@ class AuthoringField:
                 raise ValueError("axis_range authoring default is below minimum")
             if self.maximum is not None and max(float(lo), float(hi)) > self.maximum:
                 raise ValueError("axis_range authoring default is above maximum")
+        if self.kind == "structured" and self.default is not None:
+            _structured_copy(self.default, f"authoring field {self.key!r}")
         if self.default is not None and self.kind in {"int", "float", "number"}:
             if self.minimum is not None and self.default < self.minimum:
                 raise ValueError("authoring default is below minimum")
@@ -150,7 +180,8 @@ class AuthoringField:
                 raise ValueError("authoring default is above maximum")
         if self.kind not in {"int", "float", "number"} and self.allow_blank is not None:
             raise ValueError("only scalar numeric fields can declare allow_blank")
-        _scalar(self.default, f"authoring field {self.key!r} default")
+        if self.kind != "structured":
+            _scalar(self.default, f"authoring field {self.key!r} default")
 
     def freeze(self, value: object) -> object:
         """Validate one authored leaf without adding presentation coercions."""
@@ -174,6 +205,8 @@ class AuthoringField:
             if not isinstance(value, str):
                 raise TypeError(f"{self.label} must be str")
             return value
+        if self.kind == "structured":
+            return _structured_copy(value, self.label)
         if self.kind == "bool":
             if type(value) is not bool:
                 raise TypeError(f"{self.label} must be bool")

@@ -1,4 +1,4 @@
-"""Canonical physical camera contracts, values, and codecs.
+"""Typed physical camera contracts, values, and durable records.
 
 This lower owner contains only hardware-facing camera facts, immutable frame
 payloads, and their canonical serialization. Runtime orchestration and logic
@@ -7,7 +7,6 @@ nodes depend on these contracts; this module never imports either layer.
 
 from __future__ import annotations
 
-import hashlib
 import math
 from dataclasses import dataclass
 from enum import Enum
@@ -33,11 +32,8 @@ from zlc_data import (
 )
 from zlc_data._arrays import immutable_array
 from zlc_storage import (
-    canonical_digest,
     canonical_text,
     canonical_text as _canonical_text,
-    decode,
-    encode,
     exact_mapping as _exact_map,
     exact_mapping as _exact_tree,
     integer,
@@ -48,8 +44,6 @@ from zlc_storage import (
     positive_integer as _positive_integer,
     positive_real as _positive_finite,
     positive_real as _positive_real,
-    sha256_text,
-    sha256_text as _sha256,
 )
 
 
@@ -251,7 +245,6 @@ class CameraEventReadoutSetting:
     exposure_seconds: float
     gain: float
     readout_mode: str
-    opaque_frame_settings_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -266,11 +259,6 @@ class CameraEventReadoutSetting:
         )
         object.__setattr__(self, "gain", _nonnegative_real(self.gain, "gain"))
         _canonical_text(self.readout_mode, "readout_mode")
-        _sha256(
-            self.opaque_frame_settings_fingerprint,
-            "opaque_frame_settings_fingerprint",
-            optional=True,
-        )
 
 
 @dataclass(frozen=True)
@@ -278,9 +266,9 @@ class CameraCaptureDescriptor:
     """Complete camera geometry and per-event schedule retained in capture lineage.
 
     ROI origin/shape and sensor shape use unbinned sensor pixels in Y,X order.
-    ``camera_arm_spec_fingerprint`` is the exact frozen camera arm/capture-spec
-    digest.  It is not an FPGA pulse-schedule digest.  Per-event untyped evidence
-    lives on :class:`CameraEventReadoutSetting` instead.
+    The request-owned :class:`CameraCaptureSpec` is carried separately as a
+    typed value. Per-event untyped evidence lives on
+    :class:`CameraEventReadoutSetting` instead.
     """
 
     camera_identity: str
@@ -297,7 +285,6 @@ class CameraCaptureDescriptor:
     count_unit: str
     readout_event_axis_id: AxisId | None
     event_settings: tuple[CameraEventReadoutSetting, ...]
-    camera_arm_spec_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("camera_identity", "sensor_identity", "optical_path"):
@@ -343,11 +330,6 @@ class CameraCaptureDescriptor:
         ) != (0,):
             raise ValueError("a capture without a readout-event axis requires event index 0")
         object.__setattr__(self, "event_settings", settings)
-        _sha256(
-            self.camera_arm_spec_fingerprint,
-            "camera_arm_spec_fingerprint",
-            optional=True,
-        )
 
     @property
     def output_shape_yx(self) -> tuple[int, int]:
@@ -434,9 +416,6 @@ def camera_event_readout_setting_to_tree(
         "exposure_seconds": value.exposure_seconds,
         "gain": value.gain,
         "readout_mode": value.readout_mode,
-        "opaque_frame_settings_fingerprint": (
-            value.opaque_frame_settings_fingerprint
-        ),
     }
 
 
@@ -448,7 +427,6 @@ def camera_event_readout_setting_from_tree(tree: Any) -> CameraEventReadoutSetti
             "exposure_seconds",
             "gain",
             "readout_mode",
-            "opaque_frame_settings_fingerprint",
         },
         "camera event readout setting",
         discriminator=None,
@@ -458,7 +436,6 @@ def camera_event_readout_setting_from_tree(tree: Any) -> CameraEventReadoutSetti
         data["exposure_seconds"],
         data["gain"],
         data["readout_mode"],
-        data["opaque_frame_settings_fingerprint"],
     )
 
 
@@ -480,7 +457,6 @@ CAMERA_FRAME_FACT_FIELDS = frozenset({
 _CAPTURE_FIELDS = CAMERA_FRAME_FACT_FIELDS | {
     "readout_event_axis_id",
     "event_settings",
-    "camera_arm_spec_fingerprint",
 }
 
 
@@ -531,7 +507,6 @@ def camera_capture_descriptor_to_tree(value: CameraCaptureDescriptor) -> dict[st
         "event_settings": [
             camera_event_readout_setting_to_tree(item) for item in value.event_settings
         ],
-        "camera_arm_spec_fingerprint": value.camera_arm_spec_fingerprint,
     }
 
 
@@ -554,55 +529,8 @@ def camera_capture_descriptor_from_tree(tree: Any) -> CameraCaptureDescriptor:
             camera_event_readout_setting_from_tree(item)
             for item in data["event_settings"]
         ),
-        camera_arm_spec_fingerprint=data["camera_arm_spec_fingerprint"],
     )
     return value
-
-@dataclass(frozen=True)
-class FrozenCaptureSpec:
-    """Canonical owner bytes; runtime never executes an arbitrary spec codec."""
-
-    owner_fingerprint: str
-    payload: bytes
-    digest: str = ""
-
-    def __post_init__(self) -> None:
-        _sha256(self.owner_fingerprint, "capture spec owner fingerprint")
-        if not isinstance(self.payload, bytes) or not self.payload:
-            raise ValueError("capture spec payload must be non-empty immutable bytes")
-        payload = bytes(self.payload)
-        digest = hashlib.sha256(payload).hexdigest()
-        if self.digest and self.digest != digest:
-            raise ValueError("capture spec digest differs from canonical payload")
-        object.__setattr__(self, "payload", payload)
-        object.__setattr__(self, "digest", digest)
-
-
-def frozen_capture_spec_to_tree(value: FrozenCaptureSpec) -> dict[str, object]:
-    if not isinstance(value, FrozenCaptureSpec):
-        raise TypeError("value must be FrozenCaptureSpec")
-    return {
-        "owner_fingerprint": value.owner_fingerprint,
-        "payload": value.payload,
-    }
-
-
-def frozen_capture_spec_from_tree(tree: object) -> FrozenCaptureSpec:
-    data = _exact_tree(
-        tree,
-        {"owner_fingerprint", "payload"},
-        "frozen capture spec",
-        discriminator=None,
-    )
-    return FrozenCaptureSpec(data["owner_fingerprint"], data["payload"])
-
-_CAMERA_CAPTURE_SPEC_SCHEMA = "zlc_neutral_atom.camera-capture-spec"
-CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT = canonical_digest(
-    {
-        "owner": "zlc_neutral_atom.devices.camera.contract",
-        "schema": _CAMERA_CAPTURE_SPEC_SCHEMA,
-    }
-)
 
 
 class CameraAcquisitionMode(str, Enum):
@@ -617,7 +545,6 @@ class CameraCaptureSpec:
     mode: CameraAcquisitionMode
     expected_frames: int
     source_group_sizes: tuple[int, ...]
-    settings_fingerprint: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, CameraAcquisitionMode):
@@ -640,68 +567,41 @@ class CameraCaptureSpec:
         if sum(groups) != frames:
             raise ValueError("source_group_sizes must exactly cover expected_frames")
         object.__setattr__(self, "source_group_sizes", groups)
-        _sha256(self.settings_fingerprint, "settings_fingerprint")
 
 
-def camera_capture_spec_to_bytes(spec: CameraCaptureSpec) -> bytes:
+def camera_capture_spec_to_tree(spec: CameraCaptureSpec) -> dict[str, object]:
     if not isinstance(spec, CameraCaptureSpec):
         raise TypeError("spec must be CameraCaptureSpec")
-    return encode(
+    return {
+        "mode": spec.mode.value,
+        "expected_frames": spec.expected_frames,
+        "source_group_sizes": list(spec.source_group_sizes),
+    }
+
+
+def camera_capture_spec_from_tree(tree: object) -> CameraCaptureSpec:
+    data = _exact_map(
+        tree,
         {
-            "schema": _CAMERA_CAPTURE_SPEC_SCHEMA,
-            "mode": spec.mode.value,
-            "expected_frames": spec.expected_frames,
-            "source_group_sizes": list(spec.source_group_sizes),
-            "settings_fingerprint": spec.settings_fingerprint,
-        }
-    )
-
-
-def freeze_camera_capture_spec(spec: CameraCaptureSpec) -> FrozenCaptureSpec:
-    return FrozenCaptureSpec(
-        CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
-        camera_capture_spec_to_bytes(spec),
-    )
-
-
-def camera_capture_spec_from_bytes(payload: bytes) -> CameraCaptureSpec:
-    if not isinstance(payload, bytes):
-        raise TypeError("payload must be canonical bytes")
-    decoded = decode(payload)
-    if not isinstance(decoded, dict) or set(decoded) != {
-        "schema",
         "mode",
         "expected_frames",
         "source_group_sizes",
-        "settings_fingerprint",
-    }:
-        raise ValueError("camera capture spec has an unknown field set")
-    if decoded["schema"] != _CAMERA_CAPTURE_SPEC_SCHEMA:
-        raise ValueError("camera capture spec schema differs")
+        },
+        "camera capture spec",
+        discriminator=None,
+    )
     try:
-        mode = CameraAcquisitionMode(decoded["mode"])
+        mode = CameraAcquisitionMode(data["mode"])
     except (TypeError, ValueError) as exc:
         raise ValueError("camera capture mode is unknown") from exc
+    groups = data["source_group_sizes"]
+    if not isinstance(groups, list):
+        raise TypeError("camera capture source_group_sizes must be a list")
     return CameraCaptureSpec(
         mode,
-        decoded["expected_frames"],
-        tuple(decoded["source_group_sizes"]),
-        decoded["settings_fingerprint"],
+        data["expected_frames"],
+        tuple(groups),
     )
-
-
-def decode_camera_capture_spec(value: FrozenCaptureSpec | bytes) -> CameraCaptureSpec:
-    """Decode exactly the current camera capture-spec schema."""
-
-    if isinstance(value, FrozenCaptureSpec):
-        if value.owner_fingerprint != CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT:
-            raise ValueError("camera capture spec owner fingerprint differs")
-        payload = value.payload
-    elif isinstance(value, bytes):
-        payload = value
-    else:
-        raise TypeError("value must be FrozenCaptureSpec or canonical bytes")
-    return camera_capture_spec_from_bytes(payload)
 
 @dataclass(frozen=True)
 class CameraFrameMetadata:
@@ -872,8 +772,8 @@ class CameraDatasetEventAdapter:
 class CameraPhysicalFacts:
     """Typed camera facts minted inside a broker capability probe.
 
-    These facts and the opaque settings fingerprint are frozen from one adapter
-    snapshot.  A later binding may name event indices, but it cannot change the
+    These facts are frozen from one adapter snapshot.  A later binding may name
+    event indices, but it cannot change the
     physical trigger wiring, exposure, gain, readout mode, geometry, identity,
     dtype, or unit attested by this capability.
 
@@ -903,7 +803,6 @@ class CameraPhysicalFacts:
     external_trigger_integration_start_offset_seconds: float | None
     gain: float
     readout_mode: str
-    opaque_frame_settings_fingerprint: str
 
     def __post_init__(self) -> None:
         for name in ("camera_identity", "sensor_identity", "optical_path"):
@@ -995,10 +894,6 @@ class CameraPhysicalFacts:
             raise ValueError("gain must be finite and non-negative")
         object.__setattr__(self, "gain", float(self.gain))
         _canonical_text(self.readout_mode, "readout_mode")
-        _sha256(
-            self.opaque_frame_settings_fingerprint,
-            "opaque_frame_settings_fingerprint",
-        )
 
     @property
     def output_shape_yx(self) -> tuple[int, int]:
@@ -1021,7 +916,6 @@ class CameraPhysicalFacts:
             self.exposure_seconds,
             self.gain,
             self.readout_mode,
-            self.opaque_frame_settings_fingerprint,
         )
 
     def validate_capture_trigger_channel(self, channel: str) -> None:
@@ -1106,9 +1000,6 @@ def _camera_physical_facts_to_tree(value: CameraPhysicalFacts) -> dict[str, obje
         ),
         "gain": value.gain,
         "readout_mode": value.readout_mode,
-        "opaque_frame_settings_fingerprint": (
-            value.opaque_frame_settings_fingerprint
-        ),
     }
 
 
@@ -1133,7 +1024,6 @@ def _camera_physical_facts_from_tree(tree: object) -> CameraPhysicalFacts:
         "external_trigger_integration_start_offset_seconds",
         "gain",
         "readout_mode",
-        "opaque_frame_settings_fingerprint",
     }
     data = _exact_tree(tree, fields, _CAMERA_PHYSICAL_FACTS_SCHEMA)
     return CameraPhysicalFacts(
@@ -1159,36 +1049,22 @@ def _camera_physical_facts_from_tree(tree: object) -> CameraPhysicalFacts:
         ],
         gain=data["gain"],
         readout_mode=data["readout_mode"],
-        opaque_frame_settings_fingerprint=data[
-            "opaque_frame_settings_fingerprint"
-        ],
     )
 
 
 @dataclass(frozen=True)
 class CameraCapabilityEvidence:
-    """Canonical facts whose digest is the broker capability fingerprint.
-
-    This value is minted from the same frozen adapter snapshot as
-    :class:`CameraPhysicalFacts`.  Persisting it lets the durable boundary
-    recompute the terminal capability fingerprint instead of trusting a second
-    caller-provided digest.
-    """
+    """Typed broker facts from one camera working-point probe."""
 
     adapter_type: str
     source_id: str
-    capture_spec_owner_fingerprint: str
     max_blocking_call_seconds: float
     physical_facts: CameraPhysicalFacts
-    exact_external_trigger_qualification_digest: str | None = None
+    exact_external_trigger_qualified: bool = False
 
     def __post_init__(self) -> None:
         _canonical_text(self.adapter_type, "adapter_type")
         _canonical_text(self.source_id, "source_id")
-        _sha256(
-            self.capture_spec_owner_fingerprint,
-            "capture_spec_owner_fingerprint",
-        )
         object.__setattr__(
             self,
             "max_blocking_call_seconds",
@@ -1199,12 +1075,9 @@ class CameraCapabilityEvidence:
         )
         if not isinstance(self.physical_facts, CameraPhysicalFacts):
             raise TypeError("physical_facts must be CameraPhysicalFacts")
-        qualification = self.exact_external_trigger_qualification_digest
-        if qualification is not None:
-            _sha256(
-                qualification,
-                "exact_external_trigger_qualification_digest",
-            )
+        if type(self.exact_external_trigger_qualified) is not bool:
+            raise TypeError("exact_external_trigger_qualified must be bool")
+        if self.exact_external_trigger_qualified:
             required_interval = (
                 self.physical_facts.required_external_trigger_interval_seconds
             )
@@ -1218,21 +1091,11 @@ class CameraCapabilityEvidence:
     def exact_external_trigger_quiet_window_seconds(self) -> float | None:
         """Derive the current quiet window; never persist a second timing fact."""
 
-        if self.exact_external_trigger_qualification_digest is None:
+        if not self.exact_external_trigger_qualified:
             return None
         interval = self.physical_facts.required_external_trigger_interval_seconds
         assert interval is not None
         return camera_external_trigger_quiet_window_seconds(interval)
-
-    @property
-    def settings_fingerprint(self) -> str:
-        """The settings digest owned by the frozen physical-facts snapshot."""
-
-        return self.physical_facts.opaque_frame_settings_fingerprint
-
-    @property
-    def fingerprint(self) -> str:
-        return canonical_digest(camera_capability_evidence_to_tree(self))
 
 
 def camera_capability_evidence_to_tree(
@@ -1244,12 +1107,9 @@ def camera_capability_evidence_to_tree(
         "schema": _CAMERA_CAPABILITY_EVIDENCE_SCHEMA,
         "adapter_type": value.adapter_type,
         "source_id": value.source_id,
-        "capture_spec_owner_fingerprint": value.capture_spec_owner_fingerprint,
         "max_blocking_call_seconds": value.max_blocking_call_seconds,
         "physical_facts": _camera_physical_facts_to_tree(value.physical_facts),
-        "exact_external_trigger_qualification_digest": (
-            value.exact_external_trigger_qualification_digest
-        ),
+        "exact_external_trigger_qualified": value.exact_external_trigger_qualified,
     }
 
 
@@ -1258,22 +1118,18 @@ def camera_capability_evidence_from_tree(tree: object) -> CameraCapabilityEviden
         "schema",
         "adapter_type",
         "source_id",
-        "capture_spec_owner_fingerprint",
         "max_blocking_call_seconds",
         "physical_facts",
-        "exact_external_trigger_qualification_digest",
+        "exact_external_trigger_qualified",
     }
     data = _exact_tree(tree, fields, _CAMERA_CAPABILITY_EVIDENCE_SCHEMA)
     facts = _camera_physical_facts_from_tree(data["physical_facts"])
     return CameraCapabilityEvidence(
         adapter_type=data["adapter_type"],
         source_id=data["source_id"],
-        capture_spec_owner_fingerprint=data["capture_spec_owner_fingerprint"],
         max_blocking_call_seconds=data["max_blocking_call_seconds"],
         physical_facts=facts,
-        exact_external_trigger_qualification_digest=data[
-            "exact_external_trigger_qualification_digest"
-        ],
+        exact_external_trigger_qualified=data["exact_external_trigger_qualified"],
     )
 
 def camera_roi_local_spatial_identity(
@@ -1378,13 +1234,12 @@ class CameraCaptureTerminalRecord:
 class CameraWorkingPoint:
     """One adapter-read physical working point frozen for capability minting.
 
-    The adapter owns ``settings_fingerprint`` and physical readback only.  It
-    cannot grant itself exact-capture qualification; installation/Q0 composition
-    supplies that separate authority to the endpoint.  The endpoint converts
-    these primitive facts once into its authoritative camera-domain values.
+    The adapter owns physical readback only.  It cannot grant itself exact-
+    capture qualification; installation/Q0 composition supplies that separate
+    authority to the endpoint.  The endpoint converts these primitive facts
+    once into its authoritative camera-domain values.
     """
 
-    settings_fingerprint: str
     acquisition_mode: str
     frame_shape_yx: tuple[int, int]
     sensor_shape_yx: tuple[int, int]
@@ -1401,7 +1256,6 @@ class CameraWorkingPoint:
     readout_mode: str
 
     def __post_init__(self) -> None:
-        sha256_text(self.settings_fingerprint, "settings_fingerprint")
         object.__setattr__(
             self,
             "acquisition_mode",
@@ -1516,7 +1370,6 @@ class CameraAssociationProgress(Protocol):
 
 
 __all__ = [
-    "CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT",
     "CAMERA_FRAME_FACT_FIELDS",
     "CameraAcquisitionMode",
     "CameraAdapter",
@@ -1535,14 +1388,13 @@ __all__ = [
     "CameraSample",
     "CameraSampleContract",
     "CameraWorkingPoint",
-    "FrozenCaptureSpec",
     "ReadoutBindingKey",
     "camera_capability_evidence_from_tree",
     "camera_capability_evidence_to_tree",
     "camera_capture_descriptor_from_tree",
     "camera_capture_descriptor_to_tree",
-    "camera_capture_spec_from_bytes",
-    "camera_capture_spec_to_bytes",
+    "camera_capture_spec_from_tree",
+    "camera_capture_spec_to_tree",
     "camera_event_readout_setting_from_tree",
     "camera_event_readout_setting_to_tree",
     "camera_frame_facts_from_tree",
@@ -1551,10 +1403,6 @@ __all__ = [
     "camera_frame_metadata_to_tree",
     "camera_output_shape_yx",
     "camera_roi_local_spatial_identity",
-    "decode_camera_capture_spec",
-    "freeze_camera_capture_spec",
-    "frozen_capture_spec_from_tree",
-    "frozen_capture_spec_to_tree",
     "normalize_camera_count_dtype",
     "normalize_camera_geometry",
     "readout_binding_key_from_tree",

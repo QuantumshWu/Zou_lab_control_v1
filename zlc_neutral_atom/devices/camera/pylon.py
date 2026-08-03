@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from zlc_storage import canonical_digest, canonical_text, integer, positive_integer, positive_real
+from zlc_storage import canonical_text, integer, positive_integer, positive_real
 
 from ._owner_lane import CameraSdkOwnerLane
 from .contract import CameraCaptureTerminalRecord, CameraFrameRecord, CameraWorkingPoint
@@ -296,22 +296,7 @@ class PylonCameraAdapter:
         rate = self._read_optional_positive_rate_on_owner()
         interval = None if rate is None else 1.0 / rate
         integration_offset = self._read_optional_delay_seconds_on_owner()
-        primitive = {
-            "camera": "pylon",
-            "serial": self._config.serial,
-            "finite_trigger_source": self._config.trigger_source,
-            "monitor_trigger_mode": "Off",
-            "pixel_format": pixel_format,
-            "frame_shape_yx": (height, width),
-            "sensor_shape_yx": (sensor_height, sensor_width),
-            "roi_origin_yx": (y, x),
-            "exposure_seconds": exposure,
-            "required_external_trigger_interval_seconds": interval,
-            "external_trigger_integration_start_offset_seconds": integration_offset,
-            "capture_trigger_channels": self._config.capture_trigger_channels,
-        }
         return CameraWorkingPoint(
-            settings_fingerprint=canonical_digest(primitive),
             acquisition_mode="EXTERNAL_TRIGGERED",
             frame_shape_yx=(height, width),
             sensor_shape_yx=(sensor_height, sensor_width),

@@ -456,32 +456,6 @@ def _runtime_threshold_source_mask(
     return mask
 
 
-def calibration_runtime_threshold_sources(
-    report: CalibrationReport,
-) -> tuple[tuple[str, ...], ...]:
-    """Describe the exact threshold source selected for every model/site.
-
-    The nested tuples follow ``report.models`` and each model's canonical site
-    axis.  Values are ``"formal"`` or ``"quick-fallback"`` and are derived
-    from the same all-model gate used to construct the runtime artifact; callers
-    must not infer provenance by comparing floating-point threshold values.
-    """
-
-    if not isinstance(report, CalibrationReport):
-        raise TypeError("report must be CalibrationReport")
-    use_reference_thresholds = _reference_thresholds_available(report.models)
-    return tuple(
-        tuple(
-            "formal" if uses_formal else "quick-fallback"
-            for uses_formal in _runtime_threshold_source_mask(
-                model,
-                use_reference_thresholds=use_reference_thresholds,
-            )
-        )
-        for model in report.models
-    )
-
-
 def _runtime_model_values(
     feature: ReadoutFeature,
     report: ModelCalibrationReport,
@@ -1893,7 +1867,6 @@ __all__ = [
     "SiteFidelity",
     "TrainTestSplit",
     "characterize_readout",
-    "calibration_runtime_threshold_sources",
     "find_site_centers",
     "otsu_threshold",
     "reference_labels",

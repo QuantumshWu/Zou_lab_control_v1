@@ -6,7 +6,7 @@
 
 - Branch：`codex/system-architecture-migration`。
 - 重开基线：`476d125304fc90b6ef4f5009184dd2119206fcc2`；C0规范提交：`ed6dfe21c0d99999444c099d8c644a20b44e561d`。
-- 当前checkpoint：§8 C2 `DeviceInstance` graph已经dependency-closed；下一唯一工作是C3最小Logic Node host。不得返回旧M1–M7叙事，也不得重做已经闭合的C1/C2。
+- 当前checkpoint：§8 C3 最小 Logic Node host 已 dependency-closed；下一唯一工作是 C4 Task takeover、Edit 与输出。不得返回旧 M1–M7 叙事，也不得重做已经闭合的 C1/C2/C3。
 - 预期worktree例外：未跟踪用户文件`pulses/scan_test.json`。永远不得读取、修改、移动、删除、stage或commit。
 - RTL、Tcl、XDC、bitstream和wire protocol仍冻结；C1/C2没有硬件改动。
 
@@ -46,8 +46,23 @@
 - current modified合同集合195项通过；architecture/import集合41项通过；Camera/Occupancy/MOT正式纵切3项通过。全仓collect得到885项且无旧模块import collection错误。
 - 固定口径生产包：324 modules / 138,722 physical LOC / 929 classes / 555 dataclasses / 38 enums；相对C1净删7 modules / 556 LOC / 4 classes / 3 dataclasses。tests为111 modules / 36,405 LOC。C2没有硬件文件diff。
 
-## 当前下一步：C3 最小 Logic Node host
+## C3 已闭合的 owner
 
-只按`docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md` §2、§6.1、§6.7、§8 C3、§9推进：先从当前tree列出generic host、Declaration/Package、全部leaf重复binder/API/Prepared/Bound/presenter/repository/lifecycle、TaskConsole第二胶水与ordinary SHA/bytes的精确owner/consumer/deletion manifest；随后用一个dependency-closed cut迁移所有leaf并删除完整旧闭包。不得新增阶段类族、中央node import或为旧tests留兼容，不复核已闭合的C1/C2。
+- 所有当前 Logic Node leaf 通过 `zlc_neutral_atom.logic_node.LogicNodeDescriptor` 发现；通用 `LogicNodeHost`/`LogicNodeExecutionContext` 统一 request freeze、device capability binding、Run 生命周期、Processor cursor 与最终输出发布。删除旧的 per-leaf API/Package/Prepared/Bound/HostedProcessor/LiveDatasetHost/ArtifactDispatch/NodeInput 闭包；没有兼容 re-export。
+- `Experiment.nodes.<api>` 对所有 leaf 只投影同一个轻量 `NodeApi`（`build/start/run/stop/open_ui` 与 descriptor operations）；TaskConsole 只消费 descriptor、通用 host factory 和 SignalPlane，不再列举具体 calibration/occupancy/camera/pulse 分支。
+- Calibration 的嵌套 capture/analysis 继续由同一个 host 生命周期承载；Camera/Occupancy/MOT/PulseScan/Duration/Release-recapture 均保留各自领域算法和必要 device Port seam，不复制 host。Occupancy 是纯 Processor，Calibration 的 raw-frame export 与 report 只写项目 `runs/` 记录。
+- 终端 live Dataset 的 FINAL front 由 `SignalDataPlane.detach_live()` 保留，失败/取消仍 retire；Calibration source facts 通过 capture artifact 的 typed adapter properties 读取，不再引入 per-event binding digest。
+- zlc_plot pointer/front 修正把 data/selector revision 与 pointer surface validity 分离，持续拖动不再因新帧取消已按下的 pointer；Fluent signal-tree reconcile 从当前 Qt model 恢复 expansion，删除 expanded producer 不再解引用已移除 `QStandardItem`。
 
-恢复时严格依次完整读取当前Goal、`AGENTS.md`、本文件、Git branch/HEAD/status/recent log，再只读台账当前未闭合项和设计§2、§6.1、§6.7、§8 C3、§9。不得重答、重审或重做C1/C2。
+## C3 证据与规模
+
+- 定向产品流：TaskConsole Camera live→Area→第二 Image→Fit 与 Occupancy `2 passed`；MOT-field final card/shape/output `2 passed`；Signal picker topology delta `9 passed`；current Logic host/descriptor/calibration/capture/runtime contracts `97 passed`；另一 device/workbench group `73 passed`。
+- 过期合同已按当前 API 改写或删除：duration 测试改为 `exp.nodes.readout_duration_fidelity.build(...)`，pulse failure test 使用通用 `require_capability("pulse.execute")`，旧 tutorial 完整重写为 current `Experiment.nodes` 并由 nbclient 执行。`tests/test_pulse_scan_signal_consumer.py` 的旧 API 闭包已删除，不恢复兼容。
+- 全套回归：`823 passed, 1 skipped`（含 1 个 zmq Proactor 环境 warning），总耗时约 144 秒；没有生产失败或旧 API 兼容失败。
+- 当前 C3 worktree 仍待本 checkpoint commit；保护性用户文件 `pulses/scan_test.json` 未读取、未修改、未 stage。提交前必须用显式路径 stage，并确认 cached name 中没有该文件。
+
+## 当前下一步：C4 Task takeover、Edit 与输出
+
+只按 `docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md` §2、§6、§8 C4、§9 推进：恢复 Task 专属 header/progress/Stop 与统一 mutation admission；让 producer 的同一 typed draft/controller 同时服务 Logic Edit 与 Plot Edit；把 Calibration/Task 输出稳定落在项目 `tasks/`、`runs/`、`figures/`。先列唯一 owner、删除清单和当前 LOC，再做一个 dependency-closed 产品纵切；不得为旧测试/API 留兼容，不复核已经闭合的 C1/C2/C3。
+
+恢复时严格依次完整读取当前 Goal、`AGENTS.md`、本文件、Git branch/HEAD/status/recent log，再只读台账当前未闭合项和设计对应章节。不得重答、重审或重做 C1/C2/C3；若发现矛盾，先停止该 cut，更新设计与删除清单后再实现。

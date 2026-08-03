@@ -1,83 +1,56 @@
-"""Compose the generic TaskConsole from explicit Logic-node attachments."""
+"""Compose TaskConsole directly from current application facts."""
 
 from __future__ import annotations
 
-from .application_ports import TaskConsoleApplicationPorts
+from pathlib import Path
 
-__all__ = ["TaskConsoleApplicationPorts", "open_task_console"]
+from zlc_neutral_atom.installation import DeviceCatalogView
+from zlc_neutral_atom.logic_node import LogicNodeDescriptor
+from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
+
+__all__ = ["open_task_console"]
 
 
 def open_task_console(
-    ports: TaskConsoleApplicationPorts,
     *,
+    descriptors: tuple[LogicNodeDescriptor, ...],
+    device_catalog: DeviceCatalogView,
+    host_factory,
+    data_plane: SignalDataPlane,
+    project_root: Path,
+    pulses_root: Path,
+    tasks_root: Path,
+    figures_root: Path,
     state=None,
     task=None,
     **kwargs,
 ):
-    """Open one shell that has no concrete Logic-node knowledge."""
+    """Open the generic shell without a second catalog or attachment layer."""
 
-    if not isinstance(ports, TaskConsoleApplicationPorts):
-        raise TypeError("ports must be TaskConsoleApplicationPorts")
+    values = tuple(descriptors)
+    if any(not isinstance(value, LogicNodeDescriptor) for value in values):
+        raise TypeError("descriptors must contain LogicNodeDescriptor values")
+    if len({value.definition.key for value in values}) != len(values):
+        raise ValueError("TaskConsole descriptor keys must be unique")
+    if not isinstance(device_catalog, DeviceCatalogView):
+        raise TypeError("device_catalog must be DeviceCatalogView")
+    if not callable(host_factory):
+        raise TypeError("host_factory must be callable")
+    if not isinstance(data_plane, SignalDataPlane):
+        raise TypeError("data_plane must be SignalDataPlane")
 
-    from .capability import ConsoleNodeHost
-    from .catalog_bridge import ConsoleCatalogView
     from .window import show_task_console
 
-    catalog_view = ConsoleCatalogView(
-        tuple(attachment.spec for attachment in ports.attachments)
-    )
-    console: list[object] = []
-
-    def request_owner_wake() -> None:
-        # Worker callbacks cross exactly one queued Qt-owner seam.  A node cannot
-        # start before ``show_task_console`` has returned its composed body, so a
-        # wake before that point is a broken composition order, not work to drop.
-        if not console:
-            raise RuntimeError("TaskConsole owner is not composed")
-        console[0].request_owner_wake()
-
-    data_plane = ports.data_plane
-
-    def resolve_inputs(spec, values):
-        if not console:
-            raise RuntimeError(
-                "TaskConsole composition is not ready for input binding"
-            )
-        return console[0].resolve_node_inputs(spec, values)
-
-    host = ConsoleNodeHost(
+    return show_task_console(
+        descriptors=values,
+        device_catalog=device_catalog,
+        host_factory=host_factory,
         data_plane=data_plane,
-        resolve_inputs=resolve_inputs,
-        request_owner_wake=request_owner_wake,
-    )
-
-    def run_factory(
-        spec,
-        values,
-        *,
-        instance_id: str,
-    ):
-        attachment = ports.attachment_for(spec.key)
-        if attachment is None or attachment.spec is not spec:
-            raise RuntimeError(
-                "TaskConsole catalog/attachment invariant was violated"
-            )
-        return attachment.create_node(
-            host,
-            spec,
-            values,
-            instance_id,
-        )
-
-    body = show_task_console(
-        tasks_root=ports.tasks_root,
-        output_root=ports.output_root,
+        project_root=project_root,
+        pulses_root=pulses_root,
+        tasks_root=tasks_root,
+        figures_root=figures_root,
         state=state,
         task=task,
-        catalog_view=catalog_view,
-        run_factory=run_factory,
-        data_plane=data_plane,
         **kwargs,
     )
-    console.append(body)
-    return body

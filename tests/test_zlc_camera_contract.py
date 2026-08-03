@@ -8,7 +8,6 @@ import pytest
 from zlc_neutral_atom.devices.camera.contract import (
     CameraAcquisitionMode,
     CameraCaptureSpec,
-    freeze_camera_capture_spec,
 )
 from zlc_neutral_atom.devices.camera.contract import (
     CameraCaptureTerminalRecord,
@@ -28,7 +27,6 @@ from zlc_neutral_atom.runtime.resources import (
     PhysicalDeviceIdentity,
     ResourceKey,
 )
-from zlc_storage import canonical_digest
 
 
 class _ReusingRingCamera:
@@ -43,7 +41,6 @@ class _ReusingRingCamera:
 
     def capture_working_point(self) -> CameraWorkingPoint:
         return CameraWorkingPoint(
-            canonical_digest({"fake": "working-point"}),
             "EXTERNAL_TRIGGERED",
             (3, 4),
             (3, 4),
@@ -113,11 +110,7 @@ def _bound(camera: _ReusingRingCamera, *, qualified: bool = True):
     endpoint = CameraCaptureEndpoint(
         camera,
         "camera",
-        exact_external_trigger_qualification_digest=(
-            canonical_digest({"qualified": "test-composition"})
-            if qualified
-            else None
-        ),
+        exact_external_trigger_qualified=qualified,
     )
     broker = DeviceBroker()
     identity = PhysicalDeviceIdentity(
@@ -144,31 +137,24 @@ def _bound(camera: _ReusingRingCamera, *, qualified: bool = True):
 
 
 def _prepare_started(camera: _ReusingRingCamera):
-    endpoint, binding, capability, broker = _bound(camera)
-    command = _prepare_command(capability)
+    endpoint, binding, _capability, broker = _bound(camera)
+    command = _prepare_command()
     session_id = command.session_id
     endpoint.execute_command(binding, command)
     endpoint.execute_command(binding, StartCaptureCommand(session_id, 1.0))
     return endpoint, binding, session_id, broker
 
 
-def _prepare_command(capability) -> PrepareCaptureCommand:
-    spec = freeze_camera_capture_spec(
-        CameraCaptureSpec(
-            CameraAcquisitionMode.EXTERNAL_TRIGGERED,
-            2,
-            (1, 1),
-            capability.settings_fingerprint,
-        )
+def _prepare_command() -> PrepareCaptureCommand:
+    spec = CameraCaptureSpec(
+        CameraAcquisitionMode.EXTERNAL_TRIGGERED,
+        2,
+        (1, 1),
     )
     session_id = "fake-session"
     return PrepareCaptureCommand(
         session_id,
-        spec.payload,
-        spec.owner_fingerprint,
-        spec.digest,
-        capability.capability_fingerprint,
-        capability.settings_fingerprint,
+        spec,
         2,
         1.0,
     )
@@ -217,7 +203,7 @@ def test_raw_adapter_cannot_self_grant_exact_qualification() -> None:
     endpoint, binding, capability, broker = _bound(camera, qualified=False)
     try:
         with pytest.raises(ValueError, match="requires E0-qualified"):
-            endpoint.execute_command(binding, _prepare_command(capability))
+            endpoint.execute_command(binding, _prepare_command())
     finally:
         broker.shutdown()
 

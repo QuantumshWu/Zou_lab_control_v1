@@ -12,15 +12,14 @@ from zlc_storage import (
     canonical_text as _canonical_text,
     exact_mapping as _exact_tree,
     nonnegative_integer as _nonnegative_int,
-    sha256_text as _sha256,
 )
 
 from zlc_data import DatasetSchema, StreamGenerationId
 from zlc_neutral_atom.devices.camera.contract import (
     CameraCapabilityEvidence,
     CameraCaptureDescriptor,
+    CameraCaptureSpec,
     CameraDatasetEventAdapter,
-    FrozenCaptureSpec,
     ReadoutBindingKey,
     camera_capture_descriptor_from_tree,
     camera_capture_descriptor_to_tree,
@@ -84,32 +83,19 @@ class CameraCaptureProvenance:
 
     No readout event is selected here.  A later calibration/analysis request
     combines this raw descriptor with an explicit ``CalibrationCaptureLayout``
-    to derive a ``FrameContract``.  ``camera_arm_spec_fingerprint`` is only the
-    frozen camera arm/capture-spec digest; it is not an FPGA pulse-schedule digest.
+    to derive a ``FrameContract``. The request-owned capture spec is carried
+    separately as a typed value rather than mirrored by a digest.
     """
 
     descriptor: CameraCaptureDescriptor
     binding: ReadoutBindingKey
     binding_stamp: DeviceBindingStamp
-    capability_fingerprint: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.descriptor, CameraCaptureDescriptor):
             raise TypeError("descriptor must be CameraCaptureDescriptor")
         if not isinstance(self.binding, ReadoutBindingKey):
             raise TypeError("binding must be ReadoutBindingKey")
-        settings_fingerprints = {
-            setting.opaque_frame_settings_fingerprint
-            for setting in self.descriptor.event_settings
-        }
-        if None in settings_fingerprints or len(settings_fingerprints) != 1:
-            raise ValueError(
-                "descriptor event settings require one active settings fingerprint"
-            )
-        if self.descriptor.camera_arm_spec_fingerprint is None:
-            raise ValueError(
-                "camera descriptor requires camera_arm_spec_fingerprint"
-            )
         if not isinstance(self.binding_stamp, DeviceBindingStamp):
             raise TypeError("binding_stamp must be DeviceBindingStamp")
         if (
@@ -117,19 +103,6 @@ class CameraCaptureProvenance:
             != self.binding_stamp.physical_identity.stable_device_identity
         ):
             raise ValueError("camera descriptor identity differs from binding stamp")
-        _sha256(self.capability_fingerprint, "capability_fingerprint")
-
-    @property
-    def camera_arm_spec_fingerprint(self) -> str:
-        value = self.descriptor.camera_arm_spec_fingerprint
-        assert value is not None
-        return value
-
-    @property
-    def active_settings_fingerprint(self) -> str:
-        value = self.descriptor.event_settings[0].opaque_frame_settings_fingerprint
-        assert value is not None
-        return value
 
     def validate_schema(self, schema: DatasetSchema) -> None:
         if not isinstance(schema, DatasetSchema):
@@ -146,7 +119,6 @@ def camera_capture_provenance_to_tree(
         "descriptor": camera_capture_descriptor_to_tree(value.descriptor),
         "binding": readout_binding_key_to_tree(value.binding),
         "binding_stamp": device_binding_stamp_to_tree(value.binding_stamp),
-        "capability_fingerprint": value.capability_fingerprint,
     }
 
 
@@ -157,7 +129,6 @@ def camera_capture_provenance_from_tree(tree: object) -> CameraCaptureProvenance
             "descriptor",
             "binding",
             "binding_stamp",
-            "capability_fingerprint",
         },
         "camera capture provenance",
         discriminator=None,
@@ -166,7 +137,6 @@ def camera_capture_provenance_from_tree(tree: object) -> CameraCaptureProvenance
         descriptor=camera_capture_descriptor_from_tree(data["descriptor"]),
         binding=readout_binding_key_from_tree(data["binding"]),
         binding_stamp=device_binding_stamp_from_tree(data["binding_stamp"]),
-        capability_fingerprint=data["capability_fingerprint"],
     )
 
 
@@ -207,13 +177,6 @@ class CameraCaptureContract:
             raise ValueError("camera provenance binding differs from capture source_id")
         if self.camera_provenance.binding_stamp != self.capability.binding_stamp:
             raise ValueError("camera provenance binding differs from capability")
-        if (
-            self.camera_provenance.capability_fingerprint
-            != self.capability.capability_fingerprint
-        ):
-            raise ValueError(
-                "camera provenance capability fingerprint differs from capability"
-            )
         self.capability.camera_physical_facts.validate_descriptor(
             self.camera_provenance.descriptor
         )
@@ -241,10 +204,6 @@ class CameraCaptureContract:
         return schedule
 
     @property
-    def capture_spec_owner_fingerprint(self) -> str:
-        return self.capability.capture_spec_owner_fingerprint
-
-    @property
     def total_events(self) -> int:
         return len(self.cell_schedule)
 
@@ -268,7 +227,7 @@ class CaptureCompletion:
         "_source_cell_schedule",
         "_camera_provenance",
         "_camera_capability_evidence",
-        "_camera_arm_spec",
+        "_camera_capture_spec",
         "_source_event_span",
         "_terminal_reservation",
         "_direct_terminal_consumer",
@@ -312,7 +271,7 @@ class CaptureCompletion:
             "_camera_capability_evidence",
             session._contract.capability.camera_capability_evidence,
         )
-        object.__setattr__(self, "_camera_arm_spec", session._capture_spec)
+        object.__setattr__(self, "_camera_capture_spec", session._capture_spec)
         source_reservation = readiness._source_reservation
         if source_reservation._stream is not session._stream:
             raise RuntimeError(
@@ -381,8 +340,8 @@ class CaptureCompletion:
         return self._camera_capability_evidence
 
     @property
-    def camera_arm_spec(self) -> FrozenCaptureSpec:
-        return self._camera_arm_spec
+    def camera_capture_spec(self) -> CameraCaptureSpec:
+        return self._camera_capture_spec
 
     @property
     def direct_terminal_consumer(self) -> bool:
@@ -440,17 +399,16 @@ class CaptureSession:
         self,
         port: BoundCapturePort,
         contract: CameraCaptureContract,
-        capture_spec: FrozenCaptureSpec,
+        capture_spec: CameraCaptureSpec,
     ) -> None:
-        if not isinstance(capture_spec, FrozenCaptureSpec):
-            raise TypeError("capture_spec must be FrozenCaptureSpec")
-        if capture_spec.owner_fingerprint != contract.capture_spec_owner_fingerprint:
-            raise ValueError("capture spec owner differs from CameraCaptureContract")
+        if not isinstance(capture_spec, CameraCaptureSpec):
+            raise TypeError("capture_spec must be CameraCaptureSpec")
+        if capture_spec.expected_frames != contract.total_events:
+            raise ValueError("capture spec cardinality differs from Camera contract")
         self._port = port
         self._contract = contract
         self._run_id: str | None = None
         self._capture_spec = capture_spec
-        self._capture_spec_digest = capture_spec.digest
         self._session_id = uuid.uuid4().hex
         stream, producer = AcquisitionStream.create(
             contract.stream_id,
@@ -544,13 +502,7 @@ class CaptureSession:
                 ack = context.device(self._port.device.key).execute(
                     PrepareCaptureCommand(
                         session_id=self._session_id,
-                        capture_spec_payload=self._capture_spec.payload,
-                        capture_spec_owner_fingerprint=(
-                            self._capture_spec.owner_fingerprint
-                        ),
-                        capture_spec_fingerprint=self._capture_spec_digest,
-                        capability_fingerprint=self._port.capability.capability_fingerprint,
-                        settings_fingerprint=self._port.capability.settings_fingerprint,
+                        capture_spec=self._capture_spec,
                         expected_total_events=self._contract.total_events,
                         timeout_seconds=(
                             self._port.capability.max_blocking_call_seconds
@@ -558,16 +510,6 @@ class CaptureSession:
                     )
                 )
                 self._validate_ack(ack, CapturePreparedAck)
-                if (
-                    ack.settings_fingerprint
-                    != self._port.capability.settings_fingerprint
-                    or ack.capability_fingerprint
-                    != self._port.capability.capability_fingerprint
-                    or ack.capture_spec_fingerprint != self._capture_spec_digest
-                ):
-                    raise RuntimeError(
-                        "capture prepare acknowledgement differs from frozen contract"
-                    )
             except BaseException as error:
                 self._poison(
                     SourceFailed(f"capture prepare failed: {safe_error_summary(error)}")
@@ -600,12 +542,7 @@ class CaptureSession:
                 )
                 self._validate_ack(ack, CaptureStartedAck)
                 if (
-                    ack.settings_fingerprint
-                    != self._port.capability.settings_fingerprint
-                    or ack.capability_fingerprint
-                    != self._port.capability.capability_fingerprint
-                    or ack.capture_spec_fingerprint != self._capture_spec_digest
-                    or ack.expected_total_events != self._contract.total_events
+                    ack.expected_total_events != self._contract.total_events
                     or ack.buffer_frame_count != self._contract.total_events
                     or ack.source_ordinal_baseline != 0
                 ):
@@ -724,14 +661,6 @@ class CaptureSession:
                     raise StreamError(
                         "capture terminal counters/stop/drain/join proof failed"
                     )
-                if (
-                    ack.settings_fingerprint
-                    != self._port.capability.settings_fingerprint
-                    or ack.capability_fingerprint
-                    != self._port.capability.capability_fingerprint
-                    or ack.capture_spec_fingerprint != self._capture_spec_digest
-                ):
-                    raise StreamError("capture terminal contract binding differs")
                 completion = CaptureCompletion(
                     _COMPLETION_TOKEN,
                     session=self,
@@ -913,7 +842,7 @@ class CaptureSession:
 def open_capture_session(
     port: BoundCapturePort,
     contract: CameraCaptureContract,
-    capture_spec: FrozenCaptureSpec,
+    capture_spec: CameraCaptureSpec,
 ) -> CaptureSession:
     """Bind physical camera authority to one exact application session."""
 

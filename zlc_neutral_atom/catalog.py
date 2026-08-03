@@ -1,4 +1,4 @@
-"""Stable identities and closed metadata for user-visible capabilities."""
+"""Stable identities for the discovered Logic-node catalog."""
 
 from __future__ import annotations
 
@@ -55,58 +55,34 @@ def definition_key_from_tree(tree: object) -> DefinitionKey:
     return value
 
 
-@dataclass(frozen=True)
-class TaskDefinition:
-    """Stable catalog metadata for one task kind, never one bound run."""
+@dataclass(frozen=True, slots=True)
+class LogicNodeDefinition:
+    """The one catalog identity shared by Tasks, Measurements and Processors.
+
+    Request and binding schemas are owned by the discovered descriptor and its
+    domain request.  Keeping schema ids here used to force three almost
+    identical Definition classes and made every consumer recover ``kind`` by
+    inspecting a Python class.
+    """
 
     key: DefinitionKey
     title: str
-    request_schema_id: str
+    kind: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, DefinitionKey):
             raise TypeError("key must be DefinitionKey")
         _canonical_text(self.title, "title")
-        _canonical_text(self.request_schema_id, "request_schema_id")
-
-
-@dataclass(frozen=True)
-class MeasurementDefinition:
-    """Stable catalog metadata; output schema belongs to the bound contract."""
-
-    key: DefinitionKey
-    title: str
-    request_schema_id: str
-    binding_schema_id: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.key, DefinitionKey):
-            raise TypeError("key must be DefinitionKey")
-        for field in ("title", "request_schema_id", "binding_schema_id"):
-            _canonical_text(getattr(self, field), field)
-
-
-@dataclass(frozen=True)
-class ProcessorDefinition:
-    """Stable catalog metadata with no callable or binding-generation facts."""
-
-    key: DefinitionKey
-    title: str
-    config_schema_id: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.key, DefinitionKey):
-            raise TypeError("key must be DefinitionKey")
-        _canonical_text(self.title, "title")
-        _canonical_text(self.config_schema_id, "config_schema_id")
+        if self.kind not in {"task", "measurement", "processor"}:
+            raise ValueError(
+                "Logic-node kind must be 'task', 'measurement', or 'processor'"
+            )
 
 
 __all__ = [
     "DEFINITION_KEY_SCHEMA",
     "DefinitionKey",
-    "MeasurementDefinition",
-    "ProcessorDefinition",
-    "TaskDefinition",
+    "LogicNodeDefinition",
     "definition_key_from_tree",
     "definition_key_to_tree",
 ]

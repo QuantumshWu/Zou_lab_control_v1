@@ -31,7 +31,7 @@ from zlc_pulse import (
     PulseTarget,
     sample_compiled_bus_codes,
 )
-from zlc_storage import canonical_digest, canonical_text, sha256_text
+from zlc_storage import canonical_text, sha256_text
 from zlc_storage.canonical import positive_integer as _positive_int
 
 
@@ -1387,21 +1387,6 @@ class VirtualCamera:
         self.ensure_open()
         shape = tuple(int(size) for size in self.frame_shape)
         sensor = tuple(int(size) for size in self.sensor_shape)
-        settings = dict(self.snapshot())
-        settings.update(
-            {
-                "adapter_type": f"{type(self).__module__}.{type(self).__qualname__}",
-                "frame_shape": shape,
-                "sensor_shape": sensor,
-                "frame_dtype": self.frame_dtype.str,
-                "acquisition_mode": "EXTERNAL_TRIGGERED",
-                "capture_trigger_channels": tuple(self.capture_trigger_channels),
-                "effective_trigger_channels": tuple(self.effective_trigger_channels),
-                "applied_exposure_seconds": float(self.exposure),
-                "required_external_trigger_interval_seconds": float(self.exposure),
-                "external_trigger_integration_start_offset_seconds": 0.0,
-            }
-        )
         if self.roi is None:
             origin_yx = (0, 0)
             roi_shape_yx = sensor
@@ -1410,7 +1395,6 @@ class VirtualCamera:
             origin_yx = (y, x)
             roi_shape_yx = (height, width)
         return CameraWorkingPoint(
-            settings_fingerprint=canonical_digest(settings),
             acquisition_mode="EXTERNAL_TRIGGERED",
             frame_shape_yx=shape,
             sensor_shape_yx=sensor,

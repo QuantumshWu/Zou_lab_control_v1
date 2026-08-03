@@ -5,14 +5,21 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 
 import numpy as np
 
-from zlc_data import DataBlock, DatasetRevisionRef, DatasetSchema, OwnedSnapshot
+from zlc_data import (
+    BlockId,
+    DataBlock,
+    DatasetRevision,
+    DatasetRevisionRef,
+    DatasetSchema,
+    OwnedSnapshot,
+    StreamGenerationId,
+)
 from zlc_data.codec import (
-    dataset_revision_ref_from_tree,
-    dataset_revision_ref_to_tree,
     dataset_schema_from_tree,
     dataset_schema_to_tree,
     validity_from_tree,
@@ -25,25 +32,20 @@ from zlc_neutral_atom.runtime.dataset import (
     dataset_seal_provenance_to_tree,
 )
 from zlc_pulse import (
-    CompiledPulseArtifact,
-    PulseExecutionForm,
     decode_compiled_pulse_artifact,
     encode_compiled_pulse_artifact,
-    materialize_scan_sweeps,
 )
-from zlc_storage import canonical_text, decode, encode, exact_mapping
+from zlc_storage import canonical_text
 from zlc_storage.durability import (
     atomic_write_bytes,
     atomic_write_file,
+    atomic_write_text,
     durable_mkdir,
     durable_makedirs,
 )
 from zlc_storage.paths import resolve_under
 
 from zlc_neutral_atom.timing.pulse_parameter_scan import (
-    ApiSlotSegmentedProgram,
-    AutonomousScanSlotProgram,
-    PulseParameterScanProgram,
     pulse_parameter_scan_program_from_tree,
     pulse_parameter_scan_program_to_tree,
 )
@@ -60,22 +62,24 @@ from .lineage import (
     pulse_scan_execution_from_tree,
     pulse_scan_execution_to_tree,
 )
-from .reference import ScanArtifactRef
+from .reference import SCAN_RECORD_PREFIX, ScanArtifactRef
 
 
-SCAN_ARTIFACT_SCHEMA = "zlc_neutral_atom.logic_nodes.pulse_scan.record"
+SCAN_ARTIFACT_SCHEMA = "zlc.pulse_scan"
 _RECORD_FIELDS = {
     "schema",
     "run_id",
-    "pulse_program_file",
+    "program",
     "compiled_pulse_files",
     "execution",
-    "dataset_ref",
-    "dataset_schema",
-    "dataset_provenance",
+    "dataset",
+    "provenance",
     "values_file",
-    "validity_file",
+    "validity",
 }
+
+_VALUES_FILE = "values.npy"
+_VALIDITY_FILE = "validity.npy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +102,6 @@ class ScanArtifact:
             execution=self.execution,
             dataset_ref=self.dataset_ref,
             dataset_schema=self.dataset_schema,
-            output_contract=self.output_contract,
             provenance=self.provenance,
         )
 
@@ -150,46 +153,12 @@ class MaterializedScanData:
         return self.snapshot.block.validity
 
 
-def _require_program_artifacts(
-    program: PulseParameterScanProgram,
-    compiled_pulses: tuple[CompiledPulseArtifact, ...],
-) -> tuple[CompiledPulseArtifact, ...]:
-    pulses = tuple(compiled_pulses)
-    if any(not isinstance(item, CompiledPulseArtifact) for item in pulses):
-        raise TypeError("compiled_pulses must contain CompiledPulseArtifact values")
-    if isinstance(program, AutonomousScanSlotProgram):
-        if len(pulses) != 1:
-            raise ValueError("autonomous scan requires exactly one compiled artifact")
-        artifact = pulses[0]
-        expected = materialize_scan_sweeps(
-            program.execution_document,
-            program.sweep_count,
-        )
-        if (
-            artifact.execution_form is not PulseExecutionForm.AUTONOMOUS_SCAN_ONCE
-            or artifact.source_document_digest != expected.fingerprint
-        ):
-            raise ValueError("autonomous compiled pulse differs from its program")
-    elif isinstance(program, ApiSlotSegmentedProgram):
-        documents = program.resolved_point_documents
-        if len(pulses) != len(documents) or any(
-            artifact.execution_form is not PulseExecutionForm.STATIC_ONCE
-            or artifact.source_document_digest != document.fingerprint
-            for artifact, document in zip(pulses, documents)
-        ):
-            raise ValueError("API compiled pulses differ from resolved point documents")
-    else:
-        raise TypeError("program must be a PulseParameterScanProgram")
-    return pulses
-
-
 def _require_scan_facts(
     *,
     run_id: str,
     execution: PulseScanExecution,
     dataset_ref: DatasetRevisionRef,
     dataset_schema: DatasetSchema,
-    output_contract: ScanOutputContract,
     provenance: DatasetSealProvenance,
 ) -> None:
     canonical_text(run_id, "run_id")
@@ -199,18 +168,12 @@ def _require_scan_facts(
         raise TypeError("dataset_ref must be DatasetRevisionRef")
     if not isinstance(dataset_schema, DatasetSchema):
         raise TypeError("dataset_schema must be DatasetSchema")
-    if not isinstance(output_contract, ScanOutputContract):
-        raise TypeError("output_contract must be ScanOutputContract")
     if not isinstance(provenance, DatasetSealProvenance):
         raise TypeError("provenance must be DatasetSealProvenance")
     if dataset_ref.schema_fingerprint != dataset_schema.fingerprint:
         raise ValueError("scan Dataset ref differs from its schema")
     if dataset_ref.stream_generation != provenance.generation:
         raise ValueError("scan Dataset generation differs from its provenance")
-    if dataset_schema != output_contract.output_dataset_schema:
-        raise ValueError("scan Dataset schema differs from its output contract")
-    if output_contract.committed_transform is not None:
-        raise ValueError("PulseScan output cannot duplicate signal transform authority")
     program = execution.program
     if dataset_schema.repeat_axis.size != program.sweep_count:
         raise ValueError("scan repeat axis differs from frozen scan sweeps")
@@ -223,31 +186,80 @@ def _require_scan_facts(
         raise ValueError("external signal lineage count differs from R by P")
     if dataset_schema.cell_schema != execution.source.projection_authority.output_value_schema:
         raise ValueError("scan Dataset differs from committed signal projection")
-    if bind_scan_output_contract(dataset_schema, program.point_table, None) != output_contract:
-        raise ValueError("ScanOutputContract differs from the collected Dataset")
-    _require_program_artifacts(program, execution_compiled_artifacts(execution))
 
 
-def _encode_program(program: PulseParameterScanProgram) -> bytes:
-    return encode(pulse_parameter_scan_program_to_tree(program))
+def _write_npy(path: Path, array: np.ndarray) -> None:
+    atomic_write_file(
+        path,
+        lambda stream: np.save(stream, np.asarray(array), allow_pickle=False),
+    )
 
 
-def _decode_program(payload: bytes) -> PulseParameterScanProgram:
-    program = pulse_parameter_scan_program_from_tree(decode(payload))
-    if _encode_program(program) != payload:
-        raise ValueError("PulseParameterScanProgram is not canonical current format")
-    return program
+def _write_validity(run_directory: Path, validity: object) -> dict[str, object]:
+    record = validity_to_tree(validity)
+    mask = record.pop("mask", None)
+    filename = None
+    if mask is not None:
+        filename = _VALIDITY_FILE
+        _write_npy(run_directory / filename, mask)
+    record["file"] = filename
+    return record
 
 
-def _encode_validity(validity: object) -> bytes:
-    return encode(validity_to_tree(validity))
+def _read_validity(
+    run_directory: Path,
+    tree: object,
+):
+    if not isinstance(tree, dict) or "file" not in tree:
+        raise ValueError("scan validity record must name its optional mask file")
+    record = dict(tree)
+    filename = record.pop("file")
+    if filename is not None:
+        mask = np.load(
+            resolve_under(
+                run_directory,
+                canonical_text(filename, "validity file"),
+            ),
+            allow_pickle=False,
+        )
+        if mask.dtype != np.dtype(bool):
+            raise TypeError("scan validity mask must have bool dtype")
+        record["mask"] = mask
+    return validity_from_tree(record)
 
 
-def _decode_validity(payload: bytes):
-    validity = validity_from_tree(decode(payload))
-    if _encode_validity(validity) != payload:
-        raise ValueError("scan validity is not canonical current format")
-    return validity
+def _dataset_record(
+    reference: DatasetRevisionRef,
+    schema: DatasetSchema,
+) -> dict[str, object]:
+    return {
+        "block_id": reference.block_id.value,
+        "revision": reference.revision.value,
+        "schema": dataset_schema_to_tree(schema),
+    }
+
+
+def _dataset_from_record(
+    tree: object,
+    generation: StreamGenerationId,
+) -> tuple[DatasetRevisionRef, DatasetSchema]:
+    if not isinstance(tree, dict) or set(tree) != {
+        "block_id",
+        "revision",
+        "schema",
+    }:
+        raise ValueError("scan Dataset record has an unknown field set")
+    schema = dataset_schema_from_tree(tree["schema"])
+    revision = tree["revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise ValueError("scan Dataset revision must be a nonnegative integer")
+    reference = DatasetRevisionRef(
+        BlockId(canonical_text(tree["block_id"], "block_id")),
+        generation,
+        schema.fingerprint,
+        DatasetRevision(revision),
+    )
+    return reference, schema
 
 
 def _run_directory_name(run_id: str) -> str:
@@ -260,7 +272,7 @@ def _run_directory_name(run_id: str) -> str:
 
 
 def write_scan_artifact(
-    scans_root: str | Path,
+    project_root: str | Path,
     *,
     run_id: str,
     execution: PulseScanExecution,
@@ -277,71 +289,66 @@ def write_scan_artifact(
         execution=execution,
         dataset_ref=snapshot.ref,
         dataset_schema=snapshot.block.schema,
-        output_contract=output_contract,
         provenance=provenance,
     )
-    root = Path(scans_root).expanduser().resolve()
-    durable_makedirs(root)
-    run_directory = resolve_under(root, _run_directory_name(run_id))
+    if output_contract != bind_scan_output_contract(
+        snapshot.block.schema,
+        execution.program.point_table,
+        None,
+    ):
+        raise ValueError("ScanOutputContract differs from the collected Dataset")
+    root = Path(project_root).expanduser().resolve()
+    scan_root = resolve_under(root, "/".join(SCAN_RECORD_PREFIX))
+    durable_makedirs(scan_root)
+    run_directory = resolve_under(scan_root, _run_directory_name(run_id))
     durable_mkdir(run_directory)
 
-    program_file = "pulse-program.zlc"
     compiled = execution_compiled_artifacts(execution)
     compiled_files = tuple(
-        f"compiled-pulse-{index:03d}.zlc" for index in range(len(compiled))
+        f"compiled-pulse-{index:03d}.bin" for index in range(len(compiled))
     )
-    values_file = "values.npy"
-    validity_file = "validity.zlc"
-    atomic_write_bytes(run_directory / program_file, _encode_program(execution.program))
     for filename, artifact in zip(compiled_files, compiled):
         atomic_write_bytes(
             run_directory / filename,
             encode_compiled_pulse_artifact(artifact),
         )
-    atomic_write_file(
-        run_directory / values_file,
-        lambda stream: np.save(stream, snapshot.block.values, allow_pickle=False),
-    )
-    atomic_write_bytes(
-        run_directory / validity_file,
-        _encode_validity(snapshot.block.validity),
-    )
+    _write_npy(run_directory / _VALUES_FILE, snapshot.block.values)
+    validity = _write_validity(run_directory, snapshot.block.validity)
     record = {
         "schema": SCAN_ARTIFACT_SCHEMA,
         "run_id": run_id,
-        "pulse_program_file": program_file,
+        "program": pulse_parameter_scan_program_to_tree(execution.program),
         "compiled_pulse_files": list(compiled_files),
         "execution": pulse_scan_execution_to_tree(execution),
-        "dataset_ref": dataset_revision_ref_to_tree(snapshot.ref),
-        "dataset_schema": dataset_schema_to_tree(snapshot.block.schema),
-        "dataset_provenance": dataset_seal_provenance_to_tree(provenance),
-        "values_file": values_file,
-        "validity_file": validity_file,
+        "dataset": _dataset_record(snapshot.ref, snapshot.block.schema),
+        "provenance": dataset_seal_provenance_to_tree(provenance),
+        "values_file": _VALUES_FILE,
+        "validity": validity,
     }
-    payload = encode(record)
-    if encode(exact_mapping(decode(payload), _RECORD_FIELDS, SCAN_ARTIFACT_SCHEMA)) != payload:
-        raise ValueError("scan record failed its canonical round-trip")
     record_path = run_directory / "scan.json"
-    atomic_write_bytes(record_path, payload)
+    atomic_write_text(
+        record_path,
+        json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
     return ScanArtifactRef(record_path.relative_to(root).as_posix())
 
 
 def _read_scan(
-    scans_root: str | Path,
+    project_root: str | Path,
     reference: ScanArtifactRef,
 ) -> tuple[ScanArtifact, Path, dict[str, object]]:
     if not isinstance(reference, ScanArtifactRef):
         raise TypeError("reference must be ScanArtifactRef")
-    root = Path(scans_root).expanduser().resolve()
+    root = Path(project_root).expanduser().resolve()
     record_path = resolve_under(root, reference.record_path)
-    payload = record_path.read_bytes()
-    record = exact_mapping(decode(payload), _RECORD_FIELDS, SCAN_ARTIFACT_SCHEMA)
-    if encode(record) != payload:
-        raise ValueError("scan record is not canonical current format")
+    with record_path.open("r", encoding="utf-8") as stream:
+        record = json.load(stream)
+    if not isinstance(record, dict) or set(record) != _RECORD_FIELDS:
+        raise ValueError("scan record has an unknown field set")
+    if record["schema"] != SCAN_ARTIFACT_SCHEMA:
+        raise ValueError("scan record schema is not current")
     run_directory = record_path.parent
-    program = _decode_program(
-        resolve_under(run_directory, canonical_text(record["pulse_program_file"], "program file")).read_bytes()
-    )
+    program = pulse_parameter_scan_program_from_tree(record["program"])
     compiled_trees = record["compiled_pulse_files"]
     if not isinstance(compiled_trees, list) or not compiled_trees:
         raise ValueError("compiled_pulse_files must be a non-empty list")
@@ -351,28 +358,32 @@ def _read_scan(
         )
         for name in compiled_trees
     )
-    _require_program_artifacts(program, compiled)
     execution = pulse_scan_execution_from_tree(record["execution"], program, compiled)
+    provenance = dataset_seal_provenance_from_tree(record["provenance"])
+    dataset_ref, dataset_schema = _dataset_from_record(
+        record["dataset"],
+        provenance.generation,
+    )
     artifact = ScanArtifact(
         reference,
         canonical_text(record["run_id"], "run_id"),
         execution,
-        dataset_revision_ref_from_tree(record["dataset_ref"]),
-        dataset_schema_from_tree(record["dataset_schema"]),
-        dataset_seal_provenance_from_tree(record["dataset_provenance"]),
+        dataset_ref,
+        dataset_schema,
+        provenance,
     )
     return artifact, run_directory, record
 
 
 def load_scan_artifact(
-    scans_root: str | Path,
+    project_root: str | Path,
     reference: ScanArtifactRef,
 ) -> ScanArtifact:
-    return _read_scan(scans_root, reference)[0]
+    return _read_scan(project_root, reference)[0]
 
 
 def materialize_scan_data(
-    scans_root: str | Path,
+    project_root: str | Path,
     reference: ScanArtifactRef,
     *,
     abort_check: Callable[[], None] | None = None,
@@ -381,7 +392,7 @@ def materialize_scan_data(
         raise TypeError("abort_check must be callable or None")
     if abort_check is not None:
         abort_check()
-    artifact, run_directory, record = _read_scan(scans_root, reference)
+    artifact, run_directory, record = _read_scan(project_root, reference)
     if abort_check is not None:
         abort_check()
     values_path = resolve_under(
@@ -391,11 +402,9 @@ def materialize_scan_data(
     values = np.load(values_path, allow_pickle=False)
     if abort_check is not None:
         abort_check()
-    validity = _decode_validity(
-        resolve_under(
-            run_directory,
-            canonical_text(record["validity_file"], "validity file"),
-        ).read_bytes()
+    validity = _read_validity(
+        run_directory,
+        record["validity"],
     )
     if values.shape != artifact.dataset_schema.physical_shape:
         raise ValueError("scan values shape differs from the persisted schema")
@@ -415,7 +424,7 @@ def materialize_scan_data(
 
 
 def project_scan_dataset(
-    scans_root: str | Path,
+    project_root: str | Path,
     reference: ScanArtifactRef,
     *,
     materialize: bool,
@@ -425,14 +434,14 @@ def project_scan_dataset(
         raise TypeError("materialize must be bool")
     if materialize:
         snapshot = materialize_scan_data(
-            scans_root,
+            project_root,
             reference,
             abort_check=abort_check,
         ).snapshot
         return ArtifactDatasetSource(snapshot.block.schema, snapshot.ref, snapshot)
     if abort_check is not None:
         abort_check()
-    artifact = load_scan_artifact(scans_root, reference)
+    artifact = load_scan_artifact(project_root, reference)
     return ArtifactDatasetSource(artifact.dataset_schema, artifact.dataset_ref)
 
 

@@ -51,7 +51,6 @@ from zlc_pulse import (
     load_deployed_pulse_target,
     pulse_target_manifest,
 )
-from zlc_storage import canonical_digest
 
 
 DEFAULT_VIRTUAL_SEED = 7
@@ -234,13 +233,8 @@ def _bind_camera(
 ):
     endpoint = CameraMonitorEndpoint(
         camera,
-        instance.role,
-        exact_external_trigger_qualification_digest=canonical_digest(
-            {
-                "evidence": "target-owned deterministic virtual trigger wire",
-                "instance_id": instance.instance_id,
-            }
-        ),
+        instance.instance_id,
+        exact_external_trigger_qualified=True,
         acquisition_mode=CameraAcquisitionMode.EXTERNAL_TRIGGERED,
         monitor_acquisition_mode=(
             CameraAcquisitionMode.FREE_RUNNING

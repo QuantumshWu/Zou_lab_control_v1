@@ -125,7 +125,7 @@ def _connect_dcam(
     if not isinstance(camera, CameraAdapter):
         raise TypeError("DcamCameraAdapter returned a non-CameraAdapter")
     try:
-        qualification = qualify_external_trigger_path(
+        qualify_external_trigger_path(
             client=client,
             camera=camera,
             trigger_lane=values["trigger_lane"],
@@ -133,8 +133,8 @@ def _connect_dcam(
         working_point = camera.capture_working_point()
         endpoint = CameraMonitorEndpoint(
             camera,
-            instance.role,
-            exact_external_trigger_qualification_digest=qualification,
+            instance.instance_id,
+            exact_external_trigger_qualified=True,
             acquisition_mode=CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             monitor_acquisition_mode=CameraAcquisitionMode.EXTERNAL_TRIGGERED,
         )
@@ -198,15 +198,15 @@ def _connect_pylon(
     if not isinstance(camera, CameraAdapter):
         raise TypeError("PylonCameraAdapter returned a non-CameraAdapter")
     try:
-        qualification = qualify_external_trigger_path(
+        qualify_external_trigger_path(
             client=client,
             camera=camera,
             trigger_lane=values["trigger_lane"],
         )
         endpoint = CameraMonitorEndpoint(
             camera,
-            instance.role,
-            exact_external_trigger_qualification_digest=qualification,
+            instance.instance_id,
+            exact_external_trigger_qualified=True,
             acquisition_mode=CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             monitor_acquisition_mode=CameraAcquisitionMode.FREE_RUNNING,
         )

@@ -81,12 +81,13 @@ def _snapshot() -> OwnedSnapshot:
 
 def _bare_experiment(monkeypatch, output_root: Path):
     experiment = object.__new__(public_api.Experiment)
-    experiment._services = object()
+    services = object()
+    experiment._binding = (services, None, None, None, None)
 
     @contextmanager
     def service_guard(_services):
         yield SimpleNamespace(
-            workspace_paths=SimpleNamespace(output_root=output_root),
+            workspace_paths=SimpleNamespace(figures_root=output_root),
         )
 
     monkeypatch.setattr(facade_module, "_service_guard", service_guard)

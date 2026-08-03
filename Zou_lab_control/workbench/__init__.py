@@ -3,54 +3,34 @@
 from __future__ import annotations
 
 
-def _build_logic_node_ui(
-    contributions,
-    purpose: str,
-    *args,
-    **kwargs,
-):
+def _build_logic_node_ui(contribution, *args, **kwargs):
     """Resolve and call one leaf-owned optional UI contribution lazily."""
 
     from importlib import import_module
 
-    from zlc_neutral_atom.logic_node_package import UiContributionDescriptor
+    from zlc_neutral_atom.logic_node import UiContribution
 
-    descriptors = tuple(contributions)
-    if any(not isinstance(value, UiContributionDescriptor) for value in descriptors):
-        raise TypeError("contributions must contain UiContributionDescriptor values")
-    name = str(purpose).strip()
-    matches = tuple(
-        value for value in descriptors if value.purpose == name
+    if not isinstance(contribution, UiContribution):
+        raise TypeError("contribution must be UiContribution")
+    symbol = getattr(
+        import_module(contribution.module),
+        contribution.symbol,
     )
-    if len(matches) != 1:
-        raise ValueError(f"Logic-node has no unique UI purpose {name!r}")
-    descriptor = matches[0]
-    symbol = getattr(import_module(descriptor.module), descriptor.symbol)
     if not callable(symbol):
         raise TypeError(
-            f"Logic-node UI symbol {descriptor.module}:{descriptor.symbol} "
+            f"Logic-node UI symbol {contribution.module}:{contribution.symbol} "
             "must be callable"
         )
     return symbol(*args, **kwargs)
 
 
-def _invoke_logic_node_ui(
-    contributions,
-    purpose: str,
-    *args,
-    **kwargs,
-):
+def _invoke_logic_node_ui(contribution, *args, **kwargs):
     """Launch one already-frozen optional contribution as an owned window."""
 
     from zlc_frontend.qt_widgets import launch_qt_window
 
     return launch_qt_window(
-        lambda: _build_logic_node_ui(
-            contributions,
-            purpose,
-            *args,
-            **kwargs,
-        )
+        lambda: _build_logic_node_ui(contribution, *args, **kwargs)
     )
 
 
@@ -102,7 +82,7 @@ def open_pulse_editor(
         return _open(
             connection_factory=standalone_pulse_connection_factory(workspace),
             pulses_root=workspace.pulses_root,
-            output_root=workspace.output_root,
+            output_root=workspace.project_root,
             initial_connection_mode="offline",
             document=document,
             path=path,
@@ -125,7 +105,7 @@ def open_pulse_editor(
             descriptor=pulse.target,
             initial_connection_mode=bound_pulse_mode(experiment),
             pulses_root=roots.pulses_root,
-            output_root=roots.output_root,
+            output_root=roots.project_root,
             document=document,
             path=path,
         )
@@ -201,7 +181,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
     """Open the sole current Monitor/Logic TaskConsole lazily."""
 
     from zlc_workbench.task_console.app import open_task_console as _open
-    from ._composition import _require_experiment, task_console_ports
+    from ._composition import _require_experiment, task_console_dependencies
 
     experiment = _require_experiment(experiment)
     if "hide_on_close" in kwargs:
@@ -212,7 +192,7 @@ def open_task_console(experiment, *, state=None, task=None, **kwargs):
 
     def compose():
         return _open(
-            task_console_ports(experiment),
+            **task_console_dependencies(experiment),
             state=state,
             task=task,
             hide_on_close=True,

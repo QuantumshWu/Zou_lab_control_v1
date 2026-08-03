@@ -2194,9 +2194,23 @@ class FluentTreeComboBox(FluentComboBox):
         self._full_by_bare = full_by_bare
         self.select_signal(current)
         if isinstance(view, QtWidgets.QTreeView):
+            # ``expanded`` is captured before the keyed model reconcile.  A
+            # producer can disappear while a live topology is refreshed; its
+            # old QStandardItem is then owned/deleted by Qt when removed from
+            # the model.  Never dereference that stale item.  Resolve the
+            # expansion state from the reconciled model, which is the sole
+            # widget model owner.
+            reconciled_parents = {
+                self._model.item(row).text(): self._model.item(row)
+                for row in range(self._model.rowCount())
+                if (
+                    self._model.item(row) is not None
+                    and self._model.item(row).data(QtCore.Qt.UserRole) is None
+                )
+            }
             for producer in expanded:
-                parent = existing_parents.get(producer)
-                if parent is not None and parent.model() is self._model:
+                parent = reconciled_parents.get(producer)
+                if parent is not None:
                     view.setExpanded(parent.index(), True)
             view.verticalScrollBar().setValue(vertical)
             view.horizontalScrollBar().setValue(horizontal)

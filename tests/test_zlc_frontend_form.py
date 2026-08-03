@@ -343,3 +343,22 @@ def test_required_empty_field_is_reported_by_key() -> None:
     with pytest.raises(KeyError, match="unknown form field"):
         form.widget_for("missing")
 
+
+def test_structured_authoring_stays_in_owner_draft_but_not_generic_form() -> None:
+    from zlc_frontend.form import project_authoring_form
+    from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema
+
+    schema = AuthoringSchema(
+        (
+            AuthoringField("name", "text", "Name", default="scan"),
+            AuthoringField("slots", "structured", "Slots"),
+        )
+    )
+    source = {"api": {"detuning": 3.0}, "program": "scan_table"}
+    frozen = schema.freeze({"slots": source})
+
+    assert frozen["slots"] == source
+    assert frozen["slots"] is not source
+    assert project_authoring_form(schema).keys == ("name",)
+    with pytest.raises(TypeError, match="JSON-like"):
+        schema.freeze({"slots": {"bad": object()}})

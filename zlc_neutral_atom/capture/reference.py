@@ -10,7 +10,7 @@ from zlc_storage import canonical_text
 
 
 CAPTURE_ARTIFACT_REF_SCHEMA = "zlc_neutral_atom.capture-artifact-ref"
-CAPTURE_ARTIFACT_NAMESPACE = "capture"
+CAPTURE_RECORD_PREFIX = ("runs", "camera")
 
 
 def _capture_record_path(value: object) -> str:
@@ -22,17 +22,23 @@ def _capture_record_path(value: object) -> str:
     path = PurePosixPath(value)
     if path.is_absolute() or path.as_posix() != value:
         raise ValueError("record_path must be a canonical relative path")
-    if len(path.parts) != 2 or path.parts[1] != "capture.json":
-        raise ValueError("record_path must be '<run-name>/capture.json'")
-    if path.parts[0] in {"", ".", ".."}:
+    if (
+        len(path.parts) != 4
+        or path.parts[:2] != CAPTURE_RECORD_PREFIX
+        or path.parts[-1] != "capture.json"
+    ):
+        raise ValueError(
+            "record_path must be 'runs/camera/<run-name>/capture.json'"
+        )
+    if path.parts[2] in {"", ".", ".."}:
         raise ValueError("record_path requires one concrete run-name")
-    canonical_text(path.parts[0], "capture run-name")
+    canonical_text(path.parts[2], "capture run-name")
     return value
 
 
 @dataclass(frozen=True, order=True)
 class CaptureArtifactRef:
-    """Location of one Capture record relative to its explicit captures root."""
+    """Project-relative location of one directly written Camera capture."""
 
     record_path: str
 
@@ -41,7 +47,9 @@ class CaptureArtifactRef:
 
     @property
     def target_ref(self) -> str:
-        return f"{CAPTURE_ARTIFACT_NAMESPACE}/{self.record_path}"
+        """Canonical lineage identity; the project-relative path is sufficient."""
+
+        return self.record_path
 
 
 def capture_artifact_ref_to_tree(value: CaptureArtifactRef) -> dict[str, object]:
@@ -58,15 +66,12 @@ def capture_artifact_ref_from_tree(tree: Any) -> CaptureArtifactRef:
         raise ValueError("CaptureArtifactRef has an unknown field set")
     if tree["schema"] != CAPTURE_ARTIFACT_REF_SCHEMA:
         raise ValueError("CaptureArtifactRef schema is not current")
-    value = CaptureArtifactRef(tree["record_path"])
-    if capture_artifact_ref_to_tree(value) != tree:
-        raise ValueError("CaptureArtifactRef tree is typed but non-canonical")
-    return value
+    return CaptureArtifactRef(tree["record_path"])
 
 
 __all__ = [
-    "CAPTURE_ARTIFACT_NAMESPACE",
     "CAPTURE_ARTIFACT_REF_SCHEMA",
+    "CAPTURE_RECORD_PREFIX",
     "CaptureArtifactRef",
     "capture_artifact_ref_from_tree",
     "capture_artifact_ref_to_tree",

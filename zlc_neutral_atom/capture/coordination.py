@@ -6,8 +6,7 @@ from typing import Protocol, TypeVar
 
 from zlc_neutral_atom.devices.camera.contract import (
     CameraAcquisitionMode,
-    FrozenCaptureSpec,
-    decode_camera_capture_spec,
+    CameraCaptureSpec,
 )
 from zlc_neutral_atom.devices.sequencer.port import PulseSession, PulseTerminalAck
 from zlc_neutral_atom.runtime._failure import record_secondary_failure
@@ -62,14 +61,14 @@ def execute_autonomous_single_fire(
 
 def validate_single_trigger_capture_binding(
     *,
-    capture_spec: FrozenCaptureSpec,
+    capture_spec: CameraCaptureSpec,
     contract: CameraCaptureContract,
     pulse_binding: PulseCaptureBinding,
 ) -> DigitalTriggerSchedule:
     """Validate the exact single-wire camera/pulse join shared by coordinators."""
 
-    if not isinstance(capture_spec, FrozenCaptureSpec):
-        raise TypeError("capture_spec must be FrozenCaptureSpec")
+    if not isinstance(capture_spec, CameraCaptureSpec):
+        raise TypeError("capture_spec must be CameraCaptureSpec")
     if not isinstance(contract, CameraCaptureContract):
         raise TypeError("contract must be CameraCaptureContract")
     if not isinstance(pulse_binding, PulseCaptureBinding):
@@ -77,14 +76,13 @@ def validate_single_trigger_capture_binding(
     artifact = pulse_binding.compiled_artifact
     trigger_channel = pulse_binding.trigger_channel
     cell_plan = pulse_binding.cell_plan
-    camera_spec = decode_camera_capture_spec(capture_spec)
-    if camera_spec.mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
+    if capture_spec.mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
         raise ValueError("exact triggered capture requires an external-trigger camera")
     evidence = contract.capability.camera_capability_evidence
     evidence.physical_facts.require_single_capture_trigger_channel(
         trigger_channel
     )
-    if evidence.exact_external_trigger_qualification_digest is None:
+    if not evidence.exact_external_trigger_qualified:
         raise ValueError(
             "exact triggered capture requires E0-qualified ordered one-frame-per-trigger evidence"
         )

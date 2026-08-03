@@ -61,9 +61,9 @@ Zou_lab_control   -> 上述 public contracts
 8. `Zou_lab_control` 保留为脚本、notebook和desktop共用的稳定API与composition root；它只做生命周期和窄委托，不实现领域算法或Qt/Fit状态机。
 9. 新增或删除内建Device或Logic Node只改对应leaf。fixed-namespace discovery自动发现，不存在第二份中央concrete import/installation列表、service locator或mutable registry。
 
-叶包边界也固定：默认表单、choice、API、resource与signal requirements都在inert descriptor中声明；composition在Experiment可用前一次解析成frozen narrow facts。普通UI完全由通用declaration projector生成。确实无法由声明表达的可选`ui/**`只导出lazy`UiContributionDescriptor(module, symbol)`；headless只验证它位于本leaf namespace且descriptor canonical，不加载Qt；Workbench product启动时在窗口可用前解析并类型校验factory，再通过frontend-owned generic UI context和同一`zlc_plot` surface实例化。leaf UI不导入Workbench、catalog或service graph，失败则该product启动失败而不是静默回退。
+叶包边界也固定：一个`LogicNodeDefinition(key, kind, title)`表达三类节点的共同身份；每个fixed-namespace leaf只导出一个inert `LogicNodeDescriptor`。descriptor声明默认表单、device capability requirements、typed inputs/outputs、真实resource claims、一个domain bind/execute seam、Task-only preview与真正optional lazy UI。普通device choice由capability与stable instance id机械派生；role只作显示，不进入identity或binding。普通UI完全由通用descriptor projector生成。确实无法由声明表达的可选`ui/**`只导出lazy contribution；headless只验证它属于本leaf namespace，不加载Qt；Workbench启动时再通过frontend-owned generic UI context和同一`zlc_plot` surface实例化。leaf UI不导入Workbench、catalog或service graph，失败则该product启动失败而不是静默回退。
 
-Request binding也只有一个owner：generic host按declaration统一解析DeviceRef、SignalRef、artifact ref与普通fields；leaf只有在这些frozen facts之外确有领域构造不变量时，才在同一`LogicNodePackage`提供一个domain bind/execute seam。composition在产品启动前拒绝缺失或双binder。Package只保留declaration、该唯一领域seam及真正可选contribution；不得继续充当prepare/start/API/presenter/repository各阶段回调的聚合清单。
+Request binding也只有一个owner：唯一Logic Node host按descriptor统一freeze authored draft并解析DeviceRef、SignalRef、artifact ref与普通fields；leaf的单一domain seam只构造真实领域request并执行acquire/compute/Port调用。request-dependent output cardinality等真实物理事实可以保留纯领域projector，但Package式`bind_api/prepare_hosted/bind_hosted_request/start_prepared/api_dependencies/dynamic_choice_fact/close_api`回调表禁止存在。public `Experiment.nodes`对所有leaf投影同一个轻量`NodeApi`；复杂领域便利函数可以由descriptor贡献普通函数，但不能再形成每leaf一套状态化API、Prepared/Bound阶段或repository/lifecycle。
 
 ## 3. 数据与 point domain 的唯一终态
 
@@ -320,7 +320,9 @@ application admission method（一个内部owner，不是新framework）
 - selector 属于PlotSession。Area发布保留dtype、axes、validity和exact selection provenance的Dataset；Cross发布所选sample/cell的数据值，坐标只进入provenance。Fit只发布具名参数sibling bundle，不发布拟合曲线数组；拟合曲线、点、中心或半径作为同一zlc_plot overlay可见。
 - 普通 pointer motion 不发布 hover 数据。Area/Cross/Fit 不重配 Measurement、不建立 ROI Measurement/Processor，也不弹出第二个 DataFigure。
 
-通用Logic Node host唯一拥有start/stop、Run观察、input cursor、same-shot atomic publish、request binding、通用form、API forwarding、普通持久化与错误投影。普通leaf只保留一个discovered declaration、领域request/value、typed inputs/outputs、真实resource claims及acquire/compute算法；Camera live/finite复用同一个acquisition path，同类scan Measurement复用同一个scan skeleton。不得为每个leaf重复Intent/Request/Bound/Prepared/API/presenter/codec/repository/lifecycle链；只有独立不变量或第二真实消费者才能保留额外类型。
+通用Logic Node host唯一拥有start/stop、Run观察、input cursor、same-shot atomic publish、request binding、通用form、API forwarding、普通持久化与错误投影。现有`HostedRun`必须原位演化或一次性重命名为这一唯一host；`HostedProcessor`和`LiveDatasetHost`的职责折入后删除，不能旁建第二host。host内部允许两种真实策略：Task/Measurement执行flat `RunPlan`；Processor由host持event cursor并调用leaf纯`compute(source, request)`。策略不得泄漏成两套公共lifecycle类型或TaskConsole分支。
+
+普通leaf只保留一个discovered descriptor、一个领域request/value、typed inputs/outputs、真实resource claims及acquire/compute算法；Camera live/finite复用同一个acquisition path，同类scan Measurement复用同一个scan collector。不得为每个leaf重复Intent/Request/Bound/Prepared/API/presenter/codec/repository/lifecycle链；只有独立不变量或第二真实消费者才能保留额外类型。Calibration capture→analysis这类Task明文要求的多个flat Runs是Task的领域步骤，不是可复制到普通leaf的阶段骨架。普通artifact由host拥有project目录与arrays-first/record-last提交顺序，leaf只提供少量可读record字段、科学arrays与reader；不得恢复per-leaf repository、canonical bytes或recursive externalizer。
 
 普通fields、choices、dynamic outputs与推荐PlotSpec都由inert declaration提供；Workbench不按DefinitionKey写具名分支。新增普通Measurement/Processor的领域代码应为几十到低几百行；超出时必须指出不可替代的物理算法或特殊交互，而不能把通用骨架搬进leaf。
 
@@ -449,13 +451,19 @@ Device Manager只编辑该graph：按domain分组、Add device、每卡独立rol
 
 ### 6.7 Logic Node、Task takeover 与 Edit
 
-Logic Node同样使用固定namespace与一个discovered leaf descriptor。descriptor只含identity/kind/title、AuthoringSchema、typed inputs/outputs、actual claims、一个真正必要时才存在的domain bind/execute seam、optional task preview与可选UI contribution。Task preview直接携`PlotKind | PlotSpec`，只允许Task声明；运行时始终传typed value，codec只存在于TaskConsole layout文件I/O，不能恢复string kind/params接缝。generic host私有完成build/start/evaluate投影，并生成form、public`exp.nodes.*`API、start/stop/run、publish、persistence和error projection；不再保留两级callback package、per-leaf API/Prepared/Bound forwarding zoo或中央concrete import。
+Logic Node同样使用固定namespace与一个discovered leaf descriptor。descriptor只含单一`LogicNodeDefinition`、AuthoringSchema、typed inputs/outputs、capability-derived device requirements、actual claims、一个domain bind/execute seam、optional task preview与可选UI contribution。Task preview直接携`PlotKind | PlotSpec`，只允许Task声明；运行时始终传typed value，codec只存在于TaskConsole layout文件I/O，不能恢复string kind/params接缝。唯一host私有完成build/start/evaluate投影，并生成form、同构public`exp.nodes.*` NodeApi、start/stop/run、publish、record-last persistence和统一observation；不再保留两级callback package、per-leaf API/Prepared/Bound forwarding zoo、中央concrete import或中央字符串fact service locator。
 
-普通leaf没有专用TaskConsole form/presenter/binding。只有declaration + zlc_plot无法表达的真实交互才允许leaf-local lazy`ui/**`；baseline仅有PulseScan scan-table/slot editor、Calibration creation/report workflow与Occupancy exact-cell navigator。它们仍复用frontend form和zlc_plot，不得导入Workbench或自画Figure；“字段较多”不构成custom UI理由。
+一个稳定device instance字段可以声明多项必需capability以及只在该型号存在时才使用的显式optional capability；Device form只列满足全部必需capability的实例，leaf只能通过typed application context取得已声明成员。Camera finite/monitor因此共用同一个`camera_instance_id`，association可选能力缺失时不排除普通Camera；不得为每项capability制造第二设备字段，也不得让leaf绕过context访问runtime。
+
+普通leaf没有专用TaskConsole form/presenter/binding。只有declaration + zlc_plot无法表达的真实交互才允许leaf-local lazy`ui/**`；当前baseline仅有PulseScan scan-table/slot editor与Calibration report workflow。它们仍复用frontend form和zlc_plot，不得导入Workbench或自画Figure；“字段较多”不构成custom UI理由。准入不是保留理由：没有生产producer/consumer的Occupancy artifact/load/cell navigator整条删除，Occupancy只作live Processor并发布typed Dataset siblings。
+
+custom editor拥有的结构化值仍必须作为`AuthoringSchema`中的JSON-like `structured`字段进入同一draft、layout与request freeze，不能藏在Workbench sidecar。frontend通用form projector只省略这类没有普通Fluent控件的字段；TaskConsole必须找到descriptor声明的唯一custom form来读写完整draft，否则明确失败，不能静默丢字段或退回文本编码。
 
 Measurement/Processor保持row-local。只有Task启动后由TaskConsole的唯一command-admission投影接管整个窗口：固定header显示task名、progress、stage与唯一Stop，所有其它mutating命令禁用；完成/失败/停止走同一清理出口。该投影直接消费既有HostedRun/RunSnapshot（只补真实completed/total facts），不建立第二Task session/controller。Occupancy启动只发布signals，不自动开panel；只有Task descriptor显式声明optional preview时才创建临时panel，普通recommended plot没有自动开图语义。
 
 Logic Edit和Plot Edit是同一producer-owned typed draft/controller的两个视图。selector只产出物理Selection；leaf可选声明一个窄`Selection -> ParameterPatch`纯映射，例如Camera Area预填ROI、1D interval预填scan range。zoom只改PlotSession视图；只有用户Apply才由device/producer owner在安全边界提交参数。GUI不直接配置硬件，也不维护第二参数truth。
+
+TaskConsole只消费descriptor catalog、唯一host factory、SignalPlane与project paths；它保存authored values/input refs并投影同一个host observation，不拥有ConsoleNodeSpec、run/processor attachment、resolved/bound多阶段DTO、artifact resolver callback、output presentation镜像或按host类型分开的poll/error逻辑。Workbench选择只冻结稳定Signal/Artifact ref；host一次解析为typed runtime fact，leaf看不到Workbench row、producer request、run node或Camera专用binding。
 
 `Zou_lab_control`是脚本、notebook与desktop共用的唯一public application API，暴露稳定`Experiment`、`exp.nodes.*`、device/application lifecycle与Workbench opener；它只做discovery结果投影和窄委托，不显式import具体device/Logic Node，不拥有领域schema、算法、plot或第二runtime。
 
@@ -531,8 +539,8 @@ Identity严格按成本和消费者限定：
 
 ### C3：最小 Logic Node host
 
-- 把start/stop/cursor/publish/binding/form/API/persistence/error投影收进一个generic host，压缩现有Declaration/Package，不新增阶段类族。
-- 迁移全部leaf，保留真正领域算法/ports与三个已准入optional UI；每个leaf从本cut起直接使用§7的domain record-last writer，删除自己的普通SHA/bytes/repository以及重复API/Prepared/Bound/presenter/lifecycle、中央imports与具体Workbench特判。
+- 把三种Definition合成一个`LogicNodeDefinition`，每leaf改成一个discovered descriptor；把start/stop/cursor/publish/binding/form/API/persistence/error投影收进由现有HostedRun原位演化的唯一host，不新增阶段类族或并行host。删除Package callback table、中央字符串facts、HostedProcessor/LiveDatasetHost与TaskConsole attachment/spec/resolution第二胶水。
+- 迁移全部leaf，保留真正领域算法/ports与三个已准入optional UI；每个leaf从本cut起使用§7的host-owned目录/record-last writer并只声明自己的可读record与科学arrays，删除普通SHA/bytes/repository以及重复API/Prepared/Bound/presenter/lifecycle、中央imports与具体Workbench特判。
 - 每个leaf执行discovery、typed form、construct、start/stop virtual smoke；Camera、Processor、PulseScan等代表纵切执行正式产品流。报告每leaf旧/新LOC，普通leaf仍数千行则C3未完成。
 
 ### C4：Task takeover、Edit与输出

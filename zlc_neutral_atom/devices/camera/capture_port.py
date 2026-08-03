@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 from dataclasses import dataclass, field, replace
 from typing import Protocol, Self, TypeVar, runtime_checkable
@@ -13,11 +12,11 @@ from zlc_storage import (
     nonnegative_integer as _nonnegative_int,
     positive_integer as _positive_int,
     positive_real as _positive_finite,
-    sha256_text as _sha256,
 )
 
 from zlc_neutral_atom.devices.camera.contract import (
     CameraCapabilityEvidence,
+    CameraCaptureSpec,
     CameraPhysicalFacts,
 )
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
@@ -67,18 +66,6 @@ class CaptureCapabilitySnapshot:
             )
 
     @property
-    def capability_fingerprint(self) -> str:
-        return self.camera_capability_evidence.fingerprint
-
-    @property
-    def settings_fingerprint(self) -> str:
-        return self.camera_capability_evidence.settings_fingerprint
-
-    @property
-    def capture_spec_owner_fingerprint(self) -> str:
-        return self.camera_capability_evidence.capture_spec_owner_fingerprint
-
-    @property
     def max_blocking_call_seconds(self) -> float:
         return self.camera_capability_evidence.max_blocking_call_seconds
 
@@ -93,7 +80,6 @@ class ConfigureCameraExposureCommand:
 
     session_id: str
     exposure_seconds: float
-    baseline_settings_fingerprint: str
 
     def __post_init__(self) -> None:
         _canonical_text(self.session_id, "session_id")
@@ -101,10 +87,6 @@ class ConfigureCameraExposureCommand:
             self,
             "exposure_seconds",
             _positive_finite(self.exposure_seconds, "exposure_seconds"),
-        )
-        _sha256(
-            self.baseline_settings_fingerprint,
-            "baseline_settings_fingerprint",
         )
 
 
@@ -115,8 +97,6 @@ class CameraExposureConfiguredAck:
     requested_exposure_seconds: float
     applied_exposure_seconds: float
     required_external_trigger_interval_seconds: float
-    settings_fingerprint: str
-    capability_fingerprint: str
     capability: CaptureCapabilitySnapshot
 
     def __post_init__(self) -> None:
@@ -142,17 +122,11 @@ class CameraExposureConfiguredAck:
             "required_external_trigger_interval_seconds",
             interval,
         )
-        _sha256(self.settings_fingerprint, "settings_fingerprint")
-        _sha256(self.capability_fingerprint, "capability_fingerprint")
         capability = self.capability
         if not isinstance(capability, CaptureCapabilitySnapshot):
             raise TypeError("capability must be CaptureCapabilitySnapshot")
         if capability.binding_stamp.binding_instance_id != self.binding_instance_id:
             raise ValueError("configured capability belongs to another binding")
-        if capability.settings_fingerprint != self.settings_fingerprint:
-            raise ValueError("configured capability settings fingerprint differs")
-        if capability.capability_fingerprint != self.capability_fingerprint:
-            raise ValueError("configured capability fingerprint differs")
         if not math.isclose(
             capability.camera_physical_facts.exposure_seconds,
             self.applied_exposure_seconds,
@@ -170,6 +144,8 @@ class _CameraExposurePort(Protocol):
     @property
     def capability(self) -> CaptureCapabilitySnapshot: ...
 
+    def require_current_capability(self) -> CaptureCapabilitySnapshot: ...
+
     def with_configured_exposure(
         self,
         acknowledgement: CameraExposureConfiguredAck,
@@ -178,32 +154,21 @@ class _CameraExposurePort(Protocol):
 @dataclass(frozen=True)
 class PrepareCaptureCommand:
     session_id: str
-    capture_spec_payload: bytes
-    capture_spec_owner_fingerprint: str
-    capture_spec_fingerprint: str
-    capability_fingerprint: str
-    settings_fingerprint: str
+    capture_spec: CameraCaptureSpec
     expected_total_events: int
     timeout_seconds: float
 
     def __post_init__(self) -> None:
         _canonical_text(self.session_id, "session_id")
-        for name in (
-            "capture_spec_owner_fingerprint",
-            "capture_spec_fingerprint",
-            "capability_fingerprint",
-            "settings_fingerprint",
-        ):
-            _sha256(getattr(self, name), name)
-        if not isinstance(self.capture_spec_payload, bytes) or not self.capture_spec_payload:
-            raise ValueError("capture_spec_payload must be non-empty bytes")
-        if hashlib.sha256(self.capture_spec_payload).hexdigest() != self.capture_spec_fingerprint:
-            raise ValueError("capture spec payload digest differs")
+        if not isinstance(self.capture_spec, CameraCaptureSpec):
+            raise TypeError("capture_spec must be CameraCaptureSpec")
         object.__setattr__(
             self,
             "expected_total_events",
             _positive_int(self.expected_total_events, "expected_total_events"),
         )
+        if self.capture_spec.expected_frames != self.expected_total_events:
+            raise ValueError("capture spec cardinality differs from command")
         object.__setattr__(
             self,
             "timeout_seconds",
@@ -215,16 +180,10 @@ class PrepareCaptureCommand:
 class CapturePreparedAck:
     session_id: str
     binding_instance_id: str
-    settings_fingerprint: str
-    capability_fingerprint: str
-    capture_spec_fingerprint: str
 
     def __post_init__(self) -> None:
         for name in ("session_id", "binding_instance_id"):
             _canonical_text(getattr(self, name), name)
-        _sha256(self.settings_fingerprint, "settings_fingerprint")
-        _sha256(self.capability_fingerprint, "capability_fingerprint")
-        _sha256(self.capture_spec_fingerprint, "capture_spec_fingerprint")
 
 
 @dataclass(frozen=True)
@@ -245,9 +204,6 @@ class StartCaptureCommand:
 class CaptureStartedAck:
     session_id: str
     binding_instance_id: str
-    settings_fingerprint: str
-    capability_fingerprint: str
-    capture_spec_fingerprint: str
     expected_total_events: int
     buffer_frame_count: int
     source_ordinal_baseline: int
@@ -255,12 +211,6 @@ class CaptureStartedAck:
     def __post_init__(self) -> None:
         for name in ("session_id", "binding_instance_id"):
             _canonical_text(getattr(self, name), name)
-        for name in (
-            "settings_fingerprint",
-            "capability_fingerprint",
-            "capture_spec_fingerprint",
-        ):
-            _sha256(getattr(self, name), name)
         object.__setattr__(
             self,
             "expected_total_events",
@@ -339,9 +289,6 @@ class CaptureTerminalAck:
     source_stopped: bool
     no_more_frames: bool
     joined: bool
-    settings_fingerprint: str
-    capability_fingerprint: str
-    capture_spec_fingerprint: str
 
     def __post_init__(self) -> None:
         for name in ("session_id", "binding_instance_id"):
@@ -359,9 +306,6 @@ class CaptureTerminalAck:
         for name in ("source_stopped", "no_more_frames", "joined"):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be bool")
-        _sha256(self.settings_fingerprint, "settings_fingerprint")
-        _sha256(self.capability_fingerprint, "capability_fingerprint")
-        _sha256(self.capture_spec_fingerprint, "capture_spec_fingerprint")
 
 
 def capture_terminal_ack_to_tree(value: CaptureTerminalAck) -> dict[str, object]:
@@ -375,9 +319,6 @@ def capture_terminal_ack_to_tree(value: CaptureTerminalAck) -> dict[str, object]
         "source_stopped": value.source_stopped,
         "no_more_frames": value.no_more_frames,
         "joined": value.joined,
-        "settings_fingerprint": value.settings_fingerprint,
-        "capability_fingerprint": value.capability_fingerprint,
-        "capture_spec_fingerprint": value.capture_spec_fingerprint,
     }
 
 
@@ -392,9 +333,6 @@ def capture_terminal_ack_from_tree(tree: object) -> CaptureTerminalAck:
             "source_stopped",
             "no_more_frames",
             "joined",
-            "settings_fingerprint",
-            "capability_fingerprint",
-            "capture_spec_fingerprint",
         },
         "capture terminal acknowledgement",
         discriminator=None,
@@ -542,9 +480,6 @@ def _admit_exposure_leased_capability(
         required_external_trigger_interval_seconds=(
             leased_facts.required_external_trigger_interval_seconds
         ),
-        opaque_frame_settings_fingerprint=(
-            leased_facts.opaque_frame_settings_fingerprint
-        ),
     )
     if leased_facts != expected_facts:
         raise ValueError("exposure lease changed another camera working-point fact")
@@ -564,11 +499,11 @@ def configure_camera_exposure(
         raise TypeError("port must implement the camera exposure Port contract")
     session_id = _canonical_text(session_id, "exposure session_id")
     exposure_seconds = _positive_finite(exposure_seconds, "exposure_seconds")
+    port.require_current_capability()
     acknowledgement = context.device(port.device.key).execute(
         ConfigureCameraExposureCommand(
             session_id,
             exposure_seconds,
-            port.capability.settings_fingerprint,
         )
     )
     if not isinstance(acknowledgement, CameraExposureConfiguredAck):

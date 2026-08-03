@@ -14,7 +14,7 @@ from .sitemap import (
 )
 
 
-DEFAULT_MAXIMUM_SITE_RESIDUAL_PX = 2.0
+_DEFAULT_MAXIMUM_SITE_RESIDUAL_PX = 2.0
 
 
 def build_sitemap_acquisition_profile(
@@ -30,7 +30,7 @@ def build_sitemap_acquisition_profile(
     The installation layer owns only physical wiring and geometry.  This
     Calibration owns analysis tolerance and later validates an authored pulse,
     while the composition root supplies the already-bound Ports.  Consequently
-    package composition performs no project-file I/O, and a prepared request
+    package composition performs no project-file I/O, and a bound operation
     still cannot silently target another runtime.
     """
 
@@ -59,17 +59,17 @@ def build_sitemap_acquisition_profile(
         expected_centers_xy=apparatus.site_centers_xy,
     )
     return SitemapAcquisitionProfile(
-        readout_binding=ReadoutBindingKey(camera_ref.role),
-        sequencer_role=sequencer_ref.role,
+        readout_binding=ReadoutBindingKey(camera_ref.instance_id),
+        camera_instance_id=camera_ref.instance_id,
+        sequencer_instance_id=sequencer_ref.instance_id,
         camera_facts=camera_facts,
         geometry=geometry,
-        maximum_site_residual_px=DEFAULT_MAXIMUM_SITE_RESIDUAL_PX,
+        maximum_site_residual_px=_DEFAULT_MAXIMUM_SITE_RESIDUAL_PX,
         pulse_target=pulse_port.capability.target,
         trigger_channel=apparatus.trigger_channel,
     )
 
 
 __all__ = [
-    "DEFAULT_MAXIMUM_SITE_RESIDUAL_PX",
     "build_sitemap_acquisition_profile",
 ]

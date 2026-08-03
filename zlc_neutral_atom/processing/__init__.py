@@ -1,12 +1,5 @@
-"""Causal contracts shared by current Processor applications."""
+"""Signal publication contracts shared by Logic-node hosts."""
 
-from .causal import (
-    CausalProcessorEvaluation,
-    require_causal_processor_evaluation,
-)
-from .hosted_processor import (
-    HostedProcessor,
-)
 from .signal_plane import (
     DerivedSignalOutput,
     LatestProcessorControl,
@@ -17,11 +10,8 @@ from .signal_plane import (
 )
 
 __all__ = [
-    "CausalProcessorEvaluation",
     "DerivedSignalOutput",
-    "HostedProcessor",
     "LatestProcessorControl",
-    "require_causal_processor_evaluation",
     "SignalDataPlane",
     "SignalFront",
     "SignalProducer",

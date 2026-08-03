@@ -6,9 +6,7 @@ import pytest
 
 from zlc_neutral_atom.catalog import (
     DefinitionKey,
-    MeasurementDefinition,
-    ProcessorDefinition,
-    TaskDefinition,
+    LogicNodeDefinition,
     definition_key_from_tree,
     definition_key_to_tree,
 )
@@ -31,18 +29,9 @@ def test_definition_key_has_one_exact_current_codec() -> None:
 
 def test_definition_records_are_closed_frozen_metadata() -> None:
     key = DefinitionKey("tests.logic_nodes", "probe")
-    task = TaskDefinition(key, "Probe task", "tests.ProbeTaskRequest")
-    measurement = MeasurementDefinition(
-        key,
-        "Probe measurement",
-        "tests.ProbeMeasurementRequest",
-        "tests.ProbeMeasurementBinding",
-    )
-    processor = ProcessorDefinition(
-        key,
-        "Probe processor",
-        "tests.ProbeProcessorConfig",
-    )
+    task = LogicNodeDefinition(key, "Probe task", "task")
+    measurement = LogicNodeDefinition(key, "Probe measurement", "measurement")
+    processor = LogicNodeDefinition(key, "Probe processor", "processor")
 
     assert task.key is measurement.key is processor.key
     assert not hasattr(measurement, "capture_spec_owner_fingerprint")
@@ -53,18 +42,16 @@ def test_definition_records_are_closed_frozen_metadata() -> None:
 @pytest.mark.parametrize(
     "factory",
     [
-        lambda: TaskDefinition(object(), "Probe", "tests.Request"),
-        lambda: ProcessorDefinition(
+        lambda: LogicNodeDefinition(object(), "Probe", "task"),
+        lambda: LogicNodeDefinition(
             DefinitionKey("tests", "processor"),
             lambda: None,
-            "tests.Config",
+            "processor",
         ),
-        lambda: MeasurementDefinition(
+        lambda: LogicNodeDefinition(
             DefinitionKey("tests", "measurement"),
             "Probe",
-            "tests.Request",
-            "tests.Binding",
-            "0" * 64,
+            "another-kind",
         ),
     ],
 )

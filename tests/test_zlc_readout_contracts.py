@@ -15,7 +15,6 @@ from zlc_data.axis import (
     AxisSpec,
     CoordinateFrameId,
 )
-from zlc_data.codec import value_schema_to_tree
 from zlc_data.schema import (
     DatasetSchema,
     GridTopology,
@@ -32,12 +31,6 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraCaptureDescriptor,
     CameraEventReadoutSetting,
     ReadoutBindingKey,
-)
-from zlc_neutral_atom.logic_nodes.readout.codec import (
-    calibration_capture_layout_from_tree,
-    calibration_capture_layout_to_tree,
-    frame_contract_from_tree,
-    frame_contract_to_tree,
 )
 from zlc_neutral_atom.devices.camera.contract import (
     camera_capture_descriptor_from_tree,
@@ -58,9 +51,9 @@ BINDING = ReadoutBindingKey("primary-readout")
 
 def _event_settings() -> tuple[CameraEventReadoutSetting, ...]:
     return (
-        CameraEventReadoutSetting(0, 0.001, 1.0, "fast", "0" * 64),
-        CameraEventReadoutSetting(1, 0.002, 2.0, "low-noise", "1" * 64),
-        CameraEventReadoutSetting(2, 0.003, 3.0, "low-noise", "2" * 64),
+        CameraEventReadoutSetting(0, 0.001, 1.0, "fast"),
+        CameraEventReadoutSetting(1, 0.002, 2.0, "low-noise"),
+        CameraEventReadoutSetting(2, 0.003, 3.0, "low-noise"),
     )
 
 
@@ -80,7 +73,6 @@ def _descriptor(**changes: object) -> CameraCaptureDescriptor:
         count_unit="camera-count",
         readout_event_axis_id=EVENT,
         event_settings=_event_settings(),
-        camera_arm_spec_fingerprint="a" * 64,
     )
     return replace(value, **changes)
 
@@ -180,9 +172,6 @@ def _contract() -> FrameContract:
         exposure_seconds=setting.exposure_seconds,
         gain=setting.gain,
         readout_mode=setting.readout_mode,
-        opaque_frame_settings_fingerprint=(
-            setting.opaque_frame_settings_fingerprint
-        ),
     )
     return FrameContract.from_camera_working_point(
         BINDING,
@@ -213,7 +202,6 @@ def _physical_facts() -> CameraPhysicalFacts:
         external_trigger_integration_start_offset_seconds=0.0,
         gain=setting.gain,
         readout_mode=setting.readout_mode,
-        opaque_frame_settings_fingerprint="f" * 64,
     )
 
 
@@ -364,7 +352,6 @@ def _single_event_descriptor(
     exposure: float = 0.002,
     gain: float = 2.0,
     mode: str = "low-noise",
-    frame_fingerprint: str | None = "1" * 64,
     **changes: object,
 ) -> CameraCaptureDescriptor:
     return _descriptor(
@@ -375,10 +362,8 @@ def _single_event_descriptor(
                 exposure,
                 gain,
                 mode,
-                frame_fingerprint,
             ),
         ),
-        camera_arm_spec_fingerprint="b" * 64,
         **changes,
     )
 
@@ -429,7 +414,6 @@ def test_live_camera_working_point_requires_explicit_applicability_facts() -> No
         exposure_seconds=0.002,
         gain=2.0,
         readout_mode="low-noise",
-        opaque_frame_settings_fingerprint="1" * 64,
     )
     frame_schema = _schema().cell_schema
     calibrated.assert_compatible_working_point(
@@ -451,18 +435,12 @@ def test_live_camera_working_point_requires_explicit_applicability_facts() -> No
                 frame_schema,
             )
 
-    # Raw camera exposure is not the pulse-defined atom illumination window,
-    # and the opaque digest includes that raw exposure.  They remain recorded
-    # in provenance but cannot independently invalidate the calibration.
-    for change in (
-        {"exposure_seconds": 0.0021},
-        {"opaque_frame_settings_fingerprint": "9" * 64},
-    ):
-        calibrated.assert_compatible_working_point(
-            BINDING,
-            replace(live_facts, **change),
-            frame_schema,
-        )
+    # Raw camera exposure is not the pulse-defined atom illumination window.
+    calibrated.assert_compatible_working_point(
+        BINDING,
+        replace(live_facts, exposure_seconds=0.0021),
+        frame_schema,
+    )
 
 
 @pytest.mark.parametrize(
@@ -488,19 +466,6 @@ def test_selected_gain_and_mode_changes_are_rejected(
 
 def test_selected_raw_exposure_is_provenance_not_an_applicability_blocker() -> None:
     descriptor = _single_event_descriptor(exposure=0.0021)
-    _contract().assert_compatible(
-        BINDING,
-        descriptor,
-        _single_event_schema(descriptor),
-        readout_event_index=0,
-    )
-
-
-@pytest.mark.parametrize("frame_fingerprint", ["9" * 64, None])
-def test_selected_opaque_frame_settings_evidence_is_provenance_only(
-    frame_fingerprint: str | None,
-) -> None:
-    descriptor = _single_event_descriptor(frame_fingerprint=frame_fingerprint)
     _contract().assert_compatible(
         BINDING,
         descriptor,
@@ -617,7 +582,7 @@ def test_event_setting_permutation_has_one_canonical_capture_descriptor() -> Non
     )
 
 
-def test_embedded_readout_trees_match_an_independent_field_oracle() -> None:
+def test_camera_descriptor_tree_matches_an_independent_field_oracle() -> None:
     common = {
         "camera_identity": "qcm-camera:serial-42",
         "sensor_identity": "qcm-sensor:serial-42",
@@ -641,56 +606,27 @@ def test_embedded_readout_trees_match_an_independent_field_oracle() -> None:
                 "exposure_seconds": 0.001,
                 "gain": 1.0,
                 "readout_mode": "fast",
-                "opaque_frame_settings_fingerprint": "0" * 64,
             },
             {
                 "event_index": 1,
                 "exposure_seconds": 0.002,
                 "gain": 2.0,
                 "readout_mode": "low-noise",
-                "opaque_frame_settings_fingerprint": "1" * 64,
             },
             {
                 "event_index": 2,
                 "exposure_seconds": 0.003,
                 "gain": 3.0,
                 "readout_mode": "low-noise",
-                "opaque_frame_settings_fingerprint": "2" * 64,
             },
         ],
-        "camera_arm_spec_fingerprint": "a" * 64,
     }
-    contract = _contract()
-    frame_tree = {
-        "binding": {"value": "primary-readout"},
-        **common,
-        "exposure_seconds": 0.002,
-        "gain": 2.0,
-        "readout_mode": "low-noise",
-        "opaque_frame_settings_fingerprint": "1" * 64,
-        "frame_schema": value_schema_to_tree(contract.frame_schema),
-    }
-    layout = CalibrationCaptureLayout(EVENT, (2, 0), 1)
-    layout_tree = {
-        "readout_event_axis_id": "readout-event",
-        "reference_event_indices": [0, 2],
-        "readout_event_index": 1,
-    }
-
     assert camera_capture_descriptor_to_tree(_descriptor()) == descriptor_tree
     assert camera_capture_descriptor_from_tree(descriptor_tree) == _descriptor()
-    assert frame_contract_to_tree(contract) == frame_tree
-    assert frame_contract_from_tree(frame_tree) == contract
-    assert calibration_capture_layout_to_tree(layout) == layout_tree
-    assert calibration_capture_layout_from_tree(layout_tree) == layout
     assert readout_binding_key_to_tree(BINDING) == {"value": "primary-readout"}
     assert readout_binding_key_from_tree({"value": "primary-readout"}) == BINDING
 
-    for parser, tree in (
-        (camera_capture_descriptor_from_tree, descriptor_tree),
-        (frame_contract_from_tree, frame_tree),
-        (calibration_capture_layout_from_tree, layout_tree),
-    ):
+    for parser, tree in ((camera_capture_descriptor_from_tree, descriptor_tree),):
         unknown = dict(tree)
         unknown["unknown_future_field"] = "forbidden"
         with pytest.raises(ValueError, match="exactly"):

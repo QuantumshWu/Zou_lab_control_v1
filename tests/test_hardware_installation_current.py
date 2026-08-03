@@ -38,7 +38,7 @@ from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
 )
 from zlc_neutral_atom.logic_nodes.camera_measurement.monitor import (
     CameraMonitorViewSpec,
-    prepare_live_camera_measurement,
+    open_live_camera_measurement,
 )
 from zlc_neutral_atom.runtime.resources import DeviceIdentityEvidenceKind
 from zlc_neutral_atom.runtime.signal_source import SignalAssociationRequest
@@ -55,7 +55,6 @@ from zlc_pulse import (
     load_deployed_pulse_target,
     pulse_target_manifest_from_lanes,
 )
-from zlc_storage import canonical_digest
 
 
 def _four_trigger_document(
@@ -137,9 +136,7 @@ class _FakeCamera:
         return 1.0
 
     def capture_working_point(self):
-        primitive = {"fake-camera": self.lane, "dtype": "u1"}
         return CameraWorkingPoint(
-            canonical_digest(primitive),
             "EXTERNAL_TRIGGERED",
             (4, 5),
             (4, 5),
@@ -396,7 +393,7 @@ def test_fake_real_installation_runs_both_active_e0_paths_and_binds_ports(
                 port.capability.binding_stamp.physical_identity
             )
             evidence = port.capability.camera_capability_evidence
-            assert evidence.exact_external_trigger_qualification_digest is not None
+            assert evidence.exact_external_trigger_qualified
             assert port.capability.payload_contract.value_schema.dtype == np.dtype("u1")
         pulse_port = composition.runtime.require_capability(
             catalog.require("sequencer").ref,
@@ -472,23 +469,26 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
     runtime = composition.runtime
     camera_ref = runtime.device_catalog.require("camera").ref
     authority = dict(composition.camera_signal_association_authorities)["camera"]
-    prepared = prepare_live_camera_measurement(
-        CameraMeasurementRequest(camera_ref, repeat=0),
+    sources = []
+    views = []
+
+    def open_dataset(spec, *, event_source, **_kwargs):
+        view = _LiveView(spec)
+        views.append(view)
+        sources.append(event_source)
+        return view
+
+    plan = open_live_camera_measurement(
+        CameraMeasurementRequest("camera", repeat=0),
         monitor_port=runtime.require_capability(
             camera_ref,
             CAPABILITY_CAMERA_MONITOR,
         ),
-        start_run=runtime.start,
+        open_dataset=open_dataset,
         association_authority=authority,
     )
-    views = []
-
-    def view_factory(spec):
-        view = _LiveView(spec)
-        views.append(view)
-        return view
-
-    handle = prepared.start_with_view(factory=view_factory)
+    handle = runtime.start(plan)
+    source = sources[0]
     try:
         deadline = time.monotonic() + 2.0
         while handle.snapshot().phase != "monitoring-camera":
@@ -510,7 +510,7 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
             live_target=snapshot.target,
         )
         session_id = "fake-hardware-association"
-        cursor = prepared.open_associated_signal_cursor("frame_0")
+        cursor = source.open_associated_signal_cursor("frame_0")
         token = cursor.arm_signal_association(
             SignalAssociationRequest(
                 session_id,
@@ -550,7 +550,7 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
 
         assert tuple(event.event_ref.sequence for event in events) == (0, 1, 2, 3)
 
-        rejected = prepared.open_associated_signal_cursor("frame_0")
+        rejected = source.open_associated_signal_cursor("frame_0")
         bad_token = rejected.arm_signal_association(
             SignalAssociationRequest(
                 "simulated-cause",
@@ -582,7 +582,7 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
 
         qcamera = cameras[0]
         qcamera.hardware_stamps_enabled = False
-        missing_stamp = prepared.open_associated_signal_cursor("frame_0")
+        missing_stamp = source.open_associated_signal_cursor("frame_0")
         missing_session_id = "missing-hardware-stamp"
         missing_token = missing_stamp.arm_signal_association(
             SignalAssociationRequest(
@@ -644,16 +644,23 @@ def test_real_camera_association_rejects_an_undrained_pre_fire_frame(
     runtime = composition.runtime
     camera_ref = runtime.device_catalog.require("camera").ref
     authority = dict(composition.camera_signal_association_authorities)["camera"]
-    prepared = prepare_live_camera_measurement(
-        CameraMeasurementRequest(camera_ref, repeat=0),
+    sources = []
+
+    def open_dataset(spec, *, event_source, **_kwargs):
+        sources.append(event_source)
+        return _LiveView(spec)
+
+    plan = open_live_camera_measurement(
+        CameraMeasurementRequest("camera", repeat=0),
         monitor_port=runtime.require_capability(
             camera_ref,
             CAPABILITY_CAMERA_MONITOR,
         ),
-        start_run=runtime.start,
+        open_dataset=open_dataset,
         association_authority=authority,
     )
-    handle = prepared.start_with_view(factory=_LiveView)
+    handle = runtime.start(plan)
+    source = sources[0]
     try:
         deadline = time.monotonic() + 2.0
         while handle.snapshot().phase != "monitoring-camera":
@@ -677,7 +684,7 @@ def test_real_camera_association_rejects_an_undrained_pre_fire_frame(
             trigger_channels=("ch11",),
             live_target=snapshot.target,
         )
-        cursor = prepared.open_associated_signal_cursor("frame_0")
+        cursor = source.open_associated_signal_cursor("frame_0")
         try:
             with pytest.raises(RuntimeError, match="has produced frames"):
                 cursor.arm_signal_association(

@@ -137,8 +137,6 @@ from zlc_frontend.qt_widgets import QtOwnerWake, SerialWorkerWindow, ensure_qt_a
 app = ensure_qt_app()
 from zlc_workbench.data_figure.window import DataFigureWindow
 from zlc_neutral_atom.logic_nodes.readout.calibration.ui.report_window import CalibrationReportWindow
-from zlc_neutral_atom.logic_nodes.readout.calibration.ui.workbench_window import CalibrationWorkbenchWindow
-from zlc_neutral_atom.logic_nodes.readout.occupancy.ui.workbench_window import OccupancyCellWindow
 
 pending = list(SerialWorkerWindow.__subclasses__())
 while pending:

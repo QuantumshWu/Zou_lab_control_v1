@@ -11,8 +11,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import threading
-from typing import Callable
 
 from zlc_data import (
     REPEAT,
@@ -42,11 +40,9 @@ from zlc_neutral_atom.runtime.dataset import (
 from zlc_neutral_atom.runtime.run import (
     PostSafetyContext,
     RunContext,
-    RunHandle,
     RunPlan,
 )
 from zlc_neutral_atom.runtime.signal_source import (
-    AuthoritativeSignalEventSource,
     SignalAssociationRequest,
     SignalAssociationScheduleRequirement,
     SignalAssociationUnavailable,
@@ -55,7 +51,6 @@ from zlc_neutral_atom.runtime.signal_source import (
     SignalEventAssociationSource,
     SignalEventSource,
     SignalProjectionAuthority,
-    authoritative_signal_event_source,
 )
 from zlc_neutral_atom.runtime.streams import (
     AcquisitionCursor,
@@ -81,8 +76,7 @@ from .contracts import (
     ScanOutputContract,
     bind_scan_output_contract,
 )
-from .artifact import materialize_scan_data, write_scan_artifact
-from .final_output import scan_final_outputs
+from .artifact import write_scan_artifact
 from .lineage import (
     ApiSegmentEvidence,
     ApiSegmentedScanExecution,
@@ -91,7 +85,7 @@ from .lineage import (
     SignalEventSequence,
 )
 from .reference import ScanArtifactRef
-from .source_binding import PulseScanBoundRequest
+from .source_binding import PulseScanRequest
 
 
 _SCAN_REPEAT_AXIS_ID = AxisId("pulse-scan.repeat")
@@ -128,7 +122,7 @@ class _SignalValueAdapter:
 
 
 @dataclass(slots=True)
-class _PreparedScan:
+class _ScanRunState:
     collector_producer: AcquisitionProducer[Value]
     collector_cursor: AcquisitionCursor[Value]
     builder: DatasetBuilder[Value]
@@ -138,8 +132,8 @@ class _PreparedScan:
 
 
 @dataclass(frozen=True, slots=True)
-class _ExecutedScan:
-    prepared: _PreparedScan
+class _CollectedScan:
+    prepared: _ScanRunState
     source_snapshot: OwnedSnapshot
     provenance: DatasetSealProvenance
     execution: PulseScanExecution
@@ -219,108 +213,24 @@ class _SignalSequenceAccumulator:
         )
 
 
-class PreparedExactScan:
-    """One-shot source-neutral PulseScan command."""
-
-    __slots__ = (
-        "_lock",
-        "_output_contract",
-        "_plan_factory",
-        "_program",
-        "_scans_root",
-        "_source_schema",
-        "_start_run",
-        "_started",
-    )
-
-    def __init__(
-        self,
-        *,
-        program: PulseParameterScanProgram,
-        source_schema: DatasetSchema,
-        output_contract: ScanOutputContract,
-        scans_root: Path,
-        plan_factory: Callable[[], RunPlan],
-        start_run: Callable[[RunPlan], RunHandle],
-    ) -> None:
-        if not isinstance(program, (AutonomousScanSlotProgram, ApiSlotSegmentedProgram)):
-            raise TypeError("program must be a current PulseScan program")
-        if not isinstance(source_schema, DatasetSchema):
-            raise TypeError("source_schema must be DatasetSchema")
-        if not isinstance(output_contract, ScanOutputContract):
-            raise TypeError("output_contract must be ScanOutputContract")
-        if not isinstance(scans_root, Path):
-            raise TypeError("scans_root must be pathlib.Path")
-        if not callable(plan_factory) or not callable(start_run):
-            raise TypeError("prepared scan requires plan_factory and start_run")
-        self._program = program
-        self._source_schema = source_schema
-        self._output_contract = output_contract
-        self._scans_root = scans_root.resolve()
-        self._plan_factory = plan_factory
-        self._start_run = start_run
-        self._lock = threading.Lock()
-        self._started = False
-
-    @property
-    def source_schema(self) -> DatasetSchema:
-        return self._source_schema
-
-    @property
-    def output_contract(self) -> ScanOutputContract:
-        return self._output_contract
-
-    def start(
-        self,
-        *,
-        lifecycle_owner: object | None = None,
-    ) -> RunHandle:
-        with self._lock:
-            if self._started:
-                raise RuntimeError("PreparedExactScan is one-shot")
-            self._started = True
-        plan = self._plan_factory()
-        if not isinstance(plan, RunPlan):
-            raise TypeError("PulseScan plan factory returned another type")
-        return self._start_run(
-            plan.with_lifecycle(
-                owner=self if lifecycle_owner is None else lifecycle_owner,
-                preemptible=False,
-            )
-        )
-
-    def final_dataset_outputs(self, reference: ScanArtifactRef):
-        if not isinstance(reference, ScanArtifactRef):
-            raise TypeError("scan FINAL result must be ScanArtifactRef")
-        materialized = materialize_scan_data(self._scans_root, reference)
-        if materialized.artifact.execution.program != self._program:
-            raise ValueError("scan FINAL result belongs to another pulse program")
-        if materialized.artifact.output_contract != self._output_contract:
-            raise ValueError("scan FINAL result belongs to another output contract")
-        return scan_final_outputs(materialized)
-
-
-def prepare_exact_scan(
-    request: PulseScanBoundRequest,
+def compile_pulse_scan(
+    request: PulseScanRequest,
     source: SignalEventAssociationSource,
     *,
     pulse_port: BoundPulsePort,
-    scans_root: Path,
-    start_run: Callable[[RunPlan], RunHandle],
-) -> PreparedExactScan:
+    project_root: Path,
+) -> RunPlan:
     """Bind an external live signal and sequencer without taking source ownership."""
 
-    if not isinstance(request, PulseScanBoundRequest):
-        raise TypeError("request must be PulseScanBoundRequest")
+    if not isinstance(request, PulseScanRequest):
+        raise TypeError("request must be PulseScanRequest")
     if not isinstance(source, SignalEventSource):
         raise TypeError("source must implement SignalEventSource")
     if not isinstance(pulse_port, BoundPulsePort):
         raise TypeError("pulse_port must be BoundPulsePort")
-    if not isinstance(scans_root, Path):
-        raise TypeError("scans_root must be pathlib.Path")
-    scans_root = scans_root.resolve()
-    if not callable(start_run):
-        raise TypeError("start_run must be callable")
+    if not isinstance(project_root, Path):
+        raise TypeError("project_root must be pathlib.Path")
+    project_root = project_root.resolve()
     if not isinstance(source, SignalEventAssociationSource):
         raise SignalAssociationUnavailable(
             "PulseScan requires producer-owned pulse association; ordinary "
@@ -328,30 +238,13 @@ def prepare_exact_scan(
         )
 
     program = _bind_program_target(request.program, pulse_port)
-    output_name = request.signal.output.name
-    projected_source = authoritative_signal_event_source(
-        source,
-        output_name,
-        request.signal.transform,
+    output_name = request.signal.output_name
+    value_schema = source.value_schema(output_name)
+    projection_authority = SignalProjectionAuthority(
+        value_schema,
+        None,
+        value_schema,
     )
-    if not isinstance(projected_source, SignalEventAssociationSource):
-        raise RuntimeError(
-            "authoritative signal projection dropped producer association capability"
-        )
-    if request.signal.transform is None:
-        value_schema = projected_source.value_schema(output_name)
-        projection_authority = SignalProjectionAuthority(
-            value_schema,
-            None,
-            value_schema,
-        )
-    else:
-        if not isinstance(projected_source, AuthoritativeSignalEventSource):
-            raise RuntimeError(
-                "authoritative signal transform was not schema-committed"
-            )
-        projection_authority = projected_source.projection_authority
-        value_schema = projection_authority.output_value_schema
     point_table = program.point_table
     repeat_axis = AxisSpec(
         _SCAN_REPEAT_AXIS_ID,
@@ -368,7 +261,7 @@ def prepare_exact_scan(
     )
     output_contract = bind_scan_output_contract(source_schema, point_table, None)
     schedule_requirement = (
-        projected_source.signal_association_schedule_requirement(output_name)
+        source.signal_association_schedule_requirement(output_name)
     )
     if not isinstance(
         schedule_requirement,
@@ -383,27 +276,17 @@ def prepare_exact_scan(
         schedule_requirement,
     )
 
-    def plan_factory() -> RunPlan:
-        return _compile_scan_plan(
-            request,
-            program=program,
-            source=projected_source,
-            output_name=output_name,
-            source_schema=source_schema,
-            projection_authority=projection_authority,
-            output_contract=output_contract,
-            pulse_port=pulse_port,
-            pulse_requests=pulse_requests,
-            scans_root=scans_root,
-        )
-
-    return PreparedExactScan(
+    return _compile_scan_plan(
+        request,
         program=program,
+        source=source,
+        output_name=output_name,
         source_schema=source_schema,
+        projection_authority=projection_authority,
         output_contract=output_contract,
-        scans_root=scans_root,
-        plan_factory=plan_factory,
-        start_run=start_run,
+        pulse_port=pulse_port,
+        pulse_requests=pulse_requests,
+        project_root=project_root,
     )
 
 
@@ -535,7 +418,7 @@ def _next_source_event(
 
 
 def _open_source_cursor(
-    prepared: _PreparedScan,
+    prepared: _ScanRunState,
     source: SignalEventAssociationSource,
     output_name: str,
     source_schema: DatasetSchema,
@@ -561,7 +444,7 @@ def _open_source_cursor(
 
 def _collect_event(
     context: RunContext,
-    prepared: _PreparedScan,
+    prepared: _ScanRunState,
     accumulator: _SignalSequenceAccumulator,
     address: DatasetCellAddress,
     association_token: object,
@@ -611,9 +494,9 @@ def _association_request(
 
 def _execute_scan(
     context: RunContext,
-    prepared: _PreparedScan,
+    prepared: _ScanRunState,
     *,
-    request: PulseScanBoundRequest,
+    request: PulseScanRequest,
     program: PulseParameterScanProgram,
     source: SignalEventAssociationSource,
     output_name: str,
@@ -621,7 +504,7 @@ def _execute_scan(
     projection_authority: SignalProjectionAuthority,
     pulse_port: BoundPulsePort,
     pulse_requests: tuple[FinitePulseExecutionRequest, ...],
-) -> _ExecutedScan:
+) -> _CollectedScan:
     schedule = prepared.builder.edge.cell_schedule
     if schedule is None:
         raise RuntimeError("PulseScan collector lost its exact cell schedule")
@@ -739,7 +622,7 @@ def _execute_scan(
         if source_cursor is None:
             raise RuntimeError("PulseScan completed without a source cursor")
         source_cursor.close()
-        return _ExecutedScan(
+        return _CollectedScan(
             prepared,
             sealed.snapshot,
             sealed.provenance,
@@ -753,7 +636,7 @@ def _execute_scan(
 
 
 def _compile_scan_plan(
-    request: PulseScanBoundRequest,
+    request: PulseScanRequest,
     *,
     program: PulseParameterScanProgram,
     source: SignalEventAssociationSource,
@@ -763,9 +646,9 @@ def _compile_scan_plan(
     output_contract: ScanOutputContract,
     pulse_port: BoundPulsePort,
     pulse_requests: tuple[FinitePulseExecutionRequest, ...],
-    scans_root: Path,
+    project_root: Path,
 ) -> RunPlan:
-    def preflight(context: RunContext) -> _PreparedScan:
+    def preflight(context: RunContext) -> _ScanRunState:
         builder = None
         try:
             producer, collector_cursor, builder = _open_collector(
@@ -777,7 +660,7 @@ def _compile_scan_plan(
                 if isinstance(program, AutonomousScanSlotProgram)
                 else None
             )
-            return _PreparedScan(
+            return _ScanRunState(
                 producer,
                 collector_cursor,
                 builder,
@@ -788,7 +671,7 @@ def _compile_scan_plan(
                 builder.close()
             raise
 
-    def execute(context: RunContext, prepared: _PreparedScan) -> _ExecutedScan:
+    def execute(context: RunContext, prepared: _ScanRunState) -> _CollectedScan:
         return _execute_scan(
             context,
             prepared,
@@ -804,7 +687,7 @@ def _compile_scan_plan(
 
     def cleanup(
         context: RunContext,
-        prepared: _PreparedScan | None,
+        prepared: _ScanRunState | None,
         primary: BaseException | None,
     ) -> CleanupReport:
         errors: list[BaseException] = []
@@ -833,9 +716,9 @@ def _compile_scan_plan(
             errors.append(error)
         return CleanupReport.complete(errors=tuple(errors))
 
-    def finalize(context: PostSafetyContext, result: _ExecutedScan) -> ScanArtifactRef:
+    def finalize(context: PostSafetyContext, result: _CollectedScan) -> ScanArtifactRef:
         return write_scan_artifact(
-            scans_root,
+            project_root,
             run_id=context.run_id.value,
             execution=result.execution,
             snapshot=result.source_snapshot,
@@ -857,6 +740,5 @@ def _compile_scan_plan(
 
 
 __all__ = [
-    "PreparedExactScan",
-    "prepare_exact_scan",
+    "compile_pulse_scan",
 ]

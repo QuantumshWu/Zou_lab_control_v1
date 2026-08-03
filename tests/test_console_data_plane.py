@@ -269,33 +269,6 @@ def test_detach_with_slow_slot_cannot_withdraw_or_wake_replacement() -> None:
         plane.close()
 
 
-class _GatedProcessorApplication:
-    def __init__(
-        self,
-        output_names: tuple[str, ...],
-        gates: dict[int, threading.Event],
-    ) -> None:
-        self._output_names = output_names
-        self._gates = gates
-
-    def evaluate(self, snapshot, _coverage):
-        revision = snapshot.ref.revision.value
-        gate = self._gates.setdefault(revision, threading.Event())
-        if not gate.wait(2.0):
-            raise TimeoutError("test Processor gate did not open")
-        outputs = {
-            name: _live_output(
-                name,
-                revision,
-                generation=f"{name}-generation-{revision}",
-            )
-            for name in self._output_names
-        }
-        return SimpleNamespace(
-            outputs=outputs,
-        )
-
-
 class _GatedProcessorNode:
     def __init__(
         self,
@@ -325,29 +298,35 @@ class _GatedProcessorNode:
     def signal_key(self, name: str) -> str:
         return f"{self.instance_id}/{name}"
 
-    def prepare_processor_application(self):
-        return _GatedProcessorApplication(self._published_outputs, self._gates)
-
     def validate_processor_source(self, source) -> None:
         if source.name != self._source_name:
             raise ValueError("wrong test source")
 
-    def processor_application_ready(self, _application) -> None:
+    def evaluate_processor(self, source):
+        self.validate_processor_source(source)
         self.ready = True
-
-    @staticmethod
-    def processor_work_started(_source) -> None:
-        return None
+        revision = source.snapshot.ref.revision.value
+        gate = self._gates.setdefault(revision, threading.Event())
+        if not gate.wait(2.0):
+            raise TimeoutError("test Processor gate did not open")
+        return {
+            name: _live_output(
+                name,
+                revision,
+                generation=f"{name}-generation-{revision}",
+            )
+            for name in self._published_outputs
+        }
 
     def accept_processor_result(
         self,
         _source,
         source_publication: SignalPublication,
-        evaluation,
+        outputs,
     ) -> None:
         self._plane.publish_processor(
             self,
-            evaluation.outputs,
+            outputs,
             source_publication=source_publication,
         )
 

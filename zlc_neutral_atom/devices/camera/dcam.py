@@ -18,7 +18,6 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from zlc_storage import (
-    canonical_digest,
     canonical_text,
     finite_real,
     integer,
@@ -362,29 +361,7 @@ class DcamCameraAdapter:
             raise RuntimeError(
                 "qCMOS image geometry differs from ROI/binning readback"
             )
-        primitive = {
-            "acquisition_mode": "EXTERNAL_TRIGGERED",
-            "frame_shape_yx": frame_shape_yx,
-            "sensor_shape_yx": (sensor_height, sensor_width),
-            "roi_origin_yx": origin_yx,
-            "roi_shape_yx": roi_shape_yx,
-            "binning_yx": (binning, binning),
-            "dtype": dtype.str,
-            "count_unit": "count",
-            "capture_trigger_channels": self._config.capture_trigger_channels,
-            "exposure_seconds": exposure,
-            "required_external_trigger_interval_seconds": interval,
-            "external_trigger_integration_start_offset_seconds": integration_offset,
-            "readout_speed": readout_speed,
-            "sensor_mode": sensor_mode,
-            "trigger_global_exposure": global_exposure,
-            "trigger_source": trigger_source,
-            "trigger_active": trigger_active,
-            "trigger_polarity": trigger_polarity,
-            "subarray_mode": subarray_mode,
-        }
         return CameraWorkingPoint(
-            settings_fingerprint=canonical_digest(primitive),
             acquisition_mode="EXTERNAL_TRIGGERED",
             frame_shape_yx=frame_shape_yx,
             sensor_shape_yx=(sensor_height, sensor_width),

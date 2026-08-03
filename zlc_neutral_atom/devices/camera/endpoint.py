@@ -26,12 +26,10 @@ from zlc_neutral_atom.devices.camera.contract import (
     validate_camera_external_trigger_spacing,
 )
 from zlc_neutral_atom.devices.camera.contract import (
-    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
     CameraAcquisitionMode,
     CameraFrameMetadata,
     CameraSample,
     CameraSampleContract,
-    decode_camera_capture_spec,
 )
 from zlc_neutral_atom.devices.camera.capture_port import (
     CameraExposureConfiguredAck,
@@ -69,7 +67,6 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraPhysicalFacts,
 )
 from zlc_storage import (
-    canonical_digest,
     canonical_text as _canonical_text,
     sha256_text as _sha256,
 )
@@ -104,7 +101,6 @@ def _physical_facts(
         ),
         gain=working_point.gain,
         readout_mode=working_point.readout_mode,
-        opaque_frame_settings_fingerprint=working_point.settings_fingerprint,
     )
     if facts.output_shape_yx != payload_contract.value_schema.data_shape:
         raise RuntimeError(
@@ -151,7 +147,6 @@ def _value_schema(working_point: CameraWorkingPoint, source_id: str) -> ValueSch
 class _AppliedCameraWorkingPoint:
     """One owner-read configuration used by schema, timing, and admission."""
 
-    settings_fingerprint: str
     payload_contract: CameraSampleContract
     physical_facts: CameraPhysicalFacts
 
@@ -159,7 +154,6 @@ class _AppliedCameraWorkingPoint:
 @dataclass
 class _EndpointSession:
     session_id: str
-    spec_fingerprint: str
     expected_frames: int | None
     source_group_sizes: tuple[int, ...] | None
     payload_contract: CameraSampleContract
@@ -188,7 +182,6 @@ class _MonitorSignalAssociation:
     expected_group_count: int
     physical_start_ordinal: int
     session: _EndpointSession
-    qualification_digest: str
     reconciliation_deadline_seconds: float
     quiet_window_seconds: float
     observed_count: int = 0
@@ -229,7 +222,7 @@ class CameraCaptureEndpoint:
         source_id: str,
         *,
         max_blocking_call_seconds: float | None = None,
-        exact_external_trigger_qualification_digest: str | None = None,
+        exact_external_trigger_qualified: bool = False,
         acquisition_mode: CameraAcquisitionMode = CameraAcquisitionMode.EXTERNAL_TRIGGERED,
     ) -> None:
         if not isinstance(camera, CameraAdapter):
@@ -244,14 +237,9 @@ class CameraCaptureEndpoint:
         if not np.isfinite(timeout) or timeout <= 0:
             raise ValueError("max_blocking_call_seconds must be finite and positive")
         self._max_blocking_call_seconds = timeout
-        if exact_external_trigger_qualification_digest is not None:
-            _sha256(
-                exact_external_trigger_qualification_digest,
-                "exact_external_trigger_qualification_digest",
-            )
-        self._exact_external_trigger_qualification_digest = (
-            exact_external_trigger_qualification_digest
-        )
+        if type(exact_external_trigger_qualified) is not bool:
+            raise TypeError("exact_external_trigger_qualified must be bool")
+        self._exact_external_trigger_qualified = exact_external_trigger_qualified
         if not isinstance(acquisition_mode, CameraAcquisitionMode):
             raise TypeError("acquisition_mode must be CameraAcquisitionMode")
         self._acquisition_mode = acquisition_mode
@@ -272,11 +260,6 @@ class CameraCaptureEndpoint:
             if not isinstance(payload_contract, CameraSampleContract):
                 raise RuntimeError("camera capability payload contract is invalid")
             return payload_contract
-
-    def settings_fingerprint(self, binding: BoundDevice) -> str:
-        with self._lock:
-            self._validate_binding(binding)
-            return self._capability_snapshot().settings_fingerprint
 
     def capability_probe(self, binding: BoundDevice) -> CaptureCapabilitySnapshot:
         with self._lock:
@@ -324,19 +307,15 @@ class CameraCaptureEndpoint:
         payload_contract: CameraSampleContract,
         physical_facts: CameraPhysicalFacts,
     ) -> CameraCapabilityEvidence:
-        qualification = self._exact_external_trigger_qualification_digest
         return CameraCapabilityEvidence(
             adapter_type=(
                 f"{type(self._camera).__module__}."
                 f"{type(self._camera).__qualname__}"
             ),
             source_id=self._source_id,
-            capture_spec_owner_fingerprint=(
-                CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT
-            ),
             max_blocking_call_seconds=self._max_blocking_call_seconds,
             physical_facts=physical_facts,
-            exact_external_trigger_qualification_digest=qualification,
+            exact_external_trigger_qualified=self._exact_external_trigger_qualified,
         )
 
     def execute_command(self, binding: BoundDevice, command: object) -> object:
@@ -373,8 +352,6 @@ class CameraCaptureEndpoint:
             elif lease.session_id != command.session_id:
                 raise RuntimeError("camera already owns another exposure lease")
             baseline = lease.baseline_working_point
-            if command.baseline_settings_fingerprint != baseline.settings_fingerprint:
-                raise ValueError("camera exposure baseline fingerprint differs")
             configure = getattr(self._camera, "configure_exposure_seconds", None)
             token = self._begin_command_operation()
         try:
@@ -411,9 +388,6 @@ class CameraCaptureEndpoint:
                     observed.physical_facts
                     .required_external_trigger_interval_seconds
                 ),
-                opaque_frame_settings_fingerprint=(
-                    observed.settings_fingerprint
-                ),
             )
             if observed.physical_facts != expected_facts:
                 raise RuntimeError(
@@ -447,8 +421,6 @@ class CameraCaptureEndpoint:
                 command.exposure_seconds,
                 observed.physical_facts.exposure_seconds,
                 required_interval,
-                observed.settings_fingerprint,
-                capability.capability_fingerprint,
                 capability,
             )
         finally:
@@ -469,17 +441,10 @@ class CameraCaptureEndpoint:
                 raise RuntimeError("camera endpoint already owns an active session")
             capability = self._capability_snapshot()
             payload_contract = self.payload_contract(binding)
-            settings = capability.settings_fingerprint
             self._require_working_point_unchanged(binding)
-            if command.capture_spec_owner_fingerprint != CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT:
-                raise ValueError("camera capture spec owner differs")
-            spec = decode_camera_capture_spec(command.capture_spec_payload)
+            spec = command.capture_spec
             if spec.expected_frames != command.expected_total_events:
                 raise ValueError("camera spec cardinality differs from prepared run")
-            if spec.settings_fingerprint != settings or command.settings_fingerprint != settings:
-                raise ValueError("camera capture settings fingerprint differs")
-            if command.capability_fingerprint != capability.capability_fingerprint:
-                raise ValueError("camera capability fingerprint differs")
             if spec.mode is not self._acquisition_mode:
                 raise ValueError("camera acquisition mode differs from live adapter")
             if self._acquisition_mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
@@ -487,14 +452,13 @@ class CameraCaptureEndpoint:
                     "free-running cameras are monitor sources, not finite exact captures"
                 )
             evidence = capability.camera_capability_evidence
-            if evidence.exact_external_trigger_qualification_digest is None:
+            if not evidence.exact_external_trigger_qualified:
                 raise ValueError(
                     "real exact capture requires E0-qualified ordered one-frame-per-trigger evidence"
                 )
             self._operation_epoch += 1
             self._session = _EndpointSession(
                 command.session_id,
-                command.capture_spec_fingerprint,
                 spec.expected_frames,
                 spec.source_group_sizes,
                 payload_contract,
@@ -502,9 +466,6 @@ class CameraCaptureEndpoint:
             return CapturePreparedAck(
                 command.session_id,
                 binding.binding_instance_id,
-                settings,
-                capability.capability_fingerprint,
-                command.capture_spec_fingerprint,
             )
 
     def _start(
@@ -555,14 +516,10 @@ class CameraCaptureEndpoint:
                         operation_epoch,
                     )
                     self._require_working_point_unchanged(binding)
-                    capability = self._capability_snapshot()
                     session.started = True
                     return CaptureStartedAck(
                         command.session_id,
                         binding.binding_instance_id,
-                        capability.settings_fingerprint,
-                        capability.capability_fingerprint,
-                        session.spec_fingerprint,
                         expected,
                         expected,
                         source_ordinal_baseline,
@@ -702,7 +659,6 @@ class CameraCaptureEndpoint:
                     session,
                     operation_epoch,
                 )
-                capability = self._capability_snapshot()
                 self._require_working_point_unchanged(binding)
                 if not _terminal_proved(terminal):
                     raise RuntimeError(
@@ -718,9 +674,6 @@ class CameraCaptureEndpoint:
                     terminal.source_stopped,
                     terminal.no_more_frames,
                     terminal.joined,
-                    capability.settings_fingerprint,
-                    capability.capability_fingerprint,
-                    session.spec_fingerprint,
                 )
         except BaseException:
             with self._lock:
@@ -987,7 +940,6 @@ class CameraCaptureEndpoint:
             payload_contract,
         )
         return _AppliedCameraWorkingPoint(
-            working_point.settings_fingerprint,
             payload_contract,
             physical_facts,
         )
@@ -1100,7 +1052,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
         source_id: str,
         *,
         max_blocking_call_seconds: float | None = None,
-        exact_external_trigger_qualification_digest: str | None = None,
+        exact_external_trigger_qualified: bool = False,
         acquisition_mode: CameraAcquisitionMode = CameraAcquisitionMode.FREE_RUNNING,
         monitor_acquisition_mode: CameraAcquisitionMode | None = None,
     ) -> None:
@@ -1108,9 +1060,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             camera,
             source_id,
             max_blocking_call_seconds=max_blocking_call_seconds,
-            exact_external_trigger_qualification_digest=(
-                exact_external_trigger_qualification_digest
-            ),
+            exact_external_trigger_qualified=exact_external_trigger_qualified,
             acquisition_mode=acquisition_mode,
         )
         if monitor_acquisition_mode is None:
@@ -1122,7 +1072,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
         if (
             monitor_acquisition_mode
             is CameraAcquisitionMode.EXTERNAL_TRIGGERED
-            and exact_external_trigger_qualification_digest is not None
+            and exact_external_trigger_qualified
             and not isinstance(camera, CameraAssociationProgress)
         ):
             raise TypeError(
@@ -1162,8 +1112,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 raise ValueError(
                     "a free-running camera monitor has no pulse association"
                 )
-            qualification = self._exact_external_trigger_qualification_digest
-            if qualification is None:
+            if not self._exact_external_trigger_qualified:
                 raise RuntimeError(
                     "real camera signal association requires active E0 qualification"
                 )
@@ -1213,7 +1162,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
         with self._lock:
             if self._monitor_acquisition_mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
                 raise RuntimeError("camera monitor acquisition mode changed during arm")
-            if self._exact_external_trigger_qualification_digest != qualification:
+            if not self._exact_external_trigger_qualified:
                 raise RuntimeError("camera E0 qualification changed during arm")
             if self._signal_association is not None:
                 raise RuntimeError("camera monitor already owns a signal association")
@@ -1245,7 +1194,6 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 expected_group_count,
                 start,
                 session,
-                qualification,
                 self._max_blocking_call_seconds,
                 quiet_window,
                 previous_produced_count=session.last_produced_count,
@@ -1319,7 +1267,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 association.physical_start_ordinal
                 + association.expected_trigger_count
             )
-            if self._exact_external_trigger_qualification_digest != association.qualification_digest:
+            if not self._exact_external_trigger_qualified:
                 raise RuntimeError(
                     "camera E0 qualification changed during signal association"
                 )
@@ -1373,10 +1321,9 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                     "camera association changed during quiet-window reconciliation"
                 )
             if (
-                self._capability_snapshot()
+                not self._capability_snapshot()
                 .camera_capability_evidence
-                .exact_external_trigger_qualification_digest
-                != association.qualification_digest
+                .exact_external_trigger_qualified
                 or self._capability_snapshot()
                 .camera_capability_evidence
                 .exact_external_trigger_quiet_window_seconds
@@ -1517,15 +1464,10 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             if not isinstance(capability, CameraMonitorCapabilitySnapshot):
                 raise TypeError("camera endpoint has no monitor capability")
             self._require_working_point_unchanged(binding)
-            if command.settings_fingerprint != capability.settings_fingerprint:
-                raise ValueError("camera monitor settings fingerprint differs")
-            if command.capability_fingerprint != capability.capability_fingerprint:
-                raise ValueError("camera monitor capability fingerprint differs")
             payload_contract = self.payload_contract(binding)
             self._operation_epoch += 1
             self._session = _EndpointSession(
                 command.session_id,
-                capability.capability_fingerprint,
                 None,
                 None,
                 payload_contract,
@@ -1534,8 +1476,6 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             return CameraMonitorPreparedAck(
                 command.session_id,
                 binding.binding_instance_id,
-                capability.settings_fingerprint,
-                capability.capability_fingerprint,
             )
 
     def _start_monitor(

@@ -31,6 +31,14 @@ DEFAULT_PULSE_SCAN_SWEEP_COUNT = 1
 _PULSE_SCAN_AUTHORING_SCHEMA = AuthoringSchema(
     (
         AuthoringField(
+            "sequencer_instance_id",
+            "choice",
+            "Sequencer",
+            required=True,
+            dynamic_choices=True,
+            description="Installed sequencer that owns the pulse program",
+        ),
+        AuthoringField(
             "pulse",
             "path",
             "Pulse template",
@@ -50,6 +58,17 @@ _PULSE_SCAN_AUTHORING_SCHEMA = AuthoringSchema(
             allow_blank=False,
             description=(
                 "Finite Dataset repeat count; independent of pulse-timeline repeat"
+            ),
+        ),
+        AuthoringField(
+            "pulse_slots",
+            "structured",
+            "Slots",
+            default={},
+            required=True,
+            description=(
+                "PulseScan slot kind, program source and fixed API values; "
+                "edited by the leaf's structured scan editor"
             ),
         ),
     )
@@ -86,19 +105,8 @@ def _freeze_pulse_scan_authoring(
 
     if not isinstance(values, Mapping):
         raise TypeError("PulseScan values must be a mapping")
-    unknown = set(values) - {"pulse", "scan_sweep_count", "pulse_slots"}
-    if unknown:
-        raise ValueError(
-            f"PulseScan values contain unknown fields: {tuple(sorted(unknown))}"
-        )
-    authored = pulse_scan_authoring_schema().freeze(
-        {
-            key: values[key]
-            for key in ("pulse", "scan_sweep_count")
-            if key in values
-        }
-    )
-    slots = values.get("pulse_slots") or {}
+    authored = pulse_scan_authoring_schema().freeze(values)
+    slots = authored["pulse_slots"] or {}
     if not isinstance(slots, Mapping):
         raise TypeError("PulseScan pulse_slots must be a mapping")
     slots = dict(slots)

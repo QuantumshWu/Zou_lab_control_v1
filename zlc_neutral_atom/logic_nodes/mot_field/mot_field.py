@@ -45,42 +45,26 @@ from zlc_data import (
 )
 from zlc_data._arrays import immutable_array
 from zlc_data.value import expand_dataset_validity
-from zlc_neutral_atom.catalog import DefinitionKey, TaskDefinition
-from zlc_neutral_atom.dataset_output import (
-    DatasetOutputDeclaration,
-    FinalDatasetOutput,
-)
-from zlc_neutral_atom.installation import DeviceRef
 from zlc_neutral_atom.runtime.dataset import DatasetSealProvenance
 from zlc_pulse import FrozenScanTable, PulseDocument, freeze_scan_table
 from zlc_pulse.document import FIELD_DAC
-from zlc_storage import canonical_text, finite_real, positive_real
+from zlc_storage import (
+    canonical_text,
+    finite_real,
+    integer,
+    normalized_text,
+    positive_real,
+)
 
 MOT_SCAN_PARAMETER_IDS = ("da_x", "da_y", "da_z")
 _MOT_SCAN_COORDINATE_IDS = tuple(
     AxisId(f"mot-field.{parameter_id}")
     for parameter_id in MOT_SCAN_PARAMETER_IDS
 )
-MOT_FIELD_FINAL_OUTPUT_DECLARATIONS = (
-    DatasetOutputDeclaration("mot_field", "zlc_neutral_atom.mot-field.result"),
-    DatasetOutputDeclaration("scan", "zlc_neutral_atom.mot-field.source-scan"),
-)
-MOT_FIELD_REQUEST_SCHEMA = "zlc_neutral_atom.MotFieldRequest"
-MOT_FIELD_TASK_KEY = DefinitionKey(
-    "zlc_neutral_atom.logic_nodes.mot_field",
-    "optimize-mot-field",
-)
-MOT_FIELD_TASK_DEFINITION = TaskDefinition(
-    MOT_FIELD_TASK_KEY,
-    "Optimize MOT field",
-    MOT_FIELD_REQUEST_SCHEMA,
-)
-DEFAULT_MOT_FIELD_CAMERA_ROLE = "mot_camera"
 DEFAULT_MOT_FIELD_CENTER_CODE = 0.0
 DEFAULT_MOT_FIELD_SPAN_CODE = 12.0
 DEFAULT_MOT_FIELD_POINTS = 7
 MINIMUM_MOT_FIELD_POINTS = 2
-DEFAULT_MOT_FIELD_ROI_CENTER_PX = 0.0
 DEFAULT_MOT_FIELD_ROI_RADIUS_PX = 8.0
 
 
@@ -233,40 +217,54 @@ class MotFieldProgram:
 
 @dataclass(frozen=True)
 class MotFieldRequest:
-    """One immutable MOT optimization intent over an autonomous scan."""
+    """One authored MOT optimization request before device/pulse binding."""
 
-    program: MotFieldProgram
-    camera_ref: DeviceRef
-    sequencer_ref: DeviceRef
+    pulse: str
+    center_x: float
+    center_y: float
+    center_z: float
+    span: float
+    points: int
+    camera_instance_id: str
+    sequencer_instance_id: str
     roi_cx: float | None = None
     roi_cy: float | None = None
     roi_radius: float = DEFAULT_MOT_FIELD_ROI_RADIUS_PX
-    trigger_channel: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.program, MotFieldProgram):
-            raise TypeError("program must be MotFieldProgram")
-        columns = self.program.document.scan_table
-        if columns is None or columns.columns != MOT_SCAN_PARAMETER_IDS:
-            raise ValueError("MOT program must freeze da_x, da_y, da_z")
-        if not isinstance(self.camera_ref, DeviceRef):
-            raise TypeError("camera_ref must be DeviceRef")
-        if not isinstance(self.sequencer_ref, DeviceRef):
-            raise TypeError("sequencer_ref must be DeviceRef")
+        object.__setattr__(self, "pulse", normalized_text(self.pulse, "pulse"))
+        for field in ("center_x", "center_y", "center_z"):
+            object.__setattr__(self, field, finite_real(getattr(self, field), field))
+        object.__setattr__(
+            self,
+            "span",
+            finite_real(self.span, "span", minimum=0.0),
+        )
+        points = integer(
+            self.points,
+            "points",
+            minimum=MINIMUM_MOT_FIELD_POINTS,
+        )
+        assert points is not None
+        object.__setattr__(self, "points", points)
         for field in ("roi_cx", "roi_cy"):
             value = getattr(self, field)
             if value is not None:
-                object.__setattr__(self, field, finite_real(value, field))
+                object.__setattr__(
+                    self,
+                    field,
+                    finite_real(value, field, minimum=0.0),
+                )
         object.__setattr__(
             self,
             "roi_radius",
             positive_real(self.roi_radius, "roi_radius"),
         )
-        if self.trigger_channel is not None:
+        for field in ("camera_instance_id", "sequencer_instance_id"):
             object.__setattr__(
                 self,
-                "trigger_channel",
-                canonical_text(self.trigger_channel, "trigger_channel"),
+                field,
+                canonical_text(getattr(self, field), field),
             )
 
 
@@ -454,11 +452,12 @@ class MotRoiProjector:
 
 def build_mot_intensity_projector(
     request: MotFieldRequest,
+    program: MotFieldProgram,
     source_schema: DatasetSchema,
 ) -> MotRoiProjector:
     """Freeze one ROI geometry shared by live and FINAL MOT projection."""
 
-    _validate_mot_source_schema(request, source_schema)
+    _validate_mot_source_schema(program, source_schema)
     height, width = source_schema.cell_schema.data_shape
     return MotRoiProjector(
         (height, width),
@@ -469,16 +468,16 @@ def build_mot_intensity_projector(
 
 
 def mot_intensity_schema(
-    request: MotFieldRequest,
+    program: MotFieldProgram,
     source_schema: DatasetSchema,
 ) -> DatasetSchema:
     """Return the scalar Bx/By/Bz schema shared by live and FINAL analysis."""
 
-    _validate_mot_source_schema(request, source_schema)
+    _validate_mot_source_schema(program, source_schema)
     return DatasetSchema(
         source_schema.repeat_axis,
-        request.program.point_table,
-        request.program.grid_topology,
+        program.point_table,
+        program.grid_topology,
         ValueSchema.scalar(
             np.dtype("<f8"),
             source_schema.cell_schema.value_unit,
@@ -487,14 +486,13 @@ def mot_intensity_schema(
 
 
 def _validate_mot_source_schema(
-    request: MotFieldRequest,
+    program: MotFieldProgram,
     schema: DatasetSchema,
 ) -> None:
-    if not isinstance(request, MotFieldRequest):
-        raise TypeError("request must be MotFieldRequest")
+    if not isinstance(program, MotFieldProgram):
+        raise TypeError("program must be MotFieldProgram")
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
-    program = request.program
     columns = schema.point_table.columns
     if (
         schema.point_table.row_count != program.point_table.row_count
@@ -530,13 +528,14 @@ def _validate_mot_source_schema(
 
 def _mot_storage_intensities(
     request: MotFieldRequest,
+    program: MotFieldProgram,
     values: np.ndarray,
     validity,
     schema: DatasetSchema,
     *,
     written_cells: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    _validate_mot_source_schema(request, schema)
+    _validate_mot_source_schema(program, schema)
     if (
         isinstance(written_cells, bool)
         or not isinstance(written_cells, Integral)
@@ -548,7 +547,7 @@ def _mot_storage_intensities(
     expanded_validity = expand_dataset_validity(validity, schema)
     if array.shape != schema.physical_shape or expanded_validity.shape != array.shape:
         raise ValueError("MOT values/validity differ from their schema")
-    projector = build_mot_intensity_projector(request, schema)
+    projector = build_mot_intensity_projector(request, program, schema)
     intensities = np.zeros(schema.point_table.row_count, dtype=np.float64)
     present = np.zeros(schema.point_table.row_count, dtype=bool)
     for point_ordinal in range(int(written_cells)):
@@ -597,19 +596,22 @@ def refine_mot_optimum(
 
 def analyze_mot_scan(
     request: MotFieldRequest,
+    program: MotFieldProgram,
     acquisition: MotFieldAcquisitionResult,
 ) -> MotFieldResult:
     """Analyze the exact FINAL scan without flattening or implicit reduction."""
 
     if not isinstance(request, MotFieldRequest):
         raise TypeError("request must be MotFieldRequest")
+    if not isinstance(program, MotFieldProgram):
+        raise TypeError("program must be MotFieldProgram")
     if not isinstance(acquisition, MotFieldAcquisitionResult):
         raise TypeError("acquisition must be MotFieldAcquisitionResult")
     source = acquisition.snapshot.block
     schema = source.schema
-    program = request.program
     storage_values, present = _mot_storage_intensities(
         request,
+        program,
         source.values,
         source.validity,
         schema,
@@ -665,49 +667,11 @@ def materialize_mot_field_snapshot(
     return OwnedSnapshot(block.ref(result.source_ref.stream_generation), block)
 
 
-def mot_field_final_outputs(
-    result: MotFieldResult,
-    source_scan: MotFieldAcquisitionResult,
-    output_schema: DatasetSchema,
-) -> dict[str, FinalDatasetOutput]:
-    """Publish the analyzed MOT grid and its exact source scan together."""
-
-    if not isinstance(result, MotFieldResult):
-        raise TypeError("result must be MotFieldResult")
-    if not isinstance(source_scan, MotFieldAcquisitionResult):
-        raise TypeError("source_scan must be MotFieldAcquisitionResult")
-    if not isinstance(output_schema, DatasetSchema):
-        raise TypeError("output_schema must be DatasetSchema")
-    if source_scan.snapshot.ref != result.source_ref:
-        raise ValueError("MOT result and materialized source name different scans")
-    snapshots = (
-        materialize_mot_field_snapshot(result, output_schema),
-        source_scan.snapshot,
-    )
-    return {
-        declaration.name: FinalDatasetOutput(
-            declaration,
-            snapshot,
-        )
-        for declaration, snapshot in zip(
-            MOT_FIELD_FINAL_OUTPUT_DECLARATIONS,
-            snapshots,
-            strict=True,
-        )
-    }
-
-
 __all__ = [
-    "DEFAULT_MOT_FIELD_CAMERA_ROLE",
     "DEFAULT_MOT_FIELD_CENTER_CODE",
     "DEFAULT_MOT_FIELD_POINTS",
-    "DEFAULT_MOT_FIELD_ROI_CENTER_PX",
     "DEFAULT_MOT_FIELD_ROI_RADIUS_PX",
     "DEFAULT_MOT_FIELD_SPAN_CODE",
-    "MOT_FIELD_REQUEST_SCHEMA",
-    "MOT_FIELD_FINAL_OUTPUT_DECLARATIONS",
-    "MOT_FIELD_TASK_DEFINITION",
-    "MOT_FIELD_TASK_KEY",
     "MOT_SCAN_PARAMETER_IDS",
     "MINIMUM_MOT_FIELD_POINTS",
     "MotFieldRequest",
@@ -720,6 +684,5 @@ __all__ = [
     "build_mot_scan_program",
     "mot_intensity_schema",
     "materialize_mot_field_snapshot",
-    "mot_field_final_outputs",
     "refine_mot_optimum",
 ]

@@ -86,19 +86,18 @@ class SignalProducer(Protocol):
 class LatestProcessorControl(SignalProducer, Protocol):
     """Public owner callbacks used by the shared latest-only lane."""
 
-    def prepare_processor_application(self) -> object: ...
-
     def validate_processor_source(self, source: "SignalValue") -> None: ...
 
-    def processor_application_ready(self, application: object) -> None: ...
-
-    def processor_work_started(self, source: "SignalValue") -> None: ...
+    def evaluate_processor(
+        self,
+        source: "SignalValue",
+    ) -> Mapping[str, LiveDatasetOutput]: ...
 
     def accept_processor_result(
         self,
         source: "SignalValue",
         source_publication: "SignalPublication",
-        result: object,
+        result: Mapping[str, LiveDatasetOutput],
     ) -> None: ...
 
     def accept_processor_failure(self, error: Exception) -> None: ...
@@ -369,34 +368,6 @@ def _node_instance_id(node: object) -> str:
     return canonical_text(producer.instance_id, "signal producer instance_id")
 
 
-def _evaluate_prepared_processor_application(
-    application: object,
-    source: SignalValue,
-    coverage: MonitorCoverage,
-) -> object:
-    """Run one domain-owned Processor operation over an admitted revision.
-
-    The data plane knows only the common application seam: an immutable source,
-    typed coverage go into the already-prepared domain
-    command.  It never reconstructs Camera/Occupancy shapes or output schemas.
-    """
-
-    evaluate = getattr(application, "evaluate", None)
-    if not callable(evaluate):
-        raise TypeError(
-            "prepared Processor application must expose evaluate()"
-        )
-    result = evaluate(
-        source.snapshot,
-        coverage,
-    )
-    from zlc_neutral_atom.processing.causal import (
-        require_causal_processor_evaluation,
-    )
-
-    return require_causal_processor_evaluation(result)
-
-
 @dataclass(slots=True)
 class _GenerationState:
     """The sole mutable state for one process-local signal generation."""
@@ -428,8 +399,6 @@ class _GenerationState:
 class _ProcessorEntry:
     node: LatestProcessorControl
     source_name: str
-    prepare_future: Future
-    application: object | None = None
     work_future: Future | None = None
     work_publication: SignalPublication | None = None
     pending_publication: SignalPublication | None = None
@@ -471,17 +440,14 @@ class _LatestOnlyProcessorLane:
         if key in self._processors:
             raise RuntimeError("Processor node is already attached")
         node.validate_processor_source(source)
-        future = self._executor.submit(node.prepare_processor_application)
-        future.add_done_callback(
-            lambda _future, current=node: self._wake_processor(current)
-        )
-        self._processors[key] = _ProcessorEntry(
+        entry = _ProcessorEntry(
             node=node,
             source_name=name,
-            prepare_future=future,
             pending_publication=initial_publication,
             last_publication=initial_publication,
         )
+        self._processors[key] = entry
+        self._start_processor(entry)
 
     def route(self, publications: Mapping[str, SignalPublication]) -> None:
         if self._closed:
@@ -510,19 +476,6 @@ class _LatestOnlyProcessorLane:
 
     def drain_processors(self) -> None:
         for entry in tuple(self._processors.values()):
-            if not entry.prepare_future.done():
-                continue
-            if entry.cancel_requested and entry.work_future is None:
-                self._cancelled_processor(entry)
-                continue
-            if entry.application is None:
-                try:
-                    application = entry.prepare_future.result()
-                    entry.node.processor_application_ready(application)
-                except Exception as error:
-                    self._fail_processor(entry, error)
-                    continue
-                entry.application = application
             work = entry.work_future
             if work is not None and work.done():
                 publication = entry.work_publication
@@ -558,9 +511,7 @@ class _LatestOnlyProcessorLane:
             return True
         entry.cancel_requested = True
         entry.pending_publication = None
-        idle = entry.prepare_future.done() and (
-            entry.work_future is None or entry.work_future.done()
-        )
+        idle = entry.work_future is None or entry.work_future.done()
         if idle:
             self._cancelled_processor(entry)
         return idle
@@ -575,7 +526,6 @@ class _LatestOnlyProcessorLane:
     def _start_processor(self, entry: _ProcessorEntry) -> None:
         if (
             entry.cancel_requested
-            or entry.application is None
             or entry.work_future is not None
             or entry.pending_publication is None
         ):
@@ -585,15 +535,9 @@ class _LatestOnlyProcessorLane:
         try:
             if source is None:
                 raise RuntimeError("Processor pending publication lost its source")
-            coverage = source.coverage
-            if not isinstance(coverage, MonitorCoverage):
-                raise TypeError("latest Processor source requires MonitorCoverage")
-            entry.node.processor_work_started(source)
             future = self._executor.submit(
-                _evaluate_prepared_processor_application,
-                entry.application,
+                entry.node.evaluate_processor,
                 source,
-                coverage,
             )
         except Exception as error:
             self._fail_processor(entry, error)

@@ -47,8 +47,8 @@ def test_a_file_in_the_way_fails_closed(tmp_path: Path):
         durable_makedirs(blocker / "below")
 
 
-def test_connect_prepares_owned_output_roots_before_composition(tmp_path: Path):
-    """Composition creates output roots without inventing authored content."""
+def test_connect_prepares_visible_project_roots_before_composition(tmp_path: Path):
+    """Composition creates the explicit visible project roots."""
 
     from Zou_lab_control.api import WorkspacePaths, connect
 
@@ -56,8 +56,9 @@ def test_connect_prepares_owned_output_roots_before_composition(tmp_path: Path):
     workspace = WorkspacePaths.for_workspace(project)
 
     with connect("virtual", workspace=workspace):
-        assert workspace.output_root.is_dir()
-        assert (workspace.output_root / "captures").is_dir()
-        assert (workspace.output_root / "calibrations").is_dir()
-        assert not workspace.pulses_root.exists()
-        assert not workspace.tasks_root.exists()
+        assert workspace.project_root.is_dir()
+        assert workspace.pulses_root.is_dir()
+        assert workspace.tasks_root.is_dir()
+        assert workspace.runs_root.is_dir()
+        assert workspace.figures_root.is_dir()
+        assert not (workspace.project_root / "_output").exists()

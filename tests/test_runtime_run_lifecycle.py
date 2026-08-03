@@ -210,8 +210,6 @@ def _admission_environment(tmp_path):
         ),
         installation=object(),
         runtime=runtime,
-        captures_root=tmp_path.resolve() / "_output" / "captures",
-        calibrations_root=tmp_path.resolve() / "_output" / "calibrations",
         catalog=object(),
         installation_config=object(),
         pulse_application=object(),

@@ -32,22 +32,19 @@ from zlc_plot import (
 )
 from zlc_storage.canonical import canonical_text, exact_mapping, normalized_text
 
-__all__ = ["DEFAULT_UPDATE_MS", "LOGIC_KINDS", "LOGIC_NODE_CONFIG_FIELDS",
+__all__ = ["DEFAULT_UPDATE_MS", "LOGIC_NODE_CONFIG_FIELDS",
            "LogicNodeConfig", "PANEL_CONFIG_FIELDS", "PANEL_KINDS",
            "CONSOLE_STATE_SCHEMA", "PanelConfig", "TASK_CONSOLE_STATE_FIELDS",
            "UPDATE_INTERVALS", "console_signal_key", "layout_record",
            "panel_signal_key"]
 
 
-#: The three domain node families the Logic tab can add.
-LOGIC_KINDS = ("measurement", "processor", "task")
-
 LOGIC_NODE_CONFIG_FIELDS = {
     "node_id": str,
-    "kind": str,
     "definition_key": dict,
     "title": str,
-    "values": dict,
+    "authored": dict,
+    "inputs": dict,
 }
 
 
@@ -97,32 +94,25 @@ def layout_record(
 
 
 class LogicNodeConfig:
-    """One LOGIC NODE: which node it is + the param values to build it with.
+    """One saved row: identity, descriptor key, authored draft and input refs.
 
-    A logic node lives on the Logic tab, NOT the Monitor board, and is the thing
-    that PRODUCES data.  ``kind`` is one of :data:`LOGIC_KINDS`
-    (measurement / processor / task). ``node_id`` is the immutable saved row
-    identity used to namespace its outputs; the presented ``title`` never
-    participates in identity. ``definition_key`` is the opaque tree
-    emitted by the owning catalog's DefinitionKey codec; presentation titles
-    never identify a capability.
-    ``values`` is the last param-form ``{key: value}`` it was built / run with, so
-    reopening its Edit restores them.  A node is always added STOPPED -- nothing
-    runs until Start in its Edit."""
+    The descriptor is the sole owner of Task/Measurement/Processor kind, form
+    schema and outputs, so none of those facts are mirrored here. ``node_id``
+    namespaces this row's publications and ``title`` is only a user override.
+    ``authored`` and ``inputs`` are frozen independently because the latter are
+    stable Signal/Artifact references, not domain parameters. A loaded row is
+    always stopped.
+    """
 
     def __init__(
         self,
         *,
         node_id: str | None = None,
-        kind: str,
         definition_key: Mapping[str, object],
         title: str,
-        values: Mapping[str, object] | None = None,
+        authored: Mapping[str, object] | None = None,
+        inputs: Mapping[str, object] | None = None,
     ):
-        if not isinstance(kind, str):
-            raise TypeError("logic kind must be str")
-        if kind not in LOGIC_KINDS:
-            raise ValueError(f"unknown logic kind {kind!r}; choose from {list(LOGIC_KINDS)}.")
         identity = (
             f"logic_{uuid4().hex}"
             if node_id is None
@@ -130,22 +120,24 @@ class LogicNodeConfig:
         )
         if not isinstance(definition_key, Mapping) or not definition_key:
             raise TypeError("definition_key must be a non-empty owner codec tree")
-        if values is not None and not isinstance(values, Mapping):
-            raise TypeError("logic node values must be a mapping or None")
+        if authored is not None and not isinstance(authored, Mapping):
+            raise TypeError("logic node authored values must be a mapping or None")
+        if inputs is not None and not isinstance(inputs, Mapping):
+            raise TypeError("logic node input refs must be a mapping or None")
         display_title = normalized_text(title, "logic node title")
         self.node_id = identity
-        self.kind = kind
         self.definition_key = copy.deepcopy(dict(definition_key))
         self.title = display_title
-        self.values = {} if values is None else dict(values)
+        self.authored = {} if authored is None else copy.deepcopy(dict(authored))
+        self.inputs = {} if inputs is None else copy.deepcopy(dict(inputs))
 
     def to_dict(self) -> dict[str, object]:
         return {
             "node_id": self.node_id,
-            "kind": self.kind,
             "definition_key": copy.deepcopy(self.definition_key),
             "title": self.title,
-            "values": dict(self.values),
+            "authored": copy.deepcopy(self.authored),
+            "inputs": copy.deepcopy(self.inputs),
         }
 
     @classmethod

@@ -28,6 +28,7 @@ from zlc_neutral_atom.dataset_output import (
 )
 
 from .mot_field import (
+    MotFieldProgram,
     MotFieldRequest,
     MotRoiProjector,
     build_mot_intensity_projector,
@@ -36,11 +37,6 @@ from zlc_neutral_atom.runtime.dataset import (
     DatasetCoverage,
     DatasetPreviewDelta,
     DatasetPreviewSnapshot,
-)
-
-
-MOT_FIELD_LIVE_OUTPUT_DECLARATIONS = (
-    DatasetOutputDeclaration("grid", "zlc_neutral_atom.mot-field.live-grid"),
 )
 
 
@@ -56,8 +52,10 @@ class MotFieldLiveProjection:
     def __init__(
         self,
         request: MotFieldRequest,
+        program: MotFieldProgram,
         source_schema: DatasetSchema,
         output_schema: DatasetSchema,
+        output_declaration: DatasetOutputDeclaration,
     ) -> None:
         if not isinstance(request, MotFieldRequest):
             raise TypeError("request must be MotFieldRequest")
@@ -65,11 +63,15 @@ class MotFieldLiveProjection:
             raise TypeError("source_schema must be DatasetSchema")
         if not isinstance(output_schema, DatasetSchema):
             raise TypeError("output_schema must be DatasetSchema")
+        if not isinstance(output_declaration, DatasetOutputDeclaration):
+            raise TypeError("output_declaration must be DatasetOutputDeclaration")
         self._source_schema = source_schema
         self._output_schema = output_schema
+        self._output_declaration = output_declaration
         self._output_block_id = BlockId("mot-field-live-grid")
         self._projector: MotRoiProjector = build_mot_intensity_projector(
             request,
+            program,
             source_schema,
         )
         self._values = np.zeros(self._output_schema.physical_shape, dtype=np.float64)
@@ -170,13 +172,12 @@ class MotFieldLiveProjection:
             tuple(self._metadata),
         )
         output = single_live_dataset_output(
-            MOT_FIELD_LIVE_OUTPUT_DECLARATIONS[0],
+            self._output_declaration,
             front,
         )
         return {output.name: output}
 
 
 __all__ = [
-    "MOT_FIELD_LIVE_OUTPUT_DECLARATIONS",
     "MotFieldLiveProjection",
 ]

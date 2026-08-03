@@ -51,7 +51,6 @@ from zlc_pulse import (
     load_pulse_document,
     pulse_target_manifest_from_lanes,
 )
-from zlc_storage import canonical_digest
 
 
 _ROOT = Path(__file__).parents[1]
@@ -76,7 +75,6 @@ class _Camera:
 
     def capture_working_point(self) -> CameraWorkingPoint:
         return CameraWorkingPoint(
-            canonical_digest({"fixture": "runtime-camera-working-point"}),
             "EXTERNAL_TRIGGERED",
             (3, 4),
             (3, 4),
@@ -170,9 +168,7 @@ class _RuntimeFixture:
         self.endpoint = CameraCaptureEndpoint(
             self.camera,
             "camera",
-            exact_external_trigger_qualification_digest=canonical_digest(
-                {"qualification": "deterministic fixture adapter"}
-            ),
+            exact_external_trigger_qualified=True,
         )
         identity = PhysicalDeviceIdentity(
             stable_device_identity="fixture-camera",
@@ -261,6 +257,7 @@ class _RuntimeFixture:
                 AxisId("scan-ordinal"),
                 readout_events_per_repeat=3,
             ),
+            camera_instance_id="camera",
         )
         self.camera_capture = binding_result.capture
         self.spec = MinimalPipelineSpec(

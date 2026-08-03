@@ -9,7 +9,6 @@ import pytest
 
 from zlc_neutral_atom.catalog import DefinitionKey, definition_key_to_tree
 from zlc_workbench.task_console.console_records import (
-    LOGIC_KINDS,
     LogicNodeConfig,
 )
 from zlc_workbench.task_console.logic_node_row import LogicNodeRow
@@ -24,10 +23,10 @@ DEFINITION_TREE = definition_key_to_tree(
 def _record(**changes) -> LogicNodeConfig:
     values = {
         "node_id": "logic-test-analysis",
-        "kind": "processor",
         "definition_key": DEFINITION_TREE,
         "title": "Analysis #1",
-        "values": {},
+        "authored": {},
+        "inputs": {},
     }
     values.update(changes)
     return LogicNodeConfig(**values)
@@ -35,7 +34,7 @@ def _record(**changes) -> LogicNodeConfig:
 
 def _row() -> LogicNodeRow:
     ensure_qt_app()
-    return LogicNodeRow(_record())
+    return LogicNodeRow(_record(), "processor")
 
 
 def test_row_buttons_follow_run_state() -> None:
@@ -70,22 +69,23 @@ def test_publishes_uses_declared_name_shape_and_description() -> None:
 
 
 def test_record_round_trip_preserves_three_distinct_identities() -> None:
-    record = _record(values={"action": "judge"})
+    record = _record(
+        authored={"action": "judge"},
+        inputs={"source": "@logic/camera/frame"},
+    )
     payload = record.to_dict()
     assert payload == {
         "node_id": "logic-test-analysis",
-        "kind": "processor",
         "definition_key": DEFINITION_TREE,
         "title": "Analysis #1",
-        "values": {"action": "judge"},
+        "authored": {"action": "judge"},
+        "inputs": {"source": "@logic/camera/frame"},
     }
     assert LogicNodeConfig.from_dict(payload).to_dict() == payload
 
 
-def test_unknown_kind_and_noncanonical_record_are_rejected() -> None:
-    with pytest.raises(ValueError):
-        _record(kind="bogus")
-    assert LOGIC_KINDS == ("measurement", "processor", "task")
+def test_kind_is_not_mirrored_and_noncanonical_record_is_rejected() -> None:
+    assert "kind" not in _record().to_dict()
     payload = _record().to_dict()
     payload["title"] = " Analysis #1 "
     with pytest.raises(ValueError, match="canonical"):

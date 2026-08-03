@@ -23,12 +23,6 @@ from zlc_neutral_atom.installation_runtime import (
     create_installation,
 )
 from zlc_data import OwnedSnapshot
-from zlc_neutral_atom.capture.reference import CaptureArtifactRef
-from zlc_neutral_atom.capture.application import (
-    CaptureRequest,
-    PlanDescriptor,
-    PreparedFiniteCapture,
-)
 from zlc_neutral_atom.devices.sequencer.application import (
     AppliedPulseSnapshot,
     PreparedPulseExecution,
@@ -50,7 +44,6 @@ from zlc_pulse import (
 from zlc_storage import canonical_text as _text
 from zlc_storage import durable_makedirs
 
-from ._readout_core import ReadoutFacade
 from ._application_services import (
     ExperimentCloseAttempt as _ExperimentCloseAttempt,
     ExperimentServices as _ExperimentServices,
@@ -248,19 +241,13 @@ class Experiment:
             raise TypeError(
                 "installation_config must be InstallationConfigDocument"
             )
-        readout = ReadoutFacade(services)
-        nodes = compose_logic_node_apis(
-            readout,
-            readout._artifact_capabilities(),
-        )
+        nodes = compose_logic_node_apis(services)
         self._binding = (
             services,
             device_catalog,
             installation_config,
-            readout,
             nodes,
             PulseFacade(services),
-            nodes._artifact_operations,
         )
 
     @property
@@ -276,20 +263,12 @@ class Experiment:
         return self._binding[2]
 
     @property
-    def readout(self) -> ReadoutFacade:
+    def nodes(self):
         return self._binding[3]
 
     @property
-    def nodes(self):
-        return self._binding[4]
-
-    @property
     def pulse(self) -> PulseFacade:
-        return self._binding[5]
-
-    @property
-    def _artifact_operations(self):
-        return self._binding[6]
+        return self._binding[4]
 
     def pulse_gui(
         self,
@@ -376,6 +355,7 @@ class Experiment:
         services = self._services
         caller_thread_id = threading.get_ident()
         retained_manager = None
+        retained_artifacts: dict[str, object]
         with services.admission_lock:
             _prune_terminal_runs_locked(services)
             if services.active_runs:
@@ -393,6 +373,7 @@ class Experiment:
                     "device-manager",
                     None,
                 )
+                retained_artifacts = dict(services.default_artifacts)
                 services.closing_gui_handles = tuple(
                     services.gui_handles.values()
                 )
@@ -404,12 +385,15 @@ class Experiment:
 
         def publish(replacement: "Experiment") -> None:
             replacement_services = replacement._services
-            if retained_manager is not None:
-                with replacement_services.operation_lock:
-                    if replacement_services.state != "OPEN":
-                        raise RuntimeError(
-                            "replacement Experiment closed before publication"
-                        )
+            with replacement_services.operation_lock:
+                if replacement_services.state != "OPEN":
+                    raise RuntimeError(
+                        "replacement Experiment closed before publication"
+                    )
+                replacement_services.default_artifacts.update(
+                    retained_artifacts
+                )
+                if retained_manager is not None:
                     replacement_services.gui_handles[
                         "device-manager"
                     ] = retained_manager
@@ -437,26 +421,6 @@ class Experiment:
                 ) from apply_error
             raise
         publish(replacement)
-
-    def start(self, request: CaptureRequest) -> RunHandle:
-        return self.readout.prepare_capture(request).start()
-
-    def prepare_capture(self, request: CaptureRequest) -> PreparedFiniteCapture:
-        """Bind one finite capture without exposing the runtime service graph."""
-
-        return self.readout.prepare_capture(request)
-
-    def run(self, request: CaptureRequest) -> CaptureArtifactRef:
-        handle = self.readout.prepare_capture(request).start()
-        with _service_guard(self._services) as services:
-            runtime = services.runtime
-        result = runtime.wait(handle)
-        if not isinstance(result, CaptureArtifactRef):
-            raise TypeError("capture Run returned an unexpected result")
-        return result
-
-    def inspect(self, request: CaptureRequest) -> PlanDescriptor:
-        return self.readout.prepare_capture(request).descriptor
 
     def figure_gui(
         self,
@@ -494,10 +458,10 @@ class Experiment:
             from zlc_workbench.figure_viewer.app import open_figure_viewer
 
             with _service_guard(self._services) as services:
-                output_root = services.workspace_paths.output_root
+                figures_root = services.workspace_paths.figures_root
             return open_figure_viewer(
                 path=snapshot,
-                output_root=output_root,
+                output_root=figures_root,
             )
 
         if not isinstance(snapshot, OwnedSnapshot):
@@ -510,12 +474,12 @@ class Experiment:
             raise TypeError("spec must be PlotSpec")
         from Zou_lab_control.workbench import open_figure_workbench
         with _service_guard(self._services) as services:
-            output_root = services.workspace_paths.output_root
+            figures_root = services.workspace_paths.figures_root
 
         return open_figure_workbench(
             snapshot,
             spec,
-            output_root=output_root,
+            output_root=figures_root,
             size=size,
             parameters=parameters,
             archive_path=archive_path,
@@ -586,7 +550,14 @@ class Experiment:
                         "operation drain event disagrees with operation count"
                     )
 
-            # Only this attempt owner may tear down the runtime or repositories.
+            node_close_failures = list(self.nodes.close())
+            if node_close_failures:
+                raise _ResourceCleanupError(
+                    "Experiment Logic-node close failed",
+                    tuple(node_close_failures),
+                )
+
+            # Only this attempt owner may tear down the runtime.
             # Other close callers wait on the same completion fact instead of
             # racing a second cleanup sequence.
             shutdown = services.runtime.shutdown(timeout=2.0)
@@ -634,10 +605,7 @@ class Experiment:
                     tuple(gui_close_failures),
                 )
 
-            failures = (
-                _cleanup_failures(services.signal_plane.close)
-                + list(self.nodes.close())
-            )
+            failures = _cleanup_failures(services.signal_plane.close)
             if failures:
                 raise _ResourceCleanupError(
                     "Experiment close failed",
@@ -754,15 +722,17 @@ def connect(
     if not isinstance(workspace, WorkspacePaths):
         raise TypeError("workspace must be WorkspacePaths")
     canonical_name = _text(name, "experiment name")
-    output_root = workspace.output_root
-    durable_makedirs(output_root)
+    for root in (
+        workspace.project_root,
+        workspace.pulses_root,
+        workspace.tasks_root,
+        workspace.runs_root,
+        workspace.figures_root,
+    ):
+        durable_makedirs(root)
     runtime = None
     signal_plane = None
     try:
-        captures_root = output_root / "captures"
-        durable_makedirs(captures_root)
-        calibrations_root = output_root / "calibrations"
-        durable_makedirs(calibrations_root)
         installation = create_installation(
             installation_document,
             required_pulse_document=required_pulse_document,
@@ -776,8 +746,6 @@ def connect(
             workspace_paths=workspace,
             installation=installation,
             runtime=runtime,
-            captures_root=captures_root,
-            calibrations_root=calibrations_root,
             catalog=catalog,
             installation_config=installation_document,
             pulse_application=PulseApplicationOwner(),
@@ -846,15 +814,12 @@ def device_manager(
 
 __all__ = [
     "AppliedPulseSnapshot",
-    "CaptureArtifactRef",
-    "CaptureRequest",
     "connect",
     "device_manager",
     "DeviceInstanceConfig",
     "Experiment",
     "InstallationConfigDocument",
     "installation_template",
-    "PlanDescriptor",
     "PreparedPulseExecution",
     "PulseFacade",
     "PulseRunDescriptor",
@@ -862,6 +827,5 @@ __all__ = [
     "PulseRunRequest",
     "PulseRunResult",
     "PulseTargetDescriptor",
-    "ReadoutFacade",
     "WorkspacePaths",
 ]

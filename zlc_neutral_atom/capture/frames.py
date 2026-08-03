@@ -37,7 +37,7 @@ from zlc_storage.durability import atomic_write_file
 from zlc_storage.paths import resolve_under
 
 
-_FRAME_SOURCE_SCHEMA = "zlc_neutral_atom.capture-frame-source"
+_FRAME_SOURCE_SCHEMA = "zlc.capture.frames"
 _VALUES_FILE = "frames.npy"
 _VALIDITY_FILE = "validity.npy"
 _VALIDITY_KINDS = frozenset({"valid", "invalid", "cell", "component"})

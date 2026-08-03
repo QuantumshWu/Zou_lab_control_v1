@@ -10,12 +10,12 @@ from zlc_storage import canonical_text
 
 
 SCAN_ARTIFACT_REF_SCHEMA = "zlc_neutral_atom.logic_nodes.pulse_scan.artifact-ref"
-SCAN_ARTIFACT_NAMESPACE = "scan"
+SCAN_RECORD_PREFIX = ("runs", "pulse_scan")
 
 
 @dataclass(frozen=True, order=True, slots=True)
 class ScanArtifactRef:
-    """Path to ``scan.json`` relative to the configured scan output root."""
+    """Project-relative path to one durable ``scan.json`` record."""
 
     record_path: str
 
@@ -29,15 +29,16 @@ class ScanArtifactRef:
             or path.as_posix() != value
             or any(part in {"", ".", ".."} for part in path.parts)
         ):
-            raise ValueError("record_path must stay beneath the scan output root")
-        if path.name != "scan.json" or len(path.parts) != 2:
-            raise ValueError("record_path must be '<run-name>/scan.json'")
+            raise ValueError("record_path must stay beneath the project root")
+        if (
+            path.name != "scan.json"
+            or len(path.parts) != 4
+            or path.parts[:2] != SCAN_RECORD_PREFIX
+        ):
+            raise ValueError(
+                "record_path must be 'runs/pulse_scan/<run-name>/scan.json'"
+            )
         object.__setattr__(self, "record_path", path.as_posix())
-
-    @property
-    def target_ref(self) -> str:
-        return f"{SCAN_ARTIFACT_NAMESPACE}/{self.record_path}"
-
 
 def scan_artifact_ref_to_tree(value: ScanArtifactRef) -> dict[str, object]:
     if not isinstance(value, ScanArtifactRef):
@@ -54,15 +55,12 @@ def scan_artifact_ref_from_tree(tree: Any) -> ScanArtifactRef:
         raise ValueError("ScanArtifactRef has an unknown field set")
     if tree["schema"] != SCAN_ARTIFACT_REF_SCHEMA:
         raise ValueError("ScanArtifactRef schema is not current")
-    value = ScanArtifactRef(canonical_text(tree["record_path"], "record_path"))
-    if scan_artifact_ref_to_tree(value) != tree:
-        raise ValueError("ScanArtifactRef tree is typed but non-canonical")
-    return value
+    return ScanArtifactRef(canonical_text(tree["record_path"], "record_path"))
 
 
 __all__ = [
     "SCAN_ARTIFACT_REF_SCHEMA",
-    "SCAN_ARTIFACT_NAMESPACE",
+    "SCAN_RECORD_PREFIX",
     "ScanArtifactRef",
     "scan_artifact_ref_from_tree",
     "scan_artifact_ref_to_tree",

@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 import shutil
 
 import numpy as np
 
 import Zou_lab_control.api as zlc
-from zlc_neutral_atom.capture.reference import CaptureArtifactRef
-from zlc_neutral_atom.logic_nodes.mot_field.mot_field_task import MotFieldTaskIntent
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGING_PULSE = ROOT / "pulses" / "imaging_template.json"
@@ -27,94 +24,70 @@ def _workspace(project_root: Path) -> zlc.WorkspacePaths:
     return zlc.WorkspacePaths.for_workspace(project)
 
 
-def test_mot_task_projects_stateless_outputs_from_generic_capture_final(
+def test_mot_task_runs_through_the_generic_node_host(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "mot-workspace"
     workspace_paths = _workspace(workspace)
     with zlc.connect("virtual", workspace=workspace_paths) as exp:
-        command = exp.nodes.mot_field.prepare_mot_field_task(
-            MotFieldTaskIntent(
-                pulse=MOT_FIELD_PULSE.name,
-                center_x=0.0,
-                center_y=0.0,
-                center_z=0.0,
-                span=2.0,
-                points=2,
-                roi_cx=None,
-                roi_cy=None,
-                roi_radius=8.0,
-                camera_role="mot_camera",
-            )
+        request = exp.nodes.mot_field.build(
+            pulse=MOT_FIELD_PULSE.name,
+            center_x=0.0,
+            center_y=0.0,
+            center_z=0.0,
+            span=2.0,
+            points=2,
+            roi_cx=None,
+            roi_cy=None,
+            roi_radius=8.0,
+            camera_instance_id="mot-camera",
+            sequencer_instance_id="sequencer",
         )
-        reference = command.start().result()
-        assert isinstance(reference, CaptureArtifactRef)
-
-        result = command.mot_field_result(reference)
-        first = command.final_dataset_outputs(reference)
-        second = command.final_dataset_outputs(reference)
+        assert request.camera_instance_id == "mot-camera"
+        assert request.sequencer_instance_id == "sequencer"
+        result = exp.nodes.mot_field.run(
+            pulse=MOT_FIELD_PULSE.name,
+            center_x=0.0,
+            center_y=0.0,
+            center_z=0.0,
+            span=2.0,
+            points=2,
+            roi_cx=None,
+            roi_cy=None,
+            roi_radius=8.0,
+            camera_instance_id="mot-camera",
+            sequencer_instance_id="sequencer",
+        )
 
     assert len(result.best_field) == 3
     assert np.isfinite(result.best_field).all()
     assert np.isfinite(result.best_intensity)
     assert result.best_intensity == float(np.max(result.intensity))
-    assert first.keys() == second.keys() == {"mot_field", "scan"}
-    assert first["scan"].snapshot is not second["scan"].snapshot
-    assert first["scan"].snapshot.ref == second["scan"].snapshot.ref
-    assert np.array_equal(
-        first["scan"].snapshot.block.values,
-        second["scan"].snapshot.block.values,
-    )
-    assert first["mot_field"].snapshot.block.schema is command.output_schema
-    assert second["mot_field"].snapshot.block.schema is command.output_schema
-    assert np.array_equal(
-        first["mot_field"].snapshot.block.values,
-        second["mot_field"].snapshot.block.values,
-    )
-    assert (
-        workspace_paths.output_root
-        / "captures"
-        / reference.record_path
-    ).is_file()
+    records = tuple((workspace / "runs" / "camera").glob("*/capture.json"))
+    assert len(records) == 1
 
 
-def test_readout_duration_uses_the_public_experiment_path(tmp_path: Path) -> None:
-    """One current API flow proves the coupled duration Measurement end to end."""
+def test_readout_duration_request_uses_the_current_node_contract(
+    tmp_path: Path,
+) -> None:
+    """The source-neutral Measurement is authored through ``exp.nodes``.
+
+    Execution additionally requires an explicitly connected y signal.  That
+    connection belongs to the workbench/SignalPlane, so this operator test
+    only exercises the public request contract; the bound execution path is
+    covered by the owning duration-fidelity contract tests.
+    """
 
     with zlc.connect("virtual", workspace=_workspace(tmp_path / "duration")) as exp:
-        calibration = exp.nodes.calibration.sitemap(frames=4)
-        request = (
-            exp.nodes.readout_duration_fidelity.readout_duration_fidelity_request(
-                "probe_template.json",
-                duration_seconds=(2e-6, 4e-6),
-                shots=2,
-                calibration_ref=calibration,
-            )
+        request = exp.nodes.readout_duration_fidelity.build(
+            sequencer_instance_id="sequencer",
+            pulse="probe_template.json",
+            duration=(2.0, 4.0, 2),
+            shots=2,
         )
-        prepared = (
-            exp.nodes.readout_duration_fidelity
-            .prepare_readout_duration_fidelity(request)
-        )
-        result = prepared.start().result()
 
-    block = result.snapshot.block
-    assert block.schema.physical_shape == (1, 2, 1)
-    assert block.schema.point_table.columns[0].values == (2e-6, 4e-6)
-    assert len(result.capture_terminals) == len(result.pulse_terminals) == 2
-    assert not hasattr(result, "program_fingerprint")
-    capture_reordered = replace(
-        result,
-        capture_terminals=tuple(reversed(result.capture_terminals)),
-    )
-    pulse_reordered = replace(
-        result,
-        pulse_terminals=tuple(reversed(result.pulse_terminals)),
-    )
-    assert capture_reordered.capture_terminals == tuple(
-        reversed(result.capture_terminals)
-    )
-    assert pulse_reordered.pulse_terminals == tuple(
-        reversed(result.pulse_terminals)
-    )
-    final = prepared.final_dataset_outputs(result)["fidelity"]
-    assert final.snapshot is result.snapshot
+        assert request.sequencer_instance_id == "sequencer"
+        assert request.pulse == "probe_template.json"
+        assert request.duration_seconds == (2e-6, 4e-6)
+        assert request.shots == 2
+        assert exp.nodes.readout_duration_fidelity.descriptor.input_specs

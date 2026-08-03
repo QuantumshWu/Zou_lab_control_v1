@@ -38,9 +38,6 @@ from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
     ResolvedCalibration,
     apply_readout_model,
 )
-from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
-    calibration_artifact_ref_to_tree,
-)
 from zlc_neutral_atom.runtime._failure import (
     record_secondary_failure,
     safe_error_summary,
@@ -199,7 +196,6 @@ class ReleaseRecapturePipelineSpec:
     model: ReadoutModel
     per_site: bool
     output_stream_id: StreamId
-    output_source_id: str
     block_id: BlockId
     rf_port: BoundRfTablePort | None = None
     rf_table: RfDetuningTable | None = None
@@ -221,7 +217,6 @@ class ReleaseRecapturePipelineSpec:
             raise TypeError("per_site must be bool")
         if not isinstance(self.output_stream_id, StreamId):
             raise TypeError("output_stream_id must be StreamId")
-        canonical_text(self.output_source_id, "output_source_id")
         if not isinstance(self.block_id, BlockId):
             raise TypeError("block_id must be BlockId")
         if (self.rf_port is None) != (self.rf_table is None):

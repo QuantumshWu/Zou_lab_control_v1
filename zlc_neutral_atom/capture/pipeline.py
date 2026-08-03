@@ -21,8 +21,7 @@ from zlc_storage import (
 from zlc_neutral_atom.devices.camera.contract import (
     CameraAcquisitionMode,
     CameraCapabilityEvidence,
-    FrozenCaptureSpec,
-    decode_camera_capture_spec,
+    CameraCaptureSpec,
 )
 from zlc_neutral_atom.devices.camera.capture_port import (
     BoundCapturePort,
@@ -70,7 +69,7 @@ class BoundCameraCapture:
 
     capture_port: BoundCapturePort
     capture_contract: CameraCaptureContract
-    capture_spec: FrozenCaptureSpec
+    capture_spec: CameraCaptureSpec
 
     def __post_init__(self) -> None:
         if not isinstance(self.capture_port, BoundCapturePort):
@@ -79,20 +78,10 @@ class BoundCameraCapture:
             raise TypeError("capture_contract must be CameraCaptureContract")
         if self.capture_contract.capability is not self.capture_port.capability:
             raise ValueError("capture contract and port must share capability owner")
-        if not isinstance(self.capture_spec, FrozenCaptureSpec):
-            raise TypeError("capture_spec must be FrozenCaptureSpec")
-        if (
-            self.capture_spec.owner_fingerprint
-            != self.capture_contract.capture_spec_owner_fingerprint
-        ):
-            raise ValueError("capture spec and camera contract owner differ")
-        if (
-            self.capture_contract.camera_provenance.camera_arm_spec_fingerprint
-            != self.capture_spec.digest
-        ):
-            raise ValueError(
-                "camera provenance arm spec differs from FrozenCaptureSpec"
-            )
+        if not isinstance(self.capture_spec, CameraCaptureSpec):
+            raise TypeError("capture_spec must be CameraCaptureSpec")
+        if self.capture_spec.expected_frames != self.capture_contract.total_events:
+            raise ValueError("capture spec cardinality differs from camera contract")
 
 @dataclass(frozen=True)
 class MinimalPipelineSpec:
@@ -325,8 +314,8 @@ class PipelineResult:
         return self._capture_completion.camera_capability_evidence
 
     @property
-    def camera_arm_spec(self) -> FrozenCaptureSpec:
-        return self._capture_completion.camera_arm_spec
+    def camera_capture_spec(self) -> CameraCaptureSpec:
+        return self._capture_completion.camera_capture_spec
 
     @property
     def source_cell_schedule(self) -> DatasetCellSchedule:
@@ -739,8 +728,7 @@ def _require_passive_external_capture(capture: BoundCameraCapture) -> None:
     never prepares or fires one.
     """
 
-    camera_spec = decode_camera_capture_spec(capture.capture_spec)
-    if camera_spec.mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
+    if capture.capture_spec.mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
         raise ValueError(
             "passive finite camera capture requires an external-trigger source"
         )

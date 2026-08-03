@@ -11,7 +11,6 @@ import pytest
 from zlc_neutral_atom.devices.camera.contract import (
     CameraAcquisitionMode,
     CameraCaptureSpec,
-    freeze_camera_capture_spec,
 )
 from zlc_neutral_atom.devices.camera.contract import (
     CameraCaptureTerminalRecord,
@@ -39,7 +38,6 @@ from zlc_neutral_atom.runtime.resources import (
     PhysicalDeviceIdentity,
     ResourceKey,
 )
-from zlc_storage import canonical_digest
 
 
 class _Camera:
@@ -71,12 +69,6 @@ class _Camera:
 
     def capture_working_point(self) -> CameraWorkingPoint:
         return CameraWorkingPoint(
-            canonical_digest(
-                {
-                    "fixture": "camera-endpoint",
-                    "generation": self.settings_generation,
-                }
-            ),
             "EXTERNAL_TRIGGERED",
             (3, 4),
             (3, 4),
@@ -90,7 +82,7 @@ class _Camera:
             0.001,
             0.0,
             1.0,
-            "fixture-readout",
+            f"fixture-readout:{self.settings_generation}",
         )
 
     def arm(
@@ -160,11 +152,7 @@ def _bound(camera: _Camera, *, qualified: bool = True):
     endpoint = CameraCaptureEndpoint(
         camera,
         "camera",
-        exact_external_trigger_qualification_digest=(
-            canonical_digest({"qualification": "fixture"})
-            if qualified
-            else None
-        ),
+        exact_external_trigger_qualified=qualified,
     )
     broker = DeviceBroker()
     identity = PhysicalDeviceIdentity(
@@ -190,22 +178,15 @@ def _bound(camera: _Camera, *, qualified: bool = True):
     return endpoint, binding, capability, broker
 
 
-def _prepare_command(capability, *, session_id: str = "fixture-session"):
-    frozen = freeze_camera_capture_spec(
-        CameraCaptureSpec(
-            CameraAcquisitionMode.EXTERNAL_TRIGGERED,
-            2,
-            (1, 1),
-            capability.settings_fingerprint,
-        )
+def _prepare_command(*, session_id: str = "fixture-session"):
+    spec = CameraCaptureSpec(
+        CameraAcquisitionMode.EXTERNAL_TRIGGERED,
+        2,
+        (1, 1),
     )
     return PrepareCaptureCommand(
         session_id,
-        frozen.payload,
-        frozen.owner_fingerprint,
-        frozen.digest,
-        capability.capability_fingerprint,
-        capability.settings_fingerprint,
+        spec,
         2,
         1.0,
     )
@@ -213,7 +194,7 @@ def _prepare_command(capability, *, session_id: str = "fixture-session"):
 
 def _prepare_started(camera: _Camera):
     endpoint, binding, capability, broker = _bound(camera)
-    command = _prepare_command(capability)
+    command = _prepare_command()
     endpoint.execute_command(binding, command)
     endpoint.execute_command(binding, StartCaptureCommand(command.session_id, 1.0))
     return endpoint, binding, command, broker
@@ -270,7 +251,7 @@ def test_endpoint_rejects_settings_drift_before_arm() -> None:
     try:
         camera.settings_generation += 1
         with pytest.raises(RuntimeError, match="working point changed"):
-            endpoint.execute_command(binding, _prepare_command(capability))
+            endpoint.execute_command(binding, _prepare_command())
         assert camera.capture_state() == (False, 0)
     finally:
         broker.shutdown()
@@ -279,7 +260,7 @@ def test_endpoint_rejects_settings_drift_before_arm() -> None:
 def test_endpoint_revalidates_working_point_after_arm_and_disarms() -> None:
     camera = _Camera(pause_after_arm=True)
     endpoint, binding, capability, broker = _bound(camera)
-    command = _prepare_command(capability)
+    command = _prepare_command()
     endpoint.execute_command(binding, command)
     outcome: dict[str, object] = {}
 
@@ -368,7 +349,7 @@ def test_unqualified_adapter_cannot_self_grant_exact_capture() -> None:
     endpoint, binding, capability, broker = _bound(camera, qualified=False)
     try:
         with pytest.raises(ValueError, match="requires E0-qualified"):
-            endpoint.execute_command(binding, _prepare_command(capability))
+            endpoint.execute_command(binding, _prepare_command())
         assert camera.capture_state() == (False, 0)
     finally:
         broker.shutdown()
@@ -377,7 +358,7 @@ def test_unqualified_adapter_cannot_self_grant_exact_capture() -> None:
 def test_pre_arm_interrupt_supersedes_start_and_close_waits_for_join() -> None:
     camera = _Camera(block_arm=True)
     endpoint, binding, capability, broker = _bound(camera)
-    command = _prepare_command(capability)
+    command = _prepare_command()
     endpoint.execute_command(binding, command)
     outcome: dict[str, object] = {}
 
@@ -428,7 +409,7 @@ def test_pre_arm_interrupt_supersedes_start_and_close_waits_for_join() -> None:
 def test_post_arm_interrupt_never_returns_started_ack_or_double_stops() -> None:
     camera = _Camera(pause_after_arm=True)
     endpoint, binding, capability, broker = _bound(camera)
-    command = _prepare_command(capability)
+    command = _prepare_command()
     endpoint.execute_command(binding, command)
     outcome: dict[str, object] = {}
 
@@ -460,7 +441,7 @@ def test_post_arm_interrupt_never_returns_started_ack_or_double_stops() -> None:
 def test_session_identity_is_binding_scoped_and_cannot_be_replayed() -> None:
     camera = _Camera()
     endpoint, binding, capability, broker = _bound(camera)
-    command = _prepare_command(capability)
+    command = _prepare_command()
     endpoint.execute_command(binding, command)
     try:
         replay = replace(command, session_id="other-session")

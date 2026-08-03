@@ -109,32 +109,25 @@ def _is_logic_node_gui_leaf(path: Path) -> bool:
     )
 
 
-def _logic_node_declaration_sites(root: Path) -> tuple[Path, ...]:
-    sites = []
-    for source in sorted(root.rglob("*.py")):
-        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            function = node.func
-            if (
-                isinstance(function, ast.Name)
-                and function.id == "LogicNodeDeclaration"
-            ) or (
-                isinstance(function, ast.Attribute)
-                and function.attr == "LogicNodeDeclaration"
-            ):
-                sites.append(source)
-    return tuple(sites)
+def _logic_node_descriptor_sites(root: Path) -> tuple[Path, ...]:
+    """Return the fixed-namespace descriptor owners below *root*."""
+
+    return tuple(
+        sorted(
+            path
+            for path in root.rglob("logic_node.py")
+            if "ui" not in path.relative_to(root).parts
+        )
+    )
 
 
 def test_logic_node_tree_contains_only_capability_leaves_or_domain_families():
     """Keep domain-family sharing inside Logic Nodes without inventing fake nodes.
 
-    A direct child is either one standalone capability (its declaration lives in
+    A direct child is either one standalone capability (its descriptor lives in
     that directory), or a domain family whose immediate child directories are
     capability leaves.  Shared family modules may live at the family root.  A
-    declaration-free sibling such as the former ``camera_capture``/``*_common``
+    descriptor-free sibling such as the former ``camera_capture``/``*_common``
     directories is therefore impossible, while real domain sharing does not get
     promoted into framework/runtime merely to satisfy directory symmetry.
     """
@@ -151,14 +144,14 @@ def test_logic_node_tree_contains_only_capability_leaves_or_domain_families():
     for child in sorted(path for path in root.iterdir() if path.is_dir()):
         if child.name == "__pycache__":
             continue
-        declaration_sites = _logic_node_declaration_sites(child)
-        direct = tuple(path for path in declaration_sites if path.parent == child)
-        nested = tuple(path for path in declaration_sites if path.parent != child)
+        descriptor_sites = _logic_node_descriptor_sites(child)
+        direct = tuple(path for path in descriptor_sites if path.parent == child)
+        nested = tuple(path for path in descriptor_sites if path.parent != child)
         if direct:
             if len(direct) != 1 or nested:
                 violations.append(
-                    f"{child.relative_to(ROOT)} mixes a standalone declaration "
-                    f"with other declarations: {declaration_sites}"
+                    f"{child.relative_to(ROOT)} mixes a standalone descriptor "
+                    f"with other descriptors: {descriptor_sites}"
                 )
             continue
         leaf_dirs = sorted(
@@ -168,14 +161,14 @@ def test_logic_node_tree_contains_only_capability_leaves_or_domain_families():
         )
         if not leaf_dirs:
             violations.append(
-                f"{child.relative_to(ROOT)} has no declaration and no capability leaves"
+                f"{child.relative_to(ROOT)} has no descriptor and no capability leaves"
             )
             continue
         for leaf in leaf_dirs:
-            sites = _logic_node_declaration_sites(leaf)
+            sites = _logic_node_descriptor_sites(leaf)
             if len(sites) != 1:
                 violations.append(
-                    f"{leaf.relative_to(ROOT)} must own exactly one declaration, "
+                    f"{leaf.relative_to(ROOT)} must own exactly one descriptor, "
                     f"found {sites}"
                 )
     assert not violations, "\n".join(violations)
@@ -396,8 +389,7 @@ import zlc_neutral_atom.logic_nodes.readout.occupancy.processor
 forbidden = (
     'scipy',
     'zlc_neutral_atom.logic_nodes.readout.calibration.analysis',
-    'zlc_neutral_atom.logic_nodes.readout.calibration.codec',
-    'zlc_neutral_atom.logic_nodes.readout.calibration.repository',
+    'zlc_neutral_atom.logic_nodes.readout.calibration.artifact',
 )
 loaded = tuple(
     name for name in forbidden
@@ -415,19 +407,24 @@ if loaded:
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_readout_bimodal_algorithm_is_owned_by_the_family_not_a_leaf():
+def test_duration_fidelity_is_a_thin_scan_specialization():
     duration = (
         ROOT
         / "zlc_neutral_atom"
         / "logic_nodes"
         / "readout"
         / "duration_fidelity"
-        / "application.py"
+        / "measurement.py"
     )
     imported = set(_imports(duration))
-    assert "zlc_neutral_atom.logic_nodes.readout.bimodal" in imported
-    assert (
-        "zlc_neutral_atom.logic_nodes.readout.calibration.analysis" not in imported
+    assert "zlc_neutral_atom.timing.pulse_parameter_scan" in imported
+    assert not any(
+        value.startswith("zlc_neutral_atom.logic_nodes.readout.calibration")
+        for value in imported
+    )
+    assert not any(
+        value.startswith("zlc_neutral_atom.devices.camera")
+        for value in imported
     )
 
 
@@ -758,13 +755,13 @@ def test_domain_packages_may_not_import_a_gui_toolkit(package):
     )
 
 
-def _logic_node_capability_roots() -> tuple[Path, ...]:
+def _logic_node_descriptor_roots() -> tuple[Path, ...]:
     logic_nodes = ROOT / "zlc_neutral_atom" / "logic_nodes"
     roots: set[Path] = set()
-    package_files = sorted(logic_nodes.rglob("package.py"))
-    assert package_files, "Logic-node package discovery guard is scanning nothing"
-    for package_file in package_files:
-        current = package_file.parent
+    descriptor_files = sorted(logic_nodes.rglob("logic_node.py"))
+    assert descriptor_files, "Logic-node descriptor guard is scanning nothing"
+    for descriptor_file in descriptor_files:
+        current = descriptor_file.parent
         while current != logic_nodes:
             package_root = current / "__init__.py"
             assert package_root.is_file(), (
@@ -775,9 +772,9 @@ def _logic_node_capability_roots() -> tuple[Path, ...]:
     return tuple(sorted(roots))
 
 
-def test_logic_node_package_roots_do_not_eagerly_import_optional_ui():
-    roots = _logic_node_capability_roots()
-    assert roots, "logic-node package-root guard is scanning nothing"
+def test_logic_node_descriptor_roots_do_not_eagerly_import_optional_ui():
+    roots = _logic_node_descriptor_roots()
+    assert roots, "logic-node descriptor-root guard is scanning nothing"
     violations = []
     for path in roots:
         for imported in _imports(path):
@@ -837,11 +834,10 @@ def test_no_task_console_attachment_residue_exists():
 def test_logic_node_discovery_is_headless_and_keeps_optional_ui_lazy():
     code = (
         "import sys; "
-        "from zlc_neutral_atom.logic_node_package import "
-        "discover_logic_node_packages; "
-        "packages=discover_logic_node_packages(); "
-        "ui=[value.module for package in packages "
-        "for value in package.ui_contributions]; "
+        "from zlc_neutral_atom.logic_node import discover_logic_nodes; "
+        "descriptors=discover_logic_nodes(); "
+        "ui=[value.module for descriptor in descriptors "
+        "for value in descriptor.ui_contributions]; "
         "assert ui, 'UI descriptor guard is scanning nothing'; "
         "assert not [name for name in ui if name in sys.modules], ui; "
         "eager_ui=[name for name in sys.modules "
@@ -896,9 +892,9 @@ def test_headless_api_import_loads_only_plot_value_modules_and_no_qt_runtime():
 
 
 def test_task_preview_plot_seam_is_typed_and_has_no_retired_string_owner():
-    owner_path, owner = _sole_definition("TaskPreviewPlot")
+    owner_path, owner = _sole_definition("TaskPreview")
     assert owner_path.relative_to(ROOT) == Path(
-        "zlc_neutral_atom/logic_node_declaration.py"
+        "zlc_neutral_atom/logic_node.py"
     )
     annotations = {
         statement.target.id: ast.unparse(statement.annotation)
@@ -1163,6 +1159,7 @@ def test_current_format_names_do_not_encode_edit_counters():
         [
             "git", "ls-files", "--cached", "--others", "--exclude-standard",
             "-z", "--", *roots, ".gitignore",
+            ":(exclude)pulses/scan_test.json",
         ],
         cwd=ROOT,
         check=True,

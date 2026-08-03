@@ -3,13 +3,13 @@
 Calibration stores only facts needed to reproduce readout: the source capture,
 the complete camera frame contract, one site map, and a closed set of feature
 models.  Statistical diagnostics belong to :mod:`.analysis`; direct record-last
-durability belongs to :mod:`.repository`.
+durability belongs to :mod:`.artifact`.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, fields, replace
+from collections.abc import Callable
+from dataclasses import dataclass, fields
 from enum import Enum
 import math
 from typing import TypeAlias
@@ -35,11 +35,6 @@ from zlc_storage import (
     finite_real as _finite_float,
     nonnegative_integer as _nonnegative_integer,
     positive_integer as _positive_integer,
-)
-from zlc_neutral_atom.authoring import (
-    AuthoringChoice,
-    AuthoringField,
-    AuthoringSchema,
 )
 from zlc_neutral_atom.logic_nodes.readout.model_contract import (
     ReadoutModelKind as _ReadoutModelKind,
@@ -137,18 +132,11 @@ class ThresholdMethod(str, Enum):
 
 # Public request constraints.  Presentation projects these values; the
 # request constructor below remains the only validator.
-CALIBRATION_MINIMUM_BOX_RADIUS = 0
-CALIBRATION_MINIMUM_PSF_HALF_WIDTH = 0
-CALIBRATION_MINIMUM_PSF_BACKGROUND_PADDING = 1
-CALIBRATION_MINIMUM_SPLIT_SEED = 0
 CALIBRATION_MINIMUM_HISTOGRAM_BINS = 2
 CALIBRATION_MINIMUM_SITE_FIDELITY = 0.5
 CALIBRATION_MAXIMUM_SITE_FIDELITY = 1.0
-CALIBRATION_MINIMUM_MAX_DROP = 0
-CALIBRATION_MINIMUM_DETECTOR_DISTANCE = 1
 CALIBRATION_MINIMUM_DETECTOR_THRESHOLD_REL = 0.0
 CALIBRATION_MAXIMUM_DETECTOR_THRESHOLD_REL = 1.0
-CALIBRATION_MINIMUM_DETECTOR_REFINE_HALF = 0
 
 
 def _immutable_array(
@@ -368,190 +356,6 @@ class CalibrationAnalysisRequest:
         return self.grid_shape_yx[0] * self.grid_shape_yx[1]
 
 
-def calibration_analysis_authoring_schema(
-    request: CalibrationAnalysisRequest,
-) -> AuthoringSchema:
-    """Declare the ordered ordinary fields editable for one frozen request."""
-
-    if not isinstance(request, CalibrationAnalysisRequest):
-        raise TypeError("request must be CalibrationAnalysisRequest")
-    model_fields = tuple(
-        AuthoringField(
-            f"model.{kind.value}.enabled",
-            "bool",
-            f"Enable {kind.value}",
-            default=kind in request.model_kinds,
-            description=(
-                "All enabled models are calibrated and committed atomically."
-            ),
-        )
-        for kind in _ReadoutModelKind
-    )
-    return AuthoringSchema(
-        (
-            *model_fields,
-            AuthoringField(
-                "default_model_kind",
-                "choice",
-                "Default model",
-                default=request.default_model_kind,
-                choices=tuple(
-                    AuthoringChoice(kind, kind.value) for kind in _ReadoutModelKind
-                ),
-            ),
-            AuthoringField(
-                "box_radius",
-                "int",
-                "Box radius",
-                default=request.box_radius,
-                required=True,
-                unit="px",
-                minimum=CALIBRATION_MINIMUM_BOX_RADIUS,
-            ),
-            AuthoringField(
-                "box_reducer",
-                "choice",
-                "Box reducer",
-                default=request.box_reducer,
-                choices=tuple(
-                    AuthoringChoice(item, item.value) for item in BoxReducer
-                ),
-            ),
-            AuthoringField(
-                "psf_half_width",
-                "int",
-                "PSF half width",
-                default=request.psf_half_width,
-                required=True,
-                unit="px",
-                minimum=CALIBRATION_MINIMUM_PSF_HALF_WIDTH,
-            ),
-            AuthoringField(
-                "psf_background",
-                "choice",
-                "PSF background",
-                default=request.psf_background,
-                choices=tuple(
-                    AuthoringChoice(item, item.value) for item in BackgroundMode
-                ),
-            ),
-            AuthoringField(
-                "psf_background_padding",
-                "int",
-                "PSF background padding",
-                default=request.psf_background_padding,
-                required=True,
-                unit="px",
-                minimum=CALIBRATION_MINIMUM_PSF_BACKGROUND_PADDING,
-            ),
-            AuthoringField(
-                "train_fraction",
-                "float",
-                "Train fraction",
-                default=request.train_fraction,
-                required=True,
-                description="Must remain strictly between zero and one.",
-            ),
-            AuthoringField(
-                "split_seed",
-                "int",
-                "Split seed",
-                default=request.split_seed,
-                required=True,
-                minimum=CALIBRATION_MINIMUM_SPLIT_SEED,
-            ),
-            AuthoringField(
-                "histogram_bins",
-                "int",
-                "Histogram bins",
-                default=request.histogram_bins,
-                required=True,
-                minimum=CALIBRATION_MINIMUM_HISTOGRAM_BINS,
-            ),
-            AuthoringField(
-                "minimum_site_fidelity",
-                "float",
-                "Minimum site fidelity",
-                default=request.minimum_site_fidelity,
-                required=True,
-                minimum=CALIBRATION_MINIMUM_SITE_FIDELITY,
-                maximum=CALIBRATION_MAXIMUM_SITE_FIDELITY,
-            ),
-            AuthoringField(
-                "max_drop",
-                "int",
-                "Maximum dropped sites",
-                default=request.max_drop,
-                required=True,
-                minimum=CALIBRATION_MINIMUM_MAX_DROP,
-                maximum=request.site_count,
-            ),
-            AuthoringField(
-                "detector_min_distance",
-                "int",
-                "Detector minimum distance",
-                default=request.detector_min_distance,
-                unit="px",
-                minimum=CALIBRATION_MINIMUM_DETECTOR_DISTANCE,
-                allow_blank=True,
-            ),
-            AuthoringField(
-                "detector_threshold_rel",
-                "float",
-                "Detector relative threshold",
-                default=request.detector_threshold_rel,
-                required=True,
-                minimum=CALIBRATION_MINIMUM_DETECTOR_THRESHOLD_REL,
-                maximum=CALIBRATION_MAXIMUM_DETECTOR_THRESHOLD_REL,
-            ),
-            AuthoringField(
-                "detector_refine_half",
-                "int",
-                "Detector refine half width",
-                default=request.detector_refine_half,
-                required=True,
-                unit="px",
-                minimum=CALIBRATION_MINIMUM_DETECTOR_REFINE_HALF,
-            ),
-        )
-    )
-
-
-def build_calibration_analysis_request_from_authoring(
-    request: CalibrationAnalysisRequest,
-    values: Mapping[str, object],
-) -> CalibrationAnalysisRequest:
-    """Rebuild editable leaves while preserving frozen spatial authority."""
-
-    authored = calibration_analysis_authoring_schema(request).freeze(values)
-    model_kinds = tuple(
-        kind
-        for kind in _ReadoutModelKind
-        if authored[f"model.{kind.value}.enabled"] is True
-    )
-    default_model_kind = authored["default_model_kind"]
-    if default_model_kind not in model_kinds:
-        raise ValueError("default model must remain enabled")
-    return replace(
-        request,
-        model_kinds=model_kinds,
-        default_model_kind=default_model_kind,
-        box_radius=authored["box_radius"],
-        box_reducer=authored["box_reducer"],
-        psf_half_width=authored["psf_half_width"],
-        psf_background=authored["psf_background"],
-        psf_background_padding=authored["psf_background_padding"],
-        train_fraction=authored["train_fraction"],
-        split_seed=authored["split_seed"],
-        histogram_bins=authored["histogram_bins"],
-        minimum_site_fidelity=authored["minimum_site_fidelity"],
-        max_drop=authored["max_drop"],
-        detector_min_distance=authored["detector_min_distance"],
-        detector_threshold_rel=authored["detector_threshold_rel"],
-        detector_refine_half=authored["detector_refine_half"],
-    )
-
-
 def _site_validity(
     value: ComponentValidity,
     site_axis: AxisSpec,
@@ -625,18 +429,14 @@ def _resolve_calibration_source(
     try:
         reference = capture.ref  # type: ignore[attr-defined]
         source = capture.frame_source  # type: ignore[attr-defined]
-        provenance = capture.camera_provenance  # type: ignore[attr-defined]
+        descriptor = capture.camera_descriptor  # type: ignore[attr-defined]
+        binding = capture.camera_binding  # type: ignore[attr-defined]
     except AttributeError as exc:
         raise TypeError("capture must be a resolved raw CaptureArtifact") from exc
     if not isinstance(reference, CaptureArtifactRef):
         raise TypeError("capture.ref must be CaptureArtifactRef")
     if not isinstance(source, CaptureFrameSource):
         raise TypeError("capture.frame_source must be CaptureFrameSource")
-    try:
-        descriptor = provenance.descriptor
-        binding = provenance.binding
-    except AttributeError as exc:
-        raise TypeError("capture omits camera provenance") from exc
     if not isinstance(descriptor, CameraCaptureDescriptor):
         raise TypeError("capture camera descriptor must be CameraCaptureDescriptor")
     if not isinstance(binding, ReadoutBindingKey):
@@ -661,32 +461,6 @@ def _resolve_calibration_source(
     )
 
 
-def _validate_calibration_artifact_source_compatibility(
-    artifact: "CalibrationArtifact",
-    capture: object,
-    *,
-    checkpoint: Callable[[], None] | None = None,
-) -> _ResolvedCalibrationSource:
-    """Compare one loaded source while honoring cancellation/resource bounds."""
-
-    if not isinstance(artifact, CalibrationArtifact):
-        raise TypeError("artifact must be CalibrationArtifact")
-    resolved = _resolve_calibration_source(
-        capture,
-        artifact.source_binding.layout,
-        checkpoint=checkpoint,
-    )
-    if resolved.source_binding != artifact.source_binding:
-        raise ValueError("calibration source differs from the resolved capture")
-    if resolved.frame_contract != artifact.frame_contract:
-        raise ValueError("calibration FrameContract differs from the resolved capture")
-    if resolved.readout_physical_context != artifact.readout_physical_context:
-        raise ValueError(
-            "calibration readout physical context differs from the resolved capture"
-        )
-    return resolved
-
-
 def derive_calibration_readout_physical_context(
     capture: object,
     layout: CalibrationCaptureLayout,
@@ -709,7 +483,7 @@ def derive_calibration_readout_physical_context(
             "authoritative calibration requires pulse-trigger lineage"
         )
     try:
-        physical_facts = capture.camera_capability_evidence.physical_facts  # type: ignore[attr-defined]
+        physical_facts = capture.camera_physical_facts  # type: ignore[attr-defined]
     except AttributeError as exc:
         raise TypeError("capture omits camera capability evidence") from exc
     integration_offset = (
@@ -1258,16 +1032,9 @@ __all__ = [
     "CalibrationSourceBinding",
     "CALIBRATION_MAXIMUM_DETECTOR_THRESHOLD_REL",
     "CALIBRATION_MAXIMUM_SITE_FIDELITY",
-    "CALIBRATION_MINIMUM_BOX_RADIUS",
-    "CALIBRATION_MINIMUM_DETECTOR_DISTANCE",
-    "CALIBRATION_MINIMUM_DETECTOR_REFINE_HALF",
     "CALIBRATION_MINIMUM_DETECTOR_THRESHOLD_REL",
     "CALIBRATION_MINIMUM_HISTOGRAM_BINS",
-    "CALIBRATION_MINIMUM_MAX_DROP",
-    "CALIBRATION_MINIMUM_PSF_BACKGROUND_PADDING",
-    "CALIBRATION_MINIMUM_PSF_HALF_WIDTH",
     "CALIBRATION_MINIMUM_SITE_FIDELITY",
-    "CALIBRATION_MINIMUM_SPLIT_SEED",
     "GridOrder",
     "PerSitePsfFeature",
     "ReadoutFeature",
@@ -1278,8 +1045,6 @@ __all__ = [
     "ThresholdMethod",
     "UniformPsfFeature",
     "apply_readout_model",
-    "build_calibration_analysis_request_from_authoring",
-    "calibration_analysis_authoring_schema",
     "classify_occupancy",
     "derive_calibration_readout_physical_context",
     "extract_readout_features",

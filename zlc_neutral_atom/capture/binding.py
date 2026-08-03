@@ -29,7 +29,6 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraEventReadoutSetting,
     CameraSampleContract,
     ReadoutBindingKey,
-    freeze_camera_capture_spec,
 )
 from .pipeline import BoundCameraCapture
 from .session import CameraCaptureContract, CameraCaptureProvenance
@@ -54,7 +53,6 @@ from zlc_neutral_atom.runtime.streams import StreamId
 from zlc_storage import (
     canonical_text,
     positive_integer as _positive_int,
-    sha256_text as _sha256,
 )
 
 
@@ -62,14 +60,14 @@ from zlc_storage import (
 class CameraCaptureBindingRequest:
     """Physical intent for one finite camera-backed Dataset binding."""
 
-    role: str
+    camera_instance_id: str
     dataset_schema: DatasetSchema
     cell_schedule: DatasetCellSchedule
     mode: CameraAcquisitionMode
     event_settings: tuple[CameraEventReadoutSetting, ...] | None = None
 
     def __post_init__(self) -> None:
-        canonical_text(self.role, "camera role")
+        canonical_text(self.camera_instance_id, "camera_instance_id")
         if not isinstance(self.dataset_schema, DatasetSchema):
             raise TypeError("dataset_schema must be DatasetSchema")
         if not isinstance(self.cell_schedule, DatasetCellSchedule):
@@ -160,8 +158,6 @@ def bind_camera_capture(
         raise TypeError("request must be CameraCaptureBindingRequest")
     capability = port.capability
     evidence = capability.camera_capability_evidence
-    if evidence.source_id != request.role:
-        raise ValueError("camera endpoint source id differs from installation role")
     payload_contract = capability.payload_contract
     if not isinstance(payload_contract, CameraSampleContract):
         raise TypeError("camera capability payload contract has the wrong type")
@@ -173,13 +169,10 @@ def bind_camera_capture(
     facts = evidence.physical_facts
     cell_schedule = request.cell_schedule
     source_group_sizes = _source_group_sizes(request)
-    capture_spec = freeze_camera_capture_spec(
-        CameraCaptureSpec(
-            request.mode,
-            len(cell_schedule),
-            source_group_sizes,
-            evidence.settings_fingerprint,
-        )
+    capture_spec = CameraCaptureSpec(
+        request.mode,
+        len(cell_schedule),
+        source_group_sizes,
     )
     readout_columns = tuple(
         column
@@ -228,19 +221,14 @@ def bind_camera_capture(
             None if not readout_columns else readout_columns[0].coordinate_id
         ),
         event_settings=event_settings,
-        camera_arm_spec_fingerprint=_sha256(
-            capture_spec.digest,
-            "camera_arm_spec_fingerprint",
-        ),
     )
     camera_provenance = CameraCaptureProvenance(
         descriptor=descriptor,
-        binding=ReadoutBindingKey(request.role),
+        binding=ReadoutBindingKey(request.camera_instance_id),
         binding_stamp=capability.binding_stamp,
-        capability_fingerprint=capability.capability_fingerprint,
     )
     capture_contract = CameraCaptureContract(
-        stream_id=StreamId(f"camera.{request.role}.frames"),
+        stream_id=StreamId(f"camera.{request.camera_instance_id}.frames"),
         dataset_edge=FrozenDatasetEdge(
             dataset_schema,
             CameraDatasetEventAdapter(payload_contract),
@@ -453,6 +441,7 @@ def bind_triggered_camera_acquisition(
     execution_form: PulseExecutionForm,
     trigger_channel: str | None,
     layout: TriggeredCameraLayout,
+    camera_instance_id: str,
 ) -> TriggeredCameraBinding:
     """Bind one exact finite pulse/camera acquisition without starting hardware."""
 
@@ -471,13 +460,16 @@ def bind_triggered_camera_acquisition(
         raise ValueError("triggered camera acquisition requires a finite pulse form")
     if not isinstance(layout, TriggeredCameraLayout):
         raise TypeError("layout must be TriggeredCameraLayout")
+    camera_instance_id = canonical_text(
+        camera_instance_id,
+        "camera_instance_id",
+    )
     document = bind_pulse_document_target(
         pulse_document,
         pulse_port.capability.target,
     )
     camera_capability = camera_port.capability
     camera_evidence = camera_capability.camera_capability_evidence
-    camera_role = camera_evidence.source_id
     camera_facts = camera_evidence.physical_facts
     camera_payload_contract = camera_capability.payload_contract
     if not isinstance(camera_payload_contract, CameraSampleContract):
@@ -581,7 +573,7 @@ def bind_triggered_camera_acquisition(
     camera_capture = bind_camera_capture(
         camera_port,
         CameraCaptureBindingRequest(
-            camera_role,
+            camera_instance_id,
             dataset_schema,
             cell_plan.cell_schedule,
             CameraAcquisitionMode.EXTERNAL_TRIGGERED,

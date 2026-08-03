@@ -27,113 +27,21 @@ def _require_experiment(value):
     return value
 
 
-def task_console_ports(experiment):
-    """Decompose one Experiment into TaskConsole's explicit application port."""
+def task_console_dependencies(experiment) -> dict[str, object]:
+    """Expose only the facts consumed by the generic TaskConsole shell."""
 
     experiment = _require_experiment(experiment)
-    from zlc_workbench.task_console.application_ports import (
-        TaskConsoleApplicationPorts,
-    )
-    from zlc_workbench.task_console.artifact_resolution import (
-        resolve_final_or_saved_artifact,
-    )
-    from zlc_neutral_atom.catalog import ProcessorDefinition
-    from Zou_lab_control.workbench import _build_logic_node_ui
-    from zlc_workbench.task_console.declaration_projection import (
-        project_processor_declaration,
-        project_run_declaration,
-    )
-
     workspace = experiment._workspace_paths()
-    path_roots = {
-        "pulses": workspace.pulses_root,
-        "tasks": workspace.tasks_root,
-        "output": workspace.output_root,
+    return {
+        "descriptors": experiment.nodes.descriptors,
+        "device_catalog": experiment.device_catalog,
+        "host_factory": experiment.nodes.create_host,
+        "data_plane": experiment._signal_data_plane(),
+        "project_root": workspace.project_root,
+        "pulses_root": workspace.pulses_root,
+        "tasks_root": workspace.tasks_root,
+        "figures_root": workspace.figures_root,
     }
-    attachments = []
-    for package, api, dynamic_choices in experiment.nodes._composition_entries():
-        declaration = package.declaration
-
-        bind_request = declaration.bind_request
-        if package.bind_hosted_request is not None:
-            bind_request = (
-                lambda authored, inputs, owner=package.bind_hosted_request,
-                current_api=api: owner(current_api, authored, inputs)
-            )
-
-        resolve_artifact = None
-        if package.resolve_artifact_reference is not None:
-            resolve_artifact = (
-                lambda binding, owner=package.resolve_artifact_reference,
-                current_api=api: owner(
-                    current_api,
-                    binding,
-                    resolve_final_or_saved_artifact,
-                )
-            )
-
-        editor_builder = None
-        if any(
-            value.purpose == "task_console_editor"
-            for value in package.ui_contributions
-        ):
-            editor_builder = (
-                lambda form, contributions=package.ui_contributions: _build_logic_node_ui(
-                    contributions,
-                    "task_console_editor",
-                    form,
-                    pulses_root=workspace.pulses_root,
-                )
-            )
-
-        if isinstance(declaration.definition, ProcessorDefinition):
-            attachments.append(
-                project_processor_declaration(
-                    declaration,
-                    bind_request=bind_request,
-                    prepare=(
-                        lambda request, owner=package.prepare_hosted,
-                        current_api=api: owner(current_api, request, None)
-                    ),
-                    dynamic_choices=dynamic_choices,
-                    resolve_artifact_reference=resolve_artifact,
-                    path_roots=path_roots,
-                )
-            )
-            continue
-
-        start_prepared = None
-        if package.start_prepared is not None:
-            start_prepared = (
-                lambda command, live_host, command_context,
-                owner=package.start_prepared: owner(
-                    command,
-                    live_host,
-                    command_context,
-                )
-            )
-        attachments.append(
-            project_run_declaration(
-                declaration,
-                prepare=(
-                    lambda request, event_source, owner=package.prepare_hosted,
-                    current_api=api: owner(current_api, request, event_source)
-                ),
-                bind_request=bind_request,
-                dynamic_choices=dynamic_choices,
-                resolve_artifact_reference=resolve_artifact,
-                start_prepared=start_prepared,
-                editor_builder=editor_builder,
-                path_roots=path_roots,
-            )
-        )
-
-    return TaskConsoleApplicationPorts(
-        attachments=tuple(attachments),
-        data_plane=experiment._signal_data_plane(),
-        tasks_root=workspace.tasks_root,
-        output_root=workspace.output_root,
-    )
 
 
 def standalone_pulse_connection_factory(workspace):
@@ -408,5 +316,5 @@ __all__ = [
     "ExperimentDeviceAdmin",
     "bound_pulse_mode",
     "standalone_pulse_connection_factory",
-    "task_console_ports",
+    "task_console_dependencies",
 ]

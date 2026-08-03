@@ -20,10 +20,63 @@ from gui_user_flow import (
 )
 from zlc_frontend.qt_widgets import ensure_qt_app
 from zlc_plot import AxisRef, FacetGridPlot, ImagePlot, PlotKind
+from zlc_neutral_atom.device_types import (
+    CAPABILITY_MOT_FIELD_CAPTURE,
+    CAPABILITY_PULSE_EXECUTE,
+)
+from zlc_neutral_atom.logic_nodes.mot_field.logic_node import LOGIC_NODE
+from zlc_neutral_atom.logic_nodes.mot_field.mot_field import (
+    MotFieldRequest,
+    build_mot_scan_program,
+)
 from zlc_workbench.task_console.console_records import console_signal_key
+from zlc_pulse import load_pulse_document
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_mot_leaf_uses_one_stable_capability_bound_request() -> None:
+    request = LOGIC_NODE.build_request(
+        {
+            "pulse": "mot_field_template.json",
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "center_z": 0.0,
+            "span": 2.0,
+            "points": 2,
+            "roi_cx": None,
+            "roi_cy": None,
+            "roi_radius": 8.0,
+            "camera_instance_id": "mot-camera",
+            "sequencer_instance_id": "sequencer",
+        }
+    )
+    assert isinstance(request, MotFieldRequest)
+    assert request.camera_instance_id == "mot-camera"
+    assert request.sequencer_instance_id == "sequencer"
+    assert not hasattr(request, "camera_role")
+    assert LOGIC_NODE.device_requirements == (
+        ("camera_instance_id", (CAPABILITY_MOT_FIELD_CAPTURE,)),
+        ("sequencer_instance_id", (CAPABILITY_PULSE_EXECUTE,)),
+    )
+    assert tuple(output.name for output in LOGIC_NODE.outputs) == (
+        "grid",
+        "mot_field",
+        "scan",
+    )
+    assert LOGIC_NODE.ui_contributions == ()
+
+    program = build_mot_scan_program(
+        load_pulse_document(ROOT / "pulses" / request.pulse),
+        center_x=request.center_x,
+        center_y=request.center_y,
+        center_z=request.center_z,
+        span=request.span,
+        points=request.points,
+    )
+    assert program.point_table.row_count == 8
+    assert program.grid_topology.logical_shape == (2, 2, 2)
 
 
 def _faceted_card(console, signal_key: str):
@@ -178,7 +231,12 @@ def test_mot_field_form_runs_live_and_final_named_axis_grids(tmp_path: Path) -> 
             application,
             lambda: (
                 row.status_label.text().startswith("done")
-                and editor.form.status.text().startswith("done")
+                # The generic form re-enables its Start action at terminal and
+                # may therefore settle its local status to ``ready``.  The
+                # row is the lifecycle owner; the editor only needs to be
+                # non-running/non-error while the FINAL value is visible.
+                and not editor.form.stop_button.isEnabled()
+                and not editor.form.status.text().lower().startswith("error")
                 and (card := _faceted_card(console, final_key)) is not None
                 and _presented_value(card) is not None
             ),

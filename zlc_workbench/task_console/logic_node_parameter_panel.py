@@ -1,248 +1,299 @@
-"""One shared editor for TaskConsole measurement, processor, and task forms."""
+"""Descriptor-driven parameter form shared by every TaskConsole Logic node."""
 
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from importlib import import_module
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Mapping
 
 from PyQt5 import QtCore, QtWidgets
 
-from zlc_frontend.form import FormSpec
+from zlc_frontend.form import (
+    FormChoice,
+    FormFieldProps,
+    FormSpec,
+    project_authoring_form,
+)
 from zlc_frontend.qt_widgets import (
     ElidedLabel,
     FluentButton,
-    FluentComboBox,
-    FluentLabel,
+    FluentParameterForm,
+    FormRuntimeContext,
     GREEN,
     GREY,
     ORANGE,
     RED,
     scaled_px,
 )
-from zlc_frontend.qt_widgets import FluentParameterForm, FormRuntimeContext
+from zlc_neutral_atom.input_spec import ArtifactInputSpec, DatasetInputSpec
+from zlc_neutral_atom.installation import DeviceCatalogView
+from zlc_neutral_atom.logic_node import LogicNodeDescriptor
+from zlc_storage import resolve_under
 
 __all__ = ["LogicNodeParameterPanel"]
 
 
+def _device_choice_projection(
+    descriptor: LogicNodeDescriptor,
+    catalog: DeviceCatalogView,
+) -> dict[str, object]:
+    """Project grouped capabilities to stable instance-id choices once."""
+
+    requirements = dict(descriptor.device_requirements)
+    dynamic_keys = tuple(
+        field.key
+        for field in descriptor.authoring_schema.fields
+        if field.dynamic_choices
+    )
+    undeclared = set(dynamic_keys).difference(requirements)
+    if undeclared:
+        raise ValueError(
+            "dynamic authoring fields need descriptor device requirements; "
+            f"missing={tuple(sorted(undeclared))}"
+        )
+    projected: dict[str, object] = {}
+    for key in dynamic_keys:
+        capabilities = requirements[key]
+        devices = tuple(
+            info
+            for info in catalog.values()
+            if all(value in info.capabilities for value in capabilities)
+        )
+        choices = tuple(
+            FormChoice(
+                f"{info.role} · {info.type_id}  [{info.instance_id}]",
+                info.instance_id,
+            )
+            for info in devices
+        )
+        projected[key] = SimpleNamespace(
+            field_key=key,
+            choices=choices,
+            default=devices[0].instance_id if devices else None,
+            unavailable_reason=(
+                ""
+                if devices
+                else "no installed device provides " + ", ".join(capabilities)
+            ),
+        )
+    return projected
+
+
+def _input_fields(descriptor: LogicNodeDescriptor) -> tuple[FormFieldProps, ...]:
+    """Mechanically expose the two owner-declared input kinds."""
+
+    fields: list[FormFieldProps] = []
+    for spec in descriptor.input_specs:
+        if isinstance(spec, DatasetInputSpec):
+            fields.append(
+                FormFieldProps(
+                    spec.key,
+                    "signal",
+                    spec.label,
+                    required=True,
+                    description=spec.description,
+                )
+            )
+            continue
+        if not isinstance(spec, ArtifactInputSpec):
+            raise TypeError("descriptor contains another input kind")
+        if not spec.allow_saved_reference:
+            fields.append(
+                FormFieldProps(
+                    spec.producer_key,
+                    "signal",
+                    spec.label,
+                    required=True,
+                    description=spec.description,
+                )
+            )
+            continue
+        fields.extend(
+            (
+                FormFieldProps(
+                    spec.source_key,
+                    "choice",
+                    f"{spec.label} source",
+                    default="current",
+                    required=True,
+                    choices=(
+                        FormChoice("Current artifact", "current"),
+                        FormChoice("Task output", "producer"),
+                        FormChoice("Saved record", "saved"),
+                    ),
+                    description=spec.description,
+                ),
+                FormFieldProps(
+                    spec.producer_key,
+                    "signal",
+                    f"{spec.label} Task output",
+                    description="Used only when source is Task output.",
+                ),
+                FormFieldProps(
+                    spec.reference_path_key,
+                    "path",
+                    f"Saved {spec.label.lower()}",
+                    default=spec.default_reference_path,
+                    base_dir="",
+                    description=(
+                        "Project-relative record path; used only when source is Saved record."
+                    ),
+                ),
+            )
+        )
+    return tuple(fields)
+
+
+def _load_custom_form(
+    descriptor: LogicNodeDescriptor,
+    base_form: FormSpec,
+    *,
+    pulses_root: Path,
+):
+    structured = tuple(
+        field for field in descriptor.authoring_schema.fields
+        if field.kind == "structured"
+    )
+    contribution = next(
+        (
+            value
+            for value in descriptor.ui_contributions
+            if value.purpose == "task_console_editor"
+        ),
+        None,
+    )
+    if structured and contribution is None:
+        raise RuntimeError(
+            f"{descriptor.api_name!r} declares structured authoring without "
+            "one task_console_editor contribution"
+        )
+    if contribution is None:
+        return base_form, None
+    symbol = getattr(import_module(contribution.module), contribution.symbol)
+    if not callable(symbol):
+        raise TypeError("task_console_editor contribution must be callable")
+    built = symbol(base_form, pulses_root=pulses_root)
+    if not isinstance(built, tuple) or len(built) != 2:
+        raise TypeError("task_console_editor must return (form_spec, editor_factory)")
+    spec, factory = built
+    if not callable(factory):
+        raise TypeError("task_console_editor factory must be callable")
+    return spec, factory
+
+
 class LogicNodeParameterPanel(QtWidgets.QWidget):
-    """Render a catalog entry's one :class:`zlc_frontend.form.FormSpec`.
+    """Render one descriptor and return separate authored values/input refs."""
 
-    Catalog entries own declarations and request construction.  This widget
-    owns only stable Qt controls, validation feedback, and Start/Stop gestures.
-    """
-
-    start_requested = QtCore.pyqtSignal(object)
+    start_requested = QtCore.pyqtSignal()
     stop_requested = QtCore.pyqtSignal()
     draft_changed = QtCore.pyqtSignal()
 
     def __init__(
         self,
-        measurements: Sequence[object],
-        parent=None,
+        descriptor: LogicNodeDescriptor,
         *,
-        single: bool = False,
+        device_catalog: DeviceCatalogView,
+        project_root: Path,
+        pulses_root: Path,
+        runtime: FormRuntimeContext,
+        parent=None,
         controls: bool = True,
-        signals_provider=None,
-        signal_providers=None,
-        sources_provider=None,
-        formats_provider=None,
-        short_names_provider=None,
-        runtime: FormRuntimeContext | None = None,
     ) -> None:
+        if not isinstance(descriptor, LogicNodeDescriptor):
+            raise TypeError("descriptor must be LogicNodeDescriptor")
+        if not isinstance(device_catalog, DeviceCatalogView):
+            raise TypeError("device_catalog must be DeviceCatalogView")
+        if not isinstance(runtime, FormRuntimeContext):
+            raise TypeError("runtime must be FormRuntimeContext")
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
-        self._specs = list(measurements)
-        self._single = bool(single)
-        self._controls = bool(controls)
-        self._signals_provider = signals_provider
-        self._signal_providers = dict(signal_providers or {})
-        self._sources_provider = sources_provider
-        self._formats_provider = formats_provider
-        self._short_names_provider = short_names_provider
-        if runtime is not None and not isinstance(runtime, FormRuntimeContext):
-            raise TypeError("runtime must be FormRuntimeContext or None")
-        self._explicit_runtime = runtime
+        self._descriptor = descriptor
+        self._project_root = Path(project_root).resolve()
         self._running = False
-        self._parameter_form: QtWidgets.QWidget | None = None
+        inputs = _input_fields(descriptor)
+        base = project_authoring_form(
+            descriptor.authoring_schema,
+            dynamic_choices=_device_choice_projection(descriptor, device_catalog),
+        )
+        form_spec, editor_factory = _load_custom_form(
+            descriptor,
+            base,
+            pulses_root=Path(pulses_root).resolve(),
+        )
+        if editor_factory is None:
+            form = FluentParameterForm(
+                FormSpec((*form_spec.fields, *inputs)),
+                parent=self,
+                runtime=runtime,
+            )
+        else:
+            form = editor_factory(runtime=runtime, input_fields=inputs, parent=self)
+            if not isinstance(form, QtWidgets.QWidget):
+                raise TypeError("task_console_editor must build a QWidget")
+            for name in ("changed", "read_all", "populate", "refresh", "spec"):
+                if not hasattr(form, name):
+                    raise TypeError(f"custom Logic form lacks {name}")
+        expected = set(descriptor.authoring_schema.keys)
+        expected.update(key for spec in descriptor.input_specs for key in spec.field_keys)
+        actual = set(form.spec.keys)
+        if actual != expected:
+            raise RuntimeError(
+                "Logic form differs from descriptor-owned fields; "
+                f"missing={tuple(sorted(expected - actual))}, "
+                f"extra={tuple(sorted(actual - expected))}"
+            )
+        self._parameter_form = form
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(scaled_px(6, minimum=4))
-
-        picker = QtWidgets.QHBoxLayout()
-        picker.setSpacing(scaled_px(6, minimum=4))
-        self._pick_label = FluentLabel("measurement")
-        self._pick_label.setStyleSheet(
-            f"color: {GREY}; background: transparent; border: none;"
-        )
-        self.type_combo = FluentComboBox()
-        self.type_combo.setMinimumWidth(scaled_px(220, minimum=160))
-        for index, spec in enumerate(self._specs):
-            self.type_combo.addItem(str(spec.name), index)
-        self.type_combo.activated.connect(lambda *_: self._rebuild_form())
-        picker.addWidget(self._pick_label)
-        picker.addWidget(self.type_combo, 1)
-        root.addLayout(picker)
-        if self._single:
-            self._pick_label.hide()
-            self.type_combo.hide()
-
-        self._form_host = QtWidgets.QVBoxLayout()
-        self._form_host.setContentsMargins(0, 0, 0, 0)
-        root.addLayout(self._form_host)
-
+        root.addWidget(form)
         actions = QtWidgets.QHBoxLayout()
         self.start_button = FluentButton("Start", color=GREEN)
         self.stop_button = FluentButton("Stop", color=ORANGE)
         self.start_button.clicked.connect(self._on_start)
-        self.stop_button.clicked.connect(lambda: self.stop_requested.emit())
+        self.stop_button.clicked.connect(self.stop_requested.emit)
         self.stop_button.setEnabled(False)
         actions.addWidget(self.start_button)
         actions.addWidget(self.stop_button)
         actions.addStretch(1)
         root.addLayout(actions)
-        if not self._controls:
+        if not controls:
             self.start_button.hide()
             self.stop_button.hide()
-
         self.status = ElidedLabel("")
-        self.status.setMinimumWidth(0)
-        self.status.setSizePolicy(
-            QtWidgets.QSizePolicy.Ignored,
-            QtWidgets.QSizePolicy.Preferred,
-        )
         root.addWidget(self.status)
-
-        if self._specs:
-            self._rebuild_form()
-
-    def current_spec(self):
-        index = self.type_combo.currentData()
-        if index is None or not self._specs:
-            return None
-        return self._specs[int(index)]
-
-    def _runtime(self) -> FormRuntimeContext:
-        if self._explicit_runtime is not None:
-            return self._explicit_runtime
-        def names(key: str):
-            provider = self._signal_providers.get(key, self._signals_provider)
-            return provider() if callable(provider) else ()
-
-        return FormRuntimeContext(
-            signal_names=names,
-            signal_sources=self._sources_provider,
-            signal_formats=self._formats_provider,
-            signal_labels=self._short_names_provider,
-        )
-
-    def _clear_form(self) -> None:
-        while self._form_host.count():
-            item = self._form_host.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                # The replacement is performed on a potentially visible Edit
-                # page.  Keep the old form parented until DeferredDelete so a
-                # dynamic catalog refresh cannot flash it as a top-level.
-                widget.hide()
-                widget.deleteLater()
-        self._parameter_form = None
-
-    def _rebuild_form(self) -> None:
-        self._clear_form()
-        spec = self.current_spec()
-        if spec is None:
-            return
-        editor_factory = spec.editor_factory
-        if editor_factory is None:
-            form = FluentParameterForm(
-                FormSpec(tuple(spec.editor_fields)),
-                parent=self,
-                runtime=self._runtime(),
-            )
-        else:
-            form = editor_factory(
-                runtime=self._runtime(),
-                input_fields=spec.input_fields,
-                parent=self,
-            )
-            if not isinstance(form, QtWidgets.QWidget):
-                raise TypeError("console editor_factory must return QWidget")
-            for name in ("changed", "read_all", "refresh"):
-                if not hasattr(form, name):
-                    raise TypeError(
-                        f"console editor_factory result lacks {name}"
-                    )
-        form.changed.connect(self._on_form_changed)
-        self._parameter_form = form
-        self._form_host.addWidget(form)
+        form.changed.connect(self._on_changed)
         self._refresh_start_enabled()
 
-    def _on_form_changed(self, *_args) -> None:
-        """Report an edited draft without materialising a config snapshot.
-
-        The containing Workbench decides when that draft crosses an authored
-        commit boundary (Apply, Start, Save, or tab close).  Keeping this signal
-        value-free is deliberate: ordinary typing must never rebuild a Logic
-        node or manufacture a cross-thread snapshot.
-        """
-
+    def _on_changed(self, *_args) -> None:
         self._refresh_start_enabled()
         self.draft_changed.emit()
 
-    def collect_values(self) -> dict[str, object]:
-        if self._parameter_form is None:
-            return {}
-        return self._parameter_form.read_all()
-
-    def refresh_on_show(self) -> None:
-        if self._parameter_form is not None:
-            self._parameter_form.refresh()
-        self._refresh_start_enabled()
-
-    def set_axis_range(self, lo: float, hi: float) -> bool:
-        form = self._parameter_form
-        if form is None:
-            return False
-        for field in form.spec.fields:
-            if field.kind != "axis_range":
-                continue
-            widget = form.widget_for(field.key)
-            widget.min_spin.setValue(float(min(lo, hi)))
-            widget.max_spin.setValue(float(max(lo, hi)))
-            return True
-        return False
-
-    def _missing_required(self) -> list[str]:
-        form = self._parameter_form
-        if form is None:
-            return []
-        specialized = getattr(form, "missing_required_labels", None)
+    def _missing_required(self) -> tuple[str, ...]:
+        specialized = getattr(self._parameter_form, "missing_required_labels", None)
         if callable(specialized):
-            return list(specialized())
-        return [
+            return tuple(specialized())
+        return tuple(
             field.label
-            for field in form.spec.fields
-            if (
-                field.required
-                and form.is_empty(field.key)
-                and not field.required_choice_unavailable
-            )
-        ]
+            for field in self._parameter_form.spec.fields
+            if field.required
+            and self._parameter_form.is_empty(field.key)
+            and not field.required_choice_unavailable
+        )
 
     def _unavailable_reasons(self) -> tuple[str, ...]:
-        form = self._parameter_form
-        if form is None:
-            return ()
-        specialized = getattr(form, "unavailable_reasons", None)
+        specialized = getattr(self._parameter_form, "unavailable_reasons", None)
         if callable(specialized):
-            return tuple(str(reason) for reason in specialized() if str(reason))
+            return tuple(str(value) for value in specialized() if str(value))
         return tuple(
             field.unavailable_reason
-            for field in form.spec.fields
+            for field in self._parameter_form.spec.fields
             if field.required_choice_unavailable
         )
 
-    def _refresh_start_enabled(self, *_args) -> None:
+    def _refresh_start_enabled(self) -> None:
         if self._running:
             return
         missing = self._missing_required()
@@ -252,50 +303,107 @@ class LogicNodeParameterPanel(QtWidgets.QWidget):
             self.set_status("set required: " + ", ".join(missing), error=True)
         elif unavailable:
             self.set_status("unavailable: " + "; ".join(unavailable), error=True)
-        elif not self.status.text().startswith(("running", "done", "fit", "failed", "T")):
+        else:
             self.set_status("ready", error=False)
 
     def _on_start(self) -> None:
-        if (
-            self.current_spec() is not None
-            and not self._missing_required()
-            and not self._unavailable_reasons()
-        ):
-            self.start_requested.emit(self)
+        if not self._missing_required() and not self._unavailable_reasons():
+            self.start_requested.emit()
 
-    def seed_values(self, values: Mapping[str, object]) -> None:
-        form = self._parameter_form
-        if form is None:
-            return
-        if not isinstance(values, Mapping):
-            raise TypeError("logic-node values must be a mapping")
-        unknown = set(values) - set(form.spec.keys)
-        if unknown:
-            raise ValueError(
-                "logic-node values contain fields absent from the selected "
-                f"definition: {tuple(sorted(map(str, unknown)))}"
+    def collect_binding(self) -> tuple[dict[str, object], dict[str, object]]:
+        values = self._parameter_form.read_all()
+        authored = self._descriptor.authoring_schema.freeze(
+            {key: values[key] for key in self._descriptor.authoring_schema.keys}
+        )
+        inputs: dict[str, object] = {}
+        for spec in self._descriptor.input_specs:
+            if isinstance(spec, DatasetInputSpec):
+                selected = values[spec.key]
+                if not isinstance(selected, str) or not selected.strip():
+                    raise ValueError(f"select {spec.label}")
+                inputs[spec.key] = selected.strip()
+                continue
+            if not spec.allow_saved_reference:
+                selected = values[spec.producer_key]
+                if not isinstance(selected, str) or not selected.strip():
+                    raise ValueError(f"select {spec.label}")
+                inputs[spec.key] = selected.strip()
+                continue
+            source = values[spec.source_key]
+            if source == "current":
+                continue
+            if source == "producer":
+                selected = values[spec.producer_key]
+                if not isinstance(selected, str) or not selected.strip():
+                    raise ValueError(f"select a {spec.label} Task output")
+                inputs[spec.key] = selected.strip()
+                continue
+            if source != "saved":
+                raise ValueError(f"unknown {spec.label} source {source!r}")
+            raw = values[spec.reference_path_key]
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError(f"select a saved {spec.label.lower()}")
+            path = Path(raw).expanduser()
+            relative = (
+                path.resolve().relative_to(self._project_root)
+                if path.is_absolute()
+                else path
             )
-        merged = form.spec.default_values()
-        for key in form.spec.keys:
-            if key in values:
-                merged[key] = values[key]
-        # FluentParameterForm.populate() validates the complete value before it
-        # touches any QWidget.  A saved physical request is therefore restored
-        # exactly or rejected as a whole; no field may silently fall back.
-        form.populate(merged)
+            inputs[spec.key] = relative.as_posix()
+            resolve_under(self._project_root, relative)
+        return authored, inputs
+
+    def seed_binding(
+        self,
+        authored: Mapping[str, object],
+        inputs: Mapping[str, object],
+    ) -> None:
+        if not isinstance(authored, Mapping) or not isinstance(inputs, Mapping):
+            raise TypeError("authored values and input refs must be mappings")
+        values = self._parameter_form.spec.default_values()
+        values.update(authored)
+        for spec in self._descriptor.input_specs:
+            selected = inputs.get(spec.key)
+            if isinstance(spec, DatasetInputSpec):
+                if selected is not None:
+                    values[spec.key] = selected
+                continue
+            if not spec.allow_saved_reference:
+                if selected is not None:
+                    values[spec.producer_key] = selected
+                continue
+            if selected is None:
+                values[spec.source_key] = "current"
+            elif isinstance(selected, str) and selected.startswith("@logic/"):
+                values[spec.source_key] = "producer"
+                values[spec.producer_key] = selected
+            else:
+                values[spec.source_key] = "saved"
+                values[spec.reference_path_key] = str(selected)
+        self._parameter_form.populate(values)
         self._refresh_start_enabled()
+
+    def refresh_on_show(self) -> None:
+        self._parameter_form.refresh()
+        self._refresh_start_enabled()
+
+    def set_axis_range(self, lo: float, hi: float) -> bool:
+        for field in self._parameter_form.spec.fields:
+            if field.kind != "axis_range":
+                continue
+            widget = self._parameter_form.widget_for(field.key)
+            widget.min_spin.setValue(float(min(lo, hi)))
+            widget.max_spin.setValue(float(max(lo, hi)))
+            return True
+        return False
 
     def set_running(self, running: bool) -> None:
         self._running = bool(running)
         self.start_button.setEnabled(
-            not running
-            and not self._missing_required()
-            and not self._unavailable_reasons()
+            not running and not self._missing_required() and not self._unavailable_reasons()
         )
         self.stop_button.setEnabled(bool(running))
-        self.type_combo.setEnabled(not running)
-        if self._parameter_form is not None:
-            self._parameter_form.setEnabled(not running)
+        self._parameter_form.setEnabled(not running)
 
     def set_status(self, text: str, *, error: bool) -> None:
         self.status.setText(str(text))

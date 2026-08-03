@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import threading
-from typing import Callable
 import uuid
 
 import numpy as np
@@ -58,10 +56,9 @@ from zlc_neutral_atom.capture.binding import (
 from zlc_neutral_atom.runtime.cleanup import CleanupReport, run_cleanup_steps
 from zlc_neutral_atom.runtime.preview import (
     ExactDatasetPreviewPort,
-    ExactDatasetPreviewSpec,
     notify_preview_failure,
 )
-from zlc_neutral_atom.runtime.run import RunHandle, RunPlan
+from zlc_neutral_atom.runtime.run import RunPlan
 from zlc_storage import positive_integer
 
 from .definition import (
@@ -245,104 +242,6 @@ class _FiniteCameraLiveProjection:
         return outputs
 
 
-class PreparedFiniteCameraMeasurement:
-    """Passive finite form of the one public Camera Measurement."""
-
-    __slots__ = (
-        "_lock",
-        "_pipeline",
-        "_captures_root",
-        "_request",
-        "_start_run",
-        "_started",
-    )
-
-    def __init__(
-        self,
-        pipeline: MinimalPipelineSpec,
-        captures_root: Path,
-        start_run: Callable[[RunPlan], RunHandle],
-        request: CameraMeasurementRequest,
-    ) -> None:
-        if not isinstance(pipeline, MinimalPipelineSpec):
-            raise TypeError("pipeline must be MinimalPipelineSpec")
-        if not isinstance(request, CameraMeasurementRequest):
-            raise TypeError("request must be CameraMeasurementRequest")
-        if not isinstance(captures_root, Path):
-            raise TypeError("captures_root must be Path")
-        if not callable(start_run):
-            raise TypeError("start_run must be callable")
-        self._pipeline = pipeline
-        self._captures_root = captures_root.expanduser().resolve()
-        self._start_run = start_run
-        self._request = request
-        self._lock = threading.Lock()
-        self._started = False
-
-    @property
-    def preview_spec(self) -> ExactDatasetPreviewSpec:
-        source_schema = self._pipeline.capture.capture_contract.dataset_schema
-        return ExactDatasetPreviewSpec(source_schema.fingerprint)
-
-    def live_projection(self) -> _FiniteCameraLiveProjection:
-        source_schema = self._pipeline.capture.capture_contract.dataset_schema
-        return _FiniteCameraLiveProjection(self._request, source_schema)
-
-    def final_dataset_outputs(self, reference: CaptureArtifactRef):
-        """Materialize the request-owned Camera outputs from its FINAL ref."""
-
-        if not isinstance(reference, CaptureArtifactRef):
-            raise TypeError("Camera FINAL result must be CaptureArtifactRef")
-        source = load_capture_artifact(
-            self._captures_root,
-            reference,
-            materialize=True,
-        ).materialize_snapshot()
-        return camera_measurement_final_outputs(
-            reference,
-            source,
-            self._request,
-        )
-
-    def start(
-        self,
-        exact_preview: ExactDatasetPreviewPort | None = None,
-        *,
-        lifecycle_owner: object | None = None,
-    ) -> RunHandle:
-        try:
-            self._claim_start()
-            plan = (
-                compile_capture_artifact_pipeline(
-                    self._pipeline,
-                    self._captures_root,
-                    exact_preview=exact_preview,
-                )
-                if self._request.exposure_seconds is None
-                else _compile_exposure_configured_camera_artifact(
-                    self._request,
-                    self._pipeline,
-                    self._captures_root,
-                    exact_preview=exact_preview,
-                )
-            )
-            return self._start_run(
-                plan.with_lifecycle(
-                    owner=self if lifecycle_owner is None else lifecycle_owner,
-                    preemptible=False,
-                )
-            )
-        except BaseException as error:
-            notify_preview_failure(exact_preview, error)
-            raise
-
-    def _claim_start(self) -> None:
-        with self._lock:
-            if self._started:
-                raise RuntimeError("PreparedFiniteCameraMeasurement is one-shot")
-            self._started = True
-
-
 @dataclass
 class _ConfiguredFiniteCapture:
     exposure_session_id: str
@@ -354,7 +253,7 @@ class _ConfiguredFiniteCapture:
 def _compile_exposure_configured_camera_artifact(
     request: CameraMeasurementRequest,
     pipeline: MinimalPipelineSpec,
-    captures_root: Path,
+    project_root: Path,
     *,
     exact_preview: ExactDatasetPreviewPort | None = None,
 ) -> RunPlan:
@@ -383,7 +282,7 @@ def _compile_exposure_configured_camera_artifact(
             )
             inner = compile_capture_artifact_pipeline(
                 pipeline,
-                captures_root,
+                project_root,
                 exact_preview=exact_preview,
                 settle_exact_preview=False,
             )
@@ -458,7 +357,7 @@ def _compile_exposure_configured_camera_artifact(
         inner.dispose_unfinalized(result)
 
     return RunPlan(
-        name=f"Camera {request.camera_ref.role}",
+        name=f"Camera {request.camera_instance_id}",
         resource_claims=(port.resource_claim,),
         bound_devices=(port.device,),
         preflight=preflight,
@@ -525,7 +424,7 @@ def bind_finite_camera_measurement(
     camera_capture = bind_camera_capture(
         camera_port,
         CameraCaptureBindingRequest(
-            request.camera_ref.role,
+            request.camera_instance_id,
             schema,
             schedule,
             CameraAcquisitionMode.EXTERNAL_TRIGGERED,
@@ -533,36 +432,62 @@ def bind_finite_camera_measurement(
         ),
     )
     pipeline = MinimalPipelineSpec(
-        f"Camera {request.camera_ref.role}",
+        f"Camera {request.camera_instance_id}",
         camera_capture,
-        BlockId(f"camera-{schema.fingerprint[:20]}"),
+        BlockId(f"camera-{uuid.uuid4().hex}"),
     )
     return pipeline
 
 
-def prepare_finite_camera_measurement(
+def compile_finite_camera_measurement(
     request: CameraMeasurementRequest,
     *,
-    camera_port: BoundCapturePort,
-    captures_root: Path,
-    start_run: Callable[[RunPlan], RunHandle],
-) -> PreparedFiniteCameraMeasurement:
-    """Prepare the finite branch of the one public Camera Measurement."""
+    pipeline: MinimalPipelineSpec,
+    project_root: Path,
+    exact_preview: ExactDatasetPreviewPort | None = None,
+) -> RunPlan:
+    """Compile the finite completion policy over one bound Camera pipeline."""
 
-    pipeline = bind_finite_camera_measurement(
-        request,
-        camera_port=camera_port,
+    if not isinstance(request, CameraMeasurementRequest):
+        raise TypeError("request must be CameraMeasurementRequest")
+    if not isinstance(pipeline, MinimalPipelineSpec):
+        raise TypeError("pipeline must be MinimalPipelineSpec")
+    root = Path(project_root).expanduser().resolve()
+    return (
+        compile_capture_artifact_pipeline(
+            pipeline,
+            root,
+            exact_preview=exact_preview,
+        )
+        if request.exposure_seconds is None
+        else _compile_exposure_configured_camera_artifact(
+            request,
+            pipeline,
+            root,
+            exact_preview=exact_preview,
+        )
     )
-    return PreparedFiniteCameraMeasurement(
-        pipeline,
-        captures_root,
-        start_run,
-        request,
-    )
+
+
+def finite_camera_outputs(
+    project_root: Path,
+    reference: CaptureArtifactRef,
+    request: CameraMeasurementRequest,
+):
+    """Materialize FINAL siblings from the record-last Capture artifact."""
+
+    if not isinstance(reference, CaptureArtifactRef):
+        raise TypeError("Camera FINAL result must be CaptureArtifactRef")
+    source = load_capture_artifact(
+        Path(project_root).expanduser().resolve(),
+        reference,
+        materialize=True,
+    ).materialize_snapshot()
+    return camera_measurement_final_outputs(source, request)
 
 
 __all__ = [
-    "PreparedFiniteCameraMeasurement",
     "bind_finite_camera_measurement",
-    "prepare_finite_camera_measurement",
+    "compile_finite_camera_measurement",
+    "finite_camera_outputs",
 ]

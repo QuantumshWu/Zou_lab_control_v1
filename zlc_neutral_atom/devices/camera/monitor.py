@@ -23,7 +23,6 @@ from zlc_storage import (
     canonical_text,
     positive_integer,
     positive_real,
-    sha256_text,
 )
 
 from .capture_port import (
@@ -50,15 +49,7 @@ class CameraMonitorInterrupted(RuntimeError):
 
 @dataclass(frozen=True)
 class CameraMonitorCapabilitySnapshot(CaptureCapabilitySnapshot):
-    """The same camera capability, with its live acquisition mode attached.
-
-    ``capability_fingerprint`` remains the fingerprint inherited from
-    :class:`CaptureCapabilitySnapshot`: capture and live observation are two
-    operations on one physical camera, not two device identities.  The mode is
-    still checked by the monitor command path, but must not mint a second
-    capability digest that a finite capture artifact cannot reconstruct from
-    the camera's persisted physical evidence.
-    """
+    """The same typed camera capability with its live mode attached."""
 
     acquisition_mode: CameraAcquisitionMode
 
@@ -70,15 +61,11 @@ class CameraMonitorCapabilitySnapshot(CaptureCapabilitySnapshot):
 @dataclass(frozen=True)
 class PrepareCameraMonitorCommand:
     session_id: str
-    capability_fingerprint: str
-    settings_fingerprint: str
     buffer_frame_count: int
     timeout_seconds: float
 
     def __post_init__(self) -> None:
         canonical_text(self.session_id, "session_id")
-        sha256_text(self.capability_fingerprint, "capability_fingerprint")
-        sha256_text(self.settings_fingerprint, "settings_fingerprint")
         object.__setattr__(
             self,
             "buffer_frame_count",
@@ -95,14 +82,10 @@ class PrepareCameraMonitorCommand:
 class CameraMonitorPreparedAck:
     session_id: str
     binding_instance_id: str
-    settings_fingerprint: str
-    capability_fingerprint: str
 
     def __post_init__(self) -> None:
         canonical_text(self.session_id, "session_id")
         canonical_text(self.binding_instance_id, "binding_instance_id")
-        sha256_text(self.settings_fingerprint, "settings_fingerprint")
-        sha256_text(self.capability_fingerprint, "capability_fingerprint")
 
 
 @dataclass(frozen=True)
@@ -247,6 +230,21 @@ class BoundCameraMonitorPort:
             _leased_capability=capability,
             _exposure_session_id=acknowledgement.session_id,
         )
+
+    def require_current_capability(self) -> CameraMonitorCapabilitySnapshot:
+        """Validate the stable binding behind this baseline or leased view."""
+
+        baseline = self.capability_attestation.snapshot
+        if self.device.validate_capability(self.capability_attestation) is not baseline:
+            raise RuntimeError("camera monitor capability attestation snapshot changed")
+        capability = self.capability
+        if self._leased_capability is not None:
+            _admit_exposure_leased_capability(
+                baseline,
+                capability,
+                self._exposure_session_id,
+            )
+        return capability
 
     @property
     def resource_claim(self) -> ResourceClaim:

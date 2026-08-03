@@ -195,7 +195,7 @@ def _calibration_contracts(
     )
     layout = CalibrationCaptureLayout(AxisId(f"{namespace}-event"), (0, 2), 1)
     source_binding = CalibrationSourceBinding(
-        CaptureArtifactRef(f"{namespace}/capture.json"),
+        CaptureArtifactRef(f"runs/camera/{namespace}/capture.json"),
         layout,
     )
     frame_contract = FrameContract(
@@ -215,7 +215,6 @@ def _calibration_contracts(
         0.005,
         1.0,
         "external-trigger",
-        None,
         frame_schema,
     )
     request = CalibrationAnalysisRequest(

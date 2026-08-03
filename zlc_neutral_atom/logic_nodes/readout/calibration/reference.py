@@ -1,23 +1,22 @@
-"""Leaf-owned calibration artifact identity and strict current codec."""
+"""Leaf-owned path identity for durable Calibration results."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from zlc_storage import canonical_text, encode
+from zlc_storage import canonical_text, resolve_under
 
 
 CALIBRATION_ARTIFACT_REF_FORMAT = (
     "zlc_neutral_atom.logic_nodes.readout.calibration.artifact-ref"
 )
-CALIBRATION_ARTIFACT_NAMESPACE = "calibration"
 
 
 @dataclass(frozen=True, order=True, slots=True)
 class CalibrationArtifactRef:
-    """Path to ``calibration.json`` relative to the Calibration output root."""
+    """Project-relative path to one readable Calibration record."""
 
     record_path: str
 
@@ -31,16 +30,50 @@ class CalibrationArtifactRef:
             or path.as_posix() != value
             or any(part in {"", ".", ".."} for part in path.parts)
         ):
-            raise ValueError("record_path must stay beneath the Calibration output root")
-        if path.name != "calibration.json" or len(path.parts) != 2:
+            raise ValueError("record_path must stay beneath the project root")
+        if (
+            path.name != "calibration.json"
+            or len(path.parts) != 4
+            or path.parts[:2] != ("tasks", "calibration")
+        ):
             raise ValueError(
-                "record_path must be '<run-name>/calibration.json'"
+                "record_path must be "
+                "'tasks/calibration/<run-name>/calibration.json'"
             )
+        canonical_text(path.parts[2], "calibration run-name")
         object.__setattr__(self, "record_path", path.as_posix())
 
     @property
     def target_ref(self) -> str:
-        return f"{CALIBRATION_ARTIFACT_NAMESPACE}/{self.record_path}"
+        return self.record_path
+
+
+def calibration_artifact_ref_from_input(
+    project_root: str | Path,
+    value: CalibrationArtifactRef | str | Path,
+) -> CalibrationArtifactRef:
+    """Resolve one host-frozen current, Task-output, or saved-record input."""
+
+    if isinstance(value, CalibrationArtifactRef):
+        return value
+    if not isinstance(value, (str, Path)):
+        raise TypeError("Calibration input must be an artifact ref or record path")
+    project = Path(project_root).expanduser()
+    if not project.is_absolute():
+        raise ValueError("project_root must be absolute")
+    project = project.resolve()
+    authored = Path(value).expanduser()
+    if authored.is_absolute():
+        record = authored.resolve()
+        try:
+            record.relative_to(project)
+        except ValueError as error:
+            raise ValueError(
+                "Calibration record must stay below project_root"
+            ) from error
+    else:
+        record = resolve_under(project, authored)
+    return CalibrationArtifactRef(record.relative_to(project).as_posix())
 
 
 def calibration_artifact_ref_to_tree(value: CalibrationArtifactRef) -> dict[str, Any]:
@@ -59,20 +92,13 @@ def calibration_artifact_ref_from_tree(tree: Any) -> CalibrationArtifactRef:
     if tree["schema"] != CALIBRATION_ARTIFACT_REF_FORMAT:
         raise ValueError("CalibrationArtifactRef format is not current")
     value = CalibrationArtifactRef(canonical_text(tree["record_path"], "record_path"))
-    if calibration_artifact_ref_to_tree(value) != tree:
-        raise ValueError("CalibrationArtifactRef tree is typed but non-canonical")
     return value
 
 
-def encode_calibration_artifact_ref(value: CalibrationArtifactRef) -> bytes:
-    return encode(calibration_artifact_ref_to_tree(value))
-
-
 __all__ = [
-    "CALIBRATION_ARTIFACT_NAMESPACE",
     "CALIBRATION_ARTIFACT_REF_FORMAT",
     "CalibrationArtifactRef",
+    "calibration_artifact_ref_from_input",
     "calibration_artifact_ref_from_tree",
     "calibration_artifact_ref_to_tree",
-    "encode_calibration_artifact_ref",
 ]

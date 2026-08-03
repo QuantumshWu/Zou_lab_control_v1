@@ -52,7 +52,6 @@ from zlc_pulse import (
     load_pulse_document,
     pulse_target_manifest_from_lanes,
 )
-from zlc_storage import canonical_digest
 
 
 _ROOT = Path(__file__).parents[1]
@@ -69,7 +68,6 @@ class _Camera:
 
     def capture_working_point(self) -> CameraWorkingPoint:
         return CameraWorkingPoint(
-            canonical_digest({"fixture": "capture-artifact-camera"}),
             "EXTERNAL_TRIGGERED",
             (3, 4),
             (3, 4),
@@ -188,9 +186,7 @@ class _CaptureCase:
         camera_endpoint = CameraCaptureEndpoint(
             self.camera,
             "camera",
-            exact_external_trigger_qualification_digest=canonical_digest(
-                {"qualification": "deterministic fixture adapter"}
-            ),
+            exact_external_trigger_qualified=True,
         )
         camera_port = BoundCapturePort(
             _bind_endpoint(
@@ -239,6 +235,7 @@ class _CaptureCase:
                 AxisId("scan-ordinal"),
                 readout_events_per_repeat=3,
             ),
+            camera_instance_id="camera",
         )
         pipeline = MinimalPipelineSpec(
             "persist current exact capture",
@@ -252,7 +249,7 @@ class _CaptureCase:
             binding.trigger_channel,
             binding.cell_plan,
         )
-        self.captures_root = tmp_path / "captures"
+        self.project_root = tmp_path
         self.resources = ResourceArbiter()
         self.controller = RunController(self.resources)
         self.handle = None
@@ -261,7 +258,7 @@ class _CaptureCase:
         self.handle = self.controller.start(
             compile_capture_artifact_pipeline(
                 self.triggered,
-                self.captures_root,
+                self.project_root,
             )
         )
         return self.handle.result(5.0)
@@ -279,7 +276,7 @@ def test_exact_pipeline_commits_and_reloads_multidimensional_capture(tmp_path) -
     try:
         reference = case.run()
         assert isinstance(reference, CaptureArtifactRef)
-        artifact = load_capture_artifact(case.captures_root, reference)
+        artifact = load_capture_artifact(case.project_root, reference)
         block = artifact.materialize_snapshot().block
         assert block.values.shape == (1, 3, 3, 4)
         assert tuple(
@@ -321,27 +318,39 @@ def test_capture_record_is_the_only_visibility_boundary(
     case = _CaptureCase(tmp_path)
     try:
         reference = case.run()
-        record_path = case.captures_root / reference.record_path
+        record_path = case.project_root / reference.record_path
         assert record_writes == [record_path]
-        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record_text = record_path.read_text(encoding="utf-8")
+        record = json.loads(record_text)
         assert set(record) == {
             "schema",
             "run_id",
             "frames",
             "provenance",
             "terminal",
-            "camera_provenance",
-            "camera_capability_evidence",
-            "camera_arm_spec",
-            "compiled_pulse_file",
-            "pulse_evidence",
+            "camera",
+            "capture",
+            "pulse",
         }
-        assert record["camera_provenance"]["binding_stamp"][
-            "physical_identity"
-        ] == {
-            "stable_device_identity": "fixture-camera",
-            "evidence_kind": "INSTALLATION_ASSERTED_ENDPOINT",
-        }
+        assert record["camera"]["camera_identity"] == "fixture-camera"
+        assert record["camera"]["binding"] == "camera"
+        assert record["terminal"]["produced_count"] == 3
+        assert record["terminal"]["drained_count"] == 3
+        assert record["capture"]["mode"] == "EXTERNAL_TRIGGERED"
+        assert record["capture"]["expected_frames"] == 3
+        assert record["pulse"]["compiled_pulse_file"] == "pulse.bin"
+        assert "$zlc-bytes" not in record_text
+        ordinary_record = json.dumps(
+            {
+                "frames": record["frames"],
+                "provenance": record["provenance"],
+                "terminal": record["terminal"],
+                "camera": record["camera"],
+                "capture": record["capture"],
+            }
+        )
+        assert "fingerprint" not in ordinary_record
+        assert "digest" not in ordinary_record
         assert (record_path.parent / "frames.npy").is_file()
         assert (record_path.parent / "pulse.bin").is_file()
         frames = np.load(record_path.parent / "frames.npy", allow_pickle=False)
@@ -355,7 +364,7 @@ def test_failed_terminal_count_never_publishes_a_capture_record(tmp_path) -> Non
     try:
         with pytest.raises(RunFailed, match="terminal"):
             case.run()
-        assert not tuple((tmp_path / "captures").glob("*/capture.json"))
+        assert not tuple((tmp_path / "runs" / "camera").glob("*/capture.json"))
     finally:
         case.close()
 
@@ -364,8 +373,8 @@ def test_lazy_frame_read_rejects_a_broken_array(tmp_path) -> None:
     case = _CaptureCase(tmp_path)
     try:
         reference = case.run()
-        artifact = load_capture_artifact(case.captures_root, reference)
-        (case.captures_root / reference.record_path).parent.joinpath(
+        artifact = load_capture_artifact(case.project_root, reference)
+        (case.project_root / reference.record_path).parent.joinpath(
             "frames.npy"
         ).write_bytes(b"broken")
         with pytest.raises((OSError, ValueError)):
@@ -375,7 +384,7 @@ def test_lazy_frame_read_rejects_a_broken_array(tmp_path) -> None:
 
 
 def test_capture_ref_has_one_strict_leaf_owner() -> None:
-    reference = CaptureArtifactRef("run-001/capture.json")
+    reference = CaptureArtifactRef("runs/camera/run-001/capture.json")
     assert capture_artifact_ref_from_tree(
         capture_artifact_ref_to_tree(reference)
     ) == reference
@@ -386,31 +395,17 @@ def test_capture_ref_has_one_strict_leaf_owner() -> None:
     assert capture_artifact_ref_from_tree(tree) == reference
     with pytest.raises(ValueError, match="unknown field"):
         capture_artifact_ref_from_tree({**tree, "legacy_generation": 1})
+
+
 def test_capture_record_unknown_fields_are_rejected(tmp_path) -> None:
     case = _CaptureCase(tmp_path)
     try:
         reference = case.run()
-        record_path = case.captures_root / reference.record_path
+        record_path = case.project_root / reference.record_path
         record = json.loads(record_path.read_text(encoding="utf-8"))
         record["legacy_checkpoint_kind"] = "CHECKPOINT"
         record_path.write_text(json.dumps(record), encoding="utf-8")
         with pytest.raises(ValueError, match="CaptureArtifact"):
-            load_capture_artifact(case.captures_root, reference)
-    finally:
-        case.close()
-
-
-def test_capture_provenance_rejects_a_legacy_identity_digest(tmp_path) -> None:
-    case = _CaptureCase(tmp_path)
-    try:
-        reference = case.run()
-        record_path = case.captures_root / reference.record_path
-        record = json.loads(record_path.read_text(encoding="utf-8"))
-        record["camera_provenance"]["binding_stamp"]["physical_identity"][
-            "evidence_digest"
-        ] = "retired-identity-digest"
-        record_path.write_text(json.dumps(record), encoding="utf-8")
-        with pytest.raises(ValueError, match="physical device identity"):
-            load_capture_artifact(case.captures_root, reference)
+            load_capture_artifact(case.project_root, reference)
     finally:
         case.close()

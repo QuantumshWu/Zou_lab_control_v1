@@ -218,6 +218,7 @@ def bind_release_recapture_camera(
     scan_point_table: PointTable,
     scan_grid_topology: GridTopology | None,
     calibration: ResolvedCalibration,
+    camera_instance_id: str,
 ) -> tuple[PulseDocument, TriggeredCameraBinding]:
     """Bind the shared two-image physical acquisition, once, for both domains."""
 
@@ -249,6 +250,7 @@ def bind_release_recapture_camera(
             scan_point_table=scan_point_table,
             scan_grid_topology=scan_grid_topology,
         ),
+        camera_instance_id=camera_instance_id,
     )
     validate_live_release_recapture_calibration(binding, calibration)
     return logical_document, binding

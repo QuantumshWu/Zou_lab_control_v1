@@ -1,15 +1,12 @@
 """Public experiment API for headless, scripted, and desktop clients."""
 
 from .facade import (
-    CaptureArtifactRef,
-    CaptureRequest,
     connect,
     device_manager,
     DeviceInstanceConfig,
     Experiment,
     InstallationConfigDocument,
     installation_template,
-    PlanDescriptor,
     PreparedPulseExecution,
     PulseFacade,
     PulseRunDescriptor,
@@ -18,19 +15,15 @@ from .facade import (
     PulseTargetDescriptor,
     WorkspacePaths,
 )
-from ._readout_core import ReadoutFacade
-from ._logic_node_api import LogicNodeApis
+from ._logic_node_api import LogicNodeApis, NodeApi
 
 __all__ = [
-    "CaptureArtifactRef",
-    "CaptureRequest",
     "connect",
     "device_manager",
     "DeviceInstanceConfig",
     "Experiment",
     "InstallationConfigDocument",
     "installation_template",
-    "PlanDescriptor",
     "PreparedPulseExecution",
     "PulseFacade",
     "PulseRunDescriptor",
@@ -38,6 +31,6 @@ __all__ = [
     "PulseRunResult",
     "PulseTargetDescriptor",
     "WorkspacePaths",
-    "ReadoutFacade",
     "LogicNodeApis",
+    "NodeApi",
 ]

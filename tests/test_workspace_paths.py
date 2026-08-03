@@ -23,12 +23,14 @@ def test_workspace_paths_are_composed_from_one_explicit_project_root(tmp_path) -
         "project_root",
         "pulses_root",
         "tasks_root",
-        "output_root",
+        "runs_root",
+        "figures_root",
     )
     assert paths.project_root == project
     assert paths.pulses_root == project / "pulses"
     assert paths.tasks_root == project / "tasks"
-    assert paths.output_root == project / "_output"
+    assert paths.runs_root == project / "runs"
+    assert paths.figures_root == project / "figures"
 
 
 def test_workspace_paths_reject_relative_authorities() -> None:
@@ -73,6 +75,6 @@ def test_public_workbench_composition_forwards_workspace_roots(
 
     assert open_pulse_editor(workspace=workspace) == "opened"
     assert observed["pulses_root"] == workspace.pulses_root
-    assert observed["output_root"] == workspace.output_root
+    assert observed["output_root"] == workspace.project_root
     assert observed["initial_connection_mode"] == "offline"
     assert callable(observed["connection_factory"])

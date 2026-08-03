@@ -31,7 +31,6 @@ from zlc_storage import (
     nonnegative_real as _nonnegative_real,
     positive_integer as _positive_integer,
     positive_real as _positive_real,
-    sha256_text as _sha256,
 )
 
 from zlc_neutral_atom.devices.camera.contract import (
@@ -49,7 +48,6 @@ from zlc_neutral_atom.devices.camera.contract import (
 _NON_BLOCKING_FRAME_APPLICABILITY_FIELDS = frozenset(
     {
         "exposure_seconds",
-        "opaque_frame_settings_fingerprint",
     }
 )
 
@@ -61,11 +59,9 @@ def _frame_applicability_mismatches(
     """Return only differences that presently invalidate a readout model.
 
     Raw camera exposure is not the atom illumination/integration window: that
-    window also depends on the pulse probe/readout schedule.  The opaque camera
-    settings digest includes raw exposure on both real and virtual adapters, so
-    it cannot be a hard applicability witness either.  Both facts remain in the
-    immutable contracts and therefore in provenance, but neither may reject a
-    model until a typed effective-window contract exists.
+    window also depends on the pulse probe/readout schedule.  Exposure remains
+    visible provenance, but it cannot reject a model until a typed effective-
+    window contract exists.
     """
 
     return tuple(
@@ -274,7 +270,6 @@ class FrameContract:
     exposure_seconds: float
     gain: float
     readout_mode: str
-    opaque_frame_settings_fingerprint: str | None
     frame_schema: ValueSchema
 
     def __post_init__(self) -> None:
@@ -307,11 +302,6 @@ class FrameContract:
         )
         object.__setattr__(self, "gain", _nonnegative_real(self.gain, "gain"))
         _canonical_text(self.readout_mode, "readout_mode")
-        _sha256(
-            self.opaque_frame_settings_fingerprint,
-            "opaque_frame_settings_fingerprint",
-            optional=True,
-        )
         validate_camera_frame_schema_facts(
             spatial_y_axis_id=self.spatial_y_axis_id,
             spatial_x_axis_id=self.spatial_x_axis_id,
@@ -354,9 +344,6 @@ class FrameContract:
             exposure_seconds=physical_facts.exposure_seconds,
             gain=physical_facts.gain,
             readout_mode=physical_facts.readout_mode,
-            opaque_frame_settings_fingerprint=(
-                physical_facts.opaque_frame_settings_fingerprint
-            ),
             frame_schema=frame_schema,
         )
 
@@ -424,9 +411,6 @@ class FrameContract:
             exposure_seconds=setting.exposure_seconds,
             gain=setting.gain,
             readout_mode=setting.readout_mode,
-            opaque_frame_settings_fingerprint=(
-                setting.opaque_frame_settings_fingerprint
-            ),
             frame_schema=schema.cell_schema,
         )
 

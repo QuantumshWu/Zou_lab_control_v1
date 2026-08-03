@@ -280,7 +280,10 @@ def test_continuous_backend_failure_terminates_run_without_user_cancel(
     owner = PulseApplicationOwner()
     with _service_guard(experiment._services) as services:
         port = replace(
-            services.runtime.pulse_port(request.sequencer_ref),
+            services.runtime.require_capability(
+                request.sequencer_ref,
+                "pulse.execute",
+            ),
             _continuous_failure_waiter=(
                 lambda _session_id, _run_id, _digest, _timeout: (
                     "forced backend observer failure"

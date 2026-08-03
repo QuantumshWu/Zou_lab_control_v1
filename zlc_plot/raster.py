@@ -1281,31 +1281,15 @@ class RasterPlotHost:
                     raise RuntimeError(
                         "the painted pointer front is no longer layout-compatible"
                     )
-                if selected_action == "press":
-                    if (
-                        session.data_generation != identity.data_generation
-                        or session.data_revision != identity.data_revision
-                        or session.image_overlay_revision
-                        != identity.image_overlay_revision
-                    ):
-                        raise RuntimeError(
-                            "the painted pointer front was superseded by live data"
-                        )
-                    if axes is not None:
-                        current_axes = session._raster_axes_snapshot()
-                        if axes not in current_axes:
-                            raise RuntimeError(
-                                "the painted pointer transform is no longer current"
-                            )
-                    if interaction is not None and (
-                        tuple(session._raster_interaction_snapshot())
-                        != interaction.selectors
-                        or session._raster_color_limits_snapshot()
-                        != interaction.color_limits
-                    ):
-                        raise RuntimeError(
-                            "the painted interaction state is no longer current"
-                        )
+                # Data and selector revisions are deliberately *not* part of
+                # the pointer-surface validity contract.  A live plot may
+                # promote a newer frame between the Qt press and the worker
+                # command (or during a drag).  The pixel-to-data transform is
+                # captured for the gesture, while the session owns the latest
+                # selector state.  Rejecting that normal publication race
+                # turned continuous interaction into a fatal error.  Only a
+                # display/layout change invalidates the captured surface; a
+                # new data revision is rebased onto the same surface.
             return session._raster_pointer_event(
                 selected_action,
                 x_value,

@@ -2,23 +2,19 @@
 
 The physical operation is deliberately small: bind one loaded calibration,
 apply its selected readout model to every ``(R, P)`` camera cell, and preserve
-the model's SITE axis and component validity.  Finite artifact evaluation and
-live signal publication share these classification primitives without a
-second public Processor lifecycle.
+the model's SITE axis and component validity.  Persistence, cursor ownership,
+publication, and lifecycle belong to the generic Logic-node host.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
 
 import numpy as np
 
 from zlc_data import (
-    READOUT_EVENT,
     SITE,
-    AxisId,
     AxisSpec,
     BlockId,
     CellValidity,
@@ -27,52 +23,27 @@ from zlc_data import (
     DatasetComponentValidity,
     DatasetSchema,
     OwnedSnapshot,
-    StreamGenerationId,
     ValidityContract,
-    Value,
     ValueSchema,
 )
 from zlc_data.value import dataset_cell_value, expand_dataset_validity
-from zlc_neutral_atom.catalog import DefinitionKey, ProcessorDefinition
-from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
 from zlc_neutral_atom.dataset_output import (
     DatasetOutputDeclaration,
     LiveDatasetOutput,
 )
-from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
-from zlc_neutral_atom.input_spec import ArtifactInputSpec, DatasetInputSpec
+from zlc_neutral_atom.input_spec import DatasetInputSpec
 from zlc_neutral_atom.logic_nodes.readout.calibration.calibration import (
-    ReadoutModel,
     ResolvedCalibration,
     apply_readout_model,
 )
-from zlc_neutral_atom.logic_nodes.readout.calibration.reference import (
-    CALIBRATION_ARTIFACT_REF_FORMAT,
-    CalibrationArtifactRef,
-)
-from zlc_neutral_atom.capture.artifact import CaptureArtifact
-from zlc_neutral_atom.capture.reference import CaptureArtifactRef
-from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
-    CAMERA_FRAME_OUTPUT_CONTRACT_ID,
-)
 from zlc_neutral_atom.logic_nodes.readout.contracts import FrameContract
-from zlc_neutral_atom.logic_nodes.readout.physical_context import (
-    _derive_readout_physical_context_from_evidence,
-)
 from zlc_neutral_atom.logic_nodes.readout.model_contract import (
     ReadoutModelKind,
     readout_model_authoring_schema,
     readout_model_kind_from_authoring,
 )
 from zlc_neutral_atom.runtime.dataset import MonitorCoverage
-from zlc_storage import canonical_text
 
-from .reference import OccupancyArtifactRef
-
-OCCUPANCY_PROCESSOR_KEY = DefinitionKey(
-    "zlc_neutral_atom.logic_nodes.readout.occupancy",
-    "occupancy-processor",
-)
 _COUNTS_OUTPUT_DECLARATION = DatasetOutputDeclaration(
     "counts",
     "zlc_neutral_atom.occupancy.counts",
@@ -92,58 +63,19 @@ OCCUPANCY_LIVE_OUTPUT_DECLARATIONS = (
 )
 
 
-def occupancy_artifact_output_name(output: str | None) -> str:
-    """Resolve the one persisted Occupancy Dataset selected by a caller."""
-
-    selected = _OCCUPIED_OUTPUT_DECLARATION.name if output is None else str(output)
-    allowed = {
-        _OCCUPIED_OUTPUT_DECLARATION.name,
-        _COUNTS_OUTPUT_DECLARATION.name,
-    }
-    if selected not in allowed:
-        raise ValueError(
-            "occupancy output must be "
-            f"{_OCCUPIED_OUTPUT_DECLARATION.name!r} or "
-            f"{_COUNTS_OUTPUT_DECLARATION.name!r}"
-        )
-    return selected
-_OCCUPANCY_CONFIG_FORMAT = (
-    "zlc_neutral_atom.logic_nodes.readout.occupancy.processor-config"
-)
-OCCUPANCY_PROCESSOR_DEFINITION = ProcessorDefinition(
-    OCCUPANCY_PROCESSOR_KEY,
-    "Judge occupancy",
-    _OCCUPANCY_CONFIG_FORMAT,
-)
-OCCUPANCY_COUNTS_BLOCK_ID = BlockId("occupancy-counts")
-OCCUPANCY_OCCUPIED_BLOCK_ID = BlockId("occupancy-occupied")
-OCCUPANCY_RATE_BLOCK_ID = BlockId("occupancy-rate")
+_COUNTS_BLOCK_ID = BlockId("occupancy-counts")
+_OCCUPIED_BLOCK_ID = BlockId("occupancy-occupied")
+_RATE_BLOCK_ID = BlockId("occupancy-rate")
 
 OCCUPANCY_CAMERA_INPUT_SPEC = DatasetInputSpec(
     "camera_frame",
     "Frame source",
-    (CAMERA_FRAME_OUTPUT_CONTRACT_ID,),
+    None,
     description=(
-        "Current frame output of an already-running Camera Measurement; "
-        "Occupancy never starts or reconfigures that Camera"
+        "Current Dataset whose declared cell schema matches the selected "
+        "Calibration frame schema; Occupancy never starts a device"
     ),
 )
-OCCUPANCY_CALIBRATION_INPUT_SPEC = ArtifactInputSpec(
-    "calibration",
-    "Calibration",
-    CALIBRATION_ARTIFACT_REF_FORMAT,
-    description=(
-        "Exact FINAL CalibrationArtifactRef or an explicitly selected "
-        "calibration.json record from the current project"
-    ),
-    allow_saved_reference=True,
-)
-_OCCUPANCY_INPUT_SPECS = (
-    OCCUPANCY_CAMERA_INPUT_SPEC,
-    OCCUPANCY_CALIBRATION_INPUT_SPEC,
-)
-
-
 @dataclass(frozen=True, slots=True)
 class OccupancyProcessorConfig:
     """Operator-authored model choice before input binding."""
@@ -162,108 +94,12 @@ def occupancy_authoring_schema():
     return readout_model_authoring_schema()
 
 
-def occupancy_input_specs():
-    return _OCCUPANCY_INPUT_SPECS
-
-
 def build_occupancy_processor_config(
     values: Mapping[str, object],
 ) -> OccupancyProcessorConfig:
     authored = occupancy_authoring_schema().freeze(values)
     return OccupancyProcessorConfig(
         readout_model_kind_from_authoring(authored["model_kind"])
-    )
-
-
-def _require_output_value_schemas(
-    counts: ValueSchema,
-    occupied: ValueSchema,
-) -> AxisSpec:
-    if not isinstance(counts, ValueSchema) or not isinstance(occupied, ValueSchema):
-        raise TypeError("occupancy cell schemas must be ValueSchema")
-    axes = counts.data_axes
-    if len(axes) != 1 or axes[0].role != SITE or occupied.data_axes != axes:
-        raise ValueError("occupancy outputs require one shared SITE data axis")
-    expected_validity = ValidityContract.components(axes[0].axis_id)
-    if counts.validity_contract != expected_validity or (
-        occupied.validity_contract != expected_validity
-    ):
-        raise ValueError("occupancy outputs require SITE component validity")
-    if counts.dtype != np.dtype("<f8") or occupied.dtype != np.dtype(bool) or (
-        occupied.value_unit != "occupation"
-    ):
-        raise ValueError("occupancy output dtype/unit contracts are not canonical")
-    return axes[0]
-
-
-def _require_occupancy_output_schemas(
-    counts_schema: DatasetSchema,
-    occupied_schema: DatasetSchema,
-) -> AxisSpec:
-    """Validate the one canonical counts/occupied dataset relationship."""
-
-    if not isinstance(counts_schema, DatasetSchema) or not isinstance(
-        occupied_schema,
-        DatasetSchema,
-    ):
-        raise TypeError("occupancy output schemas must be DatasetSchema")
-    if (
-        counts_schema.repeat_axis,
-        counts_schema.point_table,
-        counts_schema.grid_topology,
-    ) != (
-        occupied_schema.repeat_axis,
-        occupied_schema.point_table,
-        occupied_schema.grid_topology,
-    ):
-        raise ValueError("occupancy outputs do not share one sampling domain")
-    return _require_output_value_schemas(
-        counts_schema.cell_schema,
-        occupied_schema.cell_schema,
-    )
-
-
-def _same_validity(left: ComponentValidity, right: ComponentValidity) -> bool:
-    return left.axis_ids == right.axis_ids and np.array_equal(
-        left.mask,
-        right.mask,
-    )
-
-
-def _require_canonical_fillers(
-    counts: np.ndarray,
-    occupied: np.ndarray,
-    valid: np.ndarray,
-) -> None:
-    count_values = np.asarray(counts)
-    occupied_values = np.asarray(occupied)
-    mask = np.asarray(valid, dtype=bool)
-    if count_values.shape != occupied_values.shape or mask.shape != count_values.shape:
-        raise ValueError("occupancy values and validity must share one shape")
-    if not np.all(np.isfinite(count_values)):
-        raise ValueError("occupancy counts must be finite")
-    invalid_counts = count_values[~mask]
-    if np.any(invalid_counts != 0.0) or np.any(np.signbit(invalid_counts)):
-        raise ValueError("invalid counts require canonical positive-zero fillers")
-    if np.any(occupied_values[~mask]):
-        raise ValueError("invalid occupied sites require canonical False fillers")
-
-
-def _validate_sample_fields(counts: Value, occupied: Value) -> None:
-    if not isinstance(counts, Value) or not isinstance(occupied, Value):
-        raise TypeError("counts and occupied must be Value")
-    _require_output_value_schemas(counts.schema, occupied.schema)
-    if not isinstance(counts.validity, ComponentValidity) or not isinstance(
-        occupied.validity,
-        ComponentValidity,
-    ):
-        raise TypeError("occupancy fields require ComponentValidity")
-    if not _same_validity(counts.validity, occupied.validity):
-        raise ValueError("counts and occupied must have identical validity")
-    _require_canonical_fillers(
-        counts.values,
-        occupied.values,
-        counts.validity.mask,
     )
 
 
@@ -283,404 +119,6 @@ def _output_schemas(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class ResolvedOccupancyProcessorSchema:
-    """Selected immutable readout model and its complete output schemas."""
-
-    selected_model: ReadoutModel
-    frame_schema: ValueSchema
-    counts_schema: DatasetSchema
-    occupied_schema: DatasetSchema
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.selected_model, ReadoutModel):
-            raise TypeError("selected_model must be ReadoutModel")
-        if not isinstance(self.frame_schema, ValueSchema):
-            raise TypeError("frame_schema must be ValueSchema")
-        site_axis = _require_occupancy_output_schemas(
-            self.counts_schema,
-            self.occupied_schema,
-        )
-        if self.selected_model.feature.site_axis != site_axis:
-            raise ValueError("occupancy schemas differ from the selected model")
-
-    @property
-    def model_kind(self) -> ReadoutModelKind:
-        return self.selected_model.kind
-
-
-def _resolve_occupancy_processor_schema_parts(
-    calibration: ResolvedCalibration,
-    source_schema: DatasetSchema,
-    model_kind: ReadoutModelKind,
-) -> ResolvedOccupancyProcessorSchema:
-    if type(calibration) is not ResolvedCalibration:
-        raise TypeError("calibration must be an exact ResolvedCalibration")
-    if not isinstance(source_schema, DatasetSchema):
-        raise TypeError("source_schema must be DatasetSchema")
-    if not isinstance(model_kind, ReadoutModelKind):
-        raise TypeError("model_kind must be a concrete ReadoutModelKind")
-
-    artifact = calibration.artifact
-    frame_contract = artifact.frame_contract
-    if source_schema.cell_schema != frame_contract.frame_schema:
-        raise ValueError("source schema differs from the calibration FrameContract")
-    model = artifact.select_model(model_kind)
-    site_axis = artifact.site_map.site_axis
-    if model.kind is not model_kind or model.feature.site_axis != site_axis:
-        raise ValueError("selected model differs from the frozen calibration choice")
-    outer_axis_ids = {
-        source_schema.repeat_axis.axis_id,
-        *(column.coordinate_id for column in source_schema.point_table.columns),
-    }
-    if site_axis.axis_id in outer_axis_ids:
-        raise ValueError("SITE AxisId collides with a capture outer AxisId")
-    counts_value, occupied_value = _output_schemas(frame_contract, site_axis)
-    outer = (
-        source_schema.repeat_axis,
-        source_schema.point_table,
-        source_schema.grid_topology,
-    )
-    return ResolvedOccupancyProcessorSchema(
-        model,
-        source_schema.cell_schema,
-        DatasetSchema(*outer, counts_value),
-        DatasetSchema(*outer, occupied_value),
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class _CommittedOccupancyBinding:
-    """Named schema facts shared by analysis and cold-open validation."""
-
-    readout_event_axis_id: AxisId
-    resolved_schema: ResolvedOccupancyProcessorSchema
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.readout_event_axis_id, AxisId):
-            raise TypeError("readout_event_axis_id must be AxisId")
-        if not isinstance(
-            self.resolved_schema,
-            ResolvedOccupancyProcessorSchema,
-        ):
-            raise TypeError("resolved_schema must be ResolvedOccupancyProcessorSchema")
-
-
-@dataclass(frozen=True, slots=True)
-class _ResolvedCommittedOccupancy:
-    """Loaded source, calibration, and schema carried across one flat Run."""
-
-    source: CaptureArtifact
-    calibration: ResolvedCalibration
-    binding: _CommittedOccupancyBinding
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.source, CaptureArtifact):
-            raise TypeError("source must be CaptureArtifact")
-        if type(self.calibration) is not ResolvedCalibration:
-            raise TypeError("calibration must be ResolvedCalibration")
-        if not isinstance(self.binding, _CommittedOccupancyBinding):
-            raise TypeError("binding must be committed occupancy binding")
-
-
-def _resolve_committed_occupancy_structure(
-    capture: object,
-    calibration: ResolvedCalibration,
-    *,
-    readout_event_axis_id: AxisId,
-    model_kind: ReadoutModelKind,
-) -> _CommittedOccupancyBinding:
-    """Resolve named-axis, frame, model, and output schema facts."""
-
-    if type(calibration) is not ResolvedCalibration:
-        raise TypeError("calibration must be an exact ResolvedCalibration")
-    if not isinstance(readout_event_axis_id, AxisId):
-        raise TypeError("readout_event_axis_id must be AxisId")
-    if not isinstance(model_kind, ReadoutModelKind):
-        raise TypeError("model_kind must be a concrete ReadoutModelKind")
-    try:
-        source = capture.frame_source  # type: ignore[attr-defined]
-        provenance = capture.camera_provenance  # type: ignore[attr-defined]
-    except AttributeError as error:
-        raise TypeError("capture must be a raw CaptureArtifact") from error
-    schema = source.schema
-    event_columns = tuple(
-        column
-        for column in schema.point_table.columns
-        if column.role == READOUT_EVENT
-    )
-    if len(event_columns) != 1 or tuple(dict.fromkeys(event_columns[0].values)) != (0,):
-        raise ValueError(
-            "committed occupancy requires one singleton READOUT_EVENT point column"
-        )
-    event_column = event_columns[0]
-    if event_column.coordinate_id != readout_event_axis_id or (
-        provenance.descriptor.readout_event_axis_id != event_column.coordinate_id
-    ):
-        raise ValueError("capture and request name different READOUT_EVENT axes")
-    artifact = calibration.artifact
-    if provenance.binding != artifact.frame_contract.binding:
-        raise ValueError("capture and calibration name different readout bindings")
-    artifact.frame_contract.assert_compatible(
-        provenance.binding,
-        provenance.descriptor,
-        schema,
-        readout_event_index=0,
-    )
-    return _CommittedOccupancyBinding(
-        event_column.coordinate_id,
-        _resolve_occupancy_processor_schema_parts(
-            calibration,
-            schema,
-            model_kind,
-        ),
-    )
-
-
-def _require_committed_occupancy_context(
-    source: object,
-    calibration: ResolvedCalibration,
-    binding: _CommittedOccupancyBinding,
-    *,
-    checkpoint: Callable[[], None] | None = None,
-) -> _ResolvedCommittedOccupancy:
-    """Compare every selected pulse window before authoritative analysis."""
-
-    if not isinstance(source, CaptureArtifact):
-        raise TypeError("source must be an exact CaptureArtifact")
-    if type(calibration) is not ResolvedCalibration:
-        raise TypeError("calibration must be an exact ResolvedCalibration")
-    if not isinstance(binding, _CommittedOccupancyBinding):
-        raise TypeError("binding must be resolved committed occupancy")
-    event_axis_id = binding.readout_event_axis_id
-    resolved_schema = binding.resolved_schema
-    capture = source
-    if capture.pulse_evidence is None:
-        raise ValueError("authoritative occupancy requires persisted pulse lineage")
-    context = _derive_readout_physical_context_from_evidence(
-        capture.pulse_evidence,
-        capture.frame_source.schema,
-        capture.frame_source.iter_cell_schedule(),
-        readout_event_index=0,
-        integration_start_offset_seconds=(
-            capture.camera_capability_evidence.physical_facts
-            .external_trigger_integration_start_offset_seconds
-        ),
-        integration_seconds=calibration.artifact.frame_contract.exposure_seconds,
-        checkpoint=checkpoint,
-    )
-    if context != calibration.artifact.readout_physical_context:
-        raise ValueError("capture pulse context differs from the calibration")
-    return _ResolvedCommittedOccupancy(source, calibration, binding)
-
-
-def _occupancy_generation_for_run(run_id: str) -> StreamGenerationId:
-    """Use the exact Run identity as the persisted Dataset generation."""
-
-    return StreamGenerationId(canonical_text(run_id, "run_id"))
-
-
-@dataclass(frozen=True, slots=True, eq=False)
-class OccupancyArtifact:
-    """Durable counts/occupation derived from two committed inputs."""
-
-    source_capture_ref: CaptureArtifactRef
-    calibration_reference: CalibrationArtifactRef
-    readout_event_axis_id: AxisId
-    model_kind: ReadoutModelKind
-    run_id: str
-    counts: DataBlock
-    occupied: DataBlock
-
-    __hash__ = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.source_capture_ref, CaptureArtifactRef):
-            raise TypeError("source_capture_ref must be CaptureArtifactRef")
-        if not isinstance(self.calibration_reference, CalibrationArtifactRef):
-            raise TypeError("calibration_reference must be CalibrationArtifactRef")
-        if not isinstance(self.readout_event_axis_id, AxisId):
-            raise TypeError("readout_event_axis_id must be AxisId")
-        if not isinstance(self.model_kind, ReadoutModelKind):
-            raise TypeError("model_kind must be ReadoutModelKind")
-        canonical_text(self.run_id, "run_id")
-        if not isinstance(self.counts, DataBlock) or not isinstance(
-            self.occupied,
-            DataBlock,
-        ):
-            raise TypeError("counts and occupied must be DataBlock")
-        if self.counts.block_id != OCCUPANCY_COUNTS_BLOCK_ID or (
-            self.occupied.block_id != OCCUPANCY_OCCUPIED_BLOCK_ID
-        ):
-            raise ValueError("occupancy blocks use non-canonical BlockId values")
-        site_axis = _require_occupancy_output_schemas(
-            self.counts.schema,
-            self.occupied.schema,
-        )
-        if self.counts.revision != self.occupied.revision or (
-            self.counts.validity is not self.occupied.validity
-        ):
-            raise ValueError("occupancy blocks must share revision and validity")
-        validity = self.counts.validity
-        if not isinstance(validity, DatasetComponentValidity) or (
-            validity.axis_ids != (site_axis.axis_id,)
-        ):
-            raise ValueError("occupancy validity must name exactly the SITE axis")
-        _require_canonical_fillers(
-            self.counts.values,
-            self.occupied.values,
-            validity.mask,
-        )
-
-    @property
-    def counts_snapshot(self) -> OwnedSnapshot:
-        return OwnedSnapshot(
-            self.counts.ref(_occupancy_generation_for_run(self.run_id)),
-            self.counts,
-        )
-
-    @property
-    def occupied_snapshot(self) -> OwnedSnapshot:
-        return OwnedSnapshot(
-            self.occupied.ref(_occupancy_generation_for_run(self.run_id)),
-            self.occupied,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class ResolvedOccupancy:
-    """One cold-opened Occupancy value and its persisted Run provenance."""
-
-    reference: OccupancyArtifactRef
-    artifact: OccupancyArtifact
-    readout_binding: ReadoutBindingKey
-    run_id: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.reference, OccupancyArtifactRef):
-            raise TypeError("reference must be OccupancyArtifactRef")
-        if not isinstance(self.artifact, OccupancyArtifact):
-            raise TypeError("artifact must be OccupancyArtifact")
-        if not isinstance(self.readout_binding, ReadoutBindingKey):
-            raise TypeError("readout_binding must be ReadoutBindingKey")
-        canonical_text(self.run_id, "run_id")
-        if self.artifact.run_id != self.run_id:
-            raise ValueError("resolved run_id differs from the Occupancy artifact")
-
-    def project_dataset_source(
-        self,
-        *,
-        output: str | None,
-        materialize: bool,
-    ) -> ArtifactDatasetSource:
-        """Project one persisted output without exposing Occupancy block fields."""
-
-        if type(materialize) is not bool:
-            raise TypeError("materialize must be bool")
-        selected = occupancy_artifact_output_name(output)
-        artifact = self.artifact
-        if selected == _OCCUPIED_OUTPUT_DECLARATION.name:
-            block = artifact.occupied
-            snapshot = artifact.occupied_snapshot if materialize else None
-        else:
-            block = artifact.counts
-            snapshot = artifact.counts_snapshot if materialize else None
-        return ArtifactDatasetSource(
-            block.schema,
-            block.ref(_occupancy_generation_for_run(artifact.run_id)),
-            snapshot,
-        )
-
-
-def _classify_cells(
-    resolved: ResolvedOccupancyProcessorSchema,
-    revision,
-    cells: Iterable[tuple[int, int, Value]],
-    *,
-    checkpoint: Callable[[], None] | None = None,
-) -> tuple[DataBlock, DataBlock]:
-    """Single R/P/SITE materializer shared by snapshot and committed analysis."""
-
-    counts_values = np.zeros(resolved.counts_schema.physical_shape, dtype="<f8")
-    occupied_values = np.zeros(resolved.occupied_schema.physical_shape, dtype=bool)
-    valid_values = np.zeros(resolved.counts_schema.physical_shape, dtype=bool)
-    for repeat_index, point_index, frame in cells:
-        if checkpoint is not None:
-            checkpoint()
-        result = apply_readout_model(
-            resolved.selected_model,
-            frame,
-            expected_frame_schema=resolved.frame_schema,
-        )
-        validity = result.occupied.validity
-        if not isinstance(validity, ComponentValidity):
-            raise TypeError("readout result requires ComponentValidity")
-        location = (repeat_index, point_index)
-        counts_values[location] = result.signals.values
-        occupied_values[location] = result.occupied.values
-        valid_values[location] = validity.mask
-    if checkpoint is not None:
-        checkpoint()
-    validity = DatasetComponentValidity(
-        (resolved.selected_model.feature.site_axis.axis_id,),
-        valid_values,
-    )
-    return (
-        DataBlock(
-            OCCUPANCY_COUNTS_BLOCK_ID,
-            revision,
-            counts_values,
-            validity,
-            resolved.counts_schema,
-        ),
-        DataBlock(
-            OCCUPANCY_OCCUPIED_BLOCK_ID,
-            revision,
-            occupied_values,
-            validity,
-            resolved.occupied_schema,
-        ),
-    )
-
-
-def _analyze_committed_occupancy_resolved(
-    resolved: _ResolvedCommittedOccupancy,
-    *,
-    run_id: str,
-    checkpoint: Callable[[], None],
-) -> OccupancyArtifact:
-    """Stream raw frames once while preserving the complete R/P/SITE domain."""
-
-    if not isinstance(resolved, _ResolvedCommittedOccupancy):
-        raise TypeError("resolved must be loaded committed occupancy")
-    source = resolved.source
-    calibration = resolved.calibration
-    event_axis_id = resolved.binding.readout_event_axis_id
-    schema = resolved.binding.resolved_schema
-    if not callable(checkpoint):
-        raise TypeError("checkpoint must be callable")
-    frame_source = source.frame_source
-    counts, occupied = _classify_cells(
-        schema,
-        frame_source.revision,
-        (
-            (cell.repeat_index, cell.point_ordinal, sample.image)
-            for cell, sample in frame_source.iter_event_order()
-        ),
-        checkpoint=checkpoint,
-    )
-    run = canonical_text(run_id, "run_id")
-    return OccupancyArtifact(
-        source.ref,
-        calibration.reference,
-        event_axis_id,
-        schema.model_kind,
-        run,
-        counts,
-        occupied,
-    )
-
-
 def _apply_occupancy_snapshot(
     source: OwnedSnapshot,
     calibration: ResolvedCalibration,
@@ -693,25 +131,51 @@ def _apply_occupancy_snapshot(
         raise TypeError("source must be OwnedSnapshot")
     if type(calibration) is not ResolvedCalibration:
         raise TypeError("calibration must be ResolvedCalibration")
-    model = calibration.artifact.select_model(model_kind)
-    resolved = _resolve_occupancy_processor_schema_parts(
-        calibration,
-        source.block.schema,
-        model.kind,
-    )
     schema = source.block.schema
-    counts, occupied = _classify_cells(
-        resolved,
-        source.block.revision,
-        (
-            (repeat_index, point_index, dataset_cell_value(
-                source.block,
-                repeat_index,
-                point_index,
-            ))
-            for repeat_index in range(schema.repeat_axis.size)
-            for point_index in range(schema.point_table.row_count)
-        ),
+    artifact = calibration.artifact
+    if schema.cell_schema != artifact.frame_contract.frame_schema:
+        raise ValueError("source schema differs from the calibration FrameContract")
+    model = artifact.select_model(model_kind)
+    site_axis = model.feature.site_axis
+    counts_value, occupied_value = _output_schemas(
+        artifact.frame_contract,
+        site_axis,
+    )
+    outer = (schema.repeat_axis, schema.point_table, schema.grid_topology)
+    counts_schema = DatasetSchema(*outer, counts_value)
+    occupied_schema = DatasetSchema(*outer, occupied_value)
+    counts_values = np.zeros(counts_schema.physical_shape, dtype="<f8")
+    occupied_values = np.zeros(occupied_schema.physical_shape, dtype=bool)
+    valid_values = np.zeros(counts_schema.physical_shape, dtype=bool)
+    for repeat_index in range(schema.repeat_axis.size):
+        for point_index in range(schema.point_table.row_count):
+            result = apply_readout_model(
+                model,
+                dataset_cell_value(source.block, repeat_index, point_index),
+                expected_frame_schema=artifact.frame_contract.frame_schema,
+            )
+            validity = result.occupied.validity
+            if not isinstance(validity, ComponentValidity):
+                raise TypeError("readout result requires ComponentValidity")
+            location = (repeat_index, point_index)
+            counts_values[location] = result.signals.values
+            occupied_values[location] = result.occupied.values
+            valid_values[location] = validity.mask
+    validity = DatasetComponentValidity((site_axis.axis_id,), valid_values)
+    revision = source.block.revision
+    counts = DataBlock(
+        _COUNTS_BLOCK_ID,
+        revision,
+        counts_values,
+        validity,
+        counts_schema,
+    )
+    occupied = DataBlock(
+        _OCCUPIED_BLOCK_ID,
+        revision,
+        occupied_values,
+        validity,
+        occupied_schema,
     )
     generation = source.ref.stream_generation
     return (
@@ -720,7 +184,7 @@ def _apply_occupancy_snapshot(
     )
 
 
-def occupancy_rate_snapshot(occupied: OwnedSnapshot) -> OwnedSnapshot:
+def _occupancy_rate_snapshot(occupied: OwnedSnapshot) -> OwnedSnapshot:
     """Reduce the declared SITE axis into a validity-aware occupancy rate."""
 
     if not isinstance(occupied, OwnedSnapshot):
@@ -750,7 +214,7 @@ def occupancy_rate_snapshot(occupied: OwnedSnapshot) -> OwnedSnapshot:
         ValueSchema.scalar(np.dtype("<f8"), None),
     )
     block = DataBlock(
-        OCCUPANCY_RATE_BLOCK_ID,
+        _RATE_BLOCK_ID,
         occupied.block.revision,
         rate[..., np.newaxis],
         CellValidity(cell_validity),
@@ -759,39 +223,13 @@ def occupancy_rate_snapshot(occupied: OwnedSnapshot) -> OwnedSnapshot:
     return OwnedSnapshot(block.ref(occupied.ref.stream_generation), block)
 
 
-@dataclass(frozen=True, slots=True, eq=False)
-class OccupancyProcessorEvaluation:
-    """Atomic typed outputs for one immutable Camera source revision."""
-
-    outputs: Mapping[str, LiveDatasetOutput]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.outputs, Mapping):
-            raise TypeError("outputs must be a mapping")
-        outputs = dict(self.outputs)
-        expected = tuple(
-            declaration.name for declaration in OCCUPANCY_LIVE_OUTPUT_DECLARATIONS
-        )
-        if tuple(outputs) != expected or any(
-            not isinstance(output, LiveDatasetOutput) or output.name != name
-            for name, output in outputs.items()
-        ):
-            raise ValueError("Occupancy outputs must be counts, occupied, and rate")
-        snapshots = tuple(output.snapshot for output in outputs.values())
-        if len({snapshot.ref.revision for snapshot in snapshots}) != 1:
-            raise ValueError("Occupancy outputs do not share one revision")
-        if len({snapshot.ref.stream_generation for snapshot in snapshots}) != 1:
-            raise ValueError("Occupancy outputs do not share one generation")
-        object.__setattr__(self, "outputs", MappingProxyType(outputs))
-
-
 def _evaluate_occupancy_processor(
     source: OwnedSnapshot,
     calibration: ResolvedCalibration,
     coverage: MonitorCoverage,
     *,
     model_kind: ReadoutModelKind | None = None,
-) -> OccupancyProcessorEvaluation:
+) -> Mapping[str, LiveDatasetOutput]:
     """Classify one current Camera revision and select its current display cell."""
 
     if not isinstance(source, OwnedSnapshot):
@@ -806,7 +244,7 @@ def _evaluate_occupancy_processor(
         calibration,
         model_kind=model.kind,
     )
-    rate = occupancy_rate_snapshot(occupied)
+    rate = _occupancy_rate_snapshot(occupied)
     source_schema = source.block.schema
     if coverage.written_cells != 1 or coverage.total_cells != 1:
         raise ValueError("Occupancy requires one committed public Camera frame cell")
@@ -826,26 +264,13 @@ def _evaluate_occupancy_processor(
             strict=True,
         )
     }
-    return OccupancyProcessorEvaluation(outputs)
+    return outputs
 
 
 __all__ = [
-    "OCCUPANCY_COUNTS_BLOCK_ID",
-    "OCCUPANCY_OCCUPIED_BLOCK_ID",
-    "OCCUPANCY_RATE_BLOCK_ID",
-    "OCCUPANCY_PROCESSOR_DEFINITION",
-    "OCCUPANCY_PROCESSOR_KEY",
     "OCCUPANCY_CAMERA_INPUT_SPEC",
-    "OCCUPANCY_CALIBRATION_INPUT_SPEC",
     "OCCUPANCY_LIVE_OUTPUT_DECLARATIONS",
-    "OccupancyArtifact",
     "OccupancyProcessorConfig",
-    "OccupancyProcessorEvaluation",
-    "ResolvedOccupancyProcessorSchema",
-    "ResolvedOccupancy",
     "build_occupancy_processor_config",
-    "occupancy_rate_snapshot",
     "occupancy_authoring_schema",
-    "occupancy_artifact_output_name",
-    "occupancy_input_specs",
 ]

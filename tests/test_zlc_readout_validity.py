@@ -92,7 +92,7 @@ def _contracts(
     )
     layout = CalibrationCaptureLayout(AxisId("validity-event"), (0, 2), 1)
     source = CalibrationSourceBinding(
-        CaptureArtifactRef("validity-tests/capture.json"),
+        CaptureArtifactRef("runs/camera/validity-tests/capture.json"),
         layout,
     )
     contract = FrameContract(
@@ -112,7 +112,6 @@ def _contracts(
         0.005,
         1.0,
         "external-trigger",
-        None,
         schema,
     )
     return source, contract

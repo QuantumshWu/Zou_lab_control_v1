@@ -21,7 +21,6 @@ from zlc_data.schema import DatasetSchema, PointColumn, PointTable, ValueSchema
 from zlc_data.validity import VALID, ValidityContract
 from zlc_data.value import Value
 from zlc_neutral_atom.devices.camera.contract import (
-    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
     CameraAcquisitionMode,
     CameraCaptureSpec,
     CameraDatasetEventAdapter,
@@ -29,8 +28,8 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraFrameRecord,
     CameraSample,
     CameraSampleContract,
-    decode_camera_capture_spec,
-    freeze_camera_capture_spec,
+    camera_capture_spec_from_tree,
+    camera_capture_spec_to_tree,
 )
 from zlc_neutral_atom.capture.session import (
     CameraCaptureContract,
@@ -64,7 +63,6 @@ from zlc_neutral_atom.capture.binding import (
     bind_camera_capture,
 )
 from zlc_neutral_atom.capture.pipeline import BoundCameraCapture
-from zlc_storage import decode, encode
 
 
 def _axis(name: str, role, size: int) -> AxisSpec:
@@ -142,26 +140,17 @@ def _sample(value_schema: ValueSchema, **metadata_changes) -> CameraSample:
     )
 
 
-def test_camera_capture_spec_has_one_current_canonical_encoding():
+def test_camera_capture_spec_has_one_typed_readable_record():
     spec = CameraCaptureSpec(
         CameraAcquisitionMode.EXTERNAL_TRIGGERED,
         4,
         (1, 1, 1, 1),
-        "a" * 64,
     )
-    frozen = freeze_camera_capture_spec(spec)
-    assert frozen.owner_fingerprint == CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT
-    assert decode_camera_capture_spec(frozen) == spec
-    assert freeze_camera_capture_spec(decode_camera_capture_spec(frozen)).payload == frozen.payload
-
-    tree = decode(frozen.payload)
+    tree = camera_capture_spec_to_tree(spec)
+    assert camera_capture_spec_from_tree(tree) == spec
     tree["unexpected"] = True
-    with pytest.raises(ValueError, match="unknown field set"):
-        decode_camera_capture_spec(encode(tree))
-    with pytest.raises(ValueError, match="schema differs"):
-        decode_camera_capture_spec(
-            encode({**decode(frozen.payload), "schema": "unsupported-camera-spec"})
-        )
+    with pytest.raises(ValueError, match="must contain exactly"):
+        camera_capture_spec_from_tree(tree)
 
 
 def test_camera_sample_contract_preserves_all_data_axes_and_owned_pixels():
@@ -244,12 +233,10 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
         external_trigger_integration_start_offset_seconds=None,
         gain=0.0,
         readout_mode="test",
-        opaque_frame_settings_fingerprint="a" * 64,
     )
     evidence = CameraCapabilityEvidence(
         adapter_type="tests.Camera",
         source_id="camera",
-        capture_spec_owner_fingerprint=CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
         max_blocking_call_seconds=1.0,
         physical_facts=physical_facts,
     )
@@ -264,14 +251,6 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
         binding_stamp=binding_stamp,
         payload_contract=payload_contract,
         camera_capability_evidence=evidence,
-    )
-    arm_spec = freeze_camera_capture_spec(
-        CameraCaptureSpec(
-            CameraAcquisitionMode.EXTERNAL_TRIGGERED,
-            len(cells),
-            (1,) * len(cells),
-            evidence.settings_fingerprint,
-        )
     )
     descriptor = CameraCaptureDescriptor(
         camera_identity=physical_facts.camera_identity,
@@ -288,7 +267,6 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
         count_unit=physical_facts.count_unit,
         readout_event_axis_id=None,
         event_settings=(physical_facts.event_setting(0),),
-        camera_arm_spec_fingerprint=arm_spec.digest,
     )
     contract = CameraCaptureContract(
         stream_id=StreamId("camera.frames"),
@@ -302,7 +280,6 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
             descriptor,
             ReadoutBindingKey("camera"),
             binding_stamp,
-            capability.capability_fingerprint,
         ),
     )
 
@@ -360,19 +337,23 @@ def test_camera_capture_owner_proof_belongs_to_the_bound_camera_contract():
             ),
         )
 
-        assert camera_capture.capture_spec.owner_fingerprint == (
-            camera_capture.capture_contract.capture_spec_owner_fingerprint
+        assert camera_capture.capture_spec.expected_frames == 1
+        assert camera_capture.capture_spec.source_group_sizes == (1,)
+        assert (
+            camera_capture.capture_contract.camera_provenance.descriptor.event_settings
+            == (port.capability.camera_physical_facts.event_setting(0),)
         )
         with pytest.raises(
             ValueError,
-            match="capture spec and camera contract owner differ",
+            match="cardinality differs",
         ):
             BoundCameraCapture(
                 camera_capture.capture_port,
                 camera_capture.capture_contract,
                 replace(
                     camera_capture.capture_spec,
-                    owner_fingerprint="f" * 64,
+                    expected_frames=2,
+                    source_group_sizes=(1, 1),
                 ),
             )
     finally:

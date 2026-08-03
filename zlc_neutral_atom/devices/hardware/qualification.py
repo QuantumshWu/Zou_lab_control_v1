@@ -1,9 +1,4 @@
-"""Active E0 trigger-path qualification for one real camera connection.
-
-The digest returned here is derived from one actually executed frozen pulse,
-camera records, SDK terminal readback, and remote hardware terminal evidence.
-Configuration text alone can never mint this capability.
-"""
+"""Active E0 trigger-path qualification for one real camera connection."""
 
 from __future__ import annotations
 
@@ -24,7 +19,7 @@ from zlc_pulse import (
     RemotePulseExecutionClient,
     compile_pulse_artifact,
 )
-from zlc_storage import canonical_digest, canonical_text
+from zlc_storage import canonical_text
 
 
 E0_TRIGGER_COUNT = 4
@@ -97,12 +92,12 @@ def _qualification_document(
     )
 
 
-def _record_evidence(
+def _validate_records(
     records: list[CameraFrameRecord],
     *,
     expected_shape: tuple[int, int],
     expected_dtype,
-) -> list[dict[str, object]]:
+) -> None:
     if len(records) != E0_TRIGGER_COUNT:
         raise RuntimeError("E0 camera drain count differs from the trigger schedule")
     if [record.source_ordinal for record in records] != list(range(E0_TRIGGER_COUNT)):
@@ -148,20 +143,6 @@ def _record_evidence(
         raise RuntimeError(
             "E0 exact qualification requires a hardware frame or camera stamp"
         )
-    return [
-        {
-            "source_ordinal": record.source_ordinal,
-            "produced_count": record.produced_count,
-            "frame_stamp": record.frame_stamp,
-            "camera_stamp": record.camera_stamp,
-            "timestamp_seconds": record.timestamp_seconds,
-            "timestamp_microseconds": record.timestamp_microseconds,
-            "host_received_at_ns": record.host_received_at_ns,
-            "shape": record.image.shape,
-            "dtype": record.image.dtype.str,
-        }
-        for record in records
-    ]
 
 
 def qualify_external_trigger_path(
@@ -169,7 +150,7 @@ def qualify_external_trigger_path(
     client: RemotePulseExecutionClient,
     camera: CameraAdapter,
     trigger_lane: str,
-) -> str:
+) -> None:
     """Actively qualify ordered one-frame-per-trigger path semantics."""
 
     if not isinstance(client, RemotePulseExecutionClient):
@@ -288,50 +269,11 @@ def qualify_external_trigger_path(
         terminal.source_stopped and terminal.no_more_frames and terminal.joined
     ):
         raise RuntimeError("E0 camera terminal record did not reconcile the full run")
-    record_rows = _record_evidence(
+    _validate_records(
         records,
         expected_shape=working_point.frame_shape_yx,
         expected_dtype=working_point.dtype,
     )
-    qualification_scope = {
-        "adapter_type": f"{type(camera).__module__}.{type(camera).__qualname__}",
-        "acquisition_mode": working_point.acquisition_mode,
-        "frame_shape_yx": working_point.frame_shape_yx,
-        "sensor_shape_yx": working_point.sensor_shape_yx,
-        "roi_origin_yx": working_point.roi_origin_yx,
-        "roi_shape_yx": working_point.roi_shape_yx,
-        "binning_yx": working_point.binning_yx,
-        "dtype": working_point.dtype.str,
-        "count_unit": working_point.count_unit,
-        "capture_trigger_channels": working_point.capture_trigger_channels,
-        "external_trigger_integration_start_offset_seconds": (
-            working_point.external_trigger_integration_start_offset_seconds
-        ),
-        "gain": working_point.gain,
-        "readout_mode": working_point.readout_mode,
-    }
-    evidence = {
-        "contract": "zlc.real-camera-active-e0",
-        "connection_generation": snapshot.connection_generation,
-        "manifest_fingerprint": snapshot.manifest.fingerprint,
-        "artifact_fingerprint": artifact.fingerprint,
-        "trigger_schedule_fingerprint": schedule.fingerprint,
-        # Exposure and its read-back minimum interval are deliberately not
-        # part of this structural path qualification.  Every exact run freezes
-        # current readback and derives its own spacing and quiet-window facts.
-        "camera_qualification_scope": qualification_scope,
-        "camera_records": record_rows,
-        "camera_terminal": {
-            "produced_count": terminal.produced_count,
-            "source_stopped": terminal.source_stopped,
-            "no_more_frames": terminal.no_more_frames,
-            "joined": terminal.joined,
-        },
-        "pulse_terminal_fingerprint": completion.hardware_terminal.fingerprint,
-        "pulse_tail_fingerprint": completion.post_terminal_tail.fingerprint,
-        "expected_trigger_counts": completion.expected_trigger_counts_from_completed_schedule,
-    }
-    return canonical_digest(evidence)
 
 
 __all__ = ["qualify_external_trigger_path"]

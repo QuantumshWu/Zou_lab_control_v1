@@ -3,11 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-import json
 from pathlib import Path
-import subprocess
-import sys
-import textwrap
 
 import numpy as np
 import pytest
@@ -58,41 +54,14 @@ def _contract_with_required_trigger_interval(contract, seconds: float):
         contract.capability,
         camera_capability_evidence=evidence,
     )
-    provenance = replace(
-        contract.camera_provenance,
-        capability_fingerprint=capability.capability_fingerprint,
-    )
     return replace(
         contract,
         capability=capability,
-        camera_provenance=provenance,
     )
 
 
 def _axis(name: str, role, size: int) -> AxisSpec:
     return AxisSpec(AxisId(name), name, role, size, tuple(range(size)))
-
-
-def _run_isolated(script: str, workspace: Path) -> dict[str, object]:
-    completed = subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(script), str(workspace)],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        timeout=60,
-        check=False,
-    )
-    if completed.returncode:
-        pytest.fail(
-            "isolated current-composition probe failed\n"
-            f"stdout:\n{completed.stdout}\n"
-            f"stderr:\n{completed.stderr}"
-        )
-    marker = "RESULT_JSON="
-    for line in reversed(completed.stdout.splitlines()):
-        if line.startswith(marker):
-            return json.loads(line[len(marker) :])
-    pytest.fail(f"isolated probe returned no result marker: {completed.stdout}")
 
 
 def test_ordered_cleanup_runs_later_physical_steps_after_earlier_exception():
@@ -174,6 +143,7 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
                 AxisId("capture.ordinal"),
                 readout_events_per_repeat=3,
             ),
+            camera_instance_id="camera",
         )
         schedule = static.compiled_artifact.trigger_schedules[0]
         assert schedule.minimum_interval_ticks is not None
@@ -227,6 +197,7 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
                 AxisId("single.ordinal"),
                 readout_events_per_repeat=1,
             ),
+            camera_instance_id="camera",
         )
         single_schedule = single_edge.compiled_artifact.trigger_schedules[0]
         assert single_schedule.total == 1
@@ -289,6 +260,7 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
                 execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS,
                 trigger_channel="ch11",
                 layout=scan_layout,
+                camera_instance_id="camera",
             )
         scanned = bind_triggered_camera_acquisition(
             pulse_port,
@@ -297,6 +269,7 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
             execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
             trigger_channel="ch11",
             layout=scan_layout,
+            camera_instance_id="camera",
         )
         scan_schedule = scanned.compiled_artifact.trigger_schedules[0]
         edges = tuple(scan_schedule.iter_edges())
@@ -331,189 +304,3 @@ def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
             )
     finally:
         assert runtime.shutdown(timeout=2.0)
-
-
-def test_public_current_capture_is_one_autonomous_fire_with_exact_reconciliation(
-    tmp_path,
-):
-    result = _run_isolated(
-        """
-        import json
-        from pathlib import Path
-        import sys
-
-        from Zou_lab_control.api import WorkspacePaths, connect
-        from zlc_pulse import load_pulse_document
-
-        workspace = Path(sys.argv[1])
-        document = load_pulse_document(
-            Path("pulses/imaging_template.json")
-        )
-        experiment = connect(
-            "virtual",
-                workspace=WorkspacePaths.for_workspace(workspace),
-            seed=7,
-        )
-        try:
-            request = experiment.readout.capture_request(
-                document,
-                repeat_count=1,
-                readout_events_per_repeat=3,
-            )
-            descriptor = experiment.inspect(request)
-            handle = experiment.start(request)
-            reference = handle.result(10.0)
-            artifact = experiment.readout.load_capture(reference)
-            pulse = artifact.pulse_evidence
-            assert pulse is not None
-            schedule = tuple(artifact.frame_source.iter_cell_schedule())
-            result = {
-                "expected_frames": descriptor.expected_frames,
-                "descriptor_shape": list(descriptor.output_schema.physical_shape),
-                "physical_shape": list(artifact.frame_source.schema.physical_shape),
-                "data_shape": list(
-                    artifact.frame_source.schema.cell_schema.data_shape
-                ),
-                "cells": [
-                    [cell.repeat_index, cell.point_ordinal]
-                    for cell in schedule
-                ],
-                "produced": artifact.terminal.produced_count,
-                "drained": artifact.terminal.drained_count,
-                "pulse_trigger_count": dict(
-                    pulse.terminal.receipt.expected_trigger_counts_from_completed_schedule
-                )["ch11"],
-                "execution_form": pulse.compiled_artifact.execution_form.value,
-            }
-            print("RESULT_JSON=" + json.dumps(result, sort_keys=True))
-        finally:
-            experiment.close()
-        """,
-        tmp_path / "current-capture",
-    )
-    assert result == {
-        "cells": [[0, 0], [0, 1], [0, 2]],
-        "data_shape": [96, 128],
-        "descriptor_shape": [1, 3, 96, 128],
-        "drained": 3,
-        "execution_form": "STATIC_ONCE",
-        "expected_frames": 3,
-        "physical_shape": [1, 3, 96, 128],
-        "produced": 3,
-        "pulse_trigger_count": 3,
-    }
-
-
-def test_exact_preview_filters_frozen_source_ordinals_before_capacity_one_ingest(
-    tmp_path,
-):
-    from Zou_lab_control.api import WorkspacePaths, connect
-
-    class RecordingPreview:
-        def __init__(self, spec) -> None:
-            self.spec = spec
-            self.terminal = False
-            self.failure = None
-            self.source_ordinals = []
-            self.head_sequences = []
-            self.missed_events = []
-            self.dataset = None
-
-        def bind(self, dataset) -> None:
-            self.dataset = dataset
-
-        def updated(self) -> None:
-            snapshot = self.dataset.materialize(None)
-            self.source_ordinals.append(
-                snapshot.cell_metadata[0].source_ordinal
-            )
-            self.head_sequences.append(snapshot.head.sequence)
-            self.missed_events.append(snapshot.coverage.missed_events)
-
-        def fail(self, message: str) -> None:
-            self.failure = message
-            self.terminal = True
-            self.close()
-
-        def source_terminal(self) -> None:
-            self.terminal = True
-
-        def close(self) -> None:
-            dataset, self.dataset = self.dataset, None
-            if dataset is not None:
-                dataset.close()
-
-    project = (tmp_path / "preview-selection").resolve()
-    experiment = connect(
-        "virtual",
-        workspace=WorkspacePaths(
-            project_root=project,
-            pulses_root=(ROOT / "pulses").resolve(),
-            tasks_root=(ROOT / "tasks").resolve(),
-            output_root=project / "_output",
-        ),
-        seed=7,
-    )
-    ports = []
-    try:
-        sequence = experiment.nodes.calibration.sitemap_request(frames=2)
-        grouping = sequence.capture_request.within_point_grouping
-        assert grouping is not None
-        reference_event = sequence.analysis.layout.reference_event_indices[0]
-        selected = tuple(
-            source_ordinal
-            for source_ordinal, (_repeat, event) in enumerate(grouping)
-            if event == reference_event
-        )
-        assert selected == (0, 3)
-
-        def run_preview(source_ordinals, suffix):
-            prepared = experiment.readout.prepare_capture(sequence.capture_request)
-
-            def factory(spec):
-                port = RecordingPreview(spec)
-                ports.append(port)
-                return port
-
-            handle = prepared.start_with_preview(
-                factory=factory,
-                source_ordinals=source_ordinals,
-            )
-            return ports[-1], handle.result(10.0)
-
-        selected_port, selected_ref = run_preview(selected, "selected")
-        assert selected_port.source_ordinals == [0, 3], selected_port.failure
-        assert selected_port.head_sequences == [0, 3]
-        assert selected_port.missed_events == [0, 0]
-        assert selected_port.failure is None and selected_port.terminal
-        assert tuple(
-            sample.metadata.source_ordinal
-            for _cell, sample in experiment.readout.load_capture(
-                selected_ref
-            ).frame_source.iter_event_order()
-        ) == tuple(range(6))
-
-        all_port, _all_ref = run_preview(None, "all")
-        assert all_port.source_ordinals == list(range(6))
-        assert all_port.head_sequences == list(range(6))
-        assert all_port.missed_events == [0] * 6
-        assert all_port.failure is None and all_port.terminal
-
-        rejected = experiment.readout.prepare_capture(sequence.capture_request)
-
-        def rejected_factory(spec):
-            port = RecordingPreview(spec)
-            ports.append(port)
-            return port
-
-        with pytest.raises(ValueError, match="frozen cell schedule"):
-            rejected.start_with_preview(
-                factory=rejected_factory,
-                source_ordinals=(6,),
-            )
-        assert ports[-1].terminal
-        assert "frozen cell schedule" in ports[-1].failure
-    finally:
-        for port in ports:
-            port.close()
-        experiment.close()

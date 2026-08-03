@@ -7,14 +7,6 @@ from dataclasses import dataclass
 from zlc_data import (
     StreamGenerationId,
 )
-from zlc_data.transform_codec import (
-    data_transform_spec_from_tree,
-    data_transform_spec_to_tree,
-)
-from zlc_neutral_atom.catalog import (
-    definition_key_from_tree,
-    definition_key_to_tree,
-)
 from zlc_neutral_atom.devices.sequencer.port import (
     PulseTerminalAck,
     pulse_terminal_ack_from_tree,
@@ -32,7 +24,11 @@ from zlc_neutral_atom.runtime.signal_source import (
     signal_projection_authority_from_tree,
     signal_projection_authority_to_tree,
 )
-from zlc_pulse import CompiledPulseArtifact, PulseExecutionForm
+from zlc_pulse import (
+    CompiledPulseArtifact,
+    PulseExecutionForm,
+    materialize_scan_sweeps,
+)
 from zlc_storage import (
     exact_mapping,
     nonnegative_integer,
@@ -76,11 +72,10 @@ class SignalEventSequence:
             raise TypeError(
                 "projection_authority must be SignalProjectionAuthority"
             )
-        committed = self.projection_authority.committed_transform
-        committed_spec = None if committed is None else committed.spec
-        if self.binding.transform != committed_spec:
+        if self.projection_authority.committed_transform is not None:
             raise ValueError(
-                "signal binding authoring transform differs from committed authority"
+                "PulseScan consumes the selected signal as declared; authoritative "
+                "projection belongs to its upstream producer"
             )
         references = tuple(self.event_refs)
         if not references or any(
@@ -146,6 +141,12 @@ class AutonomousScanExecution:
             raise TypeError("artifact must be CompiledPulseArtifact")
         if self.artifact.execution_form is not PulseExecutionForm.AUTONOMOUS_SCAN_ONCE:
             raise ValueError("autonomous scan lineage requires AUTONOMOUS_SCAN_ONCE")
+        expected_document = materialize_scan_sweeps(
+            self.program.execution_document,
+            self.program.sweep_count,
+        )
+        if self.artifact.source_document_digest != expected_document.fingerprint:
+            raise ValueError("autonomous pulse artifact differs from its scan program")
         if not isinstance(self.terminal, PulseTerminalAck):
             raise TypeError("terminal must be PulseTerminalAck")
         validate_pulse_terminal_for_artifact(self.terminal, self.artifact)
@@ -200,6 +201,13 @@ class ApiSegmentedScanExecution:
             (item.repeat_index, item.point_ordinal) for item in segments
         ) != expected_cells:
             raise ValueError("API segment order must be repeat-major and point-fast")
+        documents = self.program.resolved_point_documents
+        if any(
+            item.artifact.source_document_digest
+            != documents[item.point_ordinal].fingerprint
+            for item in segments
+        ):
+            raise ValueError("API pulse artifact differs from its scan point program")
         if not isinstance(self.source, SignalEventSequence):
             raise TypeError("source must be SignalEventSequence")
         if self.source.count != self.program.segment_count:
@@ -231,42 +239,21 @@ def execution_compiled_artifacts(
 
 def _binding_to_tree(value: ScanSignalBinding) -> dict[str, object]:
     return {
-        "producer_definition": definition_key_to_tree(value.producer_definition),
-        "output": {
-            "name": value.output.name,
-            "contract_id": value.output.contract_id,
-        },
-        "transform": (
-            None
-            if value.transform is None
-            else data_transform_spec_to_tree(value.transform)
-        ),
+        "signal_name": value.signal_name,
+        "output_name": value.output_name,
     }
 
 
 def _binding_from_tree(tree: object) -> ScanSignalBinding:
     data = exact_mapping(
         tree,
-        {"producer_definition", "output", "transform"},
+        {"signal_name", "output_name"},
         "PulseScan signal binding",
         discriminator=None,
     )
-    output = exact_mapping(
-        data["output"],
-        {"name", "contract_id"},
-        "PulseScan signal output",
-        discriminator=None,
-    )
-    from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
-
     return ScanSignalBinding(
-        definition_key_from_tree(data["producer_definition"]),
-        DatasetOutputDeclaration(output["name"], output["contract_id"]),
-        (
-            None
-            if data["transform"] is None
-            else data_transform_spec_from_tree(data["transform"])
-        ),
+        data["signal_name"],
+        data["output_name"],
     )
 
 
@@ -309,7 +296,7 @@ def signal_event_sequence_from_tree(tree: object) -> SignalEventSequence:
         raise TypeError(
             "SignalEventSequence direct_input_event_refs must be nested lists"
         )
-    value = SignalEventSequence(
+    return SignalEventSequence(
         _binding_from_tree(data["binding"]),
         signal_projection_authority_from_tree(data["projection_authority"]),
         tuple(event_ref_from_tree(item) for item in event_refs),
@@ -318,9 +305,6 @@ def signal_event_sequence_from_tree(tree: object) -> SignalEventSequence:
             for row in direct_rows
         ),
     )
-    if signal_event_sequence_to_tree(value) != tree:
-        raise ValueError("SignalEventSequence tree is non-canonical")
-    return value
 
 
 def pulse_scan_execution_to_tree(value: PulseScanExecution) -> dict[str, object]:
@@ -413,8 +397,6 @@ def pulse_scan_execution_from_tree(
         )
     else:
         raise ValueError("PulseScan execution kind is unknown")
-    if pulse_scan_execution_to_tree(value) != tree:
-        raise ValueError("PulseScan execution tree is non-canonical")
     return value
 
 

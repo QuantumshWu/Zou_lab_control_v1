@@ -18,10 +18,7 @@ from zlc_data.transform_codec import (
     committed_transform_to_tree,
 )
 from zlc_storage import exact_mapping
-from zlc_neutral_atom.catalog import DefinitionKey, MeasurementDefinition
-from zlc_neutral_atom.timing.pulse_parameter_scan import (
-    PULSE_PARAMETER_SCAN_PROGRAM_SCHEMA,
-)
+from zlc_neutral_atom.catalog import DefinitionKey, LogicNodeDefinition
 
 
 SCAN_OUTPUT_CONTRACT_SCHEMA = "zlc_neutral_atom.ScanOutputContract"
@@ -29,11 +26,10 @@ PULSE_SCAN_MEASUREMENT_KEY = DefinitionKey(
     "zlc_neutral_atom.logic_nodes.pulse_scan",
     "pulse-scan",
 )
-PULSE_SCAN_MEASUREMENT_DEFINITION = MeasurementDefinition(
+PULSE_SCAN_MEASUREMENT_DEFINITION = LogicNodeDefinition(
     PULSE_SCAN_MEASUREMENT_KEY,
     "Pulse scan",
-    PULSE_PARAMETER_SCAN_PROGRAM_SCHEMA,
-    "zlc.pulse-scan-binding",
+    "measurement",
 )
 
 

@@ -2,30 +2,26 @@
 
 from __future__ import annotations
 
-import base64
 from collections.abc import Callable
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
 
-from zlc_data import OwnedSnapshot
+from zlc_data import AxisId, CoordinateFrameId, DatasetSchema, OwnedSnapshot
 from zlc_neutral_atom.artifact_dataset_source import ArtifactDatasetSource
 from zlc_neutral_atom.devices.camera.capture_port import (
     CaptureTerminalAck,
-    capture_terminal_ack_from_tree,
-    capture_terminal_ack_to_tree,
 )
 from zlc_neutral_atom.devices.camera.contract import (
-    CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT,
-    CameraAcquisitionMode,
     CameraCapabilityEvidence,
-    FrozenCaptureSpec,
-    camera_capability_evidence_from_tree,
-    camera_capability_evidence_to_tree,
-    decode_camera_capture_spec,
-    freeze_camera_capture_spec,
-    frozen_capture_spec_from_tree,
-    frozen_capture_spec_to_tree,
+    CameraCaptureDescriptor,
+    CameraEventReadoutSetting,
+    CameraPhysicalFacts,
+    CameraCaptureSpec,
+    ReadoutBindingKey,
+    camera_capture_spec_from_tree,
+    camera_capture_spec_to_tree,
+    camera_frame_facts_to_tree,
 )
 from zlc_neutral_atom.runtime.dataset import (
     DatasetSealProvenance,
@@ -54,96 +50,38 @@ from .frames import (
     _write_capture_frame_source,
 )
 from .pipeline import CapturePreviewPort, MinimalPipelineSpec, PipelineResult, compile_pipeline
-from .reference import CaptureArtifactRef
+from .reference import CAPTURE_RECORD_PREFIX, CaptureArtifactRef
 from .session import (
     CameraCaptureProvenance,
-    camera_capture_provenance_from_tree,
-    camera_capture_provenance_to_tree,
 )
 from .triggered import TriggeredCaptureSpec, TriggeredPipelineResult, compile_triggered_pipeline
 
 
-CAPTURE_ARTIFACT_SCHEMA = "zlc_neutral_atom.capture-artifact"
+CAPTURE_ARTIFACT_SCHEMA = "zlc.capture"
 _CAPTURE_RECORD_NAME = "capture.json"
 _COMPILED_PULSE_NAME = "pulse.bin"
-_BYTES_MARKER = "$zlc-bytes"
 _CAPTURE_FIELDS = {
     "schema",
     "run_id",
     "frames",
     "provenance",
     "terminal",
-    "camera_provenance",
-    "camera_capability_evidence",
-    "camera_arm_spec",
-    "compiled_pulse_file",
-    "pulse_evidence",
+    "camera",
+    "capture",
+    "pulse",
 }
-
-
-def _json_tree(value: object) -> object:
-    if isinstance(value, bytes):
-        return {_BYTES_MARKER: base64.b64encode(value).decode("ascii")}
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, dict):
-        if any(not isinstance(key, str) for key in value):
-            raise TypeError("capture record mappings require string keys")
-        return {key: _json_tree(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_tree(item) for item in value]
-    raise TypeError(f"capture record contains unsupported {type(value).__name__}")
-
-
-def _typed_tree(value: object) -> object:
-    if isinstance(value, list):
-        return [_typed_tree(item) for item in value]
-    if isinstance(value, dict):
-        if set(value) == {_BYTES_MARKER}:
-            encoded = value[_BYTES_MARKER]
-            if not isinstance(encoded, str):
-                raise TypeError("capture bytes marker must contain text")
-            try:
-                return base64.b64decode(encoded, validate=True)
-            except ValueError as exc:
-                raise ValueError("capture bytes marker is invalid") from exc
-        return {key: _typed_tree(item) for key, item in value.items()}
-    return value
-
-
-def _record_text(tree: dict[str, object]) -> str:
-    return json.dumps(
-        _json_tree(tree),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ) + "\n"
-
-
-def _read_record(path: Path) -> dict[str, object]:
-    with path.open("r", encoding="utf-8") as stream:
-        raw = json.load(stream)
-    tree = _typed_tree(raw)
-    if not isinstance(tree, dict) or set(tree) != _CAPTURE_FIELDS:
-        raise ValueError("CaptureArtifact record has an unknown field set")
-    if tree["schema"] != CAPTURE_ARTIFACT_SCHEMA:
-        raise ValueError("CaptureArtifact schema is not current")
-    return tree
 
 
 def _validate_capture_metadata_contract(
     *,
-    schema,
+    schema: DatasetSchema,
     count: int,
     provenance: DatasetSealProvenance,
-    terminal: CaptureTerminalAck,
-    camera_provenance: CameraCaptureProvenance,
-    camera_capability_evidence: CameraCapabilityEvidence,
-    camera_arm_spec: FrozenCaptureSpec,
+    terminal: dict[str, object],
+    camera: dict[str, object],
+    capture_spec: CameraCaptureSpec,
 ) -> None:
     """Check the physical facts that make this a coherent raw capture."""
-
-    from zlc_data import DatasetSchema
 
     if not isinstance(schema, DatasetSchema):
         raise TypeError("schema must be DatasetSchema")
@@ -153,73 +91,23 @@ def _validate_capture_metadata_contract(
         raise TypeError("provenance must be DatasetSealProvenance")
     if provenance.direct_parent_span is not None:
         raise ValueError("raw CaptureArtifact cannot persist processor output")
-    if not isinstance(terminal, CaptureTerminalAck):
-        raise TypeError("terminal must be CaptureTerminalAck")
-    if not isinstance(camera_provenance, CameraCaptureProvenance):
-        raise TypeError("camera_provenance must be CameraCaptureProvenance")
-    camera_provenance.validate_schema(schema)
-    if not isinstance(camera_capability_evidence, CameraCapabilityEvidence):
-        raise TypeError("camera_capability_evidence must be CameraCapabilityEvidence")
-    if not isinstance(camera_arm_spec, FrozenCaptureSpec):
-        raise TypeError("camera_arm_spec must be FrozenCaptureSpec")
-    if camera_arm_spec.owner_fingerprint != CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT:
-        raise ValueError("camera arm spec belongs to an unknown owner")
-    decoded_arm_spec = decode_camera_capture_spec(camera_arm_spec.payload)
-    if freeze_camera_capture_spec(decoded_arm_spec) != camera_arm_spec:
-        raise ValueError("camera arm spec is not the owner encoding")
-    if decoded_arm_spec.mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
-        raise ValueError("finite CaptureArtifact requires external camera trigger")
-    if len(
-        {
-            camera_capability_evidence.fingerprint,
-            terminal.capability_fingerprint,
-            camera_provenance.capability_fingerprint,
-        }
-    ) != 1:
-        raise ValueError("camera capability lineage is inconsistent")
-    camera_capability_evidence.physical_facts.validate_descriptor(
-        camera_provenance.descriptor
-    )
-    if (
-        camera_capability_evidence.capture_spec_owner_fingerprint
-        != CAMERA_CAPTURE_SPEC_OWNER_FINGERPRINT
-    ):
-        raise ValueError("camera capability names an unknown capture-spec owner")
-    if len(
-        {
-            camera_arm_spec.digest,
-            terminal.capture_spec_fingerprint,
-            camera_provenance.camera_arm_spec_fingerprint,
-        }
-    ) != 1:
-        raise ValueError("camera arm-spec lineage is inconsistent")
-    if (
-        camera_provenance.binding_stamp.binding_instance_id
-        != terminal.binding_instance_id
-    ):
-        raise ValueError("camera binding lineage is inconsistent")
-    if camera_provenance.binding.value != camera_capability_evidence.source_id:
-        raise ValueError("camera source lineage is inconsistent")
+    canonical_text(camera["binding"], "camera binding")
+    canonical_text(camera["source_id"], "camera source_id")
     physical_cells = schema.repeat_axis.size * schema.point_table.row_count
-    if count != physical_cells or decoded_arm_spec.expected_frames != count:
-        raise ValueError("capture cardinality differs from camera arm")
-    if len(
-        {
-            decoded_arm_spec.settings_fingerprint,
-            camera_capability_evidence.settings_fingerprint,
-            terminal.settings_fingerprint,
-            camera_provenance.active_settings_fingerprint,
-        }
-    ) != 1:
-        raise ValueError("camera settings lineage is inconsistent")
+    if count != physical_cells:
+        raise ValueError("capture cardinality differs from Dataset shape")
+    if not isinstance(capture_spec, CameraCaptureSpec):
+        raise TypeError("capture_spec must be CameraCaptureSpec")
+    if capture_spec.expected_frames != count:
+        raise ValueError("capture spec cardinality differs from persisted data")
     if provenance.end_sequence - provenance.start_sequence != count:
         raise ValueError("capture provenance interval differs from event count")
     if (
-        terminal.produced_count != count
-        or terminal.drained_count != count
-        or not terminal.source_stopped
-        or not terminal.no_more_frames
-        or not terminal.joined
+        terminal["produced_count"] != count
+        or terminal["drained_count"] != count
+        or not terminal["source_stopped"]
+        or not terminal["no_more_frames"]
+        or not terminal["joined"]
     ):
         raise ValueError("capture terminal evidence differs from persisted data")
 
@@ -230,10 +118,9 @@ class CaptureArtifact:
     run_id: str
     frame_source: CaptureFrameSource
     provenance: DatasetSealProvenance
-    terminal: CaptureTerminalAck
-    camera_provenance: CameraCaptureProvenance
-    camera_capability_evidence: CameraCapabilityEvidence
-    camera_arm_spec: FrozenCaptureSpec
+    terminal: dict[str, object]
+    camera: dict[str, object]
+    capture_spec: CameraCaptureSpec
     pulse_evidence: PulseCaptureEvidence | None = None
     _snapshot: OwnedSnapshot | None = field(default=None, repr=False, compare=False)
 
@@ -241,7 +128,10 @@ class CaptureArtifact:
         if not isinstance(self.ref, CaptureArtifactRef):
             raise TypeError("ref must be CaptureArtifactRef")
         canonical_text(self.run_id, "run_id")
-        if self.ref.record_path != f"{self.run_id}/{_CAPTURE_RECORD_NAME}":
+        expected_path = "/".join(
+            (*CAPTURE_RECORD_PREFIX, self.run_id, _CAPTURE_RECORD_NAME)
+        )
+        if self.ref.record_path != expected_path:
             raise ValueError("CaptureArtifactRef run-name differs from run_id")
         if not isinstance(self.frame_source, CaptureFrameSource):
             raise TypeError("frame_source must be CaptureFrameSource")
@@ -250,9 +140,8 @@ class CaptureArtifact:
             count=self.frame_source.event_count,
             provenance=self.provenance,
             terminal=self.terminal,
-            camera_provenance=self.camera_provenance,
-            camera_capability_evidence=self.camera_capability_evidence,
-            camera_arm_spec=self.camera_arm_spec,
+            camera=self.camera,
+            capture_spec=self.capture_spec,
         )
         if self.pulse_evidence is not None and not isinstance(
             self.pulse_evidence, PulseCaptureEvidence
@@ -261,9 +150,12 @@ class CaptureArtifact:
         if self.pulse_evidence is not None:
             if self.pulse_evidence.expected_trigger_count != self.frame_source.event_count:
                 raise ValueError("pulse trigger count differs from captured frames")
-            self.camera_capability_evidence.physical_facts.require_single_capture_trigger_channel(
-                self.pulse_evidence.trigger_channel
-            )
+            if tuple(self.camera["capture_trigger_channels"]) != (
+                self.pulse_evidence.trigger_channel,
+            ):
+                raise ValueError(
+                    "capture pulse trigger differs from the camera wiring"
+                )
             expected = self.pulse_evidence.expected_cell_schedule(
                 self.frame_source.schema
             )
@@ -289,6 +181,79 @@ class CaptureArtifact:
         block = self.frame_source.materialize(abort_check=abort_check)
         return OwnedSnapshot(self.frame_source.ref(self.provenance.generation), block)
 
+    @property
+    def camera_binding(self) -> ReadoutBindingKey:
+        """The logical readout binding persisted by the capture owner."""
+
+        return ReadoutBindingKey(self.camera["binding"])
+
+    @property
+    def camera_descriptor(self) -> CameraCaptureDescriptor:
+        """Rehydrate the typed camera geometry used by downstream analysis."""
+
+        settings = tuple(
+            CameraEventReadoutSetting(
+                row["event_index"],
+                row["exposure_seconds"],
+                row["gain"],
+                row["readout_mode"],
+            )
+            for row in self.camera["event_settings"]
+        )
+        return CameraCaptureDescriptor(
+            camera_identity=self.camera["camera_identity"],
+            sensor_identity=self.camera["sensor_identity"],
+            optical_path=self.camera["optical_path"],
+            sensor_shape_yx=tuple(self.camera["sensor_shape_yx"]),
+            roi_origin_yx=tuple(self.camera["roi_origin_yx"]),
+            roi_shape_yx=tuple(self.camera["roi_shape_yx"]),
+            binning_yx=tuple(self.camera["binning_yx"]),
+            spatial_y_axis_id=AxisId(self.camera["spatial_y_axis_id"]),
+            spatial_x_axis_id=AxisId(self.camera["spatial_x_axis_id"]),
+            coordinate_frame=CoordinateFrameId(self.camera["coordinate_frame"]),
+            dtype=self.camera["dtype"],
+            count_unit=self.camera["count_unit"],
+            readout_event_axis_id=(
+                None
+                if self.camera["readout_event_axis_id"] is None
+                else AxisId(self.camera["readout_event_axis_id"])
+            ),
+            event_settings=settings,
+        )
+
+    @property
+    def camera_physical_facts(self) -> CameraPhysicalFacts:
+        """Rehydrate the physical working-point facts needed by analysis."""
+
+        settings = tuple(self.camera["event_settings"])
+        if not settings:
+            raise ValueError("capture camera record has no event settings")
+        setting = settings[0]
+        return CameraPhysicalFacts(
+            camera_identity=self.camera["camera_identity"],
+            sensor_identity=self.camera["sensor_identity"],
+            optical_path=self.camera["optical_path"],
+            capture_trigger_channels=tuple(self.camera["capture_trigger_channels"]),
+            sensor_shape_yx=tuple(self.camera["sensor_shape_yx"]),
+            roi_origin_yx=tuple(self.camera["roi_origin_yx"]),
+            roi_shape_yx=tuple(self.camera["roi_shape_yx"]),
+            binning_yx=tuple(self.camera["binning_yx"]),
+            spatial_y_axis_id=AxisId(self.camera["spatial_y_axis_id"]),
+            spatial_x_axis_id=AxisId(self.camera["spatial_x_axis_id"]),
+            coordinate_frame=CoordinateFrameId(self.camera["coordinate_frame"]),
+            dtype=self.camera["dtype"],
+            count_unit=self.camera["count_unit"],
+            exposure_seconds=setting["exposure_seconds"],
+            required_external_trigger_interval_seconds=(
+                self.camera["required_external_trigger_interval_seconds"]
+            ),
+            external_trigger_integration_start_offset_seconds=(
+                self.camera["external_trigger_integration_start_offset_seconds"]
+            ),
+            gain=setting["gain"],
+            readout_mode=setting["readout_mode"],
+        )
+
 
 def _capture_result(
     result: PipelineResult | TriggeredPipelineResult,
@@ -300,18 +265,128 @@ def _capture_result(
     raise TypeError("capture output requires an exact pipeline result")
 
 
+def _terminal_to_record(value: CaptureTerminalAck) -> dict[str, object]:
+    if not isinstance(value, CaptureTerminalAck):
+        raise TypeError("value must be CaptureTerminalAck")
+    return {
+        "session_id": value.session_id,
+        "produced_count": value.produced_count,
+        "drained_count": value.drained_count,
+        "source_stopped": value.source_stopped,
+        "no_more_frames": value.no_more_frames,
+        "joined": value.joined,
+    }
+
+
+def _terminal_from_record(tree: object) -> dict[str, object]:
+    fields = {
+        "session_id",
+        "produced_count",
+        "drained_count",
+        "source_stopped",
+        "no_more_frames",
+        "joined",
+    }
+    if not isinstance(tree, dict) or set(tree) != fields:
+        raise ValueError("capture terminal record has an unknown field set")
+    return dict(tree)
+
+
+def _camera_to_record(
+    provenance: CameraCaptureProvenance,
+    evidence: CameraCapabilityEvidence,
+) -> dict[str, object]:
+    """Project the reload/science camera facts without digest mirrors."""
+
+    if not isinstance(provenance, CameraCaptureProvenance):
+        raise TypeError("provenance must be CameraCaptureProvenance")
+    if not isinstance(evidence, CameraCapabilityEvidence):
+        raise TypeError("evidence must be CameraCapabilityEvidence")
+    descriptor = provenance.descriptor
+    facts = evidence.physical_facts
+    return {
+        "adapter_type": evidence.adapter_type,
+        "source_id": evidence.source_id,
+        "binding": provenance.binding.value,
+        **camera_frame_facts_to_tree(facts),
+        "capture_trigger_channels": list(facts.capture_trigger_channels),
+        "required_external_trigger_interval_seconds": (
+            facts.required_external_trigger_interval_seconds
+        ),
+        "external_trigger_integration_start_offset_seconds": (
+            facts.external_trigger_integration_start_offset_seconds
+        ),
+        "readout_event_axis_id": (
+            None
+            if descriptor.readout_event_axis_id is None
+            else descriptor.readout_event_axis_id.value
+        ),
+        "event_settings": [
+            {
+                "event_index": setting.event_index,
+                "exposure_seconds": setting.exposure_seconds,
+                "gain": setting.gain,
+                "readout_mode": setting.readout_mode,
+            }
+            for setting in descriptor.event_settings
+        ],
+    }
+
+
+def _camera_from_record(tree: object) -> dict[str, object]:
+    fields = {
+        "adapter_type",
+        "source_id",
+        "binding",
+        "camera_identity",
+        "sensor_identity",
+        "optical_path",
+        "capture_trigger_channels",
+        "sensor_shape_yx",
+        "roi_origin_yx",
+        "roi_shape_yx",
+        "binning_yx",
+        "spatial_y_axis_id",
+        "spatial_x_axis_id",
+        "coordinate_frame",
+        "dtype",
+        "count_unit",
+        "required_external_trigger_interval_seconds",
+        "external_trigger_integration_start_offset_seconds",
+        "readout_event_axis_id",
+        "event_settings",
+    }
+    if not isinstance(tree, dict) or set(tree) != fields:
+        raise ValueError("capture camera record has an unknown field set")
+    event_rows = tree["event_settings"]
+    if not isinstance(event_rows, list) or not event_rows:
+        raise ValueError("capture event_settings must be a non-empty list")
+    setting_fields = {
+        "event_index",
+        "exposure_seconds",
+        "gain",
+        "readout_mode",
+    }
+    for row in event_rows:
+        if not isinstance(row, dict) or set(row) != setting_fields:
+            raise ValueError("capture event setting has an unknown field set")
+    return dict(tree)
+
+
 def write_capture_artifact(
-    captures_root: Path,
+    project_root: Path,
     result: PipelineResult | TriggeredPipelineResult,
 ) -> CaptureArtifactRef:
     """Write payload files first and atomically publish ``capture.json`` last."""
 
-    root = Path(captures_root).expanduser().resolve()
-    durable_makedirs(root)
+    root = Path(project_root).expanduser().resolve()
+    durable_makedirs(resolve_under(root, "/".join(CAPTURE_RECORD_PREFIX)))
     base, pulse_evidence = _capture_result(result)
     if not base.is_direct_raw_capture:
         raise ValueError("CaptureArtifact accepts only direct raw camera data")
-    reference = CaptureArtifactRef(f"{base.run_id}/{_CAPTURE_RECORD_NAME}")
+    reference = CaptureArtifactRef(
+        "/".join((*CAPTURE_RECORD_PREFIX, base.run_id, _CAPTURE_RECORD_NAME))
+    )
     record_path = resolve_under(root, reference.record_path)
     run_dir = record_path.parent
     durable_makedirs(run_dir)
@@ -330,15 +405,18 @@ def write_capture_artifact(
             resolve_under(run_dir, compiled_pulse_file),
             encode_compiled_pulse_artifact(pulse_evidence.compiled_artifact),
         )
+    camera = _camera_to_record(
+        base.camera_provenance,
+        base.camera_capability_evidence,
+    )
     artifact = CaptureArtifact(
         ref=reference,
         run_id=base.run_id,
         frame_source=frame_source,
         provenance=base.dataset.provenance,
-        terminal=base.capture_terminal,
-        camera_provenance=base.camera_provenance,
-        camera_capability_evidence=base.camera_capability_evidence,
-        camera_arm_spec=base.camera_arm_spec,
+        terminal=_terminal_to_record(base.capture_terminal),
+        camera=camera,
+        capture_spec=base.camera_capture_spec,
         pulse_evidence=pulse_evidence,
     )
     record = {
@@ -346,52 +424,72 @@ def write_capture_artifact(
         "run_id": artifact.run_id,
         "frames": frame_tree,
         "provenance": raw_dataset_seal_provenance_to_tree(artifact.provenance),
-        "terminal": capture_terminal_ack_to_tree(artifact.terminal),
-        "camera_provenance": camera_capture_provenance_to_tree(
-            artifact.camera_provenance
+        "terminal": artifact.terminal,
+        "camera": artifact.camera,
+        "capture": camera_capture_spec_to_tree(artifact.capture_spec),
+        "pulse": (
+            None
+            if artifact.pulse_evidence is None
+            else {
+                "compiled_pulse_file": compiled_pulse_file,
+                "evidence": pulse_capture_evidence_to_tree(
+                    artifact.pulse_evidence
+                ),
+            }
         ),
-        "camera_capability_evidence": camera_capability_evidence_to_tree(
-            artifact.camera_capability_evidence
-        ),
-        "camera_arm_spec": frozen_capture_spec_to_tree(artifact.camera_arm_spec),
-        "compiled_pulse_file": compiled_pulse_file,
-        "pulse_evidence": pulse_capture_evidence_to_tree(artifact.pulse_evidence),
     }
-    atomic_write_text(record_path, _record_text(record))
+    atomic_write_text(
+        record_path,
+        json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
     return reference
 
 
 def load_capture_artifact(
-    captures_root: Path,
+    project_root: Path,
     ref: CaptureArtifactRef,
     *,
     materialize: bool = False,
 ) -> CaptureArtifact:
-    """Load one visible direct-output capture beneath an explicit root."""
+    """Load one visible direct-output capture beneath an explicit project root."""
 
     if not isinstance(ref, CaptureArtifactRef):
         raise TypeError("ref must be CaptureArtifactRef")
     if type(materialize) is not bool:
         raise TypeError("materialize must be bool")
-    root = Path(captures_root).expanduser().resolve()
+    root = Path(project_root).expanduser().resolve()
     record_path = resolve_under(root, ref.record_path)
-    tree = _read_record(record_path)
+    with record_path.open("r", encoding="utf-8") as stream:
+        tree = json.load(stream)
+    if not isinstance(tree, dict) or set(tree) != _CAPTURE_FIELDS:
+        raise ValueError("CaptureArtifact record has an unknown field set")
+    if tree["schema"] != CAPTURE_ARTIFACT_SCHEMA:
+        raise ValueError("CaptureArtifact schema is not current")
     run_id = tree["run_id"]
     if not isinstance(run_id, str):
         raise TypeError("capture run_id must be str")
     frame_source = _capture_frame_source_from_tree(record_path.parent, tree["frames"])
-    pulse_file = tree["compiled_pulse_file"]
-    if pulse_file is None:
+    pulse_record = tree["pulse"]
+    if pulse_record is None:
         compiled_pulse = None
+        pulse_evidence = None
     else:
+        if not isinstance(pulse_record, dict) or set(pulse_record) != {
+            "compiled_pulse_file",
+            "evidence",
+        }:
+            raise ValueError("capture pulse record has an unknown field set")
+        pulse_file = pulse_record["compiled_pulse_file"]
         if not isinstance(pulse_file, str):
-            raise TypeError("compiled_pulse_file must be str or None")
+            raise TypeError("compiled_pulse_file must be str")
         pulse_path = resolve_under(record_path.parent, pulse_file)
         compiled_pulse = decode_compiled_pulse_artifact(pulse_path.read_bytes())
-    pulse_evidence = pulse_capture_evidence_from_tree(
-        tree["pulse_evidence"], compiled_pulse
-    )
+        pulse_evidence = pulse_capture_evidence_from_tree(
+            pulse_record["evidence"],
+            compiled_pulse,
+        )
     provenance = raw_dataset_seal_provenance_from_tree(tree["provenance"])
+    camera = _camera_from_record(tree["camera"])
     snapshot = None
     if materialize:
         block = frame_source.materialize()
@@ -401,21 +499,16 @@ def load_capture_artifact(
         run_id=run_id,
         frame_source=frame_source,
         provenance=provenance,
-        terminal=capture_terminal_ack_from_tree(tree["terminal"]),
-        camera_provenance=camera_capture_provenance_from_tree(
-            tree["camera_provenance"]
-        ),
-        camera_capability_evidence=camera_capability_evidence_from_tree(
-            tree["camera_capability_evidence"]
-        ),
-        camera_arm_spec=frozen_capture_spec_from_tree(tree["camera_arm_spec"]),
+        terminal=_terminal_from_record(tree["terminal"]),
+        camera=camera,
+        capture_spec=camera_capture_spec_from_tree(tree["capture"]),
         pulse_evidence=pulse_evidence,
         _snapshot=snapshot,
     )
 
 
 def project_capture_dataset_source(
-    captures_root: Path,
+    project_root: Path,
     ref: CaptureArtifactRef,
     *,
     materialize: bool = False,
@@ -424,7 +517,7 @@ def project_capture_dataset_source(
     """Project a capture through the capture owner's dataset contract."""
 
     artifact = load_capture_artifact(
-        captures_root,
+        project_root,
         ref,
         materialize=False,
     )
@@ -445,7 +538,7 @@ def project_capture_dataset_source(
 
 def compile_capture_artifact_pipeline(
     spec: MinimalPipelineSpec | TriggeredCaptureSpec,
-    captures_root: Path,
+    project_root: Path,
     *,
     preview: CapturePreviewPort | None = None,
     exact_preview: ExactDatasetPreviewPort | None = None,
@@ -454,7 +547,7 @@ def compile_capture_artifact_pipeline(
     """Attach one direct Capture writer to an exact hardware RunPlan."""
 
     try:
-        root = Path(captures_root).expanduser().resolve()
+        root = Path(project_root).expanduser().resolve()
         capture_spec = spec.capture if isinstance(spec, TriggeredCaptureSpec) else spec
         if not isinstance(capture_spec, MinimalPipelineSpec):
             raise TypeError("capture artifact pipeline requires MinimalPipelineSpec")

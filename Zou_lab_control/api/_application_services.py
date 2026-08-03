@@ -1,7 +1,8 @@
 """Application-owned Experiment service graph and lifecycle borrows.
 
 This module contains only composition mechanics shared by application facades.
-Concrete Logic-node behavior and resources belong to each node-local API.
+Logic-node behavior belongs to discovered descriptors and the single generic
+host; no concrete leaf is imported here.
 """
 
 from __future__ import annotations
@@ -32,14 +33,16 @@ class WorkspacePaths:
     project_root: Path
     pulses_root: Path
     tasks_root: Path
-    output_root: Path
+    runs_root: Path
+    figures_root: Path
 
     def __post_init__(self) -> None:
         for name in (
             "project_root",
             "pulses_root",
             "tasks_root",
-            "output_root",
+            "runs_root",
+            "figures_root",
         ):
             value = Path(getattr(self, name)).expanduser()
             if not value.is_absolute():
@@ -61,7 +64,8 @@ class WorkspacePaths:
             project,
             project / "pulses",
             project / "tasks",
-            project / "_output",
+            project / "runs",
+            project / "figures",
         )
 
 
@@ -141,8 +145,6 @@ class ExperimentServices:
     workspace_paths: WorkspacePaths
     installation: object
     runtime: object
-    captures_root: Path
-    calibrations_root: Path
     catalog: DeviceCatalogView
     installation_config: InstallationConfigDocument
     pulse_application: PulseApplicationOwner
@@ -157,6 +159,7 @@ class ExperimentServices:
     state: str = "OPEN"
     closing_gui_handles: tuple[WorkbenchHandle, ...] = ()
     close_attempt: ExperimentCloseAttempt | None = None
+    default_artifacts: dict[str, object] = field(default_factory=dict)
 
 
 @contextmanager

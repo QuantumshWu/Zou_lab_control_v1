@@ -27,7 +27,7 @@ def test_all_three_console_record_field_specs_live_together():
     assert set(PANEL_CONFIG_FIELDS) == {
         "panel_id", "kind", "title", "row", "col", "size", "signal", "params"}
     assert set(LOGIC_NODE_CONFIG_FIELDS) == {
-        "node_id", "kind", "definition_key", "title", "values"}
+        "node_id", "definition_key", "title", "authored", "inputs"}
     # ``schema`` is a FIELD here, not merely a check: it round-trips into the file, and the
     # exact-key rule means a payload missing it is refused rather than defaulted.
     assert "schema" in TASK_CONSOLE_STATE_FIELDS

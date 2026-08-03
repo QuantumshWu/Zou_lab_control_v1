@@ -21,12 +21,9 @@ TUTORIAL = TUTORIALS / "neutral_atom_tutorial.ipynb"
 
 _REQUIRED_MARKDOWN = (
     "连上装置",
-    "拍一组图",
-    "标定:站点、PSF 与读出模型",
-    "阈值与保真度来自数据",
-    "逐发判定",
-    "自主 Pulse scan",
-    "Release-recapture survival scan",
+    "构造一个 Camera Measurement",
+    "构造 Calibration 与 MOT-field Task",
+    "Processor 与完整数据",
     "图形界面",
     "收尾",
 )
@@ -36,20 +33,15 @@ _REQUIRED_CURRENT_CODE = (
     "exp.nodes.calibration",
     "exp.nodes.occupancy",
     "exp.nodes.camera_measurement",
-    "exp.nodes.pulse_scan",
-    "scan_slot_program",
-    "bind_scan",
-    "run_scan",
-    "exp.nodes.temperature",
-    "resolve_api_parameters",
-    "temperature_release_recapture_request",
-    "aggregate_fidelity",
-    "global_fidelity",
-    "schema.cell_schema.data_shape",
-    "schema.point_table.columns",
+    "exp.nodes.mot_field",
+    "exp.nodes.readout_duration_fidelity",
+    ".build(",
+    "frames_per_cycle",
+    "save_frames",
+    "model_kind",
     "WorkspacePaths.for_workspace",
     "workspace=WORKSPACE",
-    "WORKSPACE.pulses_root",
+    "WORKSPACE.runs_root",
 )
 
 def _load_notebook():

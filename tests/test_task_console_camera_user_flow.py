@@ -8,6 +8,7 @@ product wiring that those tests cannot prove.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 import shutil
 import time
@@ -122,8 +123,21 @@ def _signal_leaf_keys(combo) -> set[str]:
 
 
 def _resolved_artifact(console, output_key: str):
-    producer = console.resolve_console_producer(output_key)
-    return producer.artifact if producer.artifact_resolved else None
+    for row in console.logic_nodes:
+        declared = tuple(console._declared_artifact_keys(row))
+        if output_key not in declared:
+            continue
+        host = console._logic_nodes.get(id(row)) or console._last_node.get(id(row))
+        if host is None or host.running or not host.final_result_resolved:
+            return None
+        result = host.final_result
+        if isinstance(result, Mapping):
+            output_name = console._artifacts_for_row(row)[
+                declared.index(output_key)
+            ].name
+            return result.get(output_name)
+        return result
+    return None
 
 
 def _plot_front_or_none(card):
@@ -276,14 +290,22 @@ def test_camera_live_image_area_second_image_and_fit_use_one_plot_stack(
         row = console.logic_nodes[-1]
         editor = _current_logic_editor(console, application)
         widgets = _visible_form_widgets(editor)
-        _choose_combo_data(widgets["camera_role"], "mot_camera", application)
+        _choose_combo_data(
+            widgets["camera_instance_id"],
+            "mot-camera",
+            application,
+        )
         _replace_spin_value(widgets["frames_per_cycle"], "3")
         _replace_spin_value(widgets["exposure"], "0.013")
         cards_before_start = tuple(console.cards)
         QtTest.QTest.mouseClick(editor.form.start_button, QtCore.Qt.LeftButton)
         until(
             application,
-            lambda: row.status_label.text() == "running",
+            # The generic host exposes the admitted operation phase (for a
+            # monitor this is ``monitoring-camera``), while the row state is
+            # the stable running/stopped contract.  Do not couple this test
+            # to one leaf's phase label.
+            lambda: row.stop_button.isEnabled() and not row.start_button.isEnabled(),
             timeout=15.0,
         )
         assert tuple(console.cards) == cards_before_start
@@ -476,19 +498,16 @@ def test_occupancy_start_does_not_open_panel_and_manual_binding_displays(
         )
         calibration_reference = _resolved_artifact(console, calibration_signal)
         calibration_root = (
-            workspace
-            / "_output"
-            / "calibrations"
-            / Path(calibration_reference.record_path).parent
-        )
+            workspace / Path(calibration_reference.record_path)
+        ).parent
         calibration_runtime = console._last_node[id(calibration_row)]
         until(
             application,
-            lambda: calibration_runtime.final_outputs_resolved,
+            lambda: calibration_runtime.final_result_resolved,
             timeout=25.0,
         )
-        assert calibration_runtime.final_output_error is None
-        assert calibration_runtime.post_final_warning is None
+        assert calibration_runtime.observation.error is None
+        assert calibration_runtime.observation.warnings == ()
         report_pages = sorted(
             path.name for path in (calibration_root / "report").glob("*.png")
         )
@@ -539,13 +558,18 @@ def test_occupancy_start_does_not_open_panel_and_manual_binding_displays(
         camera_row = console.logic_nodes[-1]
         camera_editor = _current_logic_editor(console, application)
         camera_widgets = _visible_form_widgets(camera_editor)
-        _choose_combo_data(camera_widgets["camera_role"], "camera", application)
+        _choose_combo_data(
+            camera_widgets["camera_instance_id"],
+            "camera",
+            application,
+        )
         _replace_spin_value(camera_widgets["repeat"], "0")
         QtTest.QTest.mouseClick(camera_editor.form.start_button, QtCore.Qt.LeftButton)
         camera_signal = console_signal_key(camera_row.node.node_id, "frame_0")
         until(
             application,
-            lambda: camera_row.status_label.text() == "running",
+            lambda: camera_row.stop_button.isEnabled()
+            and not camera_row.start_button.isEnabled(),
             timeout=20.0,
         )
         camera_card = _add_plot_and_bind(
@@ -573,11 +597,6 @@ def test_occupancy_start_does_not_open_panel_and_manual_binding_displays(
         _choose_signal_leaf(
             occupancy_widgets["camera_frame"],
             camera_signal,
-            application,
-        )
-        _choose_signal_leaf(
-            occupancy_widgets["calibration_output"],
-            calibration_signal,
             application,
         )
         cards_before_start = tuple(console.cards)

@@ -444,8 +444,17 @@ def project_authoring_form(
     ):
         raise TypeError("authoring fields do not expose the canonical vocabulary")
 
+    # Structured values belong to an explicitly declared leaf-local custom
+    # editor.  They remain part of the owner AuthoringSchema and saved draft,
+    # but have no generic Fluent widget and therefore do not enter FormSpec.
+    ordinary_fields = tuple(
+        field for field in fields if field.kind != "structured"
+    )
+
     injected = dict(dynamic_choices or {})
-    dynamic_keys = {field.key for field in fields if field.dynamic_choices}
+    dynamic_keys = {
+        field.key for field in ordinary_fields if field.dynamic_choices
+    }
     if set(injected) != dynamic_keys:
         raise ValueError(
             "dynamic choice keys must exactly cover the owner declaration"
@@ -462,7 +471,7 @@ def project_authoring_form(
         )
 
     paths = dict(path_presentations or {})
-    path_keys = {field.key for field in fields if field.kind == "path"}
+    path_keys = {field.key for field in ordinary_fields if field.kind == "path"}
     if not set(paths) <= path_keys:
         raise ValueError("path presentation keys must name owner-declared path fields")
     if any(
@@ -477,7 +486,7 @@ def project_authoring_form(
         )
 
     projected = []
-    for field in fields:
+    for field in ordinary_fields:
         if field.dynamic_choices:
             projection = injected[field.key]
             choices = tuple(

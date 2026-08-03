@@ -295,15 +295,21 @@ def task_console_editor(base_form: FormSpec, *, pulses_root: str | Path):
 
     if not isinstance(base_form, FormSpec):
         raise TypeError("base_form must be FormSpec")
-    if tuple(base_form.keys) != ("pulse", "scan_sweep_count"):
+    if tuple(base_form.keys) != (
+        "sequencer_instance_id",
+        "pulse",
+        "scan_sweep_count",
+    ):
         raise ValueError(
-            "PulseScan base form must contain pulse and scan_sweep_count"
+            "PulseScan base form must contain sequencer, pulse and sweep count"
         )
     root = Path(pulses_root).expanduser()
     if not root.is_absolute():
         raise ValueError("pulses_root must be absolute")
     root = root.resolve()
-    spec = PulseScanFormSpec(base_form.fields)
+    fields = {field.key: field for field in base_form.fields}
+    spec = PulseScanFormSpec((fields["pulse"], fields["scan_sweep_count"]))
+    device_fields = (fields["sequencer_instance_id"],)
 
     def read_template(value):
         return describe_pulse_template(resolve_under(root, value))
@@ -311,7 +317,7 @@ def task_console_editor(base_form: FormSpec, *, pulses_root: str | Path):
     def editor_factory(*, runtime, input_fields, parent=None):
         return PulseScanParameterForm(
             spec,
-            input_fields=input_fields,
+            input_fields=(*device_fields, *input_fields),
             runtime=runtime,
             pulse_template_reader=read_template,
             parent=parent,

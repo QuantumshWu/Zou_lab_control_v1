@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from concurrent.futures import Future
 from dataclasses import replace
 from io import BytesIO
-import math
 from pathlib import Path
 
 import numpy as np
@@ -25,17 +23,11 @@ from zlc_plot import (
     PlotLabels,
     PlotSession,
     PointStatus,
-    RasterPlotHost,
     default_plot_spec,
 )
 from zlc_storage.durability import atomic_write_bytes, durable_mkdir
 
-from ..analysis import CalibrationComputation
-from ..outputs import (
-    CALIBRATION_FINAL_OUTPUT_DECLARATIONS,
-    calibration_final_outputs,
-)
-from ..reference import CalibrationArtifactRef
+from ..outputs import CALIBRATION_FINAL_OUTPUT_DECLARATIONS
 
 
 def _calibration_outputs(
@@ -177,44 +169,6 @@ def _configure_distribution(session, outputs) -> None:
     session.fit("bimodal_gaussian", live=False, fit_all_facets=True)
 
 
-def calibration_plot_hosts(
-    outputs: Mapping[str, FinalDatasetOutput],
-) -> tuple[dict[str, tuple[str, RasterPlotHost]], tuple[Future, ...]]:
-    """Create the three worker-owned Qt report surfaces from FINAL outputs."""
-
-    values = _calibration_outputs(outputs)
-    result: dict[str, tuple[str, RasterPlotHost]] = {}
-    operations: list[Future] = []
-    try:
-        for key, title, source, spec in _calibration_pages(values):
-            host = RasterPlotHost.from_plot(source, spec)
-            result[key] = (title, host)
-            if key == "distribution":
-                sample_axis = (
-                    values["readout_samples"]
-                    .snapshot.block.schema.cell_schema.data_axes[0]
-                )
-                operations.extend((
-                    host.set_facet_thresholds(
-                        _site_thresholds(
-                            values["fidelity_threshold"],
-                            sample_axis,
-                        ),
-                        display=False,
-                    ),
-                    host.fit(
-                        "bimodal_gaussian",
-                        live=False,
-                        fit_all_facets=True,
-                    ),
-                ))
-    except BaseException:
-        for _title, host in result.values():
-            host.close()
-        raise
-    return result, tuple(operations)
-
-
 def export_calibration_plot_pages(
     destination: str | Path,
     outputs: Mapping[str, FinalDatasetOutput],
@@ -239,70 +193,4 @@ def export_calibration_plot_pages(
     return tuple(written)
 
 
-def calibration_report_summary(
-    computation: CalibrationComputation,
-    reference: CalibrationArtifactRef,
-) -> str:
-    """Format a compact report summary directly from domain facts."""
-
-    if not isinstance(computation, CalibrationComputation):
-        raise TypeError("computation must be CalibrationComputation")
-    if not isinstance(reference, CalibrationArtifactRef):
-        raise TypeError("reference must be CalibrationArtifactRef")
-    artifact = computation.artifact
-    report = computation.report
-
-    def metric(value: float) -> str:
-        return "N/A" if not math.isfinite(value) else f"{value:.4f}"
-
-    model_rows: list[str] = []
-    for model, model_report in zip(artifact.models, report.models, strict=True):
-        if model.kind is not model_report.kind:
-            raise ValueError("Calibration artifact/report model order differs")
-        fitted = np.asarray(
-            [value.model_fidelity for value in model_report.site_fidelity],
-            dtype=np.float64,
-        )
-        usable = np.asarray(model.usable_sites.mask, dtype=np.bool_)
-        selected = fitted[usable & np.isfinite(fitted)]
-        mean = float(np.mean(selected)) if selected.size else float("nan")
-        default = " default" if model.kind is artifact.default_model_kind else ""
-        model_rows.append(
-            f"{model.kind.value}{default}: model={metric(mean)}, "
-            f"held-out={metric(float(model_report.aggregate_fidelity))}, "
-            f"global={metric(float(model_report.global_fidelity))}, "
-            f"usable={int(np.count_nonzero(usable))}/{usable.size}"
-        )
-    frame = artifact.frame_contract
-    lineage = ", ".join(
-        f"{name}={version}" for name, version in report.software_lineage
-    )
-    return (
-        f"{reference.target_ref} · source "
-        f"{artifact.source_binding.source_capture_ref.target_ref}\n"
-        f"binding={frame.binding.value} · camera={frame.camera_identity} · "
-        f"ROI={frame.roi_shape_yx} · exposure={1e3 * frame.exposure_seconds:.4g} ms · "
-        f"groups={len(report.group_contexts)}\n"
-        f"{artifact.site_map.site_axis.size} sites · {len(artifact.models)} models\n"
-        + "\n".join(model_rows)
-        + (f"\nsoftware: {lineage}" if lineage else "")
-    )
-
-
-def calibration_report_outputs(
-    computation: CalibrationComputation,
-    reference: CalibrationArtifactRef,
-) -> tuple[dict[str, FinalDatasetOutput], str]:
-    """Materialize the ordinary FINAL outputs and their optional UI summary."""
-
-    return (
-        calibration_final_outputs(computation, reference),
-        calibration_report_summary(computation, reference),
-    )
-
-
-__all__ = [
-    "calibration_plot_hosts",
-    "calibration_report_outputs",
-    "export_calibration_plot_pages",
-]
+__all__ = ["export_calibration_plot_pages"]

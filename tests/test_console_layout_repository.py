@@ -44,7 +44,6 @@ def _state() -> TaskConsoleState:
         logic=[
             LogicNodeConfig(
                 node_id="logic-analysis-1",
-                kind="processor",
                 definition_key=definition_key_to_tree(
                     DefinitionKey("zlc_neutral_atom", "test.analysis")
                 ),
@@ -119,7 +118,6 @@ def test_duplicate_logic_identity_is_rejected_but_titles_are_presentation(layout
     first = _state().logic[0]
     second = LogicNodeConfig(
         node_id="logic-analysis-2",
-        kind=first.kind,
         definition_key=first.definition_key,
         title=first.title,
     )

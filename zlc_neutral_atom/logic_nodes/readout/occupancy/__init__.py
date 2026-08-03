@@ -1,3 +1,3 @@
-"""Occupancy Processor and artifact capability."""
+"""Pure Camera-frame to occupancy Processor."""
 
 __all__: tuple[str, ...] = ()

@@ -204,3 +204,35 @@ def test_explicit_topology_delta_preserves_items_selection_and_expansion():
     assert view.isExpanded(camera_parent.index())
     combo.deleteLater()
     application.processEvents()
+
+
+def test_topology_delta_can_remove_an_expanded_producer():
+    """Expansion state never dereferences a QStandardItem removed by Qt."""
+
+    from PyQt5 import QtWidgets
+
+    configure_offscreen_fast_path()
+    application = ensure_qt_app()
+    combo = FluentTreeComboBox()
+    combo.set_signal_tree(
+        (
+            ("Camera", (("frame", "camera.frame", "Camera · frame"),)),
+            ("Fit", (("center", "fit.center", "Fit · center"),)),
+        ),
+        current="camera.frame",
+    )
+    view = combo.view()
+    assert isinstance(view, QtWidgets.QTreeView)
+    camera_parent = combo.model().item(0)
+    view.setExpanded(camera_parent.index(), True)
+
+    combo.set_signal_tree(
+        (("Fit", (("center", "fit.center", "Fit · center"),)),),
+        current="fit.center",
+    )
+
+    assert combo.current_signal() == "fit.center"
+    assert combo.model().rowCount() == 1
+    assert combo.model().item(0).text() == "Fit"
+    combo.deleteLater()
+    application.processEvents()

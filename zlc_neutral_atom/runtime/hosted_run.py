@@ -1,631 +1,693 @@
-"""Headless hosted Run lifecycle, off the caller thread.
-
-A hosted run is a frozen typed request plus a Run.  The caller freezes the
-request; this module owns what happens next -- prepare, start, cancel, and the
-latest observable snapshot.
-
-The caller never blocks on domain preparation or start. Every round trip is
-submitted to :class:`RunOwnerMailbox`; an owner loop drains completions.
-
-Layering: this module does NOT import an application facade or UI toolkit.  It
-takes a ``prepare`` callable from the composition root, so this lifecycle stays
-free of domain and presentation authority.
-"""
+"""One headless lifecycle and publication owner for every Logic node."""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 import threading
-from typing import Callable
 
-from zlc_data import StreamGenerationId
 from zlc_neutral_atom.artifact_output import ArtifactOutputDeclaration
 from zlc_neutral_atom.catalog import DefinitionKey
-from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
+from zlc_neutral_atom.dataset_output import (
+    DatasetOutputDeclaration,
+    FinalDatasetOutput,
+    LiveDatasetOutput,
+    LiveDatasetOutputOwner,
+)
+from zlc_neutral_atom.input_spec import DatasetInputSpec
+from zlc_neutral_atom.logic_node import (
+    LogicNodeApplicationContext,
+    LogicNodeDescriptor,
+)
+from zlc_neutral_atom.processing.signal_plane import (
+    SignalDataPlane,
+    SignalPublication,
+    SignalValue,
+)
+from zlc_neutral_atom.runtime.dataset import MonitorCoverage
+from zlc_neutral_atom.runtime.preview import (
+    ExactDatasetPreviewPort,
+    ExactDatasetPreviewSpec,
+    LiveDatasetViewSpec,
+)
+from zlc_neutral_atom.runtime.signal_source import SignalEventSource
+
+from .live_dataset import LiveDatasetPort, _ExactDeltaLivePort
 from .owner_mailbox import RunOwnerMailbox
-from .run import RunCancelled, RunFailed, RunHandle
-
-__all__ = ["HostedRun"]
+from .run import RunCancelled, RunFailed, RunHandle, RunSnapshot
 
 
-_UNRESOLVED_FINAL = object()
+__all__ = ["LogicNodeExecutionContext", "LogicNodeHost", "LogicNodeObservation"]
+
+
+_UNRESOLVED = object()
 
 
 class _StartSuppressed(Exception):
-    """The user stopped this node before its starter received hardware authority."""
+    """Stop won before a finite operation acquired a RunHandle."""
 
 
-class _HostedCommandContext:
-    """Narrow sequential-child capability owned by one HostedRun generation."""
+@dataclass(frozen=True, slots=True)
+class LogicNodeObservation:
+    """The common non-blocking status projection for every Logic node."""
 
-    __slots__ = ("_owner", "_signal_generation_ref")
+    running: bool
+    terminal: bool
+    phase: str
+    error: str | None = None
+    warnings: tuple[str, ...] = ()
+    run_snapshot: RunSnapshot | None = None
 
-    def __init__(self, owner: "HostedRun") -> None:
-        self._owner = owner
-        self._signal_generation_ref: tuple[str, StreamGenerationId] | None = None
+    def __post_init__(self) -> None:
+        if type(self.running) is not bool or type(self.terminal) is not bool:
+            raise TypeError("Logic-node observation flags must be bool")
+        if not isinstance(self.phase, str) or not self.phase.strip():
+            raise ValueError("Logic-node observation phase must be non-empty")
+        if self.error is not None and (
+            not isinstance(self.error, str) or not self.error.strip()
+        ):
+            raise ValueError("Logic-node observation error must be text or None")
+        warnings = tuple(self.warnings)
+        if any(not isinstance(value, str) or not value.strip() for value in warnings):
+            raise ValueError("Logic-node observation warnings must be non-empty text")
+        object.__setattr__(self, "warnings", warnings)
+        if self.run_snapshot is not None and not isinstance(
+            self.run_snapshot,
+            RunSnapshot,
+        ):
+            raise TypeError("run_snapshot must be RunSnapshot or None")
 
-    @property
-    def signal_generation_ref(self) -> tuple[str, StreamGenerationId] | None:
-        """Exact signal generation hosted by this command, when it publishes data."""
 
-        return self._signal_generation_ref
+class LogicNodeExecutionContext:
+    """The sole runtime capability passed to a finite leaf operation.
 
-    def bind_signal_generation(self, generation: StreamGenerationId) -> None:
-        """Bind the generation minted by the application-owned SignalDataPlane."""
+    It contains lifecycle and publication mechanics only.  Device resolution,
+    authored fields and project paths were already captured when the descriptor
+    bound its one operation against ``LogicNodeApplicationContext``.
+    """
 
-        if not isinstance(generation, StreamGenerationId):
-            raise TypeError("hosted signal generation must be StreamGenerationId")
-        reference = (self._owner.instance_id, generation)
-        existing = self._signal_generation_ref
-        if existing is not None and existing != reference:
-            raise RuntimeError("HostedRun signal generation is already bound")
-        self._signal_generation_ref = reference
+    __slots__ = ("_host",)
+
+    def __init__(self, host: "LogicNodeHost") -> None:
+        self._host = host
 
     def cancel_requested(self) -> bool:
-        return self._owner.cancel_requested
+        return self._host.cancel_requested
 
-    def start_if_not_cancelled(self, starter: Callable[[], object]):
-        return self._owner.start_if_not_cancelled(starter)
+    def start_and_wait(self, starter: Callable[[], RunHandle]) -> object:
+        return self._host._start_and_wait(starter)
 
-    def start_and_wait(self, starter: Callable[[], RunHandle]):
-        return self._owner._start_child_and_wait(starter)
+    def open_live_dataset(
+        self,
+        spec: LiveDatasetViewSpec,
+        *,
+        output_owner: LiveDatasetOutputOwner,
+        retain_on_terminal: bool = True,
+        event_source: SignalEventSource | None = None,
+    ) -> LiveDatasetPort:
+        return self._host._open_live_dataset(
+            spec,
+            output_owner=output_owner,
+            retain_on_terminal=retain_on_terminal,
+            event_source=event_source,
+        )
+
+    def open_exact_dataset(
+        self,
+        spec: ExactDatasetPreviewSpec,
+        *,
+        projection: object,
+    ) -> ExactDatasetPreviewPort:
+        return self._host._open_exact_dataset(spec, projection=projection)
+
+    def publish_final(
+        self,
+        outputs: Mapping[str, FinalDatasetOutput],
+    ) -> Mapping[str, SignalValue]:
+        return self._host._publish_final(outputs)
+
+    def warn(self, message: str) -> None:
+        self._host._warn(message)
 
 
-class HostedRun:
-    """The lifecycle of one hosted run.
+class LogicNodeHost:
+    """The only public runtime owner for Task, Measurement and Processor.
 
-    ``prepare`` receives the node's frozen request and returns the domain's
-    prepared command.  The composition root binds the command's concrete start
-    operation once; this owner sequences it without interpreting devices,
-    outputs, or presentation.
+    ``create`` binds a descriptor exactly once.  Task/Measurement operations run
+    on one owner thread and may sequentially wait for flat Runs.  Processor
+    operations run on SignalDataPlane's one shared latest-only lane.  These are
+    private policies behind the same start/cancel/poll/shutdown surface.
     """
+
+    @classmethod
+    def create(
+        cls,
+        descriptor: LogicNodeDescriptor,
+        request: object,
+        application_context: LogicNodeApplicationContext,
+        instance_id: str,
+        request_owner_wake: Callable[[], None],
+    ) -> "LogicNodeHost":
+        if not isinstance(descriptor, LogicNodeDescriptor):
+            raise TypeError("descriptor must be LogicNodeDescriptor")
+        identity = str(instance_id).strip()
+        if not identity:
+            raise ValueError("Logic-node instance id must be non-empty")
+        if not callable(request_owner_wake):
+            raise TypeError("request_owner_wake must be callable")
+        data_plane = application_context.signal_plane
+        if not isinstance(data_plane, SignalDataPlane):
+            raise TypeError("application context must expose SignalDataPlane")
+
+        operation = descriptor.bind_execute(request, application_context)
+        if not callable(operation):
+            raise TypeError("Logic-node bind_execute() must return one callable")
+        output_specs = descriptor.outputs_for(request)
+        dataset_outputs = tuple(value.declaration for value in output_specs)
+        artifact_outputs = tuple(
+            value.declaration for value in descriptor.artifact_outputs
+        )
+
+        source_signal: str | None = None
+        if descriptor.definition.kind == "processor":
+            dataset_inputs = tuple(
+                value
+                for value in descriptor.input_specs
+                if isinstance(value, DatasetInputSpec)
+            )
+            if len(dataset_inputs) != 1:
+                raise ValueError(
+                    "Processor baseline requires exactly one Dataset input"
+                )
+            source = application_context.input(dataset_inputs[0])
+            if not isinstance(source, str) or not source.strip():
+                raise TypeError(
+                    "Processor Dataset input must resolve to one signal key"
+                )
+            source_signal = source.strip()
+
+        return cls(
+            descriptor=descriptor,
+            request=request,
+            instance_id=identity,
+            dataset_outputs=dataset_outputs,
+            artifact_outputs=artifact_outputs,
+            operation=operation,
+            source_signal=source_signal,
+            data_plane=data_plane,
+            request_owner_wake=request_owner_wake,
+        )
 
     def __init__(
         self,
         *,
-        definition_key: DefinitionKey,
+        descriptor: LogicNodeDescriptor,
         request: object,
         instance_id: str,
-        dataset_output_declarations: tuple[DatasetOutputDeclaration, ...],
-        artifact_output_declarations: tuple[ArtifactOutputDeclaration, ...] = (),
-        prepare: Callable[[object], object],
-        qualify_output: Callable[[str], str],
+        dataset_outputs: tuple[DatasetOutputDeclaration, ...],
+        artifact_outputs: tuple[ArtifactOutputDeclaration, ...],
+        operation: Callable[..., object],
+        source_signal: str | None,
+        data_plane: SignalDataPlane,
         request_owner_wake: Callable[[], None],
     ) -> None:
-        if not isinstance(definition_key, DefinitionKey):
-            raise TypeError("definition_key must be DefinitionKey")
-        if not callable(prepare):
-            raise TypeError("prepare must be callable")
-        if not callable(qualify_output):
-            raise TypeError("qualify_output must be callable")
-        identity = str(instance_id).strip()
-        if not identity:
-            raise ValueError("hosted instance id must be non-empty")
-        dataset_outputs = tuple(dataset_output_declarations)
-        if any(
-            not isinstance(value, DatasetOutputDeclaration)
-            for value in dataset_outputs
-        ):
-            raise TypeError(
-                "dataset_output_declarations must contain "
-                "DatasetOutputDeclaration values"
-            )
-        artifact_outputs = tuple(artifact_output_declarations)
-        if any(
-            not isinstance(value, ArtifactOutputDeclaration)
-            for value in artifact_outputs
-        ):
-            raise TypeError(
-                "artifact_output_declarations must contain "
-                "ArtifactOutputDeclaration values"
-            )
-        dataset_names = tuple(value.name for value in dataset_outputs)
-        artifact_names = tuple(value.name for value in artifact_outputs)
-        if len(set(dataset_names)) != len(dataset_names):
-            raise ValueError("Dataset output names must be unique")
-        if len(set(artifact_names)) != len(artifact_names):
-            raise ValueError("Artifact output names must be unique")
-        if set(dataset_names).intersection(artifact_names):
-            raise ValueError("Dataset and Artifact output names must not overlap")
-        self._definition_key = definition_key
-        self.instance_id = identity
-        self._prepare = prepare
-        self._qualify_output = qualify_output
-        # One worker thread per node: a node's prepare/start/cancel jobs must not
-        # interleave with each other, and thread affinity is what lets a domain
-        # port that is not thread-safe be driven from here at all.
-        self._owner = RunOwnerMailbox(
-            request_owner_wake,
-            thread_name_prefix=f"hosted-{definition_key.stable_definition_id}",
-            max_workers=1,
-        )
+        self._descriptor = descriptor
+        self._definition_key = descriptor.definition.key
+        self._kind = descriptor.definition.kind
         self._request = request
-        self._dataset_output_declarations = dataset_outputs
-        self._artifact_output_declarations = artifact_outputs
-        self._prepared_command = None
-        self._handle = None
-        self._start_pending = False
-        self._cancelled_before_start = False
-        self._stop_event = threading.Event()
-        self._start_gate_lock = threading.Lock()
-        self._snapshot = None
-        # A FINAL value belongs to exactly one started generation.  It is
-        # deliberately not inferred from the terminal snapshot: only
-        # RunHandle.result() carries the value committed by the Run.
-        self._final_result = _UNRESOLVED_FINAL
-        self._final_outputs_submitted = False
-        self._materialized_final_outputs = None
-        self._completion_summary: str | None = None
-        self._final_output_error: str | None = None
-        self._post_final_warning: str | None = None
-        self._error: str | None = None
-        self._start_exception: BaseException | None = None
-        self._stop_reason = "Host requested stop"
-        self._starter = None
-        self._command_context = _HostedCommandContext(self)
+        self.instance_id = instance_id
+        self._dataset_outputs = dataset_outputs
+        self._artifact_outputs = artifact_outputs
+        self._operation = operation
+        self._source_signal = source_signal
+        self._data_plane = data_plane
+        self._request_owner_wake = request_owner_wake
+        self._execution_context = LogicNodeExecutionContext(self)
 
-    # ----------------------------------------------------------------- facts
+        self._owner = (
+            None
+            if self._kind == "processor"
+            else RunOwnerMailbox(
+                request_owner_wake,
+                thread_name_prefix=(
+                    f"logic-{self._definition_key.stable_definition_id}"
+                ),
+                max_workers=1,
+            )
+        )
+        self._closed = False
+        self._active = False
+        self._terminal = False
+        self._phase = "not started"
+        self._error: str | None = None
+        self._warnings: list[str] = []
+        self._result: object = _UNRESOLVED
+        self._handle: RunHandle | None = None
+        self._snapshot: RunSnapshot | None = None
+        self._stop_event = threading.Event()
+        self._start_lock = threading.Lock()
+        self._stop_reason = "Host requested stop"
+        self._plane_state = False
+        self._live_opened = False
+        self._final_published = False
+
+    @property
+    def descriptor(self) -> LogicNodeDescriptor:
+        return self._descriptor
+
     @property
     def definition_key(self) -> DefinitionKey:
         return self._definition_key
 
-    def signal_key(self, output_name: str) -> str:
-        """Exact host route for one definition-owned output."""
-
-        return self._qualify_output(output_name)
-
-    def published_signals(self) -> tuple[str, ...]:
-        """Return the exact producer-instance outputs published by this node.
-
-        The short names remain owned by the domain applications.  The injected
-        qualifier supplies their stable host routes, preventing two valid
-        producers of ``frame`` or ``counts`` from overwriting one another.
-        """
-
-        return tuple(
-            self.signal_key(item.name)
-            for item in self._dataset_output_declarations
-        )
-
-    def published_artifacts(self) -> tuple[str, ...]:
-        """Return exact keys for FINAL artifact outputs, never Dataset signals."""
-
-        return tuple(
-            self.signal_key(item.name)
-            for item in self._artifact_output_declarations
-        )
+    @property
+    def request(self) -> object:
+        return self._request
 
     @property
     def dataset_output_declarations(
         self,
     ) -> tuple[DatasetOutputDeclaration, ...]:
-        return self._dataset_output_declarations
+        return self._dataset_outputs
 
     @property
     def artifact_output_declarations(
         self,
     ) -> tuple[ArtifactOutputDeclaration, ...]:
-        return self._artifact_output_declarations
+        return self._artifact_outputs
+
+    def signal_key(self, output_name: str) -> str:
+        name = str(output_name).strip()
+        declared = {
+            value.name for value in (*self._dataset_outputs, *self._artifact_outputs)
+        }
+        if name not in declared:
+            raise KeyError(f"undeclared Logic-node output {name!r}")
+        return f"@logic/{self.instance_id}/{name}"
+
+    def published_signals(self) -> tuple[str, ...]:
+        return tuple(self.signal_key(value.name) for value in self._dataset_outputs)
+
+    def published_artifacts(self) -> tuple[str, ...]:
+        return tuple(self.signal_key(value.name) for value in self._artifact_outputs)
 
     @property
-    def request(self):
-        """The frozen typed request -- the node's identity for this run."""
-
-        return self._request
-
-    def dataset_output_binding(self, output_name: str):
-        """Return an optional domain-owned binding for one running Dataset output."""
-
-        command = self._prepared_command
-        if command is None:
-            raise RuntimeError("producer has not finished prepare/start submission")
-        resolve = getattr(command, "dataset_output_binding", None)
-        return None if not callable(resolve) else resolve(output_name)
+    def running(self) -> bool:
+        return self._active
 
     @property
-    def handle(self):
-        return self._handle
+    def terminal(self) -> bool:
+        return self._terminal
+
+    @property
+    def phase(self) -> str:
+        return self._phase
 
     @property
     def last_error(self) -> str | None:
         return self._error
 
     @property
-    def start_exception(self) -> BaseException | None:
-        """Structured exception from the most recent start submission.
-
-        Normal host status uses :attr:`last_error`; callers that need typed
-        failure details inspect this exact exception without a retry surface.
-        """
-
-        return self._start_exception
+    def handle(self) -> RunHandle | None:
+        return self._handle
 
     @property
-    def final_result(self):
-        """The successful Run result, or ``None`` until/when none exists.
-
-        The property never waits.  :meth:`poll` admits the result only after
-        the matching handle reports ``SUCCEEDED`` and its owner thread has
-        finished.  Starting another generation clears it before submission,
-        so a consumer can never keep offering an earlier artifact while a rerun
-        is in flight.
-        """
-
-        return None if self._final_result is _UNRESOLVED_FINAL else self._final_result
-
-    @property
-    def prepared_command(self) -> object | None:
-        """Return the command admitted for this generation, without ownership."""
-
-        return self._prepared_command
+    def final_result(self) -> object | None:
+        return None if self._result is _UNRESOLVED else self._result
 
     @property
     def final_result_resolved(self) -> bool:
-        """Whether the successful Run result has been joined without waiting.
-
-        ``None`` may itself be a legitimate successful result, so callers must
-        not use :attr:`final_result` as a completion flag.  This property is the
-        narrow distinction needed by the host owner: keep polling a terminal
-        Run until its owner thread has exited, then detach it.
-        """
-
-        return self._final_result is not _UNRESOLVED_FINAL
-
-    @property
-    def final_outputs_resolved(self) -> bool:
-        """Whether the optional FINAL output materialization has finished.
-
-        A committed artifact remains a successful result even when its named
-        output materialization fails. That boundary error does not rewrite Run
-        terminal truth.
-        """
-
-        return (
-            self._final_result is not _UNRESOLVED_FINAL
-            and (
-                self._prepared_command is None
-                or not callable(
-                    getattr(
-                        self._prepared_command,
-                        "final_dataset_outputs",
-                        None,
-                    )
-                )
-                or self._materialized_final_outputs is not None
-            )
-        )
-
-    @property
-    def materialized_final_outputs(self):
-        if self._materialized_final_outputs is None:
-            return None
-        return dict(self._materialized_final_outputs)
-
-    @property
-    def final_output_error(self) -> str | None:
-        return self._final_output_error
-
-    @property
-    def post_final_warning(self) -> str | None:
-        """Non-fatal work performed after the exact FINAL commit."""
-
-        return self._post_final_warning
-
-    @property
-    def completion_summary(self) -> str | None:
-        """Command-owned human result location, if this run persists one."""
-
-        return self._completion_summary
-
-    @property
-    def running(self) -> bool:
-        # A start is already this node's accepted lifecycle generation before
-        # the owner-thread completion installs its RunHandle.  Live view ports
-        # may publish their first immutable revision in that narrow interval;
-        # treating the producer as stopped makes a real same-node publication
-        # impossible to bind reactively until an unrelated host poll occurs.
-        if self._start_pending:
-            return True
-        snapshot = self._snapshot
-        if self._handle is None:
-            return False
-        return snapshot is None or not snapshot.state.terminal
-
-    @property
-    def worker_idle(self) -> bool:
-        """Whether this node has no pending prepare/start/output callback."""
-
-        return self._owner.worker_idle and self._owner.owner_reaped
-
-    @property
-    def cancelled_before_start(self) -> bool:
-        """Whether Stop won before a domain RunHandle was created."""
-
-        return self._cancelled_before_start
+        return self._result is not _UNRESOLVED
 
     @property
     def cancel_requested(self) -> bool:
-        """Whether this exact hosted generation has received Stop."""
-
         return self._stop_event.is_set()
 
     @property
-    def command_context(self):
-        """Return this generation's narrow cancel/start-and-wait capability."""
+    def worker_idle(self) -> bool:
+        if self._kind == "processor":
+            return not self._active
+        owner = self._require_owner()
+        return owner.worker_idle and owner.owner_reaped
 
-        return self._command_context
-
-    def bind_signal_generation(self, generation: StreamGenerationId) -> None:
-        """Bind the SignalDataPlane reservation before submitting this node."""
-
-        self._command_context.bind_signal_generation(generation)
-
-    # ------------------------------------------------------------ lifecycle
-    def bind_starter(self, start: Callable[[object], object]) -> None:
-        """Fix how THIS node starts, so a caller with no such knowledge can start it.
-
-        The composition root knows a camera monitor needs a live view and what
-        that view is; the board's Start button knows only "start this row".
-        Binding once at construction lets the board call :meth:`start` with no
-        argument and still get the right shape.
-        """
-
-        if not callable(start):
-            raise TypeError("starter must be callable")
-        self._starter = start
-
-    def start(self, start: Callable[[object], object] | None = None) -> None:
-        """Prepare and start on the worker.  Returns immediately.
-
-        ``start`` receives the prepared command and returns its RunHandle.  How a
-        command starts is the command's own business -- a camera monitor only
-        starts with its live view, while a finite capture just starts
-        -- so this seam sequences the call rather than knowing the shapes.
-
-        One submission does both prepare and start: a prepared command that is
-        never started is a reservation the operator did not ask for, and
-        splitting them lets a stale prepare outlive the request it was frozen
-        from.
-        """
-
-        start = self._starter if start is None else start
-        if not callable(start):
-            raise TypeError(
-                "this node has no starter: bind one (bind_starter) or pass it here"
-            )
-        if self.running or self._start_pending:
-            return
-        self._error = None
-        self._start_exception = None
-        with self._start_gate_lock:
-            self._cancelled_before_start = False
-            self._stop_event.clear()
-            self._stop_reason = "Host requested stop"
-        generation = self._owner.begin_generation()
-        self._handle = None
-        self._prepared_command = None
-        self._snapshot = None
-        self._final_result = _UNRESOLVED_FINAL
-        self._final_outputs_submitted = False
-        self._materialized_final_outputs = None
-        self._completion_summary = None
-        self._final_output_error = None
-        self._post_final_warning = None
-        request = self._request
-        prepare = self._prepare
-
-        def start_owned():
-            prepared = prepare(request)
-            # Keep the exact prepared command reachable even when a later
-            # child fails.  Calibration, for example, must retain the capture
-            # artifact produced by its first flat Run when its second Run
-            # fails; the host must not hide that provenance in a failed Future.
-            self._prepared_command = prepared
-            if self._stop_event.is_set():
-                raise _StartSuppressed()
-            return prepared, start(prepared)
-
-        self._owner.submit(
-            "start",
-            start_owned,
-            generation=generation,
+    @property
+    def observation(self) -> LogicNodeObservation:
+        with self._start_lock:
+            warnings = tuple(self._warnings)
+        return LogicNodeObservation(
+            running=self.running,
+            terminal=self.terminal,
+            phase=self.phase,
+            error=self.last_error,
+            warnings=warnings,
+            run_snapshot=self._snapshot,
         )
-        self._start_pending = True
+
+    def start(self) -> None:
+        if self._closed:
+            raise RuntimeError("Logic-node host is closed")
+        if self._active:
+            return
+        self._retire_plane_state()
+        self._reset_generation()
+        if self._kind == "processor":
+            self._start_processor()
+        else:
+            self._start_finite()
 
     def cancel(self, reason: str = "Host requested stop") -> None:
-        """Ask the Run to stop.  Never waits for the worker to reap it."""
-
-        with self._start_gate_lock:
-            handle = self._handle
-            self._stop_event.set()
-            self._stop_reason = str(reason)
-        if handle is None or handle.snapshot().state.terminal:
+        if not self._active:
             return
-        handle.cancel(reason)
+        if self._kind == "processor":
+            self._cancel_processor()
+            return
+        with self._start_lock:
+            self._stop_reason = str(reason)
+            self._stop_event.set()
+            handle = self._handle
+        self._phase = "stopping"
+        if handle is not None and not handle.snapshot().state.terminal:
+            handle.cancel(reason)
 
-    def start_if_not_cancelled(self, starter: Callable[[], object]):
-        """Linearize one short runtime admission against this node's Stop."""
+    def poll(self) -> LogicNodeObservation:
+        if self._kind != "processor":
+            self._poll_finite()
+        return self.observation
 
-        if not callable(starter):
-            raise TypeError("starter must be callable")
-        with self._start_gate_lock:
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        if self._active:
+            self.cancel("Host is closing")
+            self.poll()
+            if self._active:
+                raise RuntimeError("cannot close Logic-node host before terminal")
+        if self._kind != "processor":
+            self._require_owner().shutdown()
+        self._data_plane.detach_live(self)
+        self._plane_state = False
+        self._closed = True
+
+    def _reset_generation(self) -> None:
+        self._active = False
+        self._terminal = False
+        self._phase = "starting"
+        self._error = None
+        with self._start_lock:
+            self._warnings.clear()
+        self._result = _UNRESOLVED
+        self._handle = None
+        self._snapshot = None
+        self._stop_event.clear()
+        self._stop_reason = "Host requested stop"
+        self._live_opened = False
+        self._final_published = False
+
+    def _warn(self, message: str) -> None:
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("Logic-node warning must be non-empty text")
+        with self._start_lock:
+            if not self._active:
+                raise RuntimeError("inactive Logic-node cannot publish a warning")
+            self._warnings.append(message.strip())
+        self._request_owner_wake()
+
+    def _require_owner(self) -> RunOwnerMailbox:
+        owner = self._owner
+        if owner is None:
+            raise RuntimeError("finite Run owner is unavailable for Processor")
+        return owner
+
+    def _start_finite(self) -> None:
+        if self._dataset_outputs:
+            self._data_plane.reserve(self)
+            self._plane_state = True
+        owner = self._require_owner()
+        generation = owner.begin_generation()
+        self._active = True
+
+        def execute() -> object:
             if self._stop_event.is_set():
                 raise _StartSuppressed()
-            return starter()
+            result = self._operation(self._execution_context)
+            if isinstance(result, RunHandle):
+                raise TypeError(
+                    "Logic-node operation must wait through execution_context"
+                )
+            return result
 
-    def _start_child_and_wait(self, starter: Callable[[], RunHandle]):
-        """Start one flat child Run and expose it while the owner thread waits."""
+        try:
+            owner.submit("execute", execute, generation=generation)
+        except BaseException:
+            self._active = False
+            self._terminal = True
+            owner.mark_owner_reaped()
+            self._retire_plane_state()
+            raise
 
+    def _poll_finite(self) -> None:
+        owner = self._require_owner()
+        if self._active and self._handle is not None:
+            self._snapshot = self._handle.snapshot()
+            self._phase = self._snapshot.phase
+        for completion in owner.drain_completions():
+            if completion.generation != owner.generation:
+                continue
+            error = completion.future.exception()
+            if error is None:
+                self._result = completion.future.result()
+                self._finish_finite_success()
+            else:
+                self._finish_finite_failure(error)
+            owner.mark_owner_reaped()
+
+    def _finish_finite_success(self) -> None:
+        if self._dataset_outputs and not self._final_published:
+            if self._live_opened:
+                # A successful live operation may have replaced its transient
+                # preview with a terminal FINAL publication.  Detaching the
+                # live slot must preserve that immutable FINAL generation;
+                # retiring it here would make a completed Task disappear from
+                # every consumer immediately after it reports ``done``.
+                self._detach_plane_state()
+            else:
+                self._error = (
+                    "Logic-node operation returned without publishing its "
+                    "declared Dataset outputs"
+                )
+                self._retire_plane_state()
+                self._phase = "failed"
+                self._active = False
+                self._terminal = True
+                return
+        elif self._live_opened:
+            # FINAL-only producers (or a live producer whose final publication
+            # was already recorded) follow the same retain-on-terminal rule.
+            self._detach_plane_state()
+        self._phase = "done"
+        self._active = False
+        self._terminal = True
+
+    def _finish_finite_failure(self, error: BaseException) -> None:
+        if isinstance(error, (RunCancelled, RunFailed)):
+            self._snapshot = error.snapshot
+        if isinstance(error, (_StartSuppressed, RunCancelled)):
+            self._phase = "cancelled"
+            self._error = None
+        else:
+            self._phase = "failed"
+            self._error = f"{type(error).__name__}: {error}"
+        self._active = False
+        self._terminal = True
+        self._result = _UNRESOLVED
+        self._retire_plane_state()
+
+    def _start_and_wait(self, starter: Callable[[], RunHandle]) -> object:
         if not callable(starter):
-            raise TypeError("child starter must be callable")
-        with self._start_gate_lock:
+            raise TypeError("Run starter must be callable")
+        with self._start_lock:
             if self._stop_event.is_set():
                 raise _StartSuppressed()
-            self._handle = None
-        # Do not hold the host gate across application admission.  The starter
-        # may first retire a conflicting Run before the Experiment calls this
-        # command context's short start_if_not_cancelled gate.  Holding the lock
-        # here would self-deadlock that final admission and prevent Stop from
-        # setting the cancellation token during retirement.
         handle = starter()
         if not isinstance(handle, RunHandle):
-            raise TypeError("hosted child starter returned a non-RunHandle")
-        with self._start_gate_lock:
+            raise TypeError("Run starter returned no RunHandle")
+        with self._start_lock:
             self._handle = handle
-            self._owner.set_handle(handle)
+            self._require_owner().set_handle(handle)
             cancelled = self._stop_event.is_set()
             reason = self._stop_reason
         if cancelled:
             handle.cancel(reason)
-        return handle.result()
-
-    def _accept_success_result(self, result: object) -> None:
-        """Admit one exact successful result and schedule optional projections."""
-
-        self._final_result = result
-        command = self._prepared_command
-        summary_factory = getattr(command, "completion_summary", None)
-        if callable(summary_factory):
-            try:
-                summary = summary_factory(result)
-                if not isinstance(summary, str) or not summary.strip():
-                    raise TypeError("completion_summary() must return non-empty str")
-                self._completion_summary = summary.strip()
-            except BaseException as error:
-                self._completion_summary = (
-                    "result committed; location unavailable: "
-                    f"{type(error).__name__}: {error}"
-                )
-        outputs_factory = getattr(command, "final_dataset_outputs", None)
-        if callable(outputs_factory) and not self._final_outputs_submitted:
-            self._final_outputs_submitted = True
-            self._owner.submit(
-                "materialize-final-outputs",
-                lambda: outputs_factory(result),
-                generation=self._owner.generation,
-            )
-
-    def poll(self):
-        """Drain worker completions and refresh the snapshot.  Call per tick.
-
-        Returns the current ``RunSnapshot`` (or None before the first start).
-        Consumers read state from the returned snapshot rather than from a
-        second flag, so lifecycle decisions and diagnostics cannot disagree
-        about the same run.
-        """
-
-        for completion in self._owner.drain_completions():
-            if completion.generation != self._owner.generation:
-                continue          # a job from a superseded generation; its result is stale
-            if completion.kind == "materialize-final-outputs":
-                error = completion.future.exception()
-                if error is None:
-                    projected = completion.future.result()
-                    if not isinstance(projected, dict):
-                        self._final_output_error = (
-                            "TypeError: final output owner must return a dict"
-                        )
-                        self._materialized_final_outputs = {}
-                    else:
-                        actual = set(map(str, projected))
-                        if not actual:
-                            self._final_output_error = (
-                                "ValueError: final outputs factory returned no outputs"
-                            )
-                            self._materialized_final_outputs = {}
-                        else:
-                            self._materialized_final_outputs = dict(projected)
-                            warning_factory = getattr(
-                                self._prepared_command,
-                                "post_final_warning",
-                                None,
-                            )
-                            if callable(warning_factory):
-                                try:
-                                    warning = warning_factory()
-                                    if warning is not None and (
-                                        not isinstance(warning, str)
-                                        or not warning.strip()
-                                    ):
-                                        raise TypeError(
-                                            "post_final_warning() must return "
-                                            "non-empty str or None"
-                                        )
-                                    self._post_final_warning = (
-                                        None if warning is None else warning.strip()
-                                    )
-                                except BaseException as warning_error:
-                                    self._post_final_warning = (
-                                        "post-final warning unavailable: "
-                                        f"{type(warning_error).__name__}: "
-                                        f"{warning_error}"
-                                    )
-                else:
-                    self._final_output_error = (
-                        f"{type(error).__name__}: {error}"
-                    )
-                    self._materialized_final_outputs = {}
-                continue
-            error = completion.future.exception()
-            if error is not None:
-                self._start_pending = False
-                if isinstance(error, _StartSuppressed):
-                    self._cancelled_before_start = True
-                    self._handle = None
-                    self._snapshot = None
-                    self._final_result = _UNRESOLVED_FINAL
-                    self._owner.mark_owner_reaped()
-                    continue
-                self._error = f"{type(error).__name__}: {error}"
-                self._start_exception = error
-                if isinstance(error, (RunCancelled, RunFailed)):
-                    self._snapshot = error.snapshot
-                else:
-                    self._handle = None
-                    self._snapshot = None
-                self._final_result = _UNRESOLVED_FINAL
-                self._owner.mark_owner_reaped()
-                continue
-            if completion.kind == "start":
-                self._start_pending = False
-                prepared, started = completion.future.result()
-                self._prepared_command = prepared
-                if not isinstance(started, RunHandle):
-                    error = TypeError(
-                        "prepared command starter returned a non-RunHandle"
-                    )
-                    self._error = f"TypeError: {error}"
-                    self._start_exception = error
-                    self._handle = None
-                    self._snapshot = None
-                    self._owner.mark_owner_reaped()
-                    continue
-                self._handle = started
-                self._owner.set_handle(started)
-                if self._stop_event.is_set():
-                    started.cancel(self._stop_reason)
-        handle = self._handle
-        if handle is not None:
+        try:
+            return handle.result()
+        finally:
             self._snapshot = handle.snapshot()
-            if self._snapshot.state.terminal and not self._start_pending:
-                try:
-                    # A Run publishes terminal state just before its owner
-                    # thread exits.  The mailbox may retire the handle only
-                    # after this non-blocking join succeeds; the next owner
-                    # turn retries the narrow gap.
-                    handle.wait(timeout=0.0)
-                except TimeoutError:
-                    pass
-                else:
-                    self._owner.mark_owner_reaped()
-                    if (
-                        self._snapshot.state.name == "SUCCEEDED"
-                        and self._final_result is _UNRESOLVED_FINAL
-                    ):
-                        self._accept_success_result(handle.result(timeout=0.0))
-                    elif self._snapshot.state.name != "SUCCEEDED":
-                        self._final_result = _UNRESOLVED_FINAL
-        return self._snapshot
 
-    def shutdown(self) -> None:
-        self.cancel("Host is closing")
-        self._owner.shutdown()
+    def _publish_final(
+        self,
+        outputs: Mapping[str, FinalDatasetOutput],
+    ) -> Mapping[str, SignalValue]:
+        if self._kind == "processor":
+            raise RuntimeError("Processor outputs publish through their exact parent")
+        if not self._active or not self._plane_state:
+            raise RuntimeError("Logic-node Dataset generation is not active")
+        if self._final_published:
+            raise RuntimeError("Logic-node FINAL outputs were already published")
+        published = self._data_plane.publish_final(self, outputs)
+        self._final_published = True
+        return published
+
+    def _attach_live(
+        self,
+        slot: object,
+        *,
+        event_source: SignalEventSource | None = None,
+    ) -> None:
+        if self._kind == "processor":
+            raise RuntimeError("Processor output is owned by its shared event lane")
+        if self._live_opened:
+            raise RuntimeError("one Logic-node generation may open one live Dataset")
+        if not self._plane_state:
+            raise RuntimeError("Logic-node Dataset generation is not reserved")
+        if not callable(getattr(slot, "freeze_live_outputs", None)):
+            raise TypeError("live Dataset slot has no typed output materializer")
+        if event_source is not None and not isinstance(
+            event_source,
+            SignalEventSource,
+        ):
+            raise TypeError("event_source must implement SignalEventSource")
+        try:
+            slot.set_change_listener(
+                lambda: self._data_plane.mark_changed(self, slot)
+            )
+            self._data_plane.attach(self, slot, event_source=event_source)
+        except BaseException:
+            slot.close()
+            raise
+        self._live_opened = True
+
+    def _open_live_dataset(
+        self,
+        spec: LiveDatasetViewSpec,
+        *,
+        output_owner: LiveDatasetOutputOwner,
+        retain_on_terminal: bool,
+        event_source: SignalEventSource | None,
+    ) -> LiveDatasetPort:
+        slot = LiveDatasetPort(
+            spec,
+            retain_on_terminal=retain_on_terminal,
+            output_owner=output_owner,
+        )
+        self._attach_live(slot, event_source=event_source)
+        return slot
+
+    def _open_exact_dataset(
+        self,
+        spec: ExactDatasetPreviewSpec,
+        *,
+        projection: object,
+    ) -> ExactDatasetPreviewPort:
+        slot = _ExactDeltaLivePort(spec, projection)
+        self._attach_live(slot)
+        return slot
+
+    def _retire_plane_state(self) -> None:
+        if not self._plane_state:
+            return
+        self._data_plane.retire(self)
+        self._plane_state = False
+
+    def _detach_plane_state(self) -> None:
+        """End a successful generation without withdrawing a FINAL front."""
+
+        if not self._plane_state:
+            return
+        self._data_plane.detach_live(self)
+        self._plane_state = False
+
+    def _start_processor(self) -> None:
+        signal = self._source_signal
+        if signal is None:
+            raise RuntimeError("Processor has no Dataset input")
+        publication = self._data_plane.latest_publication(signal)
+        if publication is None:
+            raise LookupError(f"Processor input signal {signal!r} is not active")
+        self.validate_processor_source(publication.value(signal))
+        self._active = True
+        self._phase = "starting"
+        try:
+            self._data_plane.attach_latest_only_processor(
+                self,
+                source_name=signal,
+                initial_publication=publication,
+            )
+            self._plane_state = True
+            self._phase = "running"
+        except BaseException as error:
+            self._active = False
+            self._terminal = True
+            self._phase = "failed"
+            self._error = f"{type(error).__name__}: {error}"
+            raise
+
+    def _cancel_processor(self) -> None:
+        self._stop_event.set()
+        self._phase = "stopping"
+        idle = self._data_plane.cancel_latest_only_processor(self)
+        self._plane_state = False
+        if idle and self._active:
+            self.accept_processor_cancelled()
+
+    def validate_processor_source(self, source: SignalValue | None) -> None:
+        if not isinstance(source, SignalValue):
+            raise TypeError("Processor input must be SignalValue")
+        if source.name != self._source_signal:
+            raise ValueError("Processor received a different input signal")
+        if not isinstance(source.coverage, MonitorCoverage):
+            raise ValueError("latest-only Processor requires monitor coverage")
+
+    def evaluate_processor(
+        self,
+        source: SignalValue,
+    ) -> Mapping[str, LiveDatasetOutput]:
+        self.validate_processor_source(source)
+        outputs = self._operation(source)
+        if not isinstance(outputs, Mapping) or not outputs:
+            raise TypeError("Processor operation must return a non-empty mapping")
+        return dict(outputs)
+
+    def accept_processor_result(
+        self,
+        source: SignalValue,
+        source_publication: SignalPublication,
+        outputs: Mapping[str, LiveDatasetOutput],
+    ) -> None:
+        if not self._active or self.cancel_requested:
+            return
+        self.validate_processor_source(source)
+        self._data_plane.publish_processor(
+            self,
+            outputs,
+            source_publication=source_publication,
+        )
+
+    def accept_processor_failure(self, error: Exception) -> None:
+        if not self._active:
+            return
+        self._data_plane.withdraw_processor(self)
+        self._plane_state = False
+        self._active = False
+        self._terminal = True
+        self._phase = "failed"
+        self._error = f"{type(error).__name__}: {error}"
+
+    def accept_processor_cancelled(self) -> None:
+        if not self._active:
+            return
+        self._active = False
+        self._terminal = True
+        self._phase = "cancelled"
+        self._error = None
+
+    def request_processor_owner_wake(self) -> None:
+        self._request_owner_wake()

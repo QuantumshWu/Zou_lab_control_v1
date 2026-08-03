@@ -45,8 +45,10 @@ class LogicNodeRow(FluentFrame):
     # confocal gui_combine colour map (INIT=grey / RUNNING=green / STOP/ERROR=red).
     STATE_COLORS = {"stopped": GREY, "running": GREEN, "error": RED}
 
-    def __init__(self, node: LogicNodeConfig, parent=None):
+    def __init__(self, node: LogicNodeConfig, kind: str, parent=None):
         super().__init__(parent)
+        if kind not in {"measurement", "processor", "task"}:
+            raise ValueError("LogicNodeRow kind must come from a descriptor")
         self.node = node
         self.setMinimumWidth(0)
         self.setSizePolicy(
@@ -68,7 +70,7 @@ class LogicNodeRow(FluentFrame):
             QtWidgets.QSizePolicy.Ignored,
             QtWidgets.QSizePolicy.Preferred,
         )
-        self.kind_label = FluentLabel(f"({node.kind})")
+        self.kind_label = FluentLabel(f"({kind})")
         self.kind_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
         self.status_label = ElidedLabel("stopped")
         self.status_label.setMinimumWidth(0)
