@@ -405,6 +405,17 @@ class LogicNodeParameterPanel(QtWidgets.QWidget):
         self.stop_button.setEnabled(bool(running))
         self._parameter_form.setEnabled(not running)
 
+    def set_mutation_enabled(self, enabled: bool) -> None:
+        """Enable/disable authored edits without changing lifecycle state."""
+
+        allowed = bool(enabled) and not self._running
+        self._parameter_form.setEnabled(allowed)
+        if not enabled:
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+        else:
+            self.set_running(self._running)
+
     def set_status(self, text: str, *, error: bool) -> None:
         self.status.setText(str(text))
         self.status.setStyleSheet(

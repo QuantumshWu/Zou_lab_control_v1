@@ -17,6 +17,7 @@ from zlc_neutral_atom.installation_config import (
     load_installation_config,
     save_installation_config,
 )
+from zlc_neutral_atom.logic_node import SelectionParameterPatch
 
 from .editor_session import DeviceConfigEditorSession
 
@@ -74,6 +75,7 @@ class DeviceManagerController(QtCore.QObject):
     busy_changed = QtCore.pyqtSignal(bool, str)
     operation_finished = QtCore.pyqtSignal(str, bool)
     status_changed = QtCore.pyqtSignal(str, str)
+    parameter_patch_staged = QtCore.pyqtSignal(str)
     _completed = QtCore.pyqtSignal(object)
 
     def __init__(
@@ -119,6 +121,27 @@ class DeviceManagerController(QtCore.QObject):
         self._field_errors.pop((instance_id, key), None)
         if self.editor.set_parameter(instance_id, key, value):
             self.draft_changed.emit(instance_id, key)
+
+    def stage_parameter_patch(self, patch: SelectionParameterPatch) -> bool:
+        """Stage a leaf-declared patch without applying hardware changes."""
+
+        self._require_idle()
+        if not isinstance(patch, SelectionParameterPatch):
+            raise TypeError("patch must be SelectionParameterPatch")
+        changed = self.editor.stage_parameter_patch(
+            patch.target_instance_id,
+            dict(patch.values),
+        )
+        for key in changed:
+            self._field_errors.pop((patch.target_instance_id, key), None)
+            self.draft_changed.emit(patch.target_instance_id, key)
+        if changed:
+            self.parameter_patch_staged.emit(patch.target_instance_id)
+            self.status_changed.emit(
+                patch.description or "selection parameters staged",
+                "info",
+            )
+        return bool(changed)
 
     def set_field_error(
         self,

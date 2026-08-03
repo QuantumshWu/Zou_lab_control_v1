@@ -12,6 +12,7 @@ import inspect
 import os
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -72,7 +73,14 @@ from zlc_data import (
     StreamGenerationId,
     materialize_value_dataset,
 )
-from zlc_plot import FitEvent, PlotKind, RasterOperation, SelectionData, SelectorKind
+from zlc_plot import (
+    FitEvent,
+    NumericRange,
+    PlotKind,
+    RasterOperation,
+    SelectionData,
+    SelectorKind,
+)
 from .panel_board import (
     GAP,
     PanelBoard,
@@ -98,11 +106,13 @@ from zlc_neutral_atom.logic_node import (
     ArtifactOutputSpec,
     DatasetOutputSpec,
     LogicNodeDescriptor,
+    SelectionParameterPatch,
 )
 from zlc_neutral_atom.runtime.hosted_run import LogicNodeHost
 from .panel_card import PanelCard, PanelSurfaceUpdate
 from .panel_editor import PanelEditor
 from .logic_node_editor import LogicNodeEditor
+from .logic_node_parameter_panel import LogicNodeParameterPanel
 from .logic_node_row import LogicNodeRow
 from .published_signal_row import PublishedSignalRow
 from .layout_repository import (
@@ -187,6 +197,7 @@ class TaskConsole(QtWidgets.QWidget):
         pulses_root: Path,
         tasks_root: Path,
         figures_root: Path,
+        selection_patch_sink=None,
         scale: float | None = None,
         window_ratio: float = WINDOW_SCREEN_FRACTION,
         window_px: tuple[int, int] | None = None,
@@ -251,8 +262,11 @@ class TaskConsole(QtWidgets.QWidget):
             raise TypeError("device_catalog must be DeviceCatalogView")
         if host_factory is not None and not callable(host_factory):
             raise TypeError("host_factory must be callable or None")
+        if selection_patch_sink is not None and not callable(selection_patch_sink):
+            raise TypeError("selection_patch_sink must be callable or None")
         self._device_catalog = device_catalog
         self._host_factory = host_factory
+        self._selection_patch_sink = selection_patch_sink
         self._panel_teardown_phases: dict[int, set[str]] = {}
         descriptor_values = tuple(descriptors)
         if any(
@@ -287,7 +301,15 @@ class TaskConsole(QtWidgets.QWidget):
         # row removal.
         self._last_node: dict[int, _ConsoleNode] = {}
         self._logic_editors: dict[int, "LogicNodeEditor"] = {}  # id(row) -> Edit tab
+        # One weak set of Qt projections per producer row.  The row's authored
+        # mapping remains the only draft owner; these are merely the Logic Edit
+        # and Plot Edit views that must be reconciled when either one changes.
+        self._draft_forms: dict[int, weakref.WeakSet[LogicNodeParameterPanel]] = {}
         self._building = False
+        # One application-level Task takeover.  This is only a UI command gate;
+        # resource admission and conflict retirement remain owned by Experiment.
+        self._task_takeover_row: LogicNodeRow | None = None
+        self._task_takeover_text = ""
         self._address: str | None = None
         # The folder the LAST panel "Save Fig" wrote into -- so a panel's Edit-tab save
         # picker reopens at the same place across panels and across reopens (remembered
@@ -421,8 +443,8 @@ class TaskConsole(QtWidgets.QWidget):
                 self.kind_combo.setItemData(self.kind_combo.count() - 1,
                                             descriptor.description, QtCore.Qt.ToolTipRole)
         self.kind_combo.setFixedWidth(scaled_px(170, minimum=130))
-        add_button = FluentButton("Add Panel", color=ACCENT)
-        add_button.clicked.connect(self._add_panel)
+        self.add_panel_button = FluentButton("Add Panel", color=ACCENT)
+        self.add_panel_button.clicked.connect(self._add_panel)
         # "Selectors" switch: the Monitor board is display-only BY DEFAULT (every panel builds
         # its selector layer but parks it inactive; the wheel scrolls the board).
         # Flip ON to arm the full selector layer (zoom/pan, area, cross,
@@ -443,14 +465,14 @@ class TaskConsole(QtWidgets.QWidget):
         # (``_mark_dirty``, ``_toggle_pause`` ...) guards on existence.
         if self.embedded:
             self.save_button = None
-            load_button = None
+            self.load_button = None
             self.pause_button = None
             self.save_image_button = None
         else:
             self.save_button = FluentButton("Save", color=ACCENT)
             self.save_button.clicked.connect(self.save_to_file)
-            load_button = FluentButton("Load", color=ORANGE)
-            load_button.clicked.connect(self.load_from_file)
+            self.load_button = FluentButton("Load", color=ORANGE)
+            self.load_button.clicked.connect(self.load_from_file)
             self.pause_button = FluentButton("Pause", color=ORANGE)
             self.pause_button.clicked.connect(self._toggle_pause)
             self.save_image_button = FluentButton("Save image", color=ACCENT)
@@ -462,18 +484,18 @@ class TaskConsole(QtWidgets.QWidget):
         # Add Panel stays even when embedded (a loaded figure is re-wired + extra panels added), and so
         # does the Selectors switch (inspecting a loaded figure is exactly when the selectors help);
         # the four whole-console buttons only when they exist.
-        for widget in (self.kind_combo, add_button, self.selectors_switch,
-                       self.pause_button, self.save_image_button, self.save_button, load_button):
+        for widget in (self.kind_combo, self.add_panel_button, self.selectors_switch,
+                       self.pause_button, self.save_image_button, self.save_button,
+                       self.load_button):
             if widget is not None:
                 header.addWidget(widget)
         root.addWidget(header_frame)
 
-        # PERSISTENT status strip -- the ONE always-visible line between the header and the
-        # tabs.  Its content switches by PRIORITY (node error > display-behind
-        # advisory; idle is empty, see _update_summary).  Run progress and Stop
-        # stay row-local, so the board never acquires a second admission mode.
-        # Its fixed height keeps status changes from moving the layout.
-        self.status_strip = FluentStatusStrip()
+        # PERSISTENT status strip -- the one always-visible line between the header and
+        # tabs.  A running Task promotes this same strip to the sole task command
+        # surface; no second banner or task-specific widget is created.
+        self.status_strip = FluentStatusStrip(action_text="Stop task")
+        self.status_strip.action_clicked.connect(self._stop_active_task)
         root.addWidget(self.status_strip)
 
         # TWO permanent tabs:
@@ -671,6 +693,7 @@ class TaskConsole(QtWidgets.QWidget):
         switch = getattr(self, "selectors_switch", None)
         if switch is not None:
             card.set_selectors_enabled(switch.isChecked())
+        card.set_editing_enabled(self._task_takeover_row is None)
         self.cards.append(card)
         self._card_topology_identities[id(card)] = self._card_topology_identity(card)
         self._signal_topology_changed()
@@ -845,6 +868,7 @@ class TaskConsole(QtWidgets.QWidget):
             card.set_status(f"Selector output: {error_summary(error)}", error=True)
             return
         if accepted:
+            self._apply_selection_parameter_patch(card, result)
             self._promote_data_front(self._data.freeze())
             if not same_route:
                 self._signal_topology_changed()
@@ -1002,6 +1026,10 @@ class TaskConsole(QtWidgets.QWidget):
             explicit or active_editor is not source_editor
         ):
             active_editor.form.seed_binding(candidate_authored, candidate_inputs)
+        self._sync_draft_forms(
+            row,
+            exclude=None if explicit else getattr(source_editor, "form", None),
+        )
         return candidate_authored, candidate_inputs
 
     def _node_label(self, node: _ConsoleNode) -> str:
@@ -1879,7 +1907,7 @@ class TaskConsole(QtWidgets.QWidget):
         acquisition / fit / limits are editable straight away.  The snapshot
         section just shows "waiting for data" until a plot exists (the data is
         produced by a Logic-tab node, not by this Edit)."""
-        if card is None:
+        if card is None or self._task_command_blocked("edit a plot panel"):
             return
         existing = self._panel_editors.get(id(card))
         if existing is not None:
@@ -1927,6 +1955,11 @@ class TaskConsole(QtWidgets.QWidget):
         registry.  The permanent Monitor / Logic tabs carry no X, so they never
         arrive here.  A logic node's Edit only closes the TAB -- the node keeps
         running and stays in the Logic list (reopen its Edit from its row)."""
+        if self._task_takeover_row is not None:
+            self._task_command_blocked("close an Edit tab")
+            self.tabs.setCurrentWidget(widget)
+            return
+
         logic_entry = next(
             (
                 (key, editor)
@@ -2059,9 +2092,88 @@ class TaskConsole(QtWidgets.QWidget):
         return vw if vw else board_width(configs)
 
     # ------------------------------------------------------------------ actions
+    def _task_command_blocked(self, action: str, row: "LogicNodeRow | None" = None) -> bool:
+        """Apply the one TaskConsole command-admission projection.
+
+        This guard is deliberately about graph/lifecycle mutations only.  Plot
+        rendering and selector view changes remain usable while a task runs, but
+        adding/removing/reconfiguring logic or replacing a saved task layout does
+        not create a second command path around the active Task.
+        """
+
+        active = self._task_takeover_row
+        if active is None:
+            return False
+        # The active task is stopped through the single status-strip command,
+        # which calls the same lifecycle endpoint as the row-local stop path.
+        # Keep that command inside the one admission gate; do not let the
+        # wording of the caller ("stop another node" versus "stop task") turn
+        # the only legal escape hatch into a rejected mutation.
+        if action.startswith("stop") and row is active:
+            return False
+        title = active.node.title if active is not None else "task"
+        self._task_takeover_text = (
+            f"{title}: task is running; use Stop task before {action}"
+        )
+        self.status_strip.show_message(self._task_takeover_text, severity="task")
+        return True
+
+    def _set_task_takeover(
+        self,
+        row: "LogicNodeRow | None",
+        *,
+        text: str | None = None,
+    ) -> None:
+        """Install/remove the single active-task UI gate.
+
+        ``row`` is the only source of task identity.  Every row projects the same
+        boolean gate, while the application remains the owner of actual resource
+        admission and cleanup.
+        """
+
+        previous = self._task_takeover_row
+        if previous is row and row is not None and text is None:
+            return
+        self._task_takeover_row = row
+        active = row is not None
+        for current in self.logic_nodes:
+            current.set_task_takeover(active)
+        for card in self.cards:
+            card.set_editing_enabled(not active)
+        for editor in self._logic_editors.values():
+            editor.set_mutation_enabled(not active)
+        for editor in self._panel_editors.values():
+            editor.set_mutation_enabled(not active)
+        for widget in (
+            self.name_edit,
+            self.kind_combo,
+            self.add_panel_button,
+            self.save_button,
+            self.load_button,
+        ):
+            if widget is not None:
+                widget.setEnabled(not active)
+        self.status_strip.set_action_visible(active)
+        if row is None:
+            self._task_takeover_text = ""
+            self.status_strip.show_message("", severity="info")
+            return
+        self._task_takeover_text = text or f"{row.node.title}: starting"
+        self.status_strip.show_message(self._task_takeover_text, severity="task")
+
+    def _stop_active_task(self) -> None:
+        """The one public Stop command exposed while a Task owns the console."""
+
+        row = self._task_takeover_row
+        if row is None:
+            return
+        self._stop_logic_node(row)
+
     def _add_panel(self) -> None:
         """Header "Add Panel": add either a BLANK plot panel (a plot kind) or a
         STOPPED logic node (measurement / processor / task)."""
+        if self._task_command_blocked("add a panel"):
+            return
         data = self.kind_combo.currentData()
         # A node LAYER -> a STOPPED logic node on the Logic tab.  It publishes
         # nothing until Started.
@@ -2113,6 +2225,8 @@ class TaskConsole(QtWidgets.QWidget):
         *,
         _state_change: bool = True,
     ) -> bool:
+        if _state_change and self._task_command_blocked("remove a plot panel"):
+            return False
         phases = self._panel_teardown_phases.setdefault(id(card), set())
         if "detached" in phases:
             return True
@@ -2243,6 +2357,7 @@ class TaskConsole(QtWidgets.QWidget):
         # insert ABOVE the trailing stretch (the hint + stretch are the last 2 items)
         self.logic_layout.insertWidget(self.logic_layout.count() - 1, row)
         self.logic_nodes.append(row)
+        row.set_task_takeover(self._task_takeover_row is not None)
         self._logic_nodes[id(row)] = None
         self._signal_topology_changed()
         self._refresh_logic_hint_visibility()
@@ -2259,6 +2374,8 @@ class TaskConsole(QtWidgets.QWidget):
 
     def _edit_logic_node(self, row: "LogicNodeRow") -> None:
         """Open (or focus) a logic node's OWN closable Edit tab (param form + Start/Stop)."""
+        if self._task_command_blocked("edit a logic node", row):
+            return
         existing = self._logic_editors.get(id(row))
         if existing is not None:
             self.tabs.setCurrentWidget(existing)
@@ -2283,9 +2400,17 @@ class TaskConsole(QtWidgets.QWidget):
         editor.stop_requested.connect(
             lambda current=row: self._stop_logic_node(current)
         )
-        # A draft makes the saved layout stale, but stays widget-local until a
-        # semantic commit boundary; typing never rebuilds a node or snapshots data.
+        # A draft makes the saved layout stale at the semantic commit boundary.
+        # The row's authored/input mapping is the
+        # shared producer draft also exposed by Plot Edit; typing never rebuilds
+        # a node or snapshots data.
         editor.draft_changed.connect(self._mark_dirty)
+        editor.form.draft_changed.connect(
+            lambda current=row, current_form=editor.form: self._sync_shared_logic_draft(
+                current, current_form
+            )
+        )
+        self._register_draft_form(row, editor.form)
         # reflect the live run state on the form (a Started node reopened keeps Stop enabled)
         node = self._logic_nodes.get(id(row))
         editor.set_running(node is not None and node.running)
@@ -2338,6 +2463,223 @@ class TaskConsole(QtWidgets.QWidget):
             signal_labels=self._signal_short_names,
         )
 
+    def _producer_row_for_signal(self, signal: object) -> "LogicNodeRow | None":
+        """Find the one saved producer row owning a signal key."""
+
+        key = str(signal or "").strip()
+        if not key:
+            return None
+        matches = [
+            row for row in self.logic_nodes
+            if key in self._declared_signal_keys(row)
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(f"signal {key!r} has more than one producer row")
+        return matches[0] if matches else None
+
+    def _register_draft_form(
+        self,
+        row: "LogicNodeRow",
+        form: LogicNodeParameterPanel,
+    ) -> None:
+        """Register one live Qt projection of a row's authored draft.
+
+        The registry is deliberately weak: closing an Edit tab must not leave a
+        hidden form, signal connection, or second parameter owner alive.  It is
+        only used to reconcile the other visible projection after a complete
+        typed value is accepted.
+        """
+
+        if row not in self.logic_nodes:
+            return
+        bucket = self._draft_forms.setdefault(id(row), weakref.WeakSet())
+        bucket.add(form)
+
+    def _sync_draft_forms(
+        self,
+        row: "LogicNodeRow",
+        *,
+        exclude: LogicNodeParameterPanel | None = None,
+    ) -> None:
+        """Project the row-owned draft into every other open Edit view."""
+
+        bucket = self._draft_forms.get(id(row))
+        if not bucket:
+            self._draft_forms.pop(id(row), None)
+            return
+        for form in tuple(bucket):
+            if form is exclude:
+                continue
+            try:
+                form.seed_binding(row.node.authored, row.node.inputs)
+            except (KeyError, TypeError, ValueError, RuntimeError):
+                # A stale Qt projection is not a second source of truth.  Its
+                # owner will be removed by the normal tab-retirement path.
+                continue
+
+    def producer_parameter_panel_for_signal(
+        self,
+        signal: object,
+        *,
+        parent: QtWidgets.QWidget,
+    ) -> tuple["LogicNodeRow", LogicNodeParameterPanel] | None:
+        """Build a Plot Edit projection over the producer row's same draft.
+
+        The form is a second Qt projection, not a second parameter model: both
+        this panel and Logic Edit write the same ``LogicNodeConfig`` draft.  No
+        leaf name or field schema is known here; the descriptor still owns it.
+        """
+
+        row = self._producer_row_for_signal(signal)
+        if row is None:
+            return None
+        descriptor = self._spec_for_logic(row.node)
+        if descriptor is None:
+            return None
+        form = LogicNodeParameterPanel(
+            descriptor,
+            device_catalog=self._device_catalog,
+            project_root=self._project_root,
+            pulses_root=self._pulses_root,
+            runtime=self.form_runtime_for_logic(row),
+            parent=parent,
+            controls=False,
+        )
+        form.seed_binding(row.node.authored, row.node.inputs)
+        form.draft_changed.connect(
+            lambda current=row, current_form=form: self._sync_shared_logic_draft(
+                current, current_form
+            )
+        )
+        self._register_draft_form(row, form)
+        runtime = self._logic_nodes.get(id(row))
+        form.set_running(runtime is not None and runtime.running)
+        return row, form
+
+    def _sync_shared_logic_draft(
+        self,
+        row: "LogicNodeRow",
+        form: LogicNodeParameterPanel,
+    ) -> None:
+        """Commit one complete typed form projection into the row's sole draft."""
+
+        if row not in self.logic_nodes:
+            return
+        try:
+            authored, inputs = form.collect_binding()
+        except (TypeError, ValueError, KeyError):
+            # Keep the last complete typed draft while a required widget is
+            # temporarily blank.  The live widgets still mirror each other on
+            # the next complete edit and Start remains the validation boundary.
+            return
+        if row.node.authored == authored and row.node.inputs == inputs:
+            return
+        row.node.authored = dict(authored)
+        row.node.inputs = dict(inputs)
+        self._sync_draft_forms(row, exclude=form)
+        self._update_row_publishes(row)
+        self._signal_topology_changed()
+        self._mark_dirty()
+
+    def _apply_selection_parameter_patch(
+        self,
+        card: PanelCard,
+        result: SelectionData,
+    ) -> None:
+        """Apply the one generic interval-to-axis-range draft projection.
+
+        A committed X-range is already a physical ``Selection`` owned by
+        ``zlc_plot``/``zlc_data``.  For a producer that explicitly declares an
+        ``axis_range`` authoring field, the same range is a convenient draft
+        prefill; it is not a hardware operation and does not alter the
+        published selection Dataset.  Other selector kinds stay pure until a
+        leaf/device owner declares a narrower patch seam.
+        """
+
+        if self._task_takeover_row is not None:
+            # Task takeover owns the mutation gate.  The physical selection
+            # publication still succeeds, but an active Task cannot have its
+            # producer draft changed behind the operator's back.
+            return
+        row = self._producer_row_for_signal(card.config.signal)
+        if row is None:
+            return
+        descriptor = self._spec_for_logic(row.node)
+        if descriptor is None:
+            return
+
+        # A leaf may describe a device-side patch (Camera Area -> ROI, for
+        # example).  TaskConsole only supplies the immutable source value and
+        # forwards the typed patch to the composition-owned Device Manager
+        # staging port; it never imports a camera or touches hardware.
+        patch_factory = descriptor.selection_parameter_patch
+        if patch_factory is not None:
+            request = None
+            try:
+                request = descriptor.build_request(
+                    descriptor.authoring_schema.freeze(row.node.authored)
+                )
+                value = card.presented_value
+                source = None if value is None else value.snapshot
+                patch = patch_factory(request, result, source)
+            except (TypeError, ValueError, KeyError, LookupError):
+                patch = None
+            if patch is not None:
+                if not isinstance(patch, SelectionParameterPatch):
+                    raise TypeError(
+                        "selection_parameter_patch returned another value"
+                    )
+                try:
+                    staged = (
+                        False
+                        if self._selection_patch_sink is None
+                        else bool(self._selection_patch_sink(patch))
+                    )
+                except (RuntimeError, TypeError, ValueError, KeyError):
+                    # The Dataset selection is already committed.  A missing
+                    # or closing Device Manager cannot invalidate that signal;
+                    # it only means the optional parameter draft was not staged.
+                    staged = False
+                card.set_status(
+                    "ROI staged in Device Manager; press Apply"
+                    if staged
+                    else "ROI ready; open Device Manager and press Apply",
+                    error=False,
+                )
+
+        if result.selector.kind is not SelectorKind.X_RANGE:
+            return
+        value = result.selector.value
+        if not isinstance(value, NumericRange):
+            return
+        fields = tuple(
+            field
+            for field in descriptor.authoring_schema.fields
+            if field.kind == "axis_range"
+        )
+        if len(fields) != 1:
+            return
+        field = fields[0]
+        current = row.node.authored.get(field.key, field.default)
+        if not isinstance(current, tuple) or len(current) != 3:
+            return
+        points = current[2]
+        candidate = dict(row.node.authored)
+        candidate[field.key] = (value.low, value.high, points)
+        try:
+            authored = descriptor.authoring_schema.freeze(candidate)
+        except (TypeError, ValueError):
+            # The selector is still a valid physical output; a range outside
+            # the producer's declared bounds is simply not a legal prefill.
+            return
+        if authored == row.node.authored:
+            return
+        row.node.authored = dict(authored)
+        self._sync_draft_forms(row)
+        self._update_row_publishes(row)
+        self._signal_topology_changed()
+        self._mark_dirty()
+
     def _start_logic_node(self, row: "LogicNodeRow") -> None:
         """Build the node FROM the node's current param-form values with display
         suppressed (it publishes to the data plane and never opens another plot),
@@ -2345,6 +2687,8 @@ class TaskConsole(QtWidgets.QWidget):
         Sets the node's status dot green; on build/run error -> red + the error
         on the status line.  Reuses the SAME node-build paths the real readout /
         notebook use."""
+        if self._task_command_blocked("start another logic node", row):
+            return
         editor = self._logic_editors.get(id(row))
         try:
             authored, inputs = self._commit_logic_authored_values(row, editor=editor)
@@ -2417,6 +2761,8 @@ class TaskConsole(QtWidgets.QWidget):
         if editor is not None:
             editor.set_running(True)
             editor.set_status("starting", error=False)
+        if row.kind == "task":
+            self._set_task_takeover(row, text=f"{row.node.title}: starting")
         self.status_dot.set_color(GREEN)
         self._mark_dirty()
         self._ensure_task_preview_panels(row)
@@ -2679,6 +3025,8 @@ class TaskConsole(QtWidgets.QWidget):
         _silent: bool = False,
     ) -> bool:
         """Cancel a logic row's hosted owner and grey its dot."""
+        if not _silent and self._task_command_blocked("stop another node", row):
+            return False
         node = self._logic_nodes.get(id(row))
         if node is not None:
             if not self._stop_node_owner(node):
@@ -2694,6 +3042,8 @@ class TaskConsole(QtWidgets.QWidget):
         self._remove_transient_result_panels(row)
         self._logic_nodes[id(row)] = None
         self._sync_terminal_poll_timer()
+        if self._task_takeover_row is row:
+            self._set_task_takeover(None)
         # Running, retained FINAL/view, and declared-not-started are
         # intentionally different picker/legend states.
         self._signal_topology_changed()
@@ -2713,6 +3063,8 @@ class TaskConsole(QtWidgets.QWidget):
         _state_change: bool = True,
     ) -> bool:
         """Stop + remove a logic node (its node is stopped, its row + Edit drop)."""
+        if _state_change and self._task_command_blocked("remove a logic node", row):
+            return False
         # Removing a row also retires its retained terminal display source.
         gone = (
             self._logic_nodes.get(id(row))
@@ -2760,6 +3112,8 @@ class TaskConsole(QtWidgets.QWidget):
             if not observation.terminal:
                 status = observation.phase + warning_text
                 row.set_state("running", status=status)
+                if self._task_takeover_row is row:
+                    self._set_task_takeover(row, text=f"{row.node.title}: {status}")
                 if editor is not None:
                     editor.set_running(True)
                     editor.set_status(status, error=False)
@@ -3033,6 +3387,13 @@ class TaskConsole(QtWidgets.QWidget):
         if telemetry != getattr(self, "_summary_text", None):
             self._summary_text = telemetry
             self.summary.setText(telemetry)
+        if self._task_takeover_row is not None:
+            self.status_strip.show_message(
+                self._task_takeover_text or f"{self._task_takeover_row.node.title}: running",
+                severity="task",
+            )
+            self.status_strip.set_action_visible(True)
+            return
         dropped = self._note_display_drops()
         # The persistent strip's ONE priority ladder (every tick): a wedged node must never fail
         # silently, so a red node error outranks the
@@ -3060,6 +3421,8 @@ class TaskConsole(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ files
     def save_to_file(self) -> None:
+        if self._task_command_blocked("save a task layout"):
+            return
         try:
             state = self.read_state()
             start = self._address or str(
@@ -3077,6 +3440,8 @@ class TaskConsole(QtWidgets.QWidget):
             self._message(f"Save failed: {exc}")
 
     def load_from_file(self) -> None:
+        if self._task_command_blocked("load a task layout"):
+            return
         try:
             start = (
                 str(Path(self._address).parent)
@@ -3381,6 +3746,7 @@ def show_task_console(
     pulses_root: Path,
     tasks_root: Path,
     figures_root: Path,
+    selection_patch_sink=None,
     state: TaskConsoleState | None = None,
     task: str | None = None,
     scale: float | None = None,
@@ -3419,6 +3785,7 @@ def show_task_console(
         pulses_root=pulses_root,
         tasks_root=tasks_root,
         figures_root=figures_root,
+        selection_patch_sink=selection_patch_sink,
         scale=scale,
         window_ratio=window_ratio,
     )

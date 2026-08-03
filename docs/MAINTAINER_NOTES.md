@@ -6,7 +6,7 @@
 
 - Branch：`codex/system-architecture-migration`。
 - 重开基线：`476d125304fc90b6ef4f5009184dd2119206fcc2`；C0规范提交：`ed6dfe21c0d99999444c099d8c644a20b44e561d`。
-- 当前checkpoint：§8 C3 最小 Logic Node host 已 dependency-closed；下一唯一工作是 C4 Task takeover、Edit 与输出。不得返回旧 M1–M7 叙事，也不得重做已经闭合的 C1/C2/C3。
+- 当前checkpoint：§8 C4 Task takeover、Edit 与输出已 dependency-closed；下一唯一工作是 C5 PulseGUI narrow hold/step。不得返回旧 M1–M7 叙事，也不得重做已经闭合的 C1/C2/C3/C4。
 - 预期worktree例外：未跟踪用户文件`pulses/scan_test.json`。永远不得读取、修改、移动、删除、stage或commit。
 - RTL、Tcl、XDC、bitstream和wire protocol仍冻结；C1/C2没有硬件改动。
 
@@ -59,10 +59,23 @@
 - 定向产品流：TaskConsole Camera live→Area→第二 Image→Fit 与 Occupancy `2 passed`；MOT-field final card/shape/output `2 passed`；Signal picker topology delta `9 passed`；current Logic host/descriptor/calibration/capture/runtime contracts `97 passed`；另一 device/workbench group `73 passed`。
 - 过期合同已按当前 API 改写或删除：duration 测试改为 `exp.nodes.readout_duration_fidelity.build(...)`，pulse failure test 使用通用 `require_capability("pulse.execute")`，旧 tutorial 完整重写为 current `Experiment.nodes` 并由 nbclient 执行。`tests/test_pulse_scan_signal_consumer.py` 的旧 API 闭包已删除，不恢复兼容。
 - 全套回归：`823 passed, 1 skipped`（含 1 个 zmq Proactor 环境 warning），总耗时约 144 秒；没有生产失败或旧 API 兼容失败。
-- 当前 C3 worktree 仍待本 checkpoint commit；保护性用户文件 `pulses/scan_test.json` 未读取、未修改、未 stage。提交前必须用显式路径 stage，并确认 cached name 中没有该文件。
+- C3 checkpoint 已由 `7cf8b64` 提交；保护性用户文件 `pulses/scan_test.json` 未读取、未修改、未 stage、未 commit。
 
-## 当前下一步：C4 Task takeover、Edit 与输出
+## C4 已闭合的 owner
 
-只按 `docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md` §2、§6、§8 C4、§9 推进：恢复 Task 专属 header/progress/Stop 与统一 mutation admission；让 producer 的同一 typed draft/controller 同时服务 Logic Edit 与 Plot Edit；把 Calibration/Task 输出稳定落在项目 `tasks/`、`runs/`、`figures/`。先列唯一 owner、删除清单和当前 LOC，再做一个 dependency-closed 产品纵切；不得为旧测试/API 留兼容，不复核已经闭合的 C1/C2/C3。
+- TaskConsole 现在只有一个 active Task takeover 投影：固定 status/header surface 显示 task/stage，唯一 Stop task action 走原有 `_stop_logic_node` 生命周期；所有 graph、node、layout、Edit/producer、panel-setting mutation 在 takeover 期间由同一 gate 置灰/拒绝，selector/zoom 等 view-only 操作仍可用。terminal、failure、Stop 都通过同一 host cleanup 出口清除 takeover。
+- Logic Edit 与 Plot Edit 使用同一 `LogicNodeConfig.authored/inputs` draft；WeakSet 只登记 Qt projections，不存第二份参数 truth。Panel Editor 的 snapshot/config controls 在 takeover 期间也由同一 gate 禁用。
+- selector 的 1-D interval 可预填 leaf 声明的 `axis_range`；Camera leaf 额外声明通用 `SelectionParameterPatch`，Area 只生成 stable camera instance + `roi_*` 草案。composition root 将它转交已打开的 Device Manager draft；Device Manager 原位校验/重绘卡片，只有用户点击 Apply 才改变 active installation，TaskConsole 不含 Camera/ROI 特判。
+- TaskConsole/DeviceManager 输出路径保持 project-root `tasks/`、`runs/`、`figures/`；Calibration 的 `save_frames` 与 concise reloadable report 已有正式纵切。没有加入 SHA、bytes、size manifest、软件预算或第二 presentation owner。
 
-恢复时严格依次完整读取当前 Goal、`AGENTS.md`、本文件、Git branch/HEAD/status/recent log，再只读台账当前未闭合项和设计对应章节。不得重答、重审或重做 C1/C2/C3；若发现矛盾，先停止该 cut，更新设计与删除清单后再实现。
+## C4 证据与规模
+
+- 定向产品流：Camera live→Area→第二 Image→两处 Fit、Occupancy 手动绑定、MOT live→FINAL、DeviceManager graph flow、TaskConsole start gate 全部通过；新增 Camera Area patch contract 与 headless discovery 也通过。
+- 当前全套回归：`824 passed, 1 skipped`，总耗时约 146 秒；headless Logic discovery 未加载 Matplotlib/Qt。`git diff --check`通过，RTL/Tcl/XDC/bitstream/wire protocol无diff。
+- C4 已由 `0adaacd` 提交，包含 16 个生产/测试/设计文件（806 insertions, 28 deletions）；受保护用户文件 `pulses/scan_test.json` 仍未读取、未修改、未 stage、未 commit。
+
+## 当前下一步：C5 PulseGUI narrow hold/step
+
+只按 `docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md` §2、§6、§8 C5、§9 推进：审查并收敛 PulseGUI 的 narrow hold/step 语义、现有 server/API-slot 路径和不可变 pulse 文档；保持 hold/step 只操作当前运行态，不引入全局 snapshot 或新安全门。先列唯一 owner、删除清单和当前 LOC，再做一个 dependency-closed 产品纵切；不得为旧测试/API 留兼容，不复核已经闭合的 C1/C2/C3/C4。
+
+恢复时严格依次完整读取当前 Goal、`AGENTS.md`、本文件、Git branch/HEAD/status/recent log，再只读台账当前未闭合项和设计对应章节。不得重答、重审或重做 C1/C2/C3/C4；若发现矛盾，先停止该 cut，更新设计与删除清单后再实现。

@@ -45,6 +45,7 @@ from zlc_neutral_atom.installation_config import (
     DeviceInstanceConfig,
     discover_installation_templates,
 )
+from zlc_neutral_atom.logic_node import SelectionParameterPatch
 
 from .controller import DeviceAdminState, DeviceManagerController
 
@@ -427,6 +428,9 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         self._controller.busy_changed.connect(self._busy_changed)
         self._controller.operation_finished.connect(self._operation_finished)
         self._controller.status_changed.connect(self._show_status)
+        self._controller.parameter_patch_staged.connect(
+            self._insert_or_reconcile_card
+        )
         self._owner_close_requested.connect(
             self._close_from_owner,
             type=QtCore.Qt.QueuedConnection,
@@ -716,6 +720,18 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
                 f"{type(error).__name__}: {error}",
                 severity="error",
             )
+
+    def stage_parameter_patch(self, patch: SelectionParameterPatch) -> bool:
+        """Stage a generic leaf patch in the visible Device Manager draft.
+
+        This is intentionally not an Apply shortcut: the controller validates
+        and reconciles the affected device card, while the operator still
+        presses the ordinary Apply button at the device-owner boundary.
+        """
+
+        if not isinstance(patch, SelectionParameterPatch):
+            raise TypeError("patch must be SelectionParameterPatch")
+        return self._controller.stage_parameter_patch(patch)
 
     @property
     def permanently_closed(self) -> bool:

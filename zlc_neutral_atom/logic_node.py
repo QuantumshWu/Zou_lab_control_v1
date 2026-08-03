@@ -124,6 +124,36 @@ class UiContribution:
             raise ValueError("UI symbol must be a public identifier")
 
 
+@dataclass(frozen=True, slots=True)
+class SelectionParameterPatch:
+    """A leaf-declared device-parameter draft derived from a physical Selection.
+
+    The patch is deliberately not a hardware command and does not contain a
+    Measurement field.  A producer leaf may describe which installed device
+    instance and typed installation fields should be prefilled; the Device
+    Manager owns staging, validation, and the explicit Apply boundary.
+    """
+
+    target_instance_id: str
+    values: Mapping[str, object]
+    description: str = ""
+
+    def __post_init__(self) -> None:
+        target = _require_text(self.target_instance_id, "patch target instance id")
+        object.__setattr__(self, "target_instance_id", target)
+        values = dict(self.values)
+        if not values:
+            raise ValueError("selection parameter patch cannot be empty")
+        if any(
+            not isinstance(key, str) or not key.strip() or key != key.strip()
+            for key in values
+        ):
+            raise ValueError("selection parameter patch keys must be canonical text")
+        object.__setattr__(self, "values", MappingProxyType(values))
+        if not isinstance(self.description, str):
+            raise TypeError("selection parameter patch description must be text")
+
+
 class LogicNodeApplicationContext(Protocol):
     """Typed application surface supplied once by the composition root.
 
@@ -249,6 +279,9 @@ class LogicNodeDescriptor:
     ) = None
     task_previews: tuple[TaskPreview, ...] = ()
     ui_contributions: tuple[UiContribution, ...] = ()
+    selection_parameter_patch: (
+        Callable[[object, object, object], SelectionParameterPatch | None] | None
+    ) = None
     operations: Mapping[str, Callable[..., object]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -282,6 +315,10 @@ class LogicNodeDescriptor:
             raise TypeError("resolve_outputs must be callable or None")
         if self.resolve_outputs is not None and outputs:
             raise ValueError("static and request-dependent outputs are exclusive")
+        if self.selection_parameter_patch is not None and not callable(
+            self.selection_parameter_patch
+        ):
+            raise TypeError("selection_parameter_patch must be callable or None")
 
         requirements = tuple(self.device_requirements)
         normalized_requirements: list[tuple[str, tuple[str, ...]]] = []
@@ -461,6 +498,7 @@ __all__ = [
     "DatasetOutputSpec",
     "LogicNodeDescriptor",
     "LogicNodeApplicationContext",
+    "SelectionParameterPatch",
     "TaskPreview",
     "UiContribution",
     "discover_logic_nodes",

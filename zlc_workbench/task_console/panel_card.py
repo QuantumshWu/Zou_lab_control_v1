@@ -830,6 +830,21 @@ class PanelCard(FluentGroupBox):
             widget.set_interaction_enabled(selected)
         self.selectors_enabled_changed.emit(selected)
 
+    def set_editing_enabled(self, enabled: bool) -> None:
+        """Gate layout/source edits without disabling plot interaction.
+
+        Task takeover keeps selector/zoom/fit display interaction available,
+        but the panel's Setting popup is a persisted graph mutation surface.
+        Hiding an already-open popup prevents a task from starting with a
+        stale editor that can still write title/signal/size state.
+        """
+
+        allowed = bool(enabled)
+        if hasattr(self, "setting_button"):
+            self.setting_button.setEnabled(allowed)
+        if not allowed and hasattr(self, "settings_popup"):
+            self.settings_popup.hide()
+
     @property
     def selectors_enabled(self) -> bool:
         return self._selectors_on

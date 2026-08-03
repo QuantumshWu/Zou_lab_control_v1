@@ -73,6 +73,9 @@ class LogicNodeEditor(QtWidgets.QWidget):
     def set_running(self, running: bool) -> None:
         self.form.set_running(running)
 
+    def set_mutation_enabled(self, enabled: bool) -> None:
+        self.form.set_mutation_enabled(enabled)
+
     def set_status(self, text: str, *, error: bool) -> None:
         self.form.set_status(text, error=error)
 

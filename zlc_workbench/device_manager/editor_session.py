@@ -221,6 +221,41 @@ class DeviceConfigEditorSession:
         row.parameters[key] = value
         return True
 
+    def stage_parameter_patch(
+        self,
+        instance_id: str,
+        values: dict[str, object],
+    ) -> tuple[str, ...]:
+        """Stage one typed device patch atomically in the local draft.
+
+        Validation is performed against a copy before the draft is changed;
+        Apply remains the only operation that touches the active installation.
+        The returned keys let the Qt controller reconcile only affected fields.
+        """
+
+        if not isinstance(values, dict):
+            raise TypeError("device parameter patch values must be a dict")
+        row = self._row(instance_id)
+        descriptor = device_type(row.type_id)
+        unknown = set(values).difference(descriptor.authoring_schema.keys)
+        if unknown:
+            raise KeyError(
+                f"parameters {tuple(sorted(unknown))!r} do not belong to "
+                f"{row.type_id!r}"
+            )
+        candidate = dict(row.parameters)
+        candidate.update(values)
+        frozen = descriptor.authoring_schema.freeze(candidate)
+        changed = tuple(
+            key
+            for key in values
+            if not _typed_equal(row.parameters.get(key), frozen[key])
+        )
+        if not changed:
+            return ()
+        row.parameters = dict(frozen)
+        return changed
+
     def retype(self, instance_id: str, type_id: str) -> bool:
         row = self._row(instance_id)
         previous = device_type(row.type_id)

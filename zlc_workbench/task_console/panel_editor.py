@@ -30,6 +30,8 @@ from zlc_frontend.qt_widgets import (
 )
 from zlc_plot import Qt5PlotWidget, RasterFront, RasterOperation, RasterPlotHost
 
+from .logic_node_parameter_panel import LogicNodeParameterPanel
+
 
 _IMAGE_FORMATS = ("png", "pdf", "svg")
 
@@ -103,8 +105,30 @@ class PanelEditor(QtWidgets.QWidget):
         self.fit_holder.setContentsMargins(0, 0, 0, 0)
         column.addLayout(self.fit_holder)
 
+        # If this panel is bound to a Logic-node output, expose the producer's
+        # same descriptor form as a second Qt projection.  The row draft remains
+        # the sole parameter owner; an unbound/pure external signal gets no
+        # invented producer form.
+        self._producer_row = None
+        self._producer_form: LogicNodeParameterPanel | None = None
+        producer = console.producer_parameter_panel_for_signal(
+            card.config.signal,
+            parent=page,
+        )
+        if producer is not None:
+            row, form = producer
+            self._producer_row = row
+            self._producer_form = form
+            column.addWidget(FluentSectionLabel("Producer"))
+            producer_holder = QtWidgets.QVBoxLayout()
+            producer_holder.setContentsMargins(0, 0, 0, 0)
+            producer_holder.addWidget(form)
+            column.addLayout(producer_holder)
+
         column.addWidget(FluentSectionLabel("Save"))
-        default_dir = console._output_root / "figures" / "task-console"
+        # Figure output is a visible project-root workspace path.  TaskConsole
+        # exposes the same figures_root used by all other figure exporters.
+        default_dir = console._figures_root / "task-console"
         self.save_dir_edit = FluentPathEdit(
             console._last_save_dir or str(default_dir),
             mode="dir",
@@ -307,6 +331,32 @@ class PanelEditor(QtWidgets.QWidget):
 
     def refresh_on_show(self) -> None:
         return
+
+    def set_producer_editing_enabled(self, enabled: bool) -> None:
+        """Backward-named narrow hook used by the console command gate."""
+
+        self.set_mutation_enabled(enabled)
+
+    def set_mutation_enabled(self, enabled: bool) -> None:
+        """Disable snapshot/config mutations while a Task owns the console."""
+
+        enabled = bool(enabled)
+        for widget in (
+            self.title_edit,
+            self.refresh_button,
+            self.save_dir_edit,
+            self.save_autoname,
+            self.save_format_combo,
+            self.save_button,
+        ):
+            widget.setEnabled(enabled)
+        if self._producer_form is not None:
+            self._producer_form.set_mutation_enabled(enabled)
+        for layout in (self.controls_holder, self.fit_holder):
+            for index in range(layout.count()):
+                child = layout.itemAt(index).widget()
+                if child is not None:
+                    child.setEnabled(enabled)
 
     def _retire_surface(self) -> None:
         future = self._initial_future

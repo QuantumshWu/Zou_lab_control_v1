@@ -461,7 +461,7 @@ custom editor拥有的结构化值仍必须作为`AuthoringSchema`中的JSON-lik
 
 Measurement/Processor保持row-local。只有Task启动后由TaskConsole的唯一command-admission投影接管整个窗口：固定header显示task名、progress、stage与唯一Stop，所有其它mutating命令禁用；完成/失败/停止走同一清理出口。该投影直接消费既有HostedRun/RunSnapshot（只补真实completed/total facts），不建立第二Task session/controller。Occupancy启动只发布signals，不自动开panel；只有Task descriptor显式声明optional preview时才创建临时panel，普通recommended plot没有自动开图语义。
 
-Logic Edit和Plot Edit是同一producer-owned typed draft/controller的两个视图。selector只产出物理Selection；leaf可选声明一个窄`Selection -> ParameterPatch`纯映射，例如Camera Area预填ROI、1D interval预填scan range。zoom只改PlotSession视图；只有用户Apply才由device/producer owner在安全边界提交参数。GUI不直接配置硬件，也不维护第二参数truth。
+Logic Edit和Plot Edit是同一producer-owned typed draft/controller的两个视图。selector只产出物理Selection；leaf可选声明一个窄`Selection -> ParameterPatch`纯映射，例如Camera Area预填ROI、1D interval预填scan range。该patch只描述目标stable device instance与参数草案，由composition root转交已打开的Device Manager draft；Device Manager原位校验/更新对应卡片，用户仍须点击普通Apply，GUI不直接配置硬件，也不把ROI塞进Measurement request。zoom只改PlotSession视图；整个流程不维护第二参数truth。
 
 TaskConsole只消费descriptor catalog、唯一host factory、SignalPlane与project paths；它保存authored values/input refs并投影同一个host observation，不拥有ConsoleNodeSpec、run/processor attachment、resolved/bound多阶段DTO、artifact resolver callback、output presentation镜像或按host类型分开的poll/error逻辑。Workbench选择只冻结稳定Signal/Artifact ref；host一次解析为typed runtime fact，leaf看不到Workbench row、producer request、run node或Camera专用binding。
 

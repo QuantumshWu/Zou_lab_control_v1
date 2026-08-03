@@ -41,7 +41,32 @@ def task_console_dependencies(experiment) -> dict[str, object]:
         "pulses_root": workspace.pulses_root,
         "tasks_root": workspace.tasks_root,
         "figures_root": workspace.figures_root,
+        "selection_patch_sink": selection_parameter_patch_sink(experiment),
     }
+
+
+def selection_parameter_patch_sink(experiment):
+    """Return the composition-owned staging port for leaf selection patches.
+
+    TaskConsole never discovers or imports a concrete Device Manager.  The
+    application composition simply forwards a typed patch to the already open
+    Device Manager, if present; the manager stages it and keeps its ordinary
+    explicit Apply boundary.
+    """
+
+    experiment = _require_experiment(experiment)
+    from Zou_lab_control.api._application_services import service_guard
+
+    def stage(patch) -> bool:
+        with service_guard(experiment._services) as services:
+            handles = tuple(services.gui_handles.values())
+        for handle in handles:
+            method = getattr(handle, "stage_parameter_patch", None)
+            if callable(method):
+                return bool(method(patch))
+        return False
+
+    return stage
 
 
 def standalone_pulse_connection_factory(workspace):
@@ -315,6 +340,7 @@ class ExperimentDeviceAdmin:
 __all__ = [
     "ExperimentDeviceAdmin",
     "bound_pulse_mode",
+    "selection_parameter_patch_sink",
     "standalone_pulse_connection_factory",
     "task_console_dependencies",
 ]

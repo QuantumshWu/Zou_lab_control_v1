@@ -50,6 +50,8 @@ class LogicNodeRow(FluentFrame):
         if kind not in {"measurement", "processor", "task"}:
             raise ValueError("LogicNodeRow kind must come from a descriptor")
         self.node = node
+        self.kind = kind
+        self._task_takeover = False
         self.setMinimumWidth(0)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
@@ -86,17 +88,17 @@ class LogicNodeRow(FluentFrame):
         self.stop_button.setFixedWidth(scaled_px(56, minimum=46))
         self.stop_button.clicked.connect(lambda: self.stop_requested.emit(self))
         self.stop_button.setEnabled(False)
-        edit_button = FluentButton("Edit", color=ACCENT)
-        edit_button.setFixedWidth(scaled_px(56, minimum=46))
-        edit_button.clicked.connect(lambda: self.edit_requested.emit(self))
-        remove = FluentButton("Remove", color=GREY)
-        remove.setFixedWidth(scaled_px(82, minimum=66))
-        remove.clicked.connect(lambda: self.remove_requested.emit(self))
+        self.edit_button = FluentButton("Edit", color=ACCENT)
+        self.edit_button.setFixedWidth(scaled_px(56, minimum=46))
+        self.edit_button.clicked.connect(lambda: self.edit_requested.emit(self))
+        self.remove_button = FluentButton("Remove", color=GREY)
+        self.remove_button.setFixedWidth(scaled_px(82, minimum=66))
+        self.remove_button.clicked.connect(lambda: self.remove_requested.emit(self))
         top.addWidget(self.dot, 0)
         top.addWidget(self.name_label, 1)
         top.addWidget(self.kind_label, 0)
         top.addWidget(self.status_label, 2)
-        for b in (self.start_button, self.stop_button, edit_button, remove):
+        for b in (self.start_button, self.stop_button, self.edit_button, self.remove_button):
             top.addWidget(b, 0)
         outer.addLayout(top)
         # --- published-signals legend: one signal per line (name | shape | meaning) ---
@@ -120,8 +122,38 @@ class LogicNodeRow(FluentFrame):
         colour = RED if state == "error" else GREY
         self.status_label.setStyleSheet(f"color: {colour}; background: transparent; border: none;")
         running = state == "running"
+        if not self._task_takeover:
+            self.start_button.setEnabled(not running)
+            self.stop_button.setEnabled(running)
+
+    def set_task_takeover(self, active: bool) -> None:
+        """Project the console's single active-task command gate onto this row.
+
+        The row remains the owner of its controls; TaskConsole only supplies the
+        application admission state.  No second Stop action is left enabled while
+        a Task owns the console.  Restoring the gate derives button state from the
+        cached lifecycle state instead of inventing a second lifecycle registry.
+        """
+
+        active = bool(active)
+        if active == self._task_takeover:
+            return
+        self._task_takeover = active
+        if active:
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+            self.edit_button.setEnabled(False)
+            self.remove_button.setEnabled(False)
+            if self.kind == "task":
+                self.stop_button.setVisible(False)
+            return
+        self.stop_button.setVisible(True)
+        state = getattr(self, "_state_key", ("stopped", ""))[0]
+        running = state == "running"
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
+        self.edit_button.setEnabled(True)
+        self.remove_button.setEnabled(True)
 
     def set_publishes(self, rows) -> None:
         """Show the node's outputs as a SHORT table -- ONE signal per line, ``name`` + ``shape`` only::
