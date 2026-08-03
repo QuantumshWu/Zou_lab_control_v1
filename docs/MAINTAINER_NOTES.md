@@ -114,7 +114,7 @@
   qCMOS/Pylon E0、AUTONOMOUS_STREAMED 与 per-run fail-closed 对账路径均指向当前 API。软件 GO
   不宣称未连接的真实装置已经 qualified；下一步仅是按该 runbook 做现场 E0。
 
-## C6-R1..R4 闭合记录
+## C6-R1..R5 当前闭合记录
 
 - R1 Calibration 现在由 leaf 声明 `capture_preview` typed transient output；正式 Qt 快轨
   已观察到 `(1,1,*frame)` 的原始 dtype live 2D 图，FINAL 后仍移除 transient card。领域
@@ -132,10 +132,18 @@
   discovery）、无 GridTopology 的双 point-coordinate Image 拒绝、Histogram/Raster/
   Facet 的 ordered `source_revisions` 与 `RollingSample` 已成为唯一投影路径；没有复制外部
   树、没有恢复外部 data/Qt owner。新增 coverage 合同与现有产品流共同通过。
+- R5 接入外部 notebook raster 更新：`NotebookView` 已从 `zlc_plot.backends` 移到独立的
+  `zlc_plot.notebook` 薄 adapter，浏览器只消费 `RasterFront` RGBA 与 `SelectorScene`，
+  notebook extra 移除 `ipympl`。`RasterPlotHost.from_session(..., close_session=...)`
+  明确借用/拥有关系；Qt staged widget 在 `auto_present=False` 时不先安装 worker 最新
+  front，避免 coherent batch 的旧 operation 因构造阶段的 sequence 竞态被拒绝。新增
+  scene round-trip/borrowed-host 合同，并复跑 Camera/Calibration 产品流。
 
 ### C6 证据与验收
 
-- C6 定向回归 `90 passed`；全仓 `831 passed, 1 skipped`，仅有既存 zmq Proactor
+- C6-R5 当前窄回归（zlc_plot core、Plot Fit、Figure archive、Qt widgets、Board、Camera/
+  Calibration flow）已通过；提交前仍需按 §9 运行最终 broad current suite。历史 C6 定向
+  回归为 `90 passed`，全仓历史记录为 `831 passed, 1 skipped`，仅有既存 zmq Proactor
   selector-thread warning。全套耗时约 126 秒；无测试失败。
 - 本轮未读取、修改、移动、stage 或 commit 用户保护文件 `pulses/scan_test.json`；RTL、Tcl、
   XDC、bitstream、wire protocol 未改。C6 完成后才允许以新的 Git checkpoint 交接，不能把

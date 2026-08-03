@@ -28,7 +28,6 @@ qt = [
 notebook = [
     "ipython",
     "ipykernel",
-    "ipympl",
     "ipywidgets",
     "jupyterlab",
     "notebook",

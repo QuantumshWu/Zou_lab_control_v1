@@ -559,18 +559,24 @@ Identity严格按成本和消费者限定：
 - 删除 hold/step 原有的完整Run cancel/reap/restart路径与其UI重投影；普通 On-Pulse 的新文档替换仍沿既有Run admission语义。分别profile compile、RPC/upload、safe/reap、UI，保持RTL/Tcl/XDC/bitstream/wire零diff。
 - 通过Virtual/Remote/Offline与真实server路径验证Stop/hold/step、dirty state、endpoint clamp和稳定文本。
 
-### C6：领域E2E、性能与全仓清理（重新打开）
+### C6：领域E2E、性能与全仓清理（当前收敛）
 
-- C6 不能标为完成：新的现场证据重新打开四个根因切片。Calibration 的中间
-  2D 预览和项目输出路径、完成报告的可交互 PlotSession、Plot Panel 的移动与
-  左上重力排版、以及外部 `zlc_plot` 的增量接入都必须重新取得产品证据。
-- C6-R1..R4 未闭合前，不得声称软件 GO，也不得删除外部审查台账；旧的测试通过
-  只能作为回归证据，不能覆盖这些用户可见反证。
+- C6-R1..R4 的现场反证已经由正式 Qt 快轨重新取得证据：Calibration 中间
+  2D preview 与项目根 `tasks/calibration/<run>/` 输出、完成报告的共享
+  `PlotSession`、Plot Panel 的拖动/north-west gravity，以及 selector/front
+  交互均通过。它们仍属于产品合同，不得用静态 PNG 或单元测试替代。
+- 外部 `zlc_plot` 后续更新只按语义增量接入。本仓的 notebook adapter 现在消费
+  同一 `RasterPlotHost` 的完整 `RasterFront`，浏览器只绘制 RGBA front 与
+  `SelectorScene` 叠加层；`ipympl`/原生 notebook canvas 交互链已退役。Qt
+  `auto_present=False` 的 staged widget 不会先安装 worker 的最新 front，避免
+  coherent batch 的旧 front 被构造阶段抢先消费。
+- C6-R1..R5 未闭合前，不得声称最终软件 GO，也不得删除外部审查台账；旧的测试通过
+  只能作为回归证据，不能覆盖新的用户可见反证。
 - 已完成 tracked source 的逐文件 change-impact 扫描。旧 plot/selector/Fit/raster
   owner、Workbench 具体 leaf import、历史 Point/Presentation/CAS/软件预算机制、死
   wrapper/compat alias、tracked 空目录均为零；当前工作树只有用户保护文件
   `pulses/scan_test.json`，不读取、不修改、不纳入 Git。
-- 最终 broad current suite 需在 R1..R4 修复后重新运行。未连接的 qCMOS/Pylon/remote
+- 最终 broad current suite 需在 R1..R5 修复后重新运行。未连接的 qCMOS/Pylon/remote
   装置仍须按 `docs/REAL_HARDWARE_BRINGUP_zh.md` 在目标机器完成 E0；软件 GO
   不等同于任何未实测装置已 qualified。
 
@@ -595,4 +601,6 @@ Identity严格按成本和消费者限定：
 
 最终架构不需要第二plot/data schema、异步workflow编排器、硬件重构、persistent quarantine、软件内存预算、普通CAS/SHA、per-revision presentation对象、为Fit预设的独立进程、device backend巨表或每leaf一套lifecycle。最关键的五个跨域语义authority是：zlc_data保存实验数据事实，SignalPlane保存因果，zlc_plot保存全部绘图交互，generic Logic host保存节点骨架，Experiment保存设备composition/admission；zlc_storage、zlc_pulse、zlc_frontend与Workbench仍分别拥有§2列出的窄职责，不能被这五项吞并。
 
-C0–C6只是替换依赖顺序，不是可并存架构。当前软件已以旧owner删除和真实产品证据闭合；真实装置资格仍只由 runbook 的 E0/bring-up 证据决定，单元测试通过不能替代。
+C0–C6只是替换依赖顺序，不是可并存架构。当前 checkpoint 已闭合 C6-R1..R5 的
+旧 owner 与产品合同；最终迁移资格仍必须满足本节 §9 的全量门，真实装置资格仍只由
+runbook 的 E0/bring-up 证据决定，单元测试通过不能替代。

@@ -1043,7 +1043,6 @@ class PlotSession:
         self._live_fit_future: Future[FitResult] | None = None
         self._live_fit_completion: Future[FitResult] | None = None
         self._live_fit_pending = False
-        self._mpl_connections: list[int] = []
         self._viewport: RectangleRange | None = None
         self._focused_facet_index: int | None = (
             0 if isinstance(spec, FacetGridPlot) else None
@@ -1069,7 +1068,6 @@ class PlotSession:
         renderer = MatplotlibRenderer(spec, plan, style=defaults.style)
         self._update_renderer(renderer, RenderEffect.LAYOUT)
         self._renderer = renderer
-        self._connect_mpl_events()
 
     @staticmethod
     def _split_image_frame(
@@ -1263,7 +1261,6 @@ class PlotSession:
                 self._layout_revision += 1
                 renderer.spec = spec
                 plan = self._resolve_plan()
-                self._disconnect_mpl_events()
             try:
                 renderer.relayout(
                     plan,
@@ -1296,9 +1293,7 @@ class PlotSession:
                     facet_focus_index=self._facet_focus_index,
                 )
                 self._update_renderer(renderer, RenderEffect.LAYOUT)
-                self._connect_mpl_events()
                 raise
-            self._connect_mpl_events()
             with self._lock:
                 self._fit_context_generation += 1
                 self._fit_request_generation += 1
@@ -1959,20 +1954,15 @@ class PlotSession:
             self._cancel_gesture()
             assert self._renderer is not None
             renderer = self._renderer
-            self._disconnect_mpl_events()
-            try:
-                renderer.relayout(
-                    plan,
-                    facet_index=self._focused_facet_index,
-                    facet_focus_index=self._facet_focus_index,
-                )
-                self._update_renderer(renderer, RenderEffect.LAYOUT)
-                with self._lock:
-                    self._assert_open()
-                    callbacks = tuple(self._surface_callbacks)
-            finally:
-                if not self._closed:
-                    self._connect_mpl_events()
+            renderer.relayout(
+                plan,
+                facet_index=self._focused_facet_index,
+                facet_focus_index=self._facet_focus_index,
+            )
+            self._update_renderer(renderer, RenderEffect.LAYOUT)
+            with self._lock:
+                self._assert_open()
+                callbacks = tuple(self._surface_callbacks)
         if notify_surface:
             self._notify_surface_callbacks(callbacks)
         return callbacks
@@ -5189,32 +5179,6 @@ class PlotSession:
             publish_front=self._presentation_epoch != presentation_epoch,
         )
 
-    def _connect_mpl_events(self) -> None:
-        if self._renderer is None or self._mpl_connections:
-            return
-        canvas = self._renderer.figure.canvas
-        connect = getattr(canvas, "mpl_connect", None)
-        if not callable(connect):
-            return
-        self._mpl_connections = [
-            connect("button_press_event", self._on_button_press),
-            connect("motion_notify_event", self._on_motion),
-            connect("button_release_event", self._on_button_release),
-            connect("scroll_event", self._on_scroll),
-            connect("key_press_event", self._on_key_press),
-            connect("figure_leave_event", self._on_figure_leave),
-        ]
-
-    def _disconnect_mpl_events(self) -> None:
-        if self._renderer is None:
-            return
-        disconnect = getattr(self._renderer.figure.canvas, "mpl_disconnect", None)
-        if callable(disconnect):
-            for connection in self._mpl_connections:
-                disconnect(connection)
-        self._mpl_connections.clear()
-
-
     @staticmethod
     def _event_coordinates(event: Any, axes: Any) -> tuple[float, float] | None:
         if (
@@ -6171,7 +6135,6 @@ class PlotSession:
                 self._live_fit_completion = None
                 self._live_fit_request = None
                 self._live_fit_pending = False
-                self._disconnect_mpl_events()
                 self._surface_callbacks.clear()
                 self._display_callbacks.clear()
                 self._fit_callbacks.clear()

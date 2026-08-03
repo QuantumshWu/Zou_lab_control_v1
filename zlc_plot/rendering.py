@@ -1,7 +1,7 @@
 """Persistent Matplotlib artists for every public ZLC plot kind.
 
 This module owns no GUI toolkit and never calls ``pyplot``.  A surface can be
-attached to Agg, ipympl, or a Qt5 canvas.  Data/display edits mutate persistent
+attached to Agg or a Qt5 canvas.  Data/display edits mutate persistent
 artists; fixed-size changes rebuild layout within the same Figure.
 """
 
@@ -645,7 +645,7 @@ class MatplotlibRenderer:
             return candidate
         # Focused Facet axes overlap the hidden overview geometry exactly.
         # Resolve against current visibility and put the semantic primary axes
-        # first so a stale ipympl ``inaxes`` value cannot steal the event.
+        # first so a stale browser-canvas ``inaxes`` value cannot steal the event.
         ordered = (self.primary_axes, *reversed(visible))
         for axis in dict.fromkeys(ordered):
             if axis in visible and bool(axis.bbox.contains(*point)):
@@ -716,7 +716,7 @@ class MatplotlibRenderer:
             FigureCanvasAgg(figure)
             # Matplotlib native canvases derive physical DPI from this logical
             # baseline.  Materialise the Agg front at the requested screen DPR
-            # without allowing a later ipympl/Qt canvas to multiply it again.
+            # without allowing a later frontend canvas to multiply it again.
             figure._original_dpi = self.plan.logical_dpi
             figure._set_dpi(self.plan.dpi, forward=False)
             self._figure = figure

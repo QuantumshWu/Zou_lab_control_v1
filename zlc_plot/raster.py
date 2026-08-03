@@ -461,8 +461,10 @@ class _WorkerSessionAdapter:
 class RasterPlotHost:
     """Serialize one ``PlotSession`` and publish immutable latest-only fronts.
 
-    The callable factory is invoked on the owned worker, and closing the host
-    always closes that session.  A live Figure is never exposed to callers.
+    The callable factory is invoked on the owned worker.  A host normally owns
+    and closes its session; ``from_session(..., close_session=False)`` is the
+    explicit borrowing seam used by adapters that receive an already-created
+    session.  A live Figure is never exposed to callers.
     :meth:`from_plot` is the standard immutable-data/spec construction path;
     the raw factory remains available for deliberate ``PlotSession`` subclasses.
     Public mutation methods never run plot work on the caller.  Pending data and
@@ -473,10 +475,15 @@ class RasterPlotHost:
     def __init__(
         self,
         session_factory: Callable[[], "PlotSession"],
+        *,
+        close_session: bool = True,
     ) -> None:
         if not callable(session_factory):
             raise TypeError("session_factory must be callable")
+        if not isinstance(close_session, bool):
+            raise TypeError("close_session must be bool")
         self._session_factory: Callable[[], PlotSession] | None = session_factory
+        self._close_session = close_session
         self._session: PlotSession | None = None
         self._session_defaults: PlotLibraryDefaults | None = None
         self._release_session_host: Callable[[], None] | None = None
@@ -535,6 +542,21 @@ class RasterPlotHost:
             )
 
         return cls(create_session)
+
+    @classmethod
+    def from_session(
+        cls,
+        session: "PlotSession",
+        *,
+        close_session: bool = True,
+    ) -> "RasterPlotHost":
+        """Place one existing session behind the raster worker boundary."""
+
+        from .session import PlotSession
+
+        if not isinstance(session, PlotSession):
+            raise TypeError("session must be PlotSession")
+        return cls(lambda: session, close_session=close_session)
 
     def _require_session(self) -> "PlotSession":
         with self._condition:
@@ -1475,7 +1497,8 @@ class RasterPlotHost:
                     )
                     if release is not None:
                         release()
-                    session.close()
+                    if self._close_session:
+                        session.close()
             finally:
                 with self._condition:
                     self._session = None

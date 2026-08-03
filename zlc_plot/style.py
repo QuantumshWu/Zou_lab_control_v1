@@ -1,7 +1,7 @@
 """Immutable visual design tokens shared by every plotting backend.
 
 The module intentionally contains no Matplotlib artists.  Backends consume a
-single :class:`PlotStyleConfig`, which keeps Qt raster, ipympl, Agg export and
+single :class:`PlotStyleConfig`, which keeps Qt raster, browser raster, Agg export and
 FacetGrid cells on the same visual contract.
 """
 

@@ -22,7 +22,6 @@ _EXPORTS_BY_MODULE = {
     ),
     ".backends": (
         "BackendUnavailableError",
-        "NotebookView",
         "Qt5PlotWidget",
         "ensure_qt5_application",
         "notebook_available",
@@ -47,6 +46,7 @@ _EXPORTS_BY_MODULE = {
         "parse_fit_initials",
     ),
     ".kinds": ("AxisRef", "PlotKind"),
+    ".notebook": ("NotebookView",),
     ".live": (
         "LiveDataRevision",
         "LivePlotController",

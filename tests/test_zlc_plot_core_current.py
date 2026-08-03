@@ -51,8 +51,14 @@ from zlc_plot import (
     plot_spec_to_tree,
     resolve_plot_spec,
 )
+from zlc_plot._selector_scene import (
+    SelectorLine,
+    SelectorScene,
+    SelectorTarget,
+)
 from zlc_plot._dataset_bridge import bridge_snapshot
 from zlc_plot.fit import FitEngine, FitOptions, RegularImageFitInput
+from zlc_plot.notebook import selector_scene_from_dict, selector_scene_to_dict
 
 
 def _scan_snapshot(
@@ -164,6 +170,43 @@ def test_private_data_bridge_preserves_shape_dtype_and_readonly_storage() -> Non
     assert not bridged.values.flags.writeable
     assert not bridged.validity.flags.writeable
     assert bridged.schema.source is snapshot.block.schema
+
+
+def test_notebook_scene_roundtrip_and_borrowed_raster_host() -> None:
+    """Notebook adapters use the same session/raster owner without taking ownership."""
+
+    snapshot = _image_snapshot(height=12, width=16)
+    scene = SelectorScene(
+        ((
+            SelectorKind.AREA,
+            (
+                SelectorLine(
+                    "area-edge",
+                    SelectorTarget("main"),
+                    ((0.1, 0.2), (0.8, 0.9)),
+                    (0.2, 0.4, 0.8, 1.0),
+                    1.0,
+                    10.0,
+                ),
+            ),
+        ),)
+    )
+    restored = selector_scene_from_dict(selector_scene_to_dict(scene))
+    assert restored == scene
+
+    session = PlotSession(
+        snapshot,
+        ImagePlot(AxisRef.data("camera.x"), AxisRef.data("camera.y")),
+    )
+    host = RasterPlotHost.from_session(session, close_session=False)
+    try:
+        front = host.wait_for_front(timeout=5.0)
+        assert front is not None
+        assert host.front is front
+    finally:
+        host.close()
+    # The borrowed session remains the caller's responsibility.
+    session.close()
 
 
 def test_live_session_accepts_equal_rebuilt_schema_but_not_new_generation() -> None:

@@ -22,7 +22,7 @@ from .specs import (
 )
 
 if TYPE_CHECKING:
-    from .backends import NotebookView
+    from .notebook import NotebookView
 
 
 def _axis(value: AxisRef | str) -> AxisRef:
@@ -214,7 +214,7 @@ def show(
 
     if not isinstance(session, PlotSession):
         raise TypeError("session must be PlotSession")
-    from .backends import NotebookView
+    from .notebook import NotebookView
 
     view = NotebookView(
         session,
