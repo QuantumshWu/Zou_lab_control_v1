@@ -150,12 +150,6 @@ class CaptureArtifact:
         if self.pulse_evidence is not None:
             if self.pulse_evidence.expected_trigger_count != self.frame_source.event_count:
                 raise ValueError("pulse trigger count differs from captured frames")
-            if tuple(self.camera["capture_trigger_channels"]) != (
-                self.pulse_evidence.trigger_channel,
-            ):
-                raise ValueError(
-                    "capture pulse trigger differs from the camera wiring"
-                )
             expected = self.pulse_evidence.expected_cell_schedule(
                 self.frame_source.schema
             )
@@ -233,7 +227,6 @@ class CaptureArtifact:
             camera_identity=self.camera["camera_identity"],
             sensor_identity=self.camera["sensor_identity"],
             optical_path=self.camera["optical_path"],
-            capture_trigger_channels=tuple(self.camera["capture_trigger_channels"]),
             sensor_shape_yx=tuple(self.camera["sensor_shape_yx"]),
             roi_origin_yx=tuple(self.camera["roi_origin_yx"]),
             roi_shape_yx=tuple(self.camera["roi_shape_yx"]),
@@ -309,7 +302,6 @@ def _camera_to_record(
         "source_id": evidence.source_id,
         "binding": provenance.binding.value,
         **camera_frame_facts_to_tree(facts),
-        "capture_trigger_channels": list(facts.capture_trigger_channels),
         "required_external_trigger_interval_seconds": (
             facts.required_external_trigger_interval_seconds
         ),
@@ -341,7 +333,6 @@ def _camera_from_record(tree: object) -> dict[str, object]:
         "camera_identity",
         "sensor_identity",
         "optical_path",
-        "capture_trigger_channels",
         "sensor_shape_yx",
         "roi_origin_yx",
         "roi_shape_yx",

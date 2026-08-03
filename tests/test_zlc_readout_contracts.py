@@ -187,7 +187,6 @@ def _physical_facts() -> CameraPhysicalFacts:
         camera_identity=descriptor.camera_identity,
         sensor_identity=descriptor.sensor_identity,
         optical_path=descriptor.optical_path,
-        capture_trigger_channels=("camera-trigger",),
         sensor_shape_yx=descriptor.sensor_shape_yx,
         roi_origin_yx=descriptor.roi_origin_yx,
         roi_shape_yx=descriptor.roi_shape_yx,

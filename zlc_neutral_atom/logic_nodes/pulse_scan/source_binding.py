@@ -38,6 +38,7 @@ class PulseScanRequest:
 
     program: PulseParameterScanProgram
     signal: ScanSignalBinding
+    trigger_port: str = "emCCD"
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -47,6 +48,11 @@ class PulseScanRequest:
             raise TypeError("program must be a current PulseScan program")
         if not isinstance(self.signal, ScanSignalBinding):
             raise TypeError("signal must be ScanSignalBinding")
+        object.__setattr__(
+            self,
+            "trigger_port",
+            canonical_text(self.trigger_port, "PulseScan trigger_port"),
+        )
 
 
 __all__ = ["PulseScanRequest", "ScanSignalBinding"]

@@ -79,13 +79,6 @@ def validate_single_trigger_capture_binding(
     if capture_spec.mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
         raise ValueError("exact triggered capture requires an external-trigger camera")
     evidence = contract.capability.camera_capability_evidence
-    evidence.physical_facts.require_single_capture_trigger_channel(
-        trigger_channel
-    )
-    if not evidence.exact_external_trigger_qualified:
-        raise ValueError(
-            "exact triggered capture requires E0-qualified ordered one-frame-per-trigger evidence"
-        )
     schedule = pulse_binding.trigger_schedule
     minimum_interval_ticks = schedule.minimum_interval_ticks
     required_interval = (

@@ -49,6 +49,17 @@ _PULSE_SCAN_AUTHORING_SCHEMA = AuthoringSchema(
             ),
         ),
         AuthoringField(
+            "trigger_port",
+            "text",
+            "Trigger endpoint",
+            default="emCCD",
+            required=True,
+            description=(
+                "Semantic digital endpoint in the pulse target used for the "
+                "associated y events; this is pulse ownership, not camera wiring."
+            ),
+        ),
+        AuthoringField(
             "scan_sweep_count",
             "int",
             "Sweeps",

@@ -218,7 +218,6 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
         camera_identity="camera:test",
         sensor_identity="sensor:test",
         optical_path="test-path",
-        capture_trigger_channels=("camera-trigger",),
         sensor_shape_yx=(3, 4),
         roi_origin_yx=(0, 0),
         roi_shape_yx=(3, 4),

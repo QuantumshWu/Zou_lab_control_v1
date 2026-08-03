@@ -5,7 +5,7 @@ from __future__ import annotations
 from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
-from zlc_neutral_atom.installation import DeviceRef, ReadoutInstallationBinding
+from zlc_neutral_atom.installation import DeviceRef
 
 from .calibration import GridOrder
 from .sitemap import (
@@ -18,13 +18,13 @@ _DEFAULT_MAXIMUM_SITE_RESIDUAL_PX = 2.0
 
 
 def build_sitemap_acquisition_profile(
-    binding: ReadoutInstallationBinding,
     *,
     grid_shape_yx: tuple[int, int],
     camera_ref: DeviceRef,
     sequencer_ref: DeviceRef,
     camera_port: BoundCapturePort,
     pulse_port: BoundPulsePort,
+    trigger_channel: str,
     expected_centers_xy=None,
     maximum_site_residual_px: float | None = None,
 ) -> SitemapAcquisitionProfile:
@@ -37,16 +37,10 @@ def build_sitemap_acquisition_profile(
     performs no project-file I/O and cannot silently target another runtime.
     """
 
-    if not isinstance(binding, ReadoutInstallationBinding):
-        raise TypeError("binding must be ReadoutInstallationBinding")
     if not isinstance(camera_ref, DeviceRef):
         raise TypeError("camera_ref must be DeviceRef")
     if not isinstance(sequencer_ref, DeviceRef):
         raise TypeError("sequencer_ref must be DeviceRef")
-    if camera_ref.instance_id != binding.camera_instance_id:
-        raise ValueError("camera_ref differs from the installed readout binding")
-    if sequencer_ref.instance_id != binding.sequencer_instance_id:
-        raise ValueError("sequencer_ref differs from the installed readout binding")
     if not isinstance(camera_port, BoundCapturePort):
         raise TypeError("camera_port must be BoundCapturePort")
     if not isinstance(pulse_port, BoundPulsePort):
@@ -73,7 +67,7 @@ def build_sitemap_acquisition_profile(
             else maximum_site_residual_px
         ),
         pulse_target=pulse_port.capability.target,
-        trigger_channel=binding.trigger_channel,
+        trigger_channel=trigger_channel,
     )
 
 

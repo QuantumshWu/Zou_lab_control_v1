@@ -75,26 +75,6 @@ class SignalAssociationUnavailable(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class SignalAssociationScheduleRequirement:
-    """One physical trigger schedule an associated producer needs preserved.
-
-    This value does not identify a Camera or prescribe how a producer proves
-    causation.  It only tells a pulse compiler which physical trigger lanes
-    must remain in the compiled artifact and terminal evidence.  Grouping and
-    cardinality remain producer-owned admission checks.
-    """
-
-    trigger_channel: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "trigger_channel",
-            canonical_text(self.trigger_channel, "association trigger channel"),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class SignalProjectionAuthority:
     """One schema-committed authoritative projection of live signal Values."""
 
@@ -176,7 +156,6 @@ class SignalAssociationRequest:
     cause_digest: str
     expected_event_count: int
     trigger_schedule_fingerprint: str
-    trigger_channel: str
     trigger_count: int
     minimum_trigger_interval_ticks: int | None
     clock_hz: int
@@ -206,14 +185,6 @@ class SignalAssociationRequest:
             sha256_text(
                 self.trigger_schedule_fingerprint,
                 "signal association trigger_schedule_fingerprint",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "trigger_channel",
-            canonical_text(
-                self.trigger_channel,
-                "signal association trigger_channel",
             ),
         )
         object.__setattr__(
@@ -462,11 +433,6 @@ class SignalEventAssociationCursor(Protocol):
 @runtime_checkable
 class SignalEventAssociationSource(SignalEventSource, Protocol):
     """Explicit producer capability; ordinary ``SignalEventSource`` is not enough."""
-
-    def signal_association_schedule_requirement(
-        self,
-        output_name: str,
-    ) -> SignalAssociationScheduleRequirement: ...
 
     def open_associated_signal_cursor(
         self,
@@ -751,7 +717,9 @@ class AuthoritativeAssociatedSignalEventSource(AuthoritativeSignalEventSource):
         output_name: str,
     ) -> AuthoritativeAssociatedSignalEventCursor:
         self._require_output(output_name)
-        cursor = self._source.open_associated_signal_cursor(self._output_name)
+        cursor = self._source.open_associated_signal_cursor(
+            self._output_name,
+        )
         try:
             return AuthoritativeAssociatedSignalEventCursor(
                 cursor,
@@ -763,17 +731,6 @@ class AuthoritativeAssociatedSignalEventSource(AuthoritativeSignalEventSource):
         except BaseException:
             cursor.close()
             raise
-
-    def signal_association_schedule_requirement(
-        self,
-        output_name: str,
-    ) -> SignalAssociationScheduleRequirement:
-        self._require_output(output_name)
-        source = self._source
-        if not isinstance(source, SignalEventAssociationSource):
-            raise RuntimeError("projected source lost association capability")
-        return source.signal_association_schedule_requirement(self._output_name)
-
 
 def authoritative_signal_event_source(
     source: SignalEventSource,
@@ -904,7 +861,6 @@ def _apply_signal_value_transform(
 
 __all__ = [
     "SignalAssociationRequest",
-    "SignalAssociationScheduleRequirement",
     "SignalAssociationUnavailable",
     "SignalProjectionAuthority",
     "SignalEvent",

@@ -8,29 +8,6 @@ from types import MappingProxyType
 
 from zlc_storage import canonical_text
 
-@dataclass(frozen=True, slots=True)
-class ReadoutInstallationBinding:
-    """Physical readout wiring, without experiment geometry.
-
-    A camera connection can prove its endpoint identity and the sequencer lane
-    that is wired to its external trigger.  It cannot know the atom-lattice
-    grid or site centers: those are calibration intent/results and belong to
-    the readout logic node.  Keeping only this binding here prevents the
-    Device Manager's hardware form from becoming a calibration database.
-    """
-
-    camera_instance_id: str
-    sequencer_instance_id: str
-    trigger_channel: str
-
-    def __post_init__(self) -> None:
-        for field in ("camera_instance_id", "sequencer_instance_id", "trigger_channel"):
-            object.__setattr__(
-                self,
-                field,
-                canonical_text(getattr(self, field), field),
-            )
-
 
 @dataclass(frozen=True, slots=True)
 class DeviceRef:
@@ -183,5 +160,4 @@ __all__ = [
     "DeviceCatalogView",
     "DeviceInfo",
     "DeviceRef",
-    "ReadoutInstallationBinding",
 ]

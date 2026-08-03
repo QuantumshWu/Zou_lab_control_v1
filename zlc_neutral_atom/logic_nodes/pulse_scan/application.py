@@ -27,6 +27,7 @@ from zlc_neutral_atom.devices.sequencer.port import (
     FinitePulseExecutionRequest,
     PulseSession,
     PulseTerminalAck,
+    validate_pulse_terminal_for_artifact,
 )
 from zlc_neutral_atom.runtime.cleanup import CleanupReport
 from zlc_neutral_atom.runtime.dataset import (
@@ -44,7 +45,6 @@ from zlc_neutral_atom.runtime.run import (
 )
 from zlc_neutral_atom.runtime.signal_source import (
     SignalAssociationRequest,
-    SignalAssociationScheduleRequirement,
     SignalAssociationUnavailable,
     SignalEvent,
     SignalEventAssociationCursor,
@@ -61,11 +61,13 @@ from zlc_neutral_atom.runtime.streams import (
 )
 from zlc_pulse import (
     CompiledPulseArtifact,
+    PORT_DIGITAL,
     PulseExecutionForm,
     bind_pulse_document_target,
     compile_pulse_artifact,
     materialize_scan_sweeps,
 )
+from zlc_storage import canonical_text
 from zlc_neutral_atom.timing.pulse_parameter_scan import (
     ApiSlotSegmentedProgram,
     AutonomousScanSlotProgram,
@@ -238,6 +240,10 @@ def compile_pulse_scan(
         )
 
     program = _bind_program_target(request.program, pulse_port)
+    trigger_channel = _resolve_trigger_channel(
+        pulse_port.capability.target,
+        request.trigger_port,
+    )
     output_name = request.signal.output_name
     value_schema = source.value_schema(output_name)
     projection_authority = SignalProjectionAuthority(
@@ -260,20 +266,10 @@ def compile_pulse_scan(
         value_schema,
     )
     output_contract = bind_scan_output_contract(source_schema, point_table, None)
-    schedule_requirement = (
-        source.signal_association_schedule_requirement(output_name)
-    )
-    if not isinstance(
-        schedule_requirement,
-        SignalAssociationScheduleRequirement,
-    ):
-        raise TypeError(
-            "associated signal source returned another schedule requirement type"
-        )
     pulse_requests = _compile_pulse_requests(
         program,
         pulse_port,
-        schedule_requirement,
+        trigger_channel,
     )
 
     return _compile_scan_plan(
@@ -288,6 +284,25 @@ def compile_pulse_scan(
         pulse_requests=pulse_requests,
         project_root=project_root,
     )
+
+
+def _resolve_trigger_channel(target, endpoint: str) -> str:
+    """Resolve a pulse-owned semantic endpoint to its one physical lane."""
+
+    endpoint = canonical_text(endpoint, "PulseScan trigger_port")
+    matches = tuple(
+        port
+        for port in target.ports
+        if port.kind == PORT_DIGITAL
+        and (port.key == endpoint or port.label == endpoint)
+        and len(port.lanes) == 1
+    )
+    if len(matches) != 1:
+        raise ValueError(
+            "PulseScan trigger_port must identify exactly one single-lane digital "
+            f"target endpoint; got {endpoint!r}"
+        )
+    return matches[0].lanes[0]
 
 
 def _bind_program_target(
@@ -312,16 +327,9 @@ def _bind_program_target(
 def _compile_pulse_requests(
     program: PulseParameterScanProgram,
     pulse_port: BoundPulsePort,
-    association_requirement: SignalAssociationScheduleRequirement,
+    trigger_channel: str,
 ) -> tuple[FinitePulseExecutionRequest, ...]:
-    if not isinstance(
-        association_requirement,
-        SignalAssociationScheduleRequirement,
-    ):
-        raise TypeError(
-            "association_requirement must be SignalAssociationScheduleRequirement"
-        )
-    trigger_channels = (association_requirement.trigger_channel,)
+    trigger_channels = (canonical_text(trigger_channel, "trigger channel"),)
     if isinstance(program, AutonomousScanSlotProgram):
         logical = program.execution_document
         document = materialize_scan_sweeps(logical, program.sweep_count)
@@ -485,7 +493,6 @@ def _association_request(
         artifact.fingerprint,
         expected_event_count,
         schedules[0].fingerprint,
-        schedules[0].channel,
         schedules[0].total,
         schedules[0].minimum_interval_ticks,
         artifact.target_ir.clock_hz,
@@ -536,6 +543,10 @@ def _execute_scan(
             association_token = source_cursor.arm_signal_association(association)
             session.fire(context)
             terminal = session.complete(context)
+            validate_pulse_terminal_for_artifact(
+                terminal,
+                pulse_requests[0].artifact,
+            )
             source_cursor.bind_signal_association(association_token, terminal)
             for address in schedule:
                 _collect_event(
@@ -586,6 +597,10 @@ def _execute_scan(
                 )
                 session.fire(context)
                 terminal = session.complete(context)
+                validate_pulse_terminal_for_artifact(
+                    terminal,
+                    pulse_request.artifact,
+                )
                 source_cursor.bind_signal_association(
                     association_token,
                     terminal,

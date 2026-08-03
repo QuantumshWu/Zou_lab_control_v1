@@ -83,7 +83,6 @@ class _Camera:
             (1, 1),
             np.dtype("<u2"),
             "count",
-            ("ch11",),
             0.001,
             0.001,
             0.0,
@@ -168,7 +167,6 @@ class _RuntimeFixture:
         self.endpoint = CameraCaptureEndpoint(
             self.camera,
             "camera",
-            exact_external_trigger_qualified=True,
         )
         identity = PhysicalDeviceIdentity(
             stable_device_identity="fixture-camera",

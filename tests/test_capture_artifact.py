@@ -76,7 +76,6 @@ class _Camera:
             (1, 1),
             np.dtype("<u2"),
             "count",
-            ("ch11",),
             0.001,
             0.001,
             0.0,
@@ -186,7 +185,6 @@ class _CaptureCase:
         camera_endpoint = CameraCaptureEndpoint(
             self.camera,
             "camera",
-            exact_external_trigger_qualified=True,
         )
         camera_port = BoundCapturePort(
             _bind_endpoint(

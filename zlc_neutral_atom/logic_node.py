@@ -21,10 +21,7 @@ from zlc_neutral_atom.authoring import AuthoringSchema
 from zlc_neutral_atom.catalog import LogicNodeDefinition
 from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
 from zlc_neutral_atom.input_spec import NodeInputSpec, require_input_specs
-from zlc_neutral_atom.installation import (
-    DeviceCatalogView,
-    ReadoutInstallationBinding,
-)
+from zlc_neutral_atom.installation import DeviceCatalogView
 from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
 from zlc_neutral_atom.runtime.run import RunHandle, RunPlan
 from zlc_plot.kinds import PlotKind
@@ -187,9 +184,6 @@ class LogicNodeApplicationContext(Protocol):
         raise NotImplementedError
 
     @property
-    def readout_bindings(self) -> tuple[ReadoutInstallationBinding, ...]:  # pragma: no cover
-        raise NotImplementedError
-
     @property
     def signal_plane(self) -> SignalDataPlane:  # pragma: no cover
         raise NotImplementedError

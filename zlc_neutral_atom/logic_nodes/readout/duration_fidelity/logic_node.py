@@ -48,6 +48,7 @@ def _bind_execute(request: object, context: LogicNodeApplicationContext):
     scan_request = PulseScanRequest(
         build_readout_duration_program(request, document),
         ScanSignalBinding(signal_name, output_name),
+        trigger_port="emCCD",
     )
     pulse_port = context.device("sequencer_instance_id", "pulse.execute")
     project_root = context.project_root

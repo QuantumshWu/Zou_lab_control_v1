@@ -49,7 +49,6 @@ class _ReusingRingCamera:
             (1, 1),
             np.dtype("<u2"),
             "count",
-            ("camera_trigger",),
             0.001,
             0.001,
             0.0,
@@ -106,11 +105,10 @@ class _ReusingRingCamera:
         return self.armed, 0
 
 
-def _bound(camera: _ReusingRingCamera, *, qualified: bool = True):
+def _bound(camera: _ReusingRingCamera):
     endpoint = CameraCaptureEndpoint(
         camera,
         "camera",
-        exact_external_trigger_qualified=qualified,
     )
     broker = DeviceBroker()
     identity = PhysicalDeviceIdentity(
@@ -195,16 +193,6 @@ def test_exact_endpoint_rejects_adapter_ordinal_gap() -> None:
             endpoint.execute_command(binding, ReadCaptureCommand(session_id, 1.0))
     finally:
         endpoint.interrupt()
-        broker.shutdown()
-
-
-def test_raw_adapter_cannot_self_grant_exact_qualification() -> None:
-    camera = _ReusingRingCamera()
-    endpoint, binding, capability, broker = _bound(camera, qualified=False)
-    try:
-        with pytest.raises(ValueError, match="requires E0-qualified"):
-            endpoint.execute_command(binding, _prepare_command())
-    finally:
         broker.shutdown()
 
 

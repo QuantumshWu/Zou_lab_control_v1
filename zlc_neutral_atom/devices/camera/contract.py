@@ -773,22 +773,18 @@ class CameraPhysicalFacts:
     """Typed camera facts minted inside a broker capability probe.
 
     These facts are frozen from one adapter snapshot.  A later binding may name
-    event indices, but it cannot change the
-    physical trigger wiring, exposure, gain, readout mode, geometry, identity,
-    dtype, or unit attested by this capability.
+    pulse event indices, but it cannot change the exposure, gain, readout mode,
+    geometry, identity, dtype, or unit attested by this capability.  FPGA pulse
+    endpoints are deliberately absent: they belong to the pulse request, not
+    to a camera's physical working point.
 
-    ``required_external_trigger_interval_seconds is None`` means no sufficient
-    safe interval has been qualified for exact capture and preflight must
-    reject.  Zero is reserved for a source (such as the deterministic virtual
-    camera) that is explicitly qualified with no positive lower bound.  A
-    ``None`` integration start offset is likewise an explicit unqualified fact;
-    consumers must not reinterpret it as zero.
+    ``required_external_trigger_interval_seconds`` is the camera readout timing
+    fact used by pulse preflight.  It is not a wiring declaration.
     """
 
     camera_identity: str
     sensor_identity: str
     optical_path: str
-    capture_trigger_channels: tuple[str, ...]
     sensor_shape_yx: tuple[int, int]
     roi_origin_yx: tuple[int, int]
     roi_shape_yx: tuple[int, int]
@@ -807,25 +803,6 @@ class CameraPhysicalFacts:
     def __post_init__(self) -> None:
         for name in ("camera_identity", "sensor_identity", "optical_path"):
             _canonical_text(getattr(self, name), name)
-        if isinstance(self.capture_trigger_channels, (str, bytes)):
-            raise TypeError("capture_trigger_channels must be a tuple of channel names")
-        try:
-            trigger_channels = tuple(self.capture_trigger_channels)
-        except TypeError as exc:
-            raise TypeError(
-                "capture_trigger_channels must be a tuple of channel names"
-            ) from exc
-        trigger_channels = tuple(
-            _canonical_text(channel, "capture trigger channel")
-            for channel in trigger_channels
-        )
-        if len(trigger_channels) != len(set(trigger_channels)):
-            raise ValueError("capture_trigger_channels must be unique")
-        object.__setattr__(
-            self,
-            "capture_trigger_channels",
-            trigger_channels,
-        )
         sensor, origin, roi, binning = normalize_camera_geometry(
             sensor_shape_yx=self.sensor_shape_yx,
             roi_origin_yx=self.roi_origin_yx,
@@ -918,28 +895,6 @@ class CameraPhysicalFacts:
             self.readout_mode,
         )
 
-    def validate_capture_trigger_channel(self, channel: str) -> None:
-        """Require one selected pulse channel to belong to this physical wiring."""
-
-        channel = _canonical_text(channel, "capture trigger channel")
-        if channel not in self.capture_trigger_channels:
-            raise ValueError(
-                f"capture trigger channel {channel!r} is not wired to camera "
-                f"{self.camera_identity!r}; attested channels are "
-                f"{self.capture_trigger_channels!r}"
-            )
-
-    def require_single_capture_trigger_channel(self, channel: str) -> None:
-        """Require exact capture to have one, and only one, physical edge source."""
-
-        self.validate_capture_trigger_channel(channel)
-        if self.capture_trigger_channels != (channel,):
-            raise ValueError(
-                "exact triggered capture requires the camera to have exactly one "
-                f"attested trigger channel {channel!r}; physical wiring is "
-                f"{self.capture_trigger_channels!r}"
-            )
-
     def validate_descriptor(self, descriptor: CameraCaptureDescriptor) -> None:
         if not isinstance(descriptor, CameraCaptureDescriptor):
             raise TypeError("descriptor must be CameraCaptureDescriptor")
@@ -981,7 +936,6 @@ def _camera_physical_facts_to_tree(value: CameraPhysicalFacts) -> dict[str, obje
         "camera_identity": value.camera_identity,
         "sensor_identity": value.sensor_identity,
         "optical_path": value.optical_path,
-        "capture_trigger_channels": list(value.capture_trigger_channels),
         "sensor_shape_yx": list(value.sensor_shape_yx),
         "roi_origin_yx": list(value.roi_origin_yx),
         "roi_shape_yx": list(value.roi_shape_yx),
@@ -1009,7 +963,6 @@ def _camera_physical_facts_from_tree(tree: object) -> CameraPhysicalFacts:
         "camera_identity",
         "sensor_identity",
         "optical_path",
-        "capture_trigger_channels",
         "sensor_shape_yx",
         "roi_origin_yx",
         "roi_shape_yx",
@@ -1030,7 +983,6 @@ def _camera_physical_facts_from_tree(tree: object) -> CameraPhysicalFacts:
         camera_identity=data["camera_identity"],
         sensor_identity=data["sensor_identity"],
         optical_path=data["optical_path"],
-        capture_trigger_channels=data["capture_trigger_channels"],
         sensor_shape_yx=data["sensor_shape_yx"],
         roi_origin_yx=data["roi_origin_yx"],
         roi_shape_yx=data["roi_shape_yx"],
@@ -1060,7 +1012,6 @@ class CameraCapabilityEvidence:
     source_id: str
     max_blocking_call_seconds: float
     physical_facts: CameraPhysicalFacts
-    exact_external_trigger_qualified: bool = False
 
     def __post_init__(self) -> None:
         _canonical_text(self.adapter_type, "adapter_type")
@@ -1075,28 +1026,6 @@ class CameraCapabilityEvidence:
         )
         if not isinstance(self.physical_facts, CameraPhysicalFacts):
             raise TypeError("physical_facts must be CameraPhysicalFacts")
-        if type(self.exact_external_trigger_qualified) is not bool:
-            raise TypeError("exact_external_trigger_qualified must be bool")
-        if self.exact_external_trigger_qualified:
-            required_interval = (
-                self.physical_facts.required_external_trigger_interval_seconds
-            )
-            if required_interval is None or required_interval <= 0.0:
-                raise ValueError(
-                    "exact external-trigger qualification requires positive "
-                    "trigger-interval readback"
-                )
-
-    @property
-    def exact_external_trigger_quiet_window_seconds(self) -> float | None:
-        """Derive the current quiet window; never persist a second timing fact."""
-
-        if not self.exact_external_trigger_qualified:
-            return None
-        interval = self.physical_facts.required_external_trigger_interval_seconds
-        assert interval is not None
-        return camera_external_trigger_quiet_window_seconds(interval)
-
 
 def camera_capability_evidence_to_tree(
     value: CameraCapabilityEvidence,
@@ -1109,7 +1038,6 @@ def camera_capability_evidence_to_tree(
         "source_id": value.source_id,
         "max_blocking_call_seconds": value.max_blocking_call_seconds,
         "physical_facts": _camera_physical_facts_to_tree(value.physical_facts),
-        "exact_external_trigger_qualified": value.exact_external_trigger_qualified,
     }
 
 
@@ -1120,7 +1048,6 @@ def camera_capability_evidence_from_tree(tree: object) -> CameraCapabilityEviden
         "source_id",
         "max_blocking_call_seconds",
         "physical_facts",
-        "exact_external_trigger_qualified",
     }
     data = _exact_tree(tree, fields, _CAMERA_CAPABILITY_EVIDENCE_SCHEMA)
     facts = _camera_physical_facts_from_tree(data["physical_facts"])
@@ -1129,7 +1056,6 @@ def camera_capability_evidence_from_tree(tree: object) -> CameraCapabilityEviden
         source_id=data["source_id"],
         max_blocking_call_seconds=data["max_blocking_call_seconds"],
         physical_facts=facts,
-        exact_external_trigger_qualified=data["exact_external_trigger_qualified"],
     )
 
 def camera_roi_local_spatial_identity(
@@ -1248,7 +1174,6 @@ class CameraWorkingPoint:
     binning_yx: tuple[int, int]
     dtype: np.dtype
     count_unit: str
-    capture_trigger_channels: tuple[str, ...]
     exposure_seconds: float
     required_external_trigger_interval_seconds: float | None
     external_trigger_integration_start_offset_seconds: float | None
@@ -1276,8 +1201,6 @@ class CameraWorkingPoint:
             "count_unit",
             canonical_text(self.count_unit, "count_unit"),
         )
-        if not isinstance(self.capture_trigger_channels, tuple):
-            raise TypeError("capture_trigger_channels must be a tuple")
         object.__setattr__(
             self,
             "readout_mode",

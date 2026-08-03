@@ -46,9 +46,6 @@ class TriggeredReleaseRecaptureResult:
                 "release-recapture camera order differs from pulse cell plan"
             )
         evidence = self.pipeline.camera_capability_evidence
-        evidence.physical_facts.require_single_capture_trigger_channel(
-            self.lineage.trigger_channel
-        )
         expected = self.lineage.expected_trigger_count
         terminal = self.pipeline.capture_terminal
         if not (

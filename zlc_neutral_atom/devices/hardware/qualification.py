@@ -1,4 +1,9 @@
-"""Active E0 trigger-path qualification for one real camera connection."""
+"""Optional E0 qualification for one explicit pulse/camera test recipe.
+
+This helper is a bring-up tool, not part of camera connection.  The selected
+pulse endpoint is supplied by its caller and is never persisted in camera
+facts or installation configuration.
+"""
 
 from __future__ import annotations
 
@@ -158,8 +163,6 @@ def qualify_external_trigger_path(
     if not isinstance(camera, CameraAdapter):
         raise TypeError("camera must implement CameraAdapter")
     working_point = camera.capture_working_point()
-    if working_point.capture_trigger_channels != (trigger_lane,):
-        raise RuntimeError("camera working point is wired to another trigger lane")
     required_interval = working_point.required_external_trigger_interval_seconds
     if required_interval is None:
         raise RuntimeError(

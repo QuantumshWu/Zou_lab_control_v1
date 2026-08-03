@@ -52,7 +52,6 @@ class DcamCameraConfig:
     history geometry for continuous acquisition.
     """
 
-    capture_trigger_channels: tuple[str, ...]
     exposure_seconds: float = 0.02
     readout_speed: int = 1
     binning: int = 1
@@ -63,17 +62,6 @@ class DcamCameraConfig:
     trigger_global_exposure: int | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.capture_trigger_channels, tuple):
-            raise TypeError("capture_trigger_channels must be a tuple")
-        channels = tuple(
-            canonical_text(value, "capture_trigger_channels item")
-            for value in self.capture_trigger_channels
-        )
-        if not channels:
-            raise ValueError("capture_trigger_channels cannot be empty")
-        if len(set(channels)) != len(channels):
-            raise ValueError("capture_trigger_channels cannot contain duplicates")
-        object.__setattr__(self, "capture_trigger_channels", channels)
         object.__setattr__(
             self,
             "exposure_seconds",
@@ -370,7 +358,6 @@ class DcamCameraAdapter:
             binning_yx=(binning, binning),
             dtype=dtype,
             count_unit="count",
-            capture_trigger_channels=self._config.capture_trigger_channels,
             exposure_seconds=exposure,
             required_external_trigger_interval_seconds=interval,
             external_trigger_integration_start_offset_seconds=integration_offset,

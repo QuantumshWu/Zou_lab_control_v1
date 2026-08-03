@@ -542,26 +542,6 @@ class _CameraMonitorTransaction:
             raise RuntimeError("camera monitor acknowledgement binding differs")
 
 
-def _association_trigger_channel(capability) -> str:
-    """Admit only a Q0-qualified, single-wire external-trigger producer."""
-
-    if capability.acquisition_mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
-        raise ValueError("free-running Camera Measurement cannot associate pulse events")
-    evidence = capability.camera_capability_evidence
-    if not evidence.exact_external_trigger_qualified:
-        raise ValueError(
-            "Camera association requires explicit exact-trigger qualification"
-        )
-    if evidence.exact_external_trigger_quiet_window_seconds is None:
-        raise ValueError(
-            "Camera association requires a qualified quiet-window fact"
-        )
-    channels = evidence.physical_facts.capture_trigger_channels
-    if len(channels) != 1:
-        raise ValueError("Camera association requires exactly one trigger channel")
-    return channels[0]
-
-
 def _compile_camera_monitor_plan(
     request: CameraMeasurementRequest,
     port: BoundCameraMonitorPort,
@@ -744,11 +724,6 @@ def open_live_camera_measurement(
         request,
         capability.payload_contract,
         association_authority=association_authority,
-        trigger_channel=(
-            None
-            if association_authority is None
-            else _association_trigger_channel(capability)
-        ),
         operation_deadline_seconds=(
             None
             if association_authority is None

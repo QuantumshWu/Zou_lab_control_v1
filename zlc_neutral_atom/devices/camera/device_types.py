@@ -1,4 +1,9 @@
-"""Real qCMOS and Basler camera leaves with active trigger qualification."""
+"""Real qCMOS and Basler camera leaves.
+
+Camera leaves configure only camera-local settings.  Pulse endpoint selection
+belongs to the pulse/measurement request; no real camera connection resolves or
+stores an FPGA trigger lane.
+"""
 
 from __future__ import annotations
 
@@ -10,9 +15,7 @@ from zlc_neutral_atom.device_types import (
     CAPABILITY_CAMERA_CAPTURE,
     CAPABILITY_CAMERA_MONITOR,
     CAPABILITY_CAMERA_SIGNAL_ASSOCIATION,
-    CAPABILITY_EXTERNAL_TRIGGER_CLIENT,
     CAPABILITY_MOT_FIELD_CAPTURE,
-    CAPABILITY_READOUT_BINDING,
     DeviceTypeDescriptor,
 )
 from zlc_neutral_atom.devices.camera.binding import bind_camera_endpoint
@@ -22,17 +25,12 @@ from zlc_neutral_atom.devices.camera.dcam import DcamCameraAdapter, DcamCameraCo
 from zlc_neutral_atom.devices.camera.endpoint import CameraMonitorEndpoint
 from zlc_neutral_atom.devices.camera.monitor import BoundCameraMonitorPort
 from zlc_neutral_atom.devices.camera.pylon import PylonCameraAdapter, PylonCameraConfig
-from zlc_neutral_atom.devices.hardware.qualification import qualify_external_trigger_path
-from zlc_neutral_atom.installation import ReadoutInstallationBinding
 from zlc_neutral_atom.installation_config import DeviceInstanceConfig
 from zlc_neutral_atom.runtime.ports import DeviceBroker
 from zlc_neutral_atom.runtime.resources import (
     DeviceIdentityEvidenceKind,
     PhysicalDeviceIdentity,
 )
-from zlc_pulse import RemotePulseExecutionClient
-from zlc_pulse import PORT_DIGITAL
-from zlc_storage import canonical_text
 
 
 def _optional_roi(values: tuple[object, ...], field: str):
@@ -58,43 +56,6 @@ def _camera_identity(value: str) -> PhysicalDeviceIdentity:
     )
 
 
-def _remote_dependency(dependencies: Mapping[str, object]) -> RemotePulseExecutionClient:
-    client = dependencies["sequencer_ref"]
-    if not isinstance(client, RemotePulseExecutionClient):
-        raise TypeError("real camera requires a remote pulse sequencer")
-    return client
-
-
-_READOUT_TRIGGER_PORT_LABEL = "emCCD"
-_MOT_TRIGGER_PORT_LABEL = "trig"
-
-
-def _target_trigger_channel(
-    client: RemotePulseExecutionClient,
-    port_label: str,
-) -> str:
-    """Resolve one physical trigger lane from the pulse target, not camera config.
-
-    The pulse target/server is the authority for FPGA endpoint names and raw lanes.
-    Camera Device Manager cards therefore never duplicate a trigger-channel field.
-    """
-
-    target = client.snapshot().manifest.target
-    matches = tuple(
-        port
-        for port in target.ports
-        if port.kind == PORT_DIGITAL
-        and port.label == port_label
-        and len(port.lanes) == 1
-    )
-    if len(matches) != 1:
-        raise RuntimeError(
-            f"pulse target must expose exactly one single-lane digital port "
-            f"labelled {port_label!r}; found {len(matches)}"
-        )
-    return matches[0].lanes[0]
-
-
 def _connect_dcam(
     instance: DeviceInstanceConfig,
     dependencies: Mapping[str, object],
@@ -103,9 +64,7 @@ def _connect_dcam(
 ):
     if not isinstance(broker, DeviceBroker):
         raise TypeError("broker must be DeviceBroker")
-    client = _remote_dependency(dependencies)
     values = _DCAM_SCHEMA.freeze(instance.parameters)
-    trigger_channel = _target_trigger_channel(client, _READOUT_TRIGGER_PORT_LABEL)
     roi = _optional_roi(
         (
             values["roi_x"],
@@ -117,7 +76,6 @@ def _connect_dcam(
     )
     camera = DcamCameraAdapter(
         DcamCameraConfig(
-            capture_trigger_channels=(trigger_channel,),
             exposure_seconds=values["exposure_seconds"],
             readout_speed=values["readout_speed"],
             binning=1,
@@ -128,15 +86,9 @@ def _connect_dcam(
     if not isinstance(camera, CameraAdapter):
         raise TypeError("DcamCameraAdapter returned a non-CameraAdapter")
     try:
-        qualify_external_trigger_path(
-            client=client,
-            camera=camera,
-            trigger_lane=trigger_channel,
-        )
         endpoint = CameraMonitorEndpoint(
             camera,
             instance.instance_id,
-            exact_external_trigger_qualified=True,
             acquisition_mode=CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             monitor_acquisition_mode=CameraAcquisitionMode.EXTERNAL_TRIGGERED,
         )
@@ -145,11 +97,6 @@ def _connect_dcam(
             instance_id=instance.instance_id,
             identity=_camera_identity(f"dcam-device-index:{values['device_index']}"),
             endpoint=endpoint,
-        )
-        readout_binding = ReadoutInstallationBinding(
-            camera_instance_id=instance.instance_id,
-            sequencer_instance_id=instance.parameters["sequencer_ref"],
-            trigger_channel=trigger_channel,
         )
     except BaseException as primary:
         try:
@@ -161,7 +108,6 @@ def _connect_dcam(
         CAPABILITY_CAMERA_CAPTURE: BoundCapturePort(attestation),
         CAPABILITY_CAMERA_MONITOR: BoundCameraMonitorPort(attestation),
         CAPABILITY_CAMERA_SIGNAL_ASSOCIATION: endpoint,
-        CAPABILITY_READOUT_BINDING: readout_binding,
     }, camera.close
 
 
@@ -173,9 +119,7 @@ def _connect_pylon(
 ):
     if not isinstance(broker, DeviceBroker):
         raise TypeError("broker must be DeviceBroker")
-    client = _remote_dependency(dependencies)
     values = _PYLON_SCHEMA.freeze(instance.parameters)
-    trigger_channel = _target_trigger_channel(client, _MOT_TRIGGER_PORT_LABEL)
     roi = _optional_roi(
         (
             values["roi_x"],
@@ -188,7 +132,6 @@ def _connect_pylon(
     camera = PylonCameraAdapter(
         PylonCameraConfig(
             serial=values["serial"],
-            capture_trigger_channels=(trigger_channel,),
             exposure_seconds=values["exposure_seconds"],
             trigger_source=values["trigger_source"],
             roi_xywh=roi,
@@ -197,15 +140,9 @@ def _connect_pylon(
     if not isinstance(camera, CameraAdapter):
         raise TypeError("PylonCameraAdapter returned a non-CameraAdapter")
     try:
-        qualify_external_trigger_path(
-            client=client,
-            camera=camera,
-            trigger_lane=trigger_channel,
-        )
         endpoint = CameraMonitorEndpoint(
             camera,
             instance.instance_id,
-            exact_external_trigger_qualified=True,
             acquisition_mode=CameraAcquisitionMode.EXTERNAL_TRIGGERED,
             monitor_acquisition_mode=CameraAcquisitionMode.FREE_RUNNING,
         )
@@ -242,7 +179,6 @@ _ROI_FIELDS = (
 )
 _DCAM_SCHEMA = AuthoringSchema(
     (
-        AuthoringField("sequencer_ref", "text", "Sequencer", "sequencer", True),
         AuthoringField("device_index", "int", "qCMOS device index", 0, True, minimum=0),
         AuthoringField(
             "exposure_seconds",
@@ -259,7 +195,6 @@ _DCAM_SCHEMA = AuthoringSchema(
 )
 _PYLON_SCHEMA = AuthoringSchema(
     (
-        AuthoringField("sequencer_ref", "text", "Sequencer", "sequencer", True),
         AuthoringField("serial", "text", "Basler serial", "REQUIRED", True),
         AuthoringField(
             "exposure_seconds",
@@ -286,9 +221,8 @@ DEVICE_TYPES = (
             CAPABILITY_CAMERA_CAPTURE,
             CAPABILITY_CAMERA_MONITOR,
             CAPABILITY_CAMERA_SIGNAL_ASSOCIATION,
-            CAPABILITY_READOUT_BINDING,
         ),
-        (("sequencer_ref", CAPABILITY_EXTERNAL_TRIGGER_CLIENT),),
+        (),
         _connect_dcam,
     ),
     DeviceTypeDescriptor(
@@ -301,7 +235,7 @@ DEVICE_TYPES = (
             CAPABILITY_CAMERA_MONITOR,
             CAPABILITY_MOT_FIELD_CAPTURE,
         ),
-        (("sequencer_ref", CAPABILITY_EXTERNAL_TRIGGER_CLIENT),),
+        (),
         _connect_pylon,
     ),
 )

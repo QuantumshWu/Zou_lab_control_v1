@@ -130,7 +130,8 @@ def test_calibration_leaf_has_one_descriptor_and_no_prepared_lifecycle():
         ("camera_instance_id", ("camera.capture",)),
         ("sequencer_instance_id", ("pulse.execute",)),
     )
-    assert tuple(field.name for field in fields(CalibrationTaskRequest))[-2:] == (
+    names = tuple(field.name for field in fields(CalibrationTaskRequest))
+    assert names[names.index("camera_instance_id") : names.index("camera_instance_id") + 2] == (
         "camera_instance_id",
         "sequencer_instance_id",
     )

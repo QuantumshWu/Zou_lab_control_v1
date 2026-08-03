@@ -173,7 +173,6 @@ class _FakeDcamDriver:
 
 def _config(*, roi=(4, 4, 8, 8)) -> DcamCameraConfig:
     return DcamCameraConfig(
-        capture_trigger_channels=("qcmos_trigger",),
         exposure_seconds=0.01,
         roi_xywh=roi,
     )
@@ -188,7 +187,6 @@ def test_working_point_is_live_readback_and_all_sdk_calls_share_owner() -> None:
         assert point.sensor_shape_yx == (12, 16)
         assert point.roi_origin_yx == (4, 4)
         assert point.roi_shape_yx == (8, 8)
-        assert point.capture_trigger_channels == ("qcmos_trigger",)
         adapter.configure_exposure_seconds(0.015)
         assert adapter.capture_working_point().exposure_seconds == 0.015
     finally:

@@ -136,10 +136,6 @@ class _BoundLogicNodeContext(LogicNodeApplicationContext):
         return self._services.catalog
 
     @property
-    def readout_bindings(self):
-        return tuple(self._services.installation.readout_installation_bindings)
-
-    @property
     def signal_plane(self):
         return self._services.signal_plane
 

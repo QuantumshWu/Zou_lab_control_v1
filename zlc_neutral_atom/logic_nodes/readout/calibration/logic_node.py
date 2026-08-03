@@ -44,7 +44,11 @@ from .outputs import (
 )
 from .preview import CalibrationCapturePreview
 from .reference import CalibrationArtifactRef
-from .sitemap import SitemapCalibrationRequest, build_sitemap_calibration_request
+from .sitemap import (
+    SitemapCalibrationRequest,
+    build_sitemap_calibration_request,
+    resolve_sitemap_trigger_channel,
+)
 from .task import (
     CalibrationTaskRequest,
     build_calibration_task_request,
@@ -81,24 +85,6 @@ _CALIBRATION_DEFINITION = LogicNodeDefinition(
 )
 
 
-def _readout_binding_for(
-    request: CalibrationTaskRequest,
-    context: LogicNodeApplicationContext,
-):
-    matches = tuple(
-        value
-        for value in context.readout_bindings
-        if value.camera_instance_id == request.camera_instance_id
-        and value.sequencer_instance_id == request.sequencer_instance_id
-    )
-    if len(matches) != 1:
-        raise ValueError(
-            "Calibration requires one installed readout binding matching "
-            "the selected camera and sequencer instances"
-        )
-    return matches[0]
-
-
 def _sequence_for(
     request: CalibrationTaskRequest,
     context: LogicNodeApplicationContext,
@@ -108,15 +94,15 @@ def _sequence_for(
     catalog = context.device_catalog
     camera_ref = catalog.require(request.camera_instance_id).ref
     sequencer_ref = catalog.require(request.sequencer_instance_id).ref
+    pulse = load_pulse_document(resolve_under(context.pulses_root, request.pulse))
     profile = build_sitemap_acquisition_profile(
-        _readout_binding_for(request, context),
         grid_shape_yx=request.grid_shape_yx,
         camera_ref=camera_ref,
         sequencer_ref=sequencer_ref,
         camera_port=camera,
         pulse_port=sequencer,
+        trigger_channel=resolve_sitemap_trigger_channel(pulse),
     )
-    pulse = load_pulse_document(resolve_under(context.pulses_root, request.pulse))
     sequence = build_sitemap_calibration_request(
         profile,
         camera_ref=camera_ref,

@@ -37,7 +37,6 @@ class PylonCameraConfig:
     """
 
     serial: str
-    capture_trigger_channels: tuple[str, ...]
     exposure_seconds: float = 0.005
     trigger_source: str = "Line1"
     roi_xywh: tuple[int, int, int, int] | None = None
@@ -45,13 +44,6 @@ class PylonCameraConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "serial", canonical_text(self.serial, "pylon serial"))
-        channels = tuple(
-            canonical_text(value, "capture_trigger_channels item")
-            for value in self.capture_trigger_channels
-        )
-        if not channels or len(channels) != len(set(channels)):
-            raise ValueError("capture_trigger_channels must be non-empty and unique")
-        object.__setattr__(self, "capture_trigger_channels", channels)
         object.__setattr__(
             self,
             "exposure_seconds",
@@ -305,7 +297,6 @@ class PylonCameraAdapter:
             binning_yx=(1, 1),
             dtype=np.dtype("u1"),
             count_unit="count",
-            capture_trigger_channels=self._config.capture_trigger_channels,
             exposure_seconds=exposure,
             required_external_trigger_interval_seconds=interval,
             external_trigger_integration_start_offset_seconds=integration_offset,

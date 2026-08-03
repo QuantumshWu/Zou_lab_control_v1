@@ -475,16 +475,10 @@ def bind_triggered_camera_acquisition(
     if not isinstance(camera_payload_contract, CameraSampleContract):
         raise TypeError("camera capability payload contract has the wrong type")
     if trigger_channel is None:
-        if len(camera_facts.capture_trigger_channels) != 1:
-            raise ValueError(
-                "exact capture requires exactly one physical camera trigger channel"
-            )
-        selected_trigger = camera_facts.capture_trigger_channels[0]
-    else:
-        selected_trigger = canonical_text(trigger_channel, "trigger_channel")
-    camera_facts.require_single_capture_trigger_channel(
-        selected_trigger
-    )
+        raise ValueError(
+            "exact capture requires the pulse-owned trigger_channel in its binding"
+        )
+    selected_trigger = canonical_text(trigger_channel, "trigger_channel")
 
     artifact = compile_pulse_artifact(
         document,

@@ -60,7 +60,6 @@ class _Camera:
         self.block_arm = block_arm
         self.pause_after_arm = pause_after_arm
         self.metadata_overrides = tuple(dict(item) for item in metadata_overrides)
-        self.trigger_channels = ("ch11",)
         self.arm_entered = threading.Event()
         self.arm_installed = threading.Event()
         self.release_arm = threading.Event()
@@ -77,7 +76,6 @@ class _Camera:
             (1, 1),
             np.dtype("<u2"),
             "count",
-            self.trigger_channels,
             0.001,
             0.001,
             0.0,
@@ -148,11 +146,10 @@ class _Camera:
             return self.armed, 0
 
 
-def _bound(camera: _Camera, *, qualified: bool = True):
+def _bound(camera: _Camera):
     endpoint = CameraCaptureEndpoint(
         camera,
         "camera",
-        exact_external_trigger_qualified=qualified,
     )
     broker = DeviceBroker()
     identity = PhysicalDeviceIdentity(
@@ -234,10 +231,8 @@ def test_capability_evidence_is_the_public_owner_of_physical_facts() -> None:
     try:
         evidence = capability.camera_capability_evidence
         assert evidence.physical_facts.output_shape_yx == (3, 4)
-        assert evidence.physical_facts.capture_trigger_channels == ("ch11",)
         tree = camera_capability_evidence_to_tree(evidence)
         assert tree["schema"] == "zlc_neutral_atom.CameraCapabilityEvidence"
-        assert tree["physical_facts"]["capture_trigger_channels"] == ["ch11"]
         assert camera_capability_evidence_from_tree(tree) == evidence
         assert not hasattr(endpoint, "_payload_contract")
         assert endpoint.payload_contract(binding) is capability.payload_contract
@@ -341,17 +336,6 @@ def test_endpoint_rejects_nonmonotonic_physical_frame_metadata(
             )
     finally:
         endpoint.interrupt()
-        broker.shutdown()
-
-
-def test_unqualified_adapter_cannot_self_grant_exact_capture() -> None:
-    camera = _Camera()
-    endpoint, binding, capability, broker = _bound(camera, qualified=False)
-    try:
-        with pytest.raises(ValueError, match="requires E0-qualified"):
-            endpoint.execute_command(binding, _prepare_command())
-        assert camera.capture_state() == (False, 0)
-    finally:
         broker.shutdown()
 
 

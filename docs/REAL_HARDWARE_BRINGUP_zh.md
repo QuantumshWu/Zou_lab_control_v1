@@ -38,9 +38,11 @@
       target manifest（含package-pin endpoints）、clock、geometry与connection generation全从current server snapshot取得并在每次Run重验。
 - [ ] 完整 `hardware` composition 由 DeviceManager 或
       `installation_template("hardware", ...)` 创建 ordered `DeviceInstance` graph；它会在发布 Experiment 前
-      主动验证两个相机的工作点、Target endpoint、帧顺序/计数与 FPGA terminal evidence。
+      主动验证两个相机的工作点、帧顺序/计数与 FPGA terminal evidence；它不把 Target endpoint
+      写入或解析进 camera leaf。
 - [ ] Pulse server 连通只证明 sequencer transport。只有本次完整 initialization 的主动 E0 成功，
-      才能说当前 connection generation 上的相机 trigger path 已取得运行期 qualification；不得恢复
+      才能说当前 connection generation 上由指定 pulse recipe 驱动的 camera 外触发行为已经通过
+      bring-up qualification；不得恢复
       raw `RemoteSequencer/QCMOSCamera` session 或旧 config 绕过这一边界。
 
 ---
@@ -87,14 +89,13 @@ python pulse_gui.py            # 默认 Offline，可编辑/Preview但执行按�
 
 先运行 `device_manager.bat`，在 **New** 选择 `hardware`，逐张 device card 填写 pulse server、
 qCMOS、Pylon 的真实硬件工作点，保存 config 后点 **Apply**。Device Manager 只保存设备身份和
-硬件工作点；FPGA trigger endpoint 由 pulse server 发布的 Target manifest 按语义 label 解析，
-不在 camera card 中复制 raw lane。lattice 的 grid rows/columns 属于 Calibration Task，site centers
-是校准输出，绝不写入 camera device 配置。Apply 是唯一真实
-bring-up 边界：它先连接 remote FPGA，再建立两个相机 adapter，读取并冻结 working point，随后
-分别运行一段只切换目标 Target endpoint、其余数字/DAC 保持 SAFE 的四触发 E0 program。只有相机帧
-ordinal、hardware stamp、produced count、terminal drain 与 FPGA completed schedule 全部一致，才
-发布可供 TaskConsole/PulseGUI 共用的同一个 Experiment。任一步失败都会清理已打开设备，不发布
-部分 runtime。
+硬件工作点；它不保存 camera trigger lane，也不从 Target manifest 为相机建立 binding。每个
+需要外触发的 Measurement/Task 在自己的 pulse recipe 中声明 semantic endpoint，由 pulse
+composition 在编译该 recipe 时解析成 physical lane。lattice 的 grid rows/columns 属于
+Calibration Task，site centers 是校准输出，绝不写入 camera device 配置。Apply 只建立并冻结
+设备工作点与 typed Ports；E0 若被显式安排，则由 bring-up helper 以一段明确的 pulse recipe
+验证外触发的帧 ordinal、stamp/count 与 terminal evidence，不改变 camera 的配置语义。任一步失败
+都会清理已打开设备，不发布部分 runtime。
 
 也可以显式构造同一个 ordered graph。模板只负责当前默认实例与不歧义的便捷覆盖；同名但属于
 不同设备的字段（例如两个 camera 的 `exposure_seconds`/ROI）必须按 stable instance id 分别修改，
@@ -117,10 +118,10 @@ template = installation_template(
 )
 per_instance = {
     "camera": {
-        # 按真实 qCMOS 工作点设置 exposure/ROI；trigger endpoint 来自 Target manifest。
+        # 按真实 qCMOS 工作点设置 exposure/ROI；不填写 FPGA trigger lane。
     },
     "mot-camera": {
-        # 按真实 Pylon 工作点设置 exposure/ROI/trigger_source；trigger endpoint 来自 Target manifest。
+        # 按真实 Pylon 工作点设置 exposure/ROI/trigger_source；不填写 FPGA trigger lane。
     },
 }
 installation = InstallationConfigDocument(tuple(
@@ -145,8 +146,9 @@ site centers；如果已有独立的中心先验，可作为 Calibration 的显�
 相机硬件参数。
 
 这里不再在 hardware installation 中填写 site centers；真机只需填写实际 camera 工作点，
-Calibration Task 负责发现并保存中心。`camera`/`mot-camera` 的 `sequencer_ref="sequencer"` 引用的是 stable instance id；role 可以改名，
-requirement 不随 role 漂移。若修改 instance id，必须同时更新所有引用该 id 的 leaf 参数，graph
+Calibration Task 负责发现并保存中心。`camera`/`mot-camera` 不引用 sequencer；pulse/measurement
+request 在运行时显式绑定已选的 sequencer Port。role 可以改名，设备 identity 不随 role 漂移。
+若修改 instance id，必须同时更新所有引用该 id 的 leaf 参数，graph
 preflight 会在连接任何设备前拒绝 missing/wrong-capability/cycle。旧 `remote_template.json`、
 `open_devices=True`、raw SDK/session、backend-wide config 与已删除 constructor 都不是 current 入口。
 
@@ -159,9 +161,10 @@ preflight 会在连接任何设备前拒绝 missing/wrong-capability/cycle。旧
    `ch00`；否则不运行。
 2. 用 **Run Once** 依次跑全 SAFE 短 pulse 与一个单通道短 pulse；示波器确认实际波形、lane 与
    编译 Preview 一致。再用 **On Pulse (HOLD)** / **Stop** 验证 terminal SAFE。
-3. 在 DeviceManager 载入完整 `hardware` graph 并点 **Apply**。此动作会在真实输出上主动
-   运行两个四触发 E0；先确保 Target manifest 的 camera endpoint 已接好、其它输出的 SAFE 值正确。只有两个
-   qualification 都成功且 DeviceManager 发布 active Experiment 才继续。
+3. 在 DeviceManager 载入完整 `hardware` graph 并点 **Apply**，确认两个 camera 的工作点与
+   typed Port 可用。若要做 E0，单独选择对应 Calibration/Measurement 的 pulse recipe，并把
+   semantic endpoint 显式交给 bring-up helper；它不由 camera card 自动推导或保存。只有相机
+   qualification 与 pulse terminal 证据一致才继续。
 4. 在 TaskConsole 分别运行 qCMOS 与 MOT camera 的 monitor/finite measurement，确认 shape、dtype、
    frame ordinal、working point 与实际设备一致；这一步不得用 GUI 是否有图替代 terminal evidence。
 5. 运行一个最小 Calibration → Occupancy 链，核对 site centers、validity、artifact identity 与原始
@@ -186,7 +189,7 @@ preflight 会在连接任何设备前拒绝 missing/wrong-capability/cycle。旧
 | `ConnectionRefused` / `socket.timeout` | server 没起 / IP 端口错 / 防火墙 | 先起 `run_server.bat`;核对Pulse GUI的host:port;放行端口 |
 | 首次 `prepare()` 报 `geometry/layout mismatch` | 运行image的几何指纹与current host `build_fingerprint(params)`不一致 | 停止运行并核对已批准的软件/bitstream资产；不得为迁就架构自动重烧，只有证实现有RTL bug或偏离既定设计才启动bitstream变更流程 |
 | server 起不来 / JTAG 报错 | hw_server 没起 / JTAG 接触 / 板掉电 | 查电源、JTAG 线;Vivado 硬件管理器单独验证 |
-| `qCMOS timed out` 等不到帧 | 相机收不到触发(Target endpoint/触发名不匹配) | 核对 server Target manifest 的 endpoint label 与 XDC/示波器实际接线 |
+| `qCMOS timed out` 等不到帧 | 本次 pulse recipe 没有产生预期的外触发，或相机工作点/布线不符 | 核对 pulse recipe 的 semantic endpoint、server Target/XDC 与示波器实际接线；不要到 camera card 里添加 lane |
 | Apply 在 E0 拒绝 stamp/count/terminal | 工作点不满足 deterministic trigger contract、发生漏帧/乱序，或 Target endpoint 接线错误 | 保留本次 pulse terminal、camera records 与示波器证据；先修实际布线/工作点/adapter，不绕过 qualification、不伪造 digest |
 
 > 真机出问题记录current server snapshot、Run diagnostics、示波器/相机证据，并按

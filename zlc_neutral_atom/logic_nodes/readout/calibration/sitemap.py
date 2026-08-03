@@ -234,6 +234,30 @@ def _validate_sitemap_pulse_document(
         )
 
 
+def resolve_sitemap_trigger_channel(document: PulseDocument) -> str:
+    """Resolve the imaging endpoint from the calibration pulse itself.
+
+    This is pulse-recipe semantics, not camera installation metadata.  A real
+    camera never receives or stores this lane; the calibration recipe chooses
+    the digital endpoint whose three rising edges are its readout events.
+    """
+
+    if not isinstance(document, PulseDocument):
+        raise TypeError("document must be PulseDocument")
+    candidates = tuple(
+        port
+        for port in document.target.ports
+        if port.kind == PORT_DIGITAL
+        and len(port.lanes) == 1
+        and port.label == "emCCD"
+    )
+    if len(candidates) != 1:
+        raise ValueError(
+            "calibration pulse must expose exactly one single-lane emCCD endpoint"
+        )
+    return candidates[0].lanes[0]
+
+
 @dataclass(frozen=True, slots=True)
 class SitemapAcquisitionProfile:
     """Installed Calibration geometry, trigger wiring, and live pulse target."""
@@ -283,7 +307,6 @@ class SitemapAcquisitionProfile:
         if not isinstance(self.pulse_target, PulseTarget):
             raise TypeError("pulse_target must be PulseTarget")
         trigger = canonical_text(self.trigger_channel, "trigger_channel")
-        self.camera_facts.require_single_capture_trigger_channel(trigger)
         if self.geometry.frame_shape_yx != self.camera_facts.output_shape_yx:
             raise ValueError(
                 "sitemap geometry differs from the frozen camera output shape"
@@ -521,4 +544,5 @@ __all__ = [
     "build_sitemap_analysis_request",
     "build_sitemap_calibration_request",
     "load_sitemap_pulse",
+    "resolve_sitemap_trigger_channel",
 ]

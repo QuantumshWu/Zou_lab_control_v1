@@ -42,7 +42,7 @@ from zlc_neutral_atom.runtime.hosted_run import LogicNodeExecutionContext
 from zlc_neutral_atom.runtime.preview import ExactDatasetPreviewSpec
 from zlc_plot.kinds import AxisRef
 from zlc_plot.specs import FacetGridPlot, ImagePlot
-from zlc_pulse import PulseExecutionForm, load_pulse_document
+from zlc_pulse import PORT_DIGITAL, PulseExecutionForm, load_pulse_document
 from zlc_storage.paths import resolve_under
 
 from .mot_field import (
@@ -64,6 +64,19 @@ from .mot_field_live import MotFieldLiveProjection
 
 
 DEFAULT_MOT_FIELD_PULSE_PATH = "mot_field_template.json"
+
+
+def _pulse_trigger_channel(document, label: str = "trig") -> str:
+    matches = tuple(
+        port
+        for port in document.target.ports
+        if port.kind == PORT_DIGITAL and port.label == label and len(port.lanes) == 1
+    )
+    if len(matches) != 1:
+        raise ValueError(
+            "MOT-field pulse must expose exactly one single-lane trig endpoint"
+        )
+    return matches[0].lanes[0]
 
 _MOT_REPEAT_AXIS = AxisSpec(
     AxisId("mot-field.repeat"),
@@ -243,7 +256,7 @@ def _bind_execute(
         camera_instance_id=request.camera_instance_id,
         pulse_document=program.document,
         execution_form=PulseExecutionForm.AUTONOMOUS_SCAN_ONCE,
-        trigger_channel=None,
+        trigger_channel=_pulse_trigger_channel(program.document),
         layout=TriggeredCameraLayout(
             repeat_axis=_MOT_REPEAT_AXIS,
             readout_event_axis_id=_MOT_READOUT_EVENT_AXIS_ID,

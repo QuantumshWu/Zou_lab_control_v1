@@ -68,6 +68,7 @@ def _bind_execute(
     request = PulseScanRequest(
         program,
         ScanSignalBinding(signal_name, output_name),
+        trigger_port=authored["trigger_port"],
     )
     pulse_port = context.device(_SEQUENCER_FIELD, _PULSE_CAPABILITY)
     project_root = context.project_root

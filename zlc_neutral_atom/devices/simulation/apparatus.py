@@ -1174,11 +1174,6 @@ class VirtualCamera:
             raise TypeError("request must be SignalAssociationRequest")
         digest = request.cause_digest
         schedule_fingerprint = request.trigger_schedule_fingerprint
-        channel = request.trigger_channel
-        if channel != self.capture_trigger_channels[0]:
-            raise ValueError(
-                "virtual signal association schedule belongs to another trigger wire"
-            )
         trigger_count = request.trigger_count
         required_interval = (
             self.capture_working_point().required_external_trigger_interval_seconds
@@ -1256,9 +1251,9 @@ class VirtualCamera:
         token: object,
         *,
         artifact_digest: str,
-        trigger_counts: tuple[tuple[str, int], ...],
+        expected_trigger_count: int,
         terminal_evidence_kind: str,
-    ) -> tuple[str, int, int]:
+    ) -> tuple[int, int]:
         """Bind the observed virtual FIRE group to its exact terminal receipt."""
 
         if terminal_evidence_kind != "SIMULATED":
@@ -1266,7 +1261,6 @@ class VirtualCamera:
                 "virtual camera association requires a simulated pulse terminal"
             )
         artifact = sha256_text(artifact_digest, "artifact_digest")
-        counts = tuple(trigger_counts)
         with self._condition:
             association = self._require_signal_association(token)
             if association.error is not None:
@@ -1281,14 +1275,12 @@ class VirtualCamera:
                 raise ValueError(
                     "virtual camera terminal belongs to another pulse artifact"
                 )
-            channel = self.capture_trigger_channels[0]
-            if counts != ((channel, association.expected_trigger_count),):
+            if expected_trigger_count != association.expected_trigger_count:
                 raise RuntimeError(
-                    "virtual pulse terminal trigger count differs from camera association"
+                    "virtual pulse terminal count differs from camera association"
                 )
             association.terminal_bound = True
             return (
-                channel,
                 association.physical_start_ordinal,
                 association.physical_end_ordinal,
             )
@@ -1296,7 +1288,7 @@ class VirtualCamera:
     def finish_signal_event_association(
         self,
         token: object,
-    ) -> tuple[str, int, int]:
+    ) -> tuple[int, int]:
         """Prove the bound ordinal interval was produced completely and exactly."""
 
         deadline = time.monotonic() + self.timeout
@@ -1331,7 +1323,6 @@ class VirtualCamera:
                     "virtual camera association has no bound pulse terminal"
                 )
             result = (
-                self.capture_trigger_channels[0],
                 association.physical_start_ordinal,
                 association.physical_end_ordinal,
             )
@@ -1403,7 +1394,6 @@ class VirtualCamera:
             binning_yx=(1, 1),
             dtype=self.frame_dtype,
             count_unit="count",
-            capture_trigger_channels=tuple(self.capture_trigger_channels),
             exposure_seconds=float(self.exposure),
             required_external_trigger_interval_seconds=float(self.exposure),
             external_trigger_integration_start_offset_seconds=0.0,

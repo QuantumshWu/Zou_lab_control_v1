@@ -107,9 +107,6 @@ class TriggeredPipelineResult:
         if not isinstance(lineage, PulseCaptureLineage):
             raise TypeError("lineage must be PulseCaptureLineage")
         evidence = capture.camera_capability_evidence
-        evidence.physical_facts.require_single_capture_trigger_channel(
-            lineage.trigger_channel
-        )
         lineage.cell_plan.validate_dataset_schema(capture.dataset.block.schema)
         if not capture.source_cell_schedule.same_order_as(
             lineage.cell_plan.cell_schedule

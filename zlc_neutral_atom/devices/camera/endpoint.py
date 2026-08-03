@@ -82,7 +82,6 @@ def _physical_facts(
         camera_identity=stable_identity,
         sensor_identity=f"{stable_identity}/sensor",
         optical_path=f"installation-role/{source_id}",
-        capture_trigger_channels=working_point.capture_trigger_channels,
         sensor_shape_yx=working_point.sensor_shape_yx,
         roi_origin_yx=working_point.roi_origin_yx,
         roi_shape_yx=working_point.roi_shape_yx,
@@ -173,7 +172,7 @@ class _EndpointSession:
 
 @dataclass
 class _MonitorSignalAssociation:
-    """One E0-qualified external-trigger interval over a live camera arm."""
+    """One pulse-associated external-trigger interval over a live camera arm."""
 
     cause_digest: str
     trigger_schedule_fingerprint: str
@@ -188,7 +187,6 @@ class _MonitorSignalAssociation:
     previous_produced_count: int | None = None
     previous_frame_stamp: int | None = None
     previous_camera_stamp: int | None = None
-    trigger_channel: str | None = None
     bound: bool = False
     error: RuntimeError | None = None
 
@@ -222,7 +220,6 @@ class CameraCaptureEndpoint:
         source_id: str,
         *,
         max_blocking_call_seconds: float | None = None,
-        exact_external_trigger_qualified: bool = False,
         acquisition_mode: CameraAcquisitionMode = CameraAcquisitionMode.EXTERNAL_TRIGGERED,
     ) -> None:
         if not isinstance(camera, CameraAdapter):
@@ -237,9 +234,6 @@ class CameraCaptureEndpoint:
         if not np.isfinite(timeout) or timeout <= 0:
             raise ValueError("max_blocking_call_seconds must be finite and positive")
         self._max_blocking_call_seconds = timeout
-        if type(exact_external_trigger_qualified) is not bool:
-            raise TypeError("exact_external_trigger_qualified must be bool")
-        self._exact_external_trigger_qualified = exact_external_trigger_qualified
         if not isinstance(acquisition_mode, CameraAcquisitionMode):
             raise TypeError("acquisition_mode must be CameraAcquisitionMode")
         self._acquisition_mode = acquisition_mode
@@ -315,7 +309,6 @@ class CameraCaptureEndpoint:
             source_id=self._source_id,
             max_blocking_call_seconds=self._max_blocking_call_seconds,
             physical_facts=physical_facts,
-            exact_external_trigger_qualified=self._exact_external_trigger_qualified,
         )
 
     def execute_command(self, binding: BoundDevice, command: object) -> object:
@@ -452,10 +445,6 @@ class CameraCaptureEndpoint:
                     "free-running cameras are monitor sources, not finite exact captures"
                 )
             evidence = capability.camera_capability_evidence
-            if not evidence.exact_external_trigger_qualified:
-                raise ValueError(
-                    "real exact capture requires E0-qualified ordered one-frame-per-trigger evidence"
-                )
             self._operation_epoch += 1
             self._session = _EndpointSession(
                 command.session_id,
@@ -1052,7 +1041,6 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
         source_id: str,
         *,
         max_blocking_call_seconds: float | None = None,
-        exact_external_trigger_qualified: bool = False,
         acquisition_mode: CameraAcquisitionMode = CameraAcquisitionMode.FREE_RUNNING,
         monitor_acquisition_mode: CameraAcquisitionMode | None = None,
     ) -> None:
@@ -1060,7 +1048,6 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             camera,
             source_id,
             max_blocking_call_seconds=max_blocking_call_seconds,
-            exact_external_trigger_qualified=exact_external_trigger_qualified,
             acquisition_mode=acquisition_mode,
         )
         if monitor_acquisition_mode is None:
@@ -1068,16 +1055,6 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
         if not isinstance(monitor_acquisition_mode, CameraAcquisitionMode):
             raise TypeError(
                 "monitor_acquisition_mode must be CameraAcquisitionMode"
-            )
-        if (
-            monitor_acquisition_mode
-            is CameraAcquisitionMode.EXTERNAL_TRIGGERED
-            and exact_external_trigger_qualified
-            and not isinstance(camera, CameraAssociationProgress)
-        ):
-            raise TypeError(
-                "an exact external-trigger monitor requires a non-consuming "
-                "physical produced-frame counter"
             )
         self._monitor_acquisition_mode = monitor_acquisition_mode
         self._signal_association: _MonitorSignalAssociation | None = None
@@ -1094,7 +1071,6 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
             raise TypeError("request must be SignalAssociationRequest")
         digest = request.cause_digest
         schedule_fingerprint = request.trigger_schedule_fingerprint
-        channel = request.trigger_channel
         expected_trigger_count = request.trigger_count
         for value, name in (
             (expected_trigger_count, "expected_trigger_count"),
@@ -1112,24 +1088,16 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 raise ValueError(
                     "a free-running camera monitor has no pulse association"
                 )
-            if not self._exact_external_trigger_qualified:
-                raise RuntimeError(
-                    "real camera signal association requires active E0 qualification"
-                )
             capability = self._capability_snapshot()
             evidence = capability.camera_capability_evidence
-            quiet_window = evidence.exact_external_trigger_quiet_window_seconds
-            if quiet_window is None:
-                raise RuntimeError(
-                    "real camera signal association lacks a qualified quiet window"
-                )
-            facts = evidence.physical_facts
-            facts.require_single_capture_trigger_channel(channel)
-            required_interval = facts.required_external_trigger_interval_seconds
+            required_interval = evidence.physical_facts.required_external_trigger_interval_seconds
             if required_interval is None:
                 raise RuntimeError(
-                    "camera signal association lacks a qualified trigger interval"
+                    "camera signal association lacks an external-trigger interval"
                 )
+            quiet_window = camera_external_trigger_quiet_window_seconds(
+                required_interval
+            )
             validate_camera_external_trigger_spacing(
                 minimum_trigger_interval_ticks=(
                     request.minimum_trigger_interval_ticks
@@ -1162,8 +1130,6 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
         with self._lock:
             if self._monitor_acquisition_mode is not CameraAcquisitionMode.EXTERNAL_TRIGGERED:
                 raise RuntimeError("camera monitor acquisition mode changed during arm")
-            if not self._exact_external_trigger_qualified:
-                raise RuntimeError("camera E0 qualification changed during arm")
             if self._signal_association is not None:
                 raise RuntimeError("camera monitor already owns a signal association")
             if (
@@ -1208,9 +1174,9 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
         token: object,
         *,
         artifact_digest: str,
-        trigger_counts: tuple[tuple[str, int], ...],
+        expected_trigger_count: int,
         terminal_evidence_kind: str,
-    ) -> tuple[str, int, int]:
+    ) -> tuple[int, int]:
         """Bind the admitted interval to the FPGA hardware-terminal receipt."""
 
         artifact = _sha256(artifact_digest, "artifact_digest")
@@ -1226,25 +1192,12 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 raise ValueError(
                     "camera association terminal belongs to another pulse artifact"
                 )
-            capability = self._capability_snapshot()
-            channels = (
-                capability.camera_capability_evidence
-                .physical_facts.capture_trigger_channels
-            )
-            if len(channels) != 1:
+            if expected_trigger_count != association.expected_trigger_count:
                 raise RuntimeError(
-                    "camera pulse association requires one physical trigger channel"
+                    "pulse terminal trigger count differs from camera association"
                 )
-            channel = channels[0]
-            counts = tuple(trigger_counts)
-            if counts != ((channel, association.expected_trigger_count),):
-                raise RuntimeError(
-                    "hardware pulse-terminal trigger count differs from camera association"
-                )
-            association.trigger_channel = channel
             association.bound = True
             return (
-                channel,
                 association.physical_start_ordinal,
                 association.physical_start_ordinal
                 + association.expected_trigger_count,
@@ -1253,7 +1206,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
     def finish_signal_event_association(
         self,
         token: object,
-    ) -> tuple[str, int, int]:
+    ) -> tuple[int, int]:
         """Reconcile one hardware FIRE with exactly its delivered camera frames."""
 
         with self._lock:
@@ -1267,13 +1220,6 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 association.physical_start_ordinal
                 + association.expected_trigger_count
             )
-            if not self._exact_external_trigger_qualified:
-                raise RuntimeError(
-                    "camera E0 qualification changed during signal association"
-                )
-            channel = association.trigger_channel
-            if channel is None:
-                raise RuntimeError("camera association lost its terminal binding")
             progress = self._camera
             if not isinstance(progress, CameraAssociationProgress):
                 raise RuntimeError(
@@ -1320,21 +1266,8 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 raise RuntimeError(
                     "camera association changed during quiet-window reconciliation"
                 )
-            if (
-                not self._capability_snapshot()
-                .camera_capability_evidence
-                .exact_external_trigger_qualified
-                or self._capability_snapshot()
-                .camera_capability_evidence
-                .exact_external_trigger_quiet_window_seconds
-                != quiet_window
-            ):
-                raise RuntimeError(
-                    "camera E0 qualification changed during quiet-window reconciliation"
-                )
             self._signal_association = None
             return (
-                channel,
                 association.physical_start_ordinal,
                 end,
             )
@@ -1420,7 +1353,7 @@ class CameraMonitorEndpoint(CameraCaptureEndpoint):
                 setattr(association, previous_field, current)
         if metadata.frame_stamp is None and metadata.camera_stamp is None:
             association.error = RuntimeError(
-                "camera frame lacks its E0-qualified hardware stamp"
+                "camera frame lacks the hardware stamp required by the association contract"
             )
             raise association.error
         association.observed_count += 1

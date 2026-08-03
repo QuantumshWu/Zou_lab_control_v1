@@ -23,7 +23,6 @@ INSTALLATION_TEMPLATES = {
                 "camera",
                 "camera.dcam",
                 {
-                    "sequencer_ref": "sequencer",
                     "device_index": 0,
                     "exposure_seconds": 0.02,
                     "readout_speed": 1,
@@ -38,7 +37,6 @@ INSTALLATION_TEMPLATES = {
                 "mot_camera",
                 "camera.pylon",
                 {
-                    "sequencer_ref": "sequencer",
                     "serial": "REQUIRED",
                     "exposure_seconds": 0.005,
                     "trigger_source": "Line1",

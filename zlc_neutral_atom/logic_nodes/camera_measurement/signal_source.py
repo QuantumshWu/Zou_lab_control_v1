@@ -30,7 +30,6 @@ from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
 )
 from zlc_neutral_atom.runtime.signal_source import (
     SignalAssociationRequest,
-    SignalAssociationScheduleRequirement,
     SignalAssociationUnavailable,
     SignalEvent,
     SignalEventCursor,
@@ -65,9 +64,9 @@ class CameraSignalAssociationAuthority(Protocol):
         token: object,
         *,
         artifact_digest: str,
-        trigger_counts: tuple[tuple[str, int], ...],
+        expected_trigger_count: int,
         terminal_evidence_kind: str,
-    ) -> tuple[str, int, int]: ...
+    ) -> tuple[int, int]: ...
 
     def finish_signal_event_association(
         self,
@@ -83,7 +82,6 @@ class _CameraAssociationToken:
     authority_token: object
     physical_start_ordinal: int
     physical_end_ordinal: int | None = None
-    trigger_channel: str | None = None
     terminal_evidence: PulseTerminalAck | None = None
     delivered_count: int = 0
     bound: bool = False
@@ -101,7 +99,6 @@ class _CameraAssociatedSignalEventCursor:
         "_phase",
         "_stream",
         "_token",
-        "_trigger_channel",
     )
 
     def __init__(
@@ -112,7 +109,6 @@ class _CameraAssociatedSignalEventCursor:
         stream: AcquisitionStream[CameraSample],
         phase: int,
         frames_per_cycle: int,
-        trigger_channel: str,
         operation_deadline_seconds: float,
     ) -> None:
         self._cursor = cursor
@@ -120,10 +116,6 @@ class _CameraAssociatedSignalEventCursor:
         self._stream = stream
         self._phase = phase
         self._frames_per_cycle = frames_per_cycle
-        self._trigger_channel = canonical_text(
-            trigger_channel,
-            "camera trigger channel",
-        )
         deadline = float(operation_deadline_seconds)
         if not math.isfinite(deadline) or deadline <= 0.0:
             raise ValueError(
@@ -206,16 +198,12 @@ class _CameraAssociatedSignalEventCursor:
             raise ValueError("pulse terminal belongs to another association cause")
         if terminal_evidence.artifact_digest != current.request.cause_digest:
             raise ValueError("pulse terminal belongs to another compiled artifact")
-        channel, start, end = self._authority.bind_signal_event_association(
+        start, end = self._authority.bind_signal_event_association(
             current.authority_token,
             artifact_digest=terminal_evidence.artifact_digest,
-            trigger_counts=(
-                terminal_evidence.expected_trigger_counts_from_completed_schedule
-            ),
+            expected_trigger_count=current.request.trigger_count,
             terminal_evidence_kind=terminal_evidence.evidence_kind.value,
         )
-        if canonical_text(channel, "associated trigger channel") != self._trigger_channel:
-            raise RuntimeError("association authority returned another trigger channel")
         expected_end = (
             current.physical_start_ordinal
             + current.request.expected_event_count * self._frames_per_cycle
@@ -223,9 +211,8 @@ class _CameraAssociatedSignalEventCursor:
         if start != current.physical_start_ordinal or end != expected_end:
             raise RuntimeError(
                 "association authority returned another physical ordinal interval"
-            )
+        )
         current.physical_end_ordinal = end
-        current.trigger_channel = channel
         current.terminal_evidence = terminal_evidence
         current.bound = True
 
@@ -284,14 +271,13 @@ class _CameraAssociatedSignalEventCursor:
             raise RuntimeError(
                 "camera published frames outside the associated hardware FIRE"
             )
-        channel, start, end = (
+        start, end = (
             self._authority.finish_signal_event_association(
                 current.authority_token
             )
         )
         if (
-            channel != current.trigger_channel
-            or start != current.physical_start_ordinal
+            start != current.physical_start_ordinal
             or end != current.physical_end_ordinal
             or current.terminal_evidence is None
         ):
@@ -338,7 +324,6 @@ class CameraAssociatedSignalEventSource:
         "_phases",
         "_source",
         "_stream",
-        "_trigger_channel",
     )
 
     def __init__(
@@ -349,7 +334,6 @@ class CameraAssociatedSignalEventSource:
         stream: AcquisitionStream[CameraSample],
         phases: dict[str, int],
         frames_per_cycle: int,
-        trigger_channel: str,
         operation_deadline_seconds: float,
     ) -> None:
         if not isinstance(authority, CameraSignalAssociationAuthority):
@@ -361,10 +345,6 @@ class CameraAssociatedSignalEventSource:
         self._association_running = False
         self._phases = dict(phases)
         self._frames_per_cycle = frames_per_cycle
-        self._trigger_channel = canonical_text(
-            trigger_channel,
-            "camera trigger channel",
-        )
         deadline = float(operation_deadline_seconds)
         if not math.isfinite(deadline) or deadline <= 0.0:
             raise ValueError(
@@ -402,16 +382,6 @@ class CameraAssociatedSignalEventSource:
                     "armed Camera producer"
                 )
 
-    def signal_association_schedule_requirement(
-        self,
-        output_name: str,
-    ) -> SignalAssociationScheduleRequirement:
-        self._require_association_running()
-        name = canonical_text(output_name, "camera output name")
-        if name not in self._phases:
-            raise KeyError(f"camera has no signal output {name!r}")
-        return SignalAssociationScheduleRequirement(self._trigger_channel)
-
     def open_associated_signal_cursor(self, output_name: str):
         self._require_association_running()
         name = canonical_text(output_name, "camera output name")
@@ -427,7 +397,6 @@ class CameraAssociatedSignalEventSource:
                 stream=self._stream,
                 phase=phase,
                 frames_per_cycle=self._frames_per_cycle,
-                trigger_channel=self._trigger_channel,
                 operation_deadline_seconds=self._operation_deadline_seconds,
             )
         except BaseException:
@@ -441,7 +410,6 @@ def camera_signal_event_source(
     payload_contract: CameraSampleContract,
     *,
     association_authority: CameraSignalAssociationAuthority | None = None,
-    trigger_channel: str | None = None,
     operation_deadline_seconds: float | None = None,
 ) -> StreamSignalEventSource[CameraSample] | CameraAssociatedSignalEventSource:
     """Expose each declared READOUT_EVENT phase as one named live output."""
@@ -475,7 +443,6 @@ def camera_signal_event_source(
         if any(
             value is not None
             for value in (
-                trigger_channel,
                 operation_deadline_seconds,
             )
         ):
@@ -483,18 +450,14 @@ def camera_signal_event_source(
                 "camera association facts require an association authority"
             )
         return source
-    if (
-        trigger_channel is None
-        or operation_deadline_seconds is None
-    ):
-        raise ValueError("camera association authority requires complete binding facts")
+    if operation_deadline_seconds is None:
+        raise ValueError("camera association authority requires an operation deadline")
     return CameraAssociatedSignalEventSource(
         source,
         authority=association_authority,
         stream=stream,
         phases=phases,
         frames_per_cycle=phase_count,
-        trigger_channel=trigger_channel,
         operation_deadline_seconds=operation_deadline_seconds,
     )
 
