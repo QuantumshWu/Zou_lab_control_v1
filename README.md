@@ -47,7 +47,7 @@ sequencer-only or complete hardware installation through DeviceManager.
 ## Package ownership
 
 ```text
-zlc_data/          multidimensional data, selections, reductions, and fit
+zlc_data/          multidimensional data, selections, reductions, and validity
 zlc_storage/       canonical encoding and durable atomic filesystem operations
 zlc_pulse/         PulseDocument, compiler, target contract, and wire protocol
 zlc_neutral_atom/  experiment domains, devices, SignalDataPlane, hosted runtime

@@ -6,7 +6,7 @@
 
 - Branch：`codex/system-architecture-migration`。
 - 重开基线：`476d125304fc90b6ef4f5009184dd2119206fcc2`；C0规范提交：`ed6dfe21c0d99999444c099d8c644a20b44e561d`。
-- 当前checkpoint：C6-R1–R6 已按现场反证闭合；最终 C6 全量门仍待当前工作目标完成，不返回旧 M1–M7 叙事，也不重做与新证据无关的旧切片。
+- 当前checkpoint：C6-R1–R6 已按现场反证闭合；当前 HEAD 为 `d12c98c`，最终 C6 全量门仍待公开审查清单收口，不返回旧 M1–M7 叙事，也不重做与新证据无关的旧切片。
 - 预期worktree例外：未跟踪用户文件`pulses/scan_test.json`。永远不得读取、修改、移动、删除、stage或commit。
 - RTL、Tcl、XDC、bitstream和wire protocol仍冻结；C1/C2没有硬件改动。
 
@@ -159,13 +159,14 @@
 
 - C6-R6 当前窄回归（zlc_plot core、Plot Fit、Figure archive、Qt widgets、Board、Camera/
   Calibration flow）为 `49 passed`，并完成当前 zlc_plot 模块的 `py_compile` 与
-  `git diff --check`；提交前仍需按 §9 运行最终 broad current suite。历史 C6 定向
-  回归为 `90 passed`，全仓历史记录为 `831 passed, 1 skipped`，仅有既存 zmq Proactor
-  selector-thread warning。无测试失败。
+  `git diff --check`；Notebook/Pulse 相关合同为 `24 passed`。当前全仓 broad suite
+  为 `832 passed, 1 skipped, 1 warning`（124.00 s），仅有既存 Windows zmq
+  Proactor selector-thread warning。生产包当前 tracked Python 口径为 `297 modules /
+  129,823 physical LOC`，tests 为 `107 modules / 33,095 physical LOC`。
 - 本轮未读取、修改、移动、stage 或 commit 用户保护文件 `pulses/scan_test.json`；RTL、Tcl、
   XDC、bitstream、wire protocol 未改。C6 完成后才允许以新的 Git checkpoint 交接，不能把
   C6 的中间态宣称为终态。
 
 恢复时仍严格依次完整读取当前 Goal、`AGENTS.md`、本文件、Git branch/HEAD/status/recent log，
-再只读当前台账和 R1–R4 对应设计章节；不得重答、重审或重做 C1/C2/C3/C4/C5，除非新证据
+再只读当前台账和 R1–R6 对应设计章节；不得重答、重审或重做 C1/C2/C3/C4/C5，除非新证据
 直接触及其 owner。
