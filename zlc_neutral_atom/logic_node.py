@@ -23,7 +23,7 @@ from zlc_neutral_atom.dataset_output import DatasetOutputDeclaration
 from zlc_neutral_atom.input_spec import NodeInputSpec, require_input_specs
 from zlc_neutral_atom.installation import (
     DeviceCatalogView,
-    ReadoutApparatusFacts,
+    ReadoutInstallationBinding,
 )
 from zlc_neutral_atom.processing.signal_plane import SignalDataPlane
 from zlc_neutral_atom.runtime.run import RunHandle, RunPlan
@@ -187,7 +187,7 @@ class LogicNodeApplicationContext(Protocol):
         raise NotImplementedError
 
     @property
-    def apparatus(self) -> tuple[ReadoutApparatusFacts, ...]:  # pragma: no cover
+    def readout_bindings(self) -> tuple[ReadoutInstallationBinding, ...]:  # pragma: no cover
         raise NotImplementedError
 
     @property

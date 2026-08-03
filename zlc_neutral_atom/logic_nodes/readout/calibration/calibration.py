@@ -160,9 +160,10 @@ def _immutable_array(
 class CalibrationAnalysisRequest:
     """Explicit physical and statistical intent for one calibration artifact.
 
-    ``expected_centers_xy`` is independent spatial admission evidence in the
-    declared ``ordering``.  It constrains authority; detector output can never
-    fill or replace it.
+    ``expected_centers_xy`` is optional independent spatial admission evidence
+    in the declared ``ordering``.  When supplied it constrains authority;
+    when absent, the calibration detector discovers and publishes the centers
+    from the captured reference frames.
     """
 
     layout: CalibrationCaptureLayout

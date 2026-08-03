@@ -11,7 +11,7 @@ from types import MappingProxyType
 
 from zlc_neutral_atom.device_types import (
     CAPABILITY_CAMERA_SIGNAL_ASSOCIATION,
-    CAPABILITY_READOUT_APPARATUS,
+    CAPABILITY_READOUT_BINDING,
     dependency_capabilities,
     device_type,
     validate_installation_graph,
@@ -20,7 +20,7 @@ from zlc_neutral_atom.installation import (
     DeviceCatalogView,
     DeviceInfo,
     DeviceRef,
-    ReadoutApparatusFacts,
+    ReadoutInstallationBinding,
 )
 from zlc_neutral_atom.installation_config import InstallationConfigDocument
 from zlc_neutral_atom.runtime.ports import DeviceBroker
@@ -225,7 +225,7 @@ class _InstallationComposition:
     """Runtime plus the two capability-free projections used by logic composition."""
 
     runtime: _InstallationRuntime
-    readout_apparatus_facts: tuple[ReadoutApparatusFacts, ...] = ()
+    readout_installation_bindings: tuple[ReadoutInstallationBinding, ...] = ()
     camera_signal_association_authorities: tuple[tuple[str, object], ...] = ()
 
 
@@ -291,16 +291,19 @@ def create_installation(
             capabilities=connected,
             closers=tuple(closers),
         )
-        apparatus = tuple(
+        readout_bindings = tuple(
             value
             for instance in document.devices
             for value in (
-                connected[instance.instance_id].get(CAPABILITY_READOUT_APPARATUS),
+                connected[instance.instance_id].get(CAPABILITY_READOUT_BINDING),
             )
             if value is not None
         )
-        if any(not isinstance(value, ReadoutApparatusFacts) for value in apparatus):
-            raise TypeError("readout apparatus capability has the wrong value type")
+        if any(
+            not isinstance(value, ReadoutInstallationBinding)
+            for value in readout_bindings
+        ):
+            raise TypeError("readout binding capability has the wrong value type")
         authorities = tuple(
             (instance.role, value)
             for instance in document.devices
@@ -313,7 +316,7 @@ def create_installation(
         )
         return _InstallationComposition(
             runtime=runtime,
-            readout_apparatus_facts=apparatus,
+            readout_installation_bindings=readout_bindings,
             camera_signal_association_authorities=authorities,
         )
     except BaseException as primary:

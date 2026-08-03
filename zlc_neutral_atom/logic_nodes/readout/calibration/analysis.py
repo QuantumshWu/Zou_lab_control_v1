@@ -75,8 +75,8 @@ def _validate_site_center_admission(
     """Admit exact detector output against independent spatial intent.
 
     The detector's returned coordinates are never snapped, reordered, or
-    replaced here.  A request without spatial intent remains valid for a pure
-    preview computation; durable Calibration writing requires the paired fields.
+    replaced here.  A request without spatial intent uses the detector's
+    ordered centers as the calibration result.
     """
 
     if not isinstance(request, CalibrationAnalysisRequest):
@@ -1822,11 +1822,6 @@ def _analyze_calibration_resolved(
         raise TypeError("calibration analysis requires a CaptureArtifact")
     if not isinstance(request, CalibrationAnalysisRequest):
         raise TypeError("request must be CalibrationAnalysisRequest")
-    if request.expected_centers_xy is None:
-        raise CalibrationAnalysisError(
-            "authoritative calibration requires expected_centers_xy and "
-            "maximum_site_residual_px"
-        )
     if not isinstance(resolved, _ResolvedCalibrationSource):
         raise TypeError("resolved must be _ResolvedCalibrationSource")
     frame_source = source.frame_source

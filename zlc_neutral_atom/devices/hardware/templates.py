@@ -16,7 +16,6 @@ INSTALLATION_TEMPLATES = {
                 {
                     "host": "127.0.0.1",
                     "port": 18861,
-                    "transport_timeout_seconds": 120.0,
                 },
             ),
             DeviceInstanceConfig(
@@ -34,9 +33,6 @@ INSTALLATION_TEMPLATES = {
                     "roi_width": None,
                     "roi_height": None,
                     "trigger_lane": "ch11",
-                    "grid_rows": 1,
-                    "grid_columns": 1,
-                    "site_centers_json": "[[0,0]]",
                 },
             ),
             DeviceInstanceConfig(
@@ -52,7 +48,6 @@ INSTALLATION_TEMPLATES = {
                     "roi_y": None,
                     "roi_width": None,
                     "roi_height": None,
-                    "timeout_seconds": 2.0,
                     "trigger_lane": "ch06",
                 },
             ),

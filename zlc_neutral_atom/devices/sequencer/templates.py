@@ -16,7 +16,6 @@ INSTALLATION_TEMPLATES = {
                 {
                     "host": "127.0.0.1",
                     "port": 18861,
-                    "transport_timeout_seconds": 120.0,
                 },
             ),
         )

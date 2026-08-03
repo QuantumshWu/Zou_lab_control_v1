@@ -23,7 +23,7 @@ CAPABILITY_MOT_FIELD_CAPTURE = "camera.mot_field_capture"
 CAPABILITY_CAMERA_SIGNAL_ASSOCIATION = "camera.signal_association"
 CAPABILITY_EXTERNAL_TRIGGER_CLIENT = "pulse.external_trigger_client"
 CAPABILITY_PULSE_EXECUTE = "pulse.execute"
-CAPABILITY_READOUT_APPARATUS = "readout.apparatus"
+CAPABILITY_READOUT_BINDING = "readout.binding"
 CAPABILITY_RF_TABLE = "rf.table"
 
 
@@ -226,7 +226,7 @@ __all__ = [
     "CAPABILITY_CAMERA_SIGNAL_ASSOCIATION",
     "CAPABILITY_EXTERNAL_TRIGGER_CLIENT",
     "CAPABILITY_PULSE_EXECUTE",
-    "CAPABILITY_READOUT_APPARATUS",
+    "CAPABILITY_READOUT_BINDING",
     "CAPABILITY_RF_TABLE",
     "DeviceTypeDescriptor",
     "device_type",

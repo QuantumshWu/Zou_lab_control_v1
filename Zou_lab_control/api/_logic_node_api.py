@@ -136,8 +136,8 @@ class _BoundLogicNodeContext(LogicNodeApplicationContext):
         return self._services.catalog
 
     @property
-    def apparatus(self):
-        return tuple(self._services.installation.readout_apparatus_facts)
+    def readout_bindings(self):
+        return tuple(self._services.installation.readout_installation_bindings)
 
     @property
     def signal_plane(self):

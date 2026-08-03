@@ -312,9 +312,6 @@ def _hardware_document():
         "hardware",
         host="test-host",
         serial="test-basler",
-        grid_rows=1,
-        grid_columns=1,
-        site_centers_json="[[1,1]]",
     )
 
 
@@ -416,10 +413,10 @@ def test_fake_real_installation_runs_both_active_e0_paths_and_binds_ports(
         assert tuple(catalog) == ("sequencer", "camera", "mot-camera")
         assert catalog.require("camera").resource_key == "device/camera"
         assert catalog.require("mot-camera").resource_key == "device/mot-camera"
-        assert composition.readout_apparatus_facts[0].trigger_channel == "ch11"
-        assert composition.readout_apparatus_facts[0].camera_instance_id == "camera"
+        assert composition.readout_installation_bindings[0].trigger_channel == "ch11"
+        assert composition.readout_installation_bindings[0].camera_instance_id == "camera"
         assert (
-            composition.readout_apparatus_facts[0].sequencer_instance_id
+            composition.readout_installation_bindings[0].sequencer_instance_id
             == "sequencer"
         )
         assert tuple(

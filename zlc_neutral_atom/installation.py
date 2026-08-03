@@ -2,36 +2,25 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
 from zlc_storage import canonical_text
 
-
-def _positive_pair(value: object, field: str) -> tuple[int, int]:
-    try:
-        pair = tuple(value)  # type: ignore[arg-type]
-    except TypeError as exc:
-        raise TypeError(f"{field} must be a two-integer tuple") from exc
-    if len(pair) != 2 or any(
-        isinstance(item, bool) or not isinstance(item, int) or item < 1
-        for item in pair
-    ):
-        raise ValueError(f"{field} must contain two positive integers")
-    return pair[0], pair[1]
-
-
 @dataclass(frozen=True, slots=True)
-class ReadoutApparatusFacts:
-    """Capability-free geometry tied to exact stable device instances."""
+class ReadoutInstallationBinding:
+    """Physical readout wiring, without experiment geometry.
+
+    A camera connection can prove its endpoint identity and the sequencer lane
+    that is wired to its external trigger.  It cannot know the atom-lattice
+    grid or site centers: those are calibration intent/results and belong to
+    the readout logic node.  Keeping only this binding here prevents the
+    Device Manager's hardware form from becoming a calibration database.
+    """
 
     camera_instance_id: str
     sequencer_instance_id: str
-    frame_shape_yx: tuple[int, int]
-    grid_shape_yx: tuple[int, int]
-    site_centers_xy: tuple[tuple[float, float], ...]
     trigger_channel: str
 
     def __post_init__(self) -> None:
@@ -41,33 +30,6 @@ class ReadoutApparatusFacts:
                 field,
                 canonical_text(getattr(self, field), field),
             )
-        frame_shape = _positive_pair(self.frame_shape_yx, "frame_shape_yx")
-        grid_shape = _positive_pair(self.grid_shape_yx, "grid_shape_yx")
-        raw_centers = tuple(self.site_centers_xy)
-        if len(raw_centers) != grid_shape[0] * grid_shape[1]:
-            raise ValueError("site_centers_xy must contain one center per grid site")
-        height, width = frame_shape
-        centers: list[tuple[float, float]] = []
-        for index, value in enumerate(raw_centers):
-            try:
-                pair = tuple(value)
-            except TypeError as exc:
-                raise TypeError(
-                    f"site_centers_xy[{index}] must be an X,Y pair"
-                ) from exc
-            if len(pair) != 2:
-                raise ValueError(f"site_centers_xy[{index}] must contain X and Y")
-            x, y = float(pair[0]), float(pair[1])
-            if not math.isfinite(x) or not math.isfinite(y):
-                raise ValueError("site centers must be finite")
-            if not 0.0 <= x < width or not 0.0 <= y < height:
-                raise ValueError("site centers must lie inside the installed frame")
-            centers.append((x, y))
-        if len(set(centers)) != len(centers):
-            raise ValueError("installed site centers must be unique")
-        object.__setattr__(self, "frame_shape_yx", frame_shape)
-        object.__setattr__(self, "grid_shape_yx", grid_shape)
-        object.__setattr__(self, "site_centers_xy", tuple(centers))
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,5 +183,5 @@ __all__ = [
     "DeviceCatalogView",
     "DeviceInfo",
     "DeviceRef",
-    "ReadoutApparatusFacts",
+    "ReadoutInstallationBinding",
 ]

@@ -37,6 +37,8 @@ DEFAULT_CALIBRATION_THRESHOLD_FRAMES = 100
 MINIMUM_CALIBRATION_THRESHOLD_FRAMES = 2
 DEFAULT_CALIBRATION_ROI_RADIUS = 1
 MINIMUM_CALIBRATION_ROI_RADIUS = 1
+DEFAULT_CALIBRATION_GRID_ROWS = 5
+DEFAULT_CALIBRATION_GRID_COLUMNS = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +54,8 @@ class CalibrationTaskRequest:
     roi_radius: int
     camera_instance_id: str
     sequencer_instance_id: str
+    grid_rows: int = DEFAULT_CALIBRATION_GRID_ROWS
+    grid_columns: int = DEFAULT_CALIBRATION_GRID_COLUMNS
 
     def __post_init__(self) -> None:
         if type(self.save_frames) is not bool:
@@ -93,6 +97,9 @@ class CalibrationTaskRequest:
             self.sequencer_instance_id,
             "sequencer_instance_id",
         )
+        rows = integer(self.grid_rows, "grid_rows", minimum=1)
+        columns = integer(self.grid_columns, "grid_columns", minimum=1)
+        assert rows is not None and columns is not None
         object.__setattr__(self, "pulse", pulse)
         object.__setattr__(self, "threshold_method", method)
         object.__setattr__(self, "reference_exposure_s", reference)
@@ -101,6 +108,12 @@ class CalibrationTaskRequest:
         object.__setattr__(self, "roi_radius", radius)
         object.__setattr__(self, "camera_instance_id", camera_id)
         object.__setattr__(self, "sequencer_instance_id", sequencer_id)
+        object.__setattr__(self, "grid_rows", rows)
+        object.__setattr__(self, "grid_columns", columns)
+
+    @property
+    def grid_shape_yx(self) -> tuple[int, int]:
+        return self.grid_rows, self.grid_columns
 
 
 _CALIBRATION_TASK_AUTHORING_SCHEMA = AuthoringSchema(
@@ -174,6 +187,26 @@ _CALIBRATION_TASK_AUTHORING_SCHEMA = AuthoringSchema(
             unit="px",
             minimum=MINIMUM_CALIBRATION_ROI_RADIUS,
             allow_blank=False,
+        ),
+        AuthoringField(
+            "grid_rows",
+            "int",
+            "Lattice rows",
+            default=DEFAULT_CALIBRATION_GRID_ROWS,
+            required=True,
+            minimum=1,
+            allow_blank=False,
+            description="Number of site rows to detect in the calibration image.",
+        ),
+        AuthoringField(
+            "grid_columns",
+            "int",
+            "Lattice columns",
+            default=DEFAULT_CALIBRATION_GRID_COLUMNS,
+            required=True,
+            minimum=1,
+            allow_blank=False,
+            description="Number of site columns to detect in the calibration image.",
         ),
         AuthoringField(
             "camera_instance_id",
@@ -269,6 +302,8 @@ def write_calibration_post_final_exports(
 __all__ = [
     "CALIBRATION_THRESHOLD_METHODS",
     "DEFAULT_CALIBRATION_PULSE_PATH",
+    "DEFAULT_CALIBRATION_GRID_ROWS",
+    "DEFAULT_CALIBRATION_GRID_COLUMNS",
     "CalibrationTaskRequest",
     "build_calibration_task_request",
     "calibration_task_authoring_schema",

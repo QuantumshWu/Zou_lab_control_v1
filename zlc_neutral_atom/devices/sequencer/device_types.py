@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -105,7 +104,6 @@ def _connect_remote(
     values = _REMOTE_SCHEMA.freeze(instance.parameters)
     host = normalized_text(values["host"], "remote pulse host")
     port = values["port"]
-    timeout = float(values["transport_timeout_seconds"])
     assert isinstance(port, int)
     if required_pulse_document is not None and not isinstance(
         required_pulse_document,
@@ -115,7 +113,7 @@ def _connect_remote(
     client = RemotePulseExecutionClient.connect(
         host,
         port,
-        transport_timeout_seconds=timeout,
+        transport_timeout_seconds=DEFAULT_TRANSPORT_TIMEOUT_SECONDS,
     )
     try:
         snapshot = client.snapshot()
@@ -129,7 +127,9 @@ def _connect_remote(
                 required_pulse_document,
                 snapshot.clock_hz,
             )
-        safe_snapshot = client.safe_state(timeout=timeout * 0.9)
+        safe_snapshot = client.safe_state(
+            timeout=DEFAULT_TRANSPORT_TIMEOUT_SECONDS * 0.9
+        )
         if safe_snapshot.connection_generation != snapshot.connection_generation:
             raise RuntimeError("remote pulse generation changed while entering SAFE")
         connection = _RemotePulseConnection(
@@ -169,15 +169,6 @@ _REMOTE_SCHEMA = AuthoringSchema(
             True,
             minimum=1,
             maximum=65535,
-        ),
-        AuthoringField(
-            "transport_timeout_seconds",
-            "float",
-            "Transport timeout",
-            DEFAULT_TRANSPORT_TIMEOUT_SECONDS,
-            True,
-            unit="s",
-            minimum=math.nextafter(0.0, math.inf),
         ),
     )
 )

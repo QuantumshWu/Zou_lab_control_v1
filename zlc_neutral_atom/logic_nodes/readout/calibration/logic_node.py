@@ -81,19 +81,19 @@ _CALIBRATION_DEFINITION = LogicNodeDefinition(
 )
 
 
-def _apparatus_for(
+def _readout_binding_for(
     request: CalibrationTaskRequest,
     context: LogicNodeApplicationContext,
 ):
     matches = tuple(
         value
-        for value in context.apparatus
+        for value in context.readout_bindings
         if value.camera_instance_id == request.camera_instance_id
         and value.sequencer_instance_id == request.sequencer_instance_id
     )
     if len(matches) != 1:
         raise ValueError(
-            "Calibration requires one installed readout apparatus matching "
+            "Calibration requires one installed readout binding matching "
             "the selected camera and sequencer instances"
         )
     return matches[0]
@@ -109,7 +109,8 @@ def _sequence_for(
     camera_ref = catalog.require(request.camera_instance_id).ref
     sequencer_ref = catalog.require(request.sequencer_instance_id).ref
     profile = build_sitemap_acquisition_profile(
-        _apparatus_for(request, context),
+        _readout_binding_for(request, context),
+        grid_shape_yx=request.grid_shape_yx,
         camera_ref=camera_ref,
         sequencer_ref=sequencer_ref,
         camera_port=camera,

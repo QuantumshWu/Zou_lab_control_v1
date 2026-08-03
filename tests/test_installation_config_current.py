@@ -28,7 +28,6 @@ def test_ordered_graph_round_trips_as_ordinary_human_readable_json(tmp_path):
             "remote_pulse",
             host="pulse-host",
             port=18862,
-            transport_timeout_seconds=45.5,
         ),
         installation_template("hardware"),
     )
@@ -58,6 +57,18 @@ def test_template_override_is_schema_driven_without_backend_dispatch():
         if "seed" in item.parameters
     )
     assert seeded == (23, 23)
+
+
+def test_real_hardware_template_keeps_calibration_geometry_out_of_devices():
+    document = installation_template("hardware")
+    by_id = {item.instance_id: item for item in document.devices}
+    camera = by_id["camera"].parameters
+    mot_camera = by_id["mot-camera"].parameters
+    sequencer = by_id["sequencer"].parameters
+
+    assert {"grid_rows", "grid_columns", "site_centers_json"}.isdisjoint(camera)
+    assert "timeout_seconds" not in mot_camera
+    assert "transport_timeout_seconds" not in sequencer
     with pytest.raises(ValueError, match="has no fields"):
         installation_template("virtual", backend="remote")
 
@@ -179,7 +190,6 @@ def test_leaf_schema_rejects_unknown_or_invalid_parameters():
                 {
                     "host": "pulse-host",
                     "port": 0,
-                    "transport_timeout_seconds": 120.0,
                 },
             ),
         )

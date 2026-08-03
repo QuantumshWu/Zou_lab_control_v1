@@ -12,7 +12,7 @@ from zlc_neutral_atom.device_types import (
     CAPABILITY_CAMERA_SIGNAL_ASSOCIATION,
     CAPABILITY_MOT_FIELD_CAPTURE,
     CAPABILITY_PULSE_EXECUTE,
-    CAPABILITY_READOUT_APPARATUS,
+    CAPABILITY_READOUT_BINDING,
     CAPABILITY_RF_TABLE,
     DeviceTypeDescriptor,
 )
@@ -34,7 +34,7 @@ from zlc_neutral_atom.devices.simulation.sequencer_endpoint import (
     VirtualSequencerExecutionEndpoint,
 )
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
-from zlc_neutral_atom.installation import ReadoutApparatusFacts
+from zlc_neutral_atom.installation import ReadoutInstallationBinding
 from zlc_neutral_atom.installation_config import DeviceInstanceConfig
 from zlc_neutral_atom.runtime.ports import BoundDevice, DeviceBroker, SafetyOperation
 from zlc_neutral_atom.runtime.resources import (
@@ -355,12 +355,9 @@ def _connect_readout_camera(
             camera,
             free_running_monitor=False,
         )
-        apparatus = ReadoutApparatusFacts(
+        readout_binding = ReadoutInstallationBinding(
             camera_instance_id=instance.instance_id,
             sequencer_instance_id=instance.parameters["sequencer_ref"],
-            frame_shape_yx=frame_shape,
-            grid_shape_yx=grid_shape,
-            site_centers_xy=centers,
             trigger_channel=_READOUT_TRIGGER_CHANNELS[0],
         )
     except BaseException as primary:
@@ -373,7 +370,7 @@ def _connect_readout_camera(
         CAPABILITY_CAMERA_CAPTURE: capture,
         CAPABILITY_CAMERA_MONITOR: monitor,
         CAPABILITY_CAMERA_SIGNAL_ASSOCIATION: authority,
-        CAPABILITY_READOUT_APPARATUS: apparatus,
+        CAPABILITY_READOUT_BINDING: readout_binding,
     }, camera.close
 
 
@@ -485,7 +482,7 @@ DEVICE_TYPES = (
             CAPABILITY_CAMERA_CAPTURE,
             CAPABILITY_CAMERA_MONITOR,
             CAPABILITY_CAMERA_SIGNAL_ASSOCIATION,
-            CAPABILITY_READOUT_APPARATUS,
+            CAPABILITY_READOUT_BINDING,
         ),
         (
             ("sequencer_ref", VIRTUAL_SEQUENCER_CAPABILITY),

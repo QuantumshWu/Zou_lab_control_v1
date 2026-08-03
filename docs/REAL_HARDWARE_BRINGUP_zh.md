@@ -70,7 +70,6 @@ python pulse_gui.py            # 默认 Offline，可编辑/Preview但执行按�
       "remote_pulse",
       host="<FPGA_IP>",
       port=18861,
-      transport_timeout_seconds=120.0,
   )
   workspace = WorkspacePaths.for_workspace(Path.cwd())
   exp = connect(installation, workspace=workspace)
@@ -87,7 +86,9 @@ python pulse_gui.py            # 默认 Offline，可编辑/Preview但执行按�
 ## 2. 完整 hardware installation（首选 DeviceManager）
 
 先运行 `device_manager.bat`，在 **New** 选择 `hardware`，逐张 device card 填写 pulse server、
-qCMOS、Pylon、trigger lane、readout grid 与 site centers，保存 config 后点 **Apply**。Apply 是唯一真实
+qCMOS、Pylon 与真实接线的 trigger lane，保存 config 后点 **Apply**。Device Manager 只保存设备身份、
+硬件工作点和安装接线；lattice 的 grid rows/columns 属于 Calibration Task，site centers 是校准输出，
+绝不写入 camera device 配置。Apply 是唯一真实
 bring-up 边界：它先连接 remote FPGA，再建立两个相机 adapter，读取并冻结 working point，随后
 分别运行一段只切换目标 trigger lane、其余数字/DAC 保持 SAFE 的四触发 E0 program。只有相机帧
 ordinal、hardware stamp、produced count、terminal drain 与 FPGA completed schedule 全部一致，才
@@ -112,9 +113,6 @@ template = installation_template(
     "hardware",
     host="<FPGA_IP>",
     serial="<BASLER_SERIAL>",
-    grid_rows=2,
-    grid_columns=2,
-    site_centers_json="[[120.0,80.0],[160.0,80.0],[120.0,120.0],[160.0,120.0]]",
 )
 per_instance = {
     "camera": {
@@ -143,8 +141,12 @@ exp = connect(
 exp.task_console()
 ```
 
-这里的示例坐标只是合法格式，不是装置标定值；真机必须填写实际 site centers 与 camera 参数。
-`camera`/`mot-camera` 的 `sequencer_ref="sequencer"` 引用的是 stable instance id；role 可以改名，
+Calibration Task 再单独填写 `grid_rows` 与 `grid_columns`。它从相机实际输出帧中发现并保存
+site centers；如果已有独立的中心先验，可作为 Calibration 的显式 admission 输入，不能伪装成
+相机硬件参数。
+
+这里不再在 hardware installation 中填写 site centers；真机只需填写实际 camera 工作点，
+Calibration Task 负责发现并保存中心。`camera`/`mot-camera` 的 `sequencer_ref="sequencer"` 引用的是 stable instance id；role 可以改名，
 requirement 不随 role 漂移。若修改 instance id，必须同时更新所有引用该 id 的 leaf 参数，graph
 preflight 会在连接任何设备前拒绝 missing/wrong-capability/cycle。旧 `remote_template.json`、
 `open_devices=True`、raw SDK/session、backend-wide config 与已删除 constructor 都不是 current 入口。

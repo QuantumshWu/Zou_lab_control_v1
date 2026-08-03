@@ -97,7 +97,13 @@ def _pair(value: object, field: str) -> tuple[int, int]:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class ReadoutGridGeometry:
-    """Independent ordered site locations in one ROI-local output-pixel frame."""
+    """Calibration-owned lattice shape and optional center admission prior.
+
+    The lattice dimensions are required to interpret the detector output.  The
+    centers are optional: a first calibration normally discovers them from the
+    reference frames; supplying them is an explicit admission prior, never a
+    camera installation fact.
+    """
 
     frame_shape_yx: tuple[int, int]
     spatial_y_axis_id: AxisId
@@ -105,7 +111,7 @@ class ReadoutGridGeometry:
     coordinate_frame: CoordinateFrameId
     grid_shape_yx: tuple[int, int]
     ordering: GridOrder
-    expected_centers_xy: np.ndarray
+    expected_centers_xy: np.ndarray | None = None
 
     __hash__ = None
 
@@ -120,23 +126,25 @@ class ReadoutGridGeometry:
         if not isinstance(self.ordering, GridOrder):
             raise TypeError("ordering must be GridOrder")
         site_count = grid_shape[0] * grid_shape[1]
-        centers = immutable_array(
-            self.expected_centers_xy,
-            dtype="<f8",
-            shape=(site_count, 2),
-        )
-        if not np.all(np.isfinite(centers)):
-            raise ValueError("expected_centers_xy must be finite")
-        height, width = frame_shape
-        if np.any(centers[:, 0] < 0.0) or np.any(centers[:, 0] >= width):
-            raise ValueError("site X coordinates lie outside the output frame")
-        if np.any(centers[:, 1] < 0.0) or np.any(centers[:, 1] >= height):
-            raise ValueError("site Y coordinates lie outside the output frame")
-        minimum_separation = _minimum_coordinate_separation(centers)
-        if not math.isfinite(minimum_separation) or minimum_separation <= 0.0:
-            if site_count > 1:
-                raise ValueError("expected site centers must be unique")
-            minimum_separation = math.inf
+        centers = self.expected_centers_xy
+        if centers is not None:
+            centers = immutable_array(
+                centers,
+                dtype="<f8",
+                shape=(site_count, 2),
+            )
+            if not np.all(np.isfinite(centers)):
+                raise ValueError("expected_centers_xy must be finite")
+            height, width = frame_shape
+            if np.any(centers[:, 0] < 0.0) or np.any(centers[:, 0] >= width):
+                raise ValueError("site X coordinates lie outside the output frame")
+            if np.any(centers[:, 1] < 0.0) or np.any(centers[:, 1] >= height):
+                raise ValueError("site Y coordinates lie outside the output frame")
+            minimum_separation = _minimum_coordinate_separation(centers)
+            if not math.isfinite(minimum_separation) or minimum_separation <= 0.0:
+                if site_count > 1:
+                    raise ValueError("expected site centers must be unique")
+                minimum_separation = math.inf
         object.__setattr__(self, "frame_shape_yx", frame_shape)
         object.__setattr__(self, "grid_shape_yx", grid_shape)
         object.__setattr__(self, "expected_centers_xy", centers)
@@ -151,7 +159,18 @@ class ReadoutGridGeometry:
             and self.coordinate_frame == other.coordinate_frame
             and self.grid_shape_yx == other.grid_shape_yx
             and self.ordering is other.ordering
-            and bool(np.array_equal(self.expected_centers_xy, other.expected_centers_xy))
+            and (
+                self.expected_centers_xy is None
+                and other.expected_centers_xy is None
+                or self.expected_centers_xy is not None
+                and other.expected_centers_xy is not None
+                and bool(
+                    np.array_equal(
+                        self.expected_centers_xy,
+                        other.expected_centers_xy,
+                    )
+                )
+            )
         )
 
 
@@ -224,7 +243,7 @@ class SitemapAcquisitionProfile:
     sequencer_instance_id: str
     camera_facts: CameraPhysicalFacts
     geometry: ReadoutGridGeometry
-    maximum_site_residual_px: float
+    maximum_site_residual_px: float | None
     pulse_target: PulseTarget
     trigger_channel: str
 
@@ -243,18 +262,24 @@ class SitemapAcquisitionProfile:
             raise TypeError("camera_facts must be CameraPhysicalFacts")
         if not isinstance(self.geometry, ReadoutGridGeometry):
             raise TypeError("geometry must be ReadoutGridGeometry")
-        maximum_residual = positive_real(
-            self.maximum_site_residual_px,
-            "maximum_site_residual_px",
-        )
-        minimum_separation = _minimum_coordinate_separation(
-            self.geometry.expected_centers_xy
-        )
-        if 2.0 * maximum_residual >= minimum_separation:
-            raise ValueError(
-                "maximum_site_residual_px must be less than half the minimum "
-                "site-center separation"
+        expected_centers = self.geometry.expected_centers_xy
+        if expected_centers is None:
+            if self.maximum_site_residual_px is not None:
+                raise ValueError(
+                    "maximum_site_residual_px requires expected_centers_xy"
+                )
+            maximum_residual = None
+        else:
+            maximum_residual = positive_real(
+                self.maximum_site_residual_px,
+                "maximum_site_residual_px",
             )
+            minimum_separation = _minimum_coordinate_separation(expected_centers)
+            if 2.0 * maximum_residual >= minimum_separation:
+                raise ValueError(
+                    "maximum_site_residual_px must be less than half the minimum "
+                    "site-center separation"
+                )
         if not isinstance(self.pulse_target, PulseTarget):
             raise TypeError("pulse_target must be PulseTarget")
         trigger = canonical_text(self.trigger_channel, "trigger_channel")

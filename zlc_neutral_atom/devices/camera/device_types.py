@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 from typing import Mapping
 
@@ -13,7 +12,7 @@ from zlc_neutral_atom.device_types import (
     CAPABILITY_CAMERA_SIGNAL_ASSOCIATION,
     CAPABILITY_EXTERNAL_TRIGGER_CLIENT,
     CAPABILITY_MOT_FIELD_CAPTURE,
-    CAPABILITY_READOUT_APPARATUS,
+    CAPABILITY_READOUT_BINDING,
     DeviceTypeDescriptor,
 )
 from zlc_neutral_atom.devices.camera.binding import bind_camera_endpoint
@@ -24,7 +23,7 @@ from zlc_neutral_atom.devices.camera.endpoint import CameraMonitorEndpoint
 from zlc_neutral_atom.devices.camera.monitor import BoundCameraMonitorPort
 from zlc_neutral_atom.devices.camera.pylon import PylonCameraAdapter, PylonCameraConfig
 from zlc_neutral_atom.devices.hardware.qualification import qualify_external_trigger_path
-from zlc_neutral_atom.installation import ReadoutApparatusFacts
+from zlc_neutral_atom.installation import ReadoutInstallationBinding
 from zlc_neutral_atom.installation_config import DeviceInstanceConfig
 from zlc_neutral_atom.runtime.ports import DeviceBroker
 from zlc_neutral_atom.runtime.resources import (
@@ -48,30 +47,6 @@ def _optional_roi(values: tuple[object, ...], field: str):
         if value < minimum:
             raise ValueError(f"{field}[{index}] must be at least {minimum}")
         result.append(value)
-    return tuple(result)
-
-
-def _centers(value: object) -> tuple[tuple[float, float], ...]:
-    text = canonical_text(value, "site_centers_json")
-    try:
-        decoded = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError("site_centers_json is not valid JSON") from exc
-    if not isinstance(decoded, list) or not decoded:
-        raise ValueError("site_centers_json must be a non-empty list")
-    result: list[tuple[float, float]] = []
-    for index, pair in enumerate(decoded):
-        if not isinstance(pair, list) or len(pair) != 2 or any(
-            isinstance(item, bool) or not isinstance(item, (int, float))
-            for item in pair
-        ):
-            raise TypeError(f"site center {index} must be [x, y]")
-        x, y = float(pair[0]), float(pair[1])
-        if not math.isfinite(x) or not math.isfinite(y):
-            raise ValueError("site centers must be finite")
-        result.append((x, y))
-    if len(set(result)) != len(result):
-        raise ValueError("site centers must be unique")
     return tuple(result)
 
 
@@ -108,10 +83,6 @@ def _connect_dcam(
         ),
         "dcam_roi",
     )
-    grid_shape = (values["grid_rows"], values["grid_columns"])
-    centers = _centers(values["site_centers_json"])
-    if len(centers) != grid_shape[0] * grid_shape[1]:
-        raise ValueError("site center count must equal grid_rows * grid_columns")
     camera = DcamCameraAdapter(
         DcamCameraConfig(
             capture_trigger_channels=(values["trigger_lane"],),
@@ -130,7 +101,6 @@ def _connect_dcam(
             camera=camera,
             trigger_lane=values["trigger_lane"],
         )
-        working_point = camera.capture_working_point()
         endpoint = CameraMonitorEndpoint(
             camera,
             instance.instance_id,
@@ -144,12 +114,9 @@ def _connect_dcam(
             identity=_camera_identity(f"dcam-device-index:{values['device_index']}"),
             endpoint=endpoint,
         )
-        apparatus = ReadoutApparatusFacts(
+        readout_binding = ReadoutInstallationBinding(
             camera_instance_id=instance.instance_id,
             sequencer_instance_id=instance.parameters["sequencer_ref"],
-            frame_shape_yx=working_point.frame_shape_yx,
-            grid_shape_yx=grid_shape,
-            site_centers_xy=centers,
             trigger_channel=values["trigger_lane"],
         )
     except BaseException as primary:
@@ -162,7 +129,7 @@ def _connect_dcam(
         CAPABILITY_CAMERA_CAPTURE: BoundCapturePort(attestation),
         CAPABILITY_CAMERA_MONITOR: BoundCameraMonitorPort(attestation),
         CAPABILITY_CAMERA_SIGNAL_ASSOCIATION: endpoint,
-        CAPABILITY_READOUT_APPARATUS: apparatus,
+        CAPABILITY_READOUT_BINDING: readout_binding,
     }, camera.close
 
 
@@ -192,7 +159,6 @@ def _connect_pylon(
             exposure_seconds=values["exposure_seconds"],
             trigger_source=values["trigger_source"],
             roi_xywh=roi,
-            timeout_seconds=values["timeout_seconds"],
         )
     )
     if not isinstance(camera, CameraAdapter):
@@ -264,10 +230,14 @@ _DCAM_SCHEMA = AuthoringSchema(
             choices=tuple(AuthoringChoice(value, str(value)) for value in (1, 2, 4, 8, 16)),
         ),
         *_ROI_FIELDS,
-        AuthoringField("trigger_lane", "text", "Trigger lane", "ch11", True),
-        AuthoringField("grid_rows", "int", "Grid rows", 1, True, minimum=1),
-        AuthoringField("grid_columns", "int", "Grid columns", 1, True, minimum=1),
-        AuthoringField("site_centers_json", "text", "Site centers [x,y]", "[[0,0]]", True),
+        AuthoringField(
+            "trigger_lane",
+            "text",
+            "Sequencer trigger lane",
+            "ch11",
+            True,
+            description="Installation wiring: FPGA lane connected to the qCMOS external trigger.",
+        ),
     )
 )
 _PYLON_SCHEMA = AuthoringSchema(
@@ -286,15 +256,13 @@ _PYLON_SCHEMA = AuthoringSchema(
         AuthoringField("trigger_source", "text", "Trigger source", "Line1", True),
         *_ROI_FIELDS,
         AuthoringField(
-            "timeout_seconds",
-            "float",
-            "Frame timeout",
-            2.0,
+            "trigger_lane",
+            "text",
+            "Sequencer trigger lane",
+            "ch06",
             True,
-            unit="s",
-            minimum=_POSITIVE,
+            description="Installation wiring: FPGA lane connected to the Basler trigger input.",
         ),
-        AuthoringField("trigger_lane", "text", "Trigger lane", "ch06", True),
     )
 )
 
@@ -309,7 +277,7 @@ DEVICE_TYPES = (
             CAPABILITY_CAMERA_CAPTURE,
             CAPABILITY_CAMERA_MONITOR,
             CAPABILITY_CAMERA_SIGNAL_ASSOCIATION,
-            CAPABILITY_READOUT_APPARATUS,
+            CAPABILITY_READOUT_BINDING,
         ),
         (("sequencer_ref", CAPABILITY_EXTERNAL_TRIGGER_CLIENT),),
         _connect_dcam,

@@ -328,7 +328,6 @@ def test_failed_candidate_restores_the_previous_graph_on_the_same_experiment(
         "remote_pulse",
         host="127.0.0.1",
         port=1,
-        transport_timeout_seconds=0.05,
     )
     try:
         with pytest.raises(Exception):

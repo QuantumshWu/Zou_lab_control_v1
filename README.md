@@ -64,23 +64,20 @@ The same public API is used by scripts, notebooks, and desktop products:
 ```python
 from pathlib import Path
 
-from Zou_lab_control.api import InstallationConfigDocument, connect
-from Zou_lab_control.api import WorkspacePaths
+from Zou_lab_control.api import WorkspacePaths, connect, installation_template
 
-installation = InstallationConfigDocument.from_parameters(
-    "virtual",
-    {"seed": 7},
-)
+installation = installation_template("virtual", seed=7)
 exp = connect(
     installation,
     workspace=WorkspacePaths.for_workspace(Path.cwd()),
 )
 ```
 
-For a real apparatus, author and initialize the `hardware` backend in
-DeviceManager. Programmatic composition uses the same
-`InstallationConfigDocument.from_parameters("hardware", values)` API; there are
-no backend-specific convenience classmethods.
+For a real apparatus, author and initialize the ordered `hardware` graph in
+DeviceManager. Programmatic composition uses the same leaf-owned template:
+`installation_template("hardware", host=..., serial=...)`. Device installation
+contains only identities, hardware working points, and trigger wiring; lattice
+geometry belongs to the Calibration Task, not the camera card.
 
 Ordinary application and GUI code receives typed facades and immutable artifacts,
 not raw camera, sequencer, registry, or SDK objects.
