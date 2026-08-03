@@ -163,27 +163,24 @@ class PulseScanView(QtWidgets.QWidget):
         self.scan_repeats_spin.editingFinished.connect(self._commit_repeats)
         run_row.addWidget(self.scan_repeats_spin)
 
-        self.scan_hold_button = FluentButton("Stop ▸ hold point", color=RED)
+        self.scan_hold_button = FluentButton("Hold current point", color=RED)
         self.scan_hold_button.setFixedHeight(row_height())
         self.scan_hold_button.setToolTip(
-            "Stop the running scan and HOLD the CURRENT scan point: reloads a "
-            "single-point pulse built from that point's values and loops it "
-            "forever.  Re-run the Scan to resume sweeping."
+            "Apply the CURRENT scan point in place and hold it forever. "
+            "The existing Pulse Run and device ownership remain active."
         )
         self.scan_hold_button.clicked.connect(self.holdRequested)
         run_row.addWidget(self.scan_hold_button)
 
         self.scan_step_back_button = FluentButton("◀ step", color=ORANGE)
         self.scan_step_back_button.setToolTip(
-            "Step the HELD scan point one row BACK in the scan table (clamped "
-            "at point 1, no wrap).  If the scan is still running, stops and "
-            "holds first -- like Stop ▸ hold point."
+            "Apply the held scan point one row BACK (clamped at point 1, no "
+            "wrap) through the existing Pulse Run."
         )
         self.scan_step_forward_button = FluentButton("step ▶", color=ORANGE)
         self.scan_step_forward_button.setToolTip(
-            "Step the HELD scan point one row FORWARD in the scan table "
-            "(clamped at the last point, no wrap).  If the scan is still "
-            "running, stops and holds first -- like Stop ▸ hold point."
+            "Apply the held scan point one row FORWARD (clamped at the last "
+            "point, no wrap) through the existing Pulse Run."
         )
         for button, delta in (
             (self.scan_step_back_button, -1),

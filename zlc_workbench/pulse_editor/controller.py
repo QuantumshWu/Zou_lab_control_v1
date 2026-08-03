@@ -116,6 +116,8 @@ class PulseRunFacade(Protocol):
 
     def cancel_active(self, reason: str = ...) -> object | None: ...
 
+    def replace_active(self, request: PulseRunRequest) -> Future: ...
+
     def observe_scan_progress(self) -> PulseScanProgress | None: ...
 
 
@@ -136,6 +138,7 @@ class OwnedPulseConnection:
             "snapshot",
             "observe_active",
             "cancel_active",
+            "replace_active",
         )
         if any(not callable(getattr(self.pulse, name, None)) for name in required):
             raise TypeError("connection pulse must provide the current application facade")
@@ -431,7 +434,8 @@ class PulseEditorController:
         self._scan_progress_inflight = False
         self._held_scan_source: PulseDocument | None = None
         self._held_scan_index: int | None = None
-        self._pending_hold: tuple[PulseDocument, int, str] | None = None
+        self._pending_hold: tuple[PulseDocument, int, str, int] | None = None
+        self._hold_generation = 0
         self._save_inflight = False
         self._load_inflight = False
         self._connect_inflight = False
@@ -1440,6 +1444,7 @@ class PulseEditorController:
         )
         self._held_scan_source = None
         self._held_scan_index = None
+        self._hold_generation += 1
         self._pending_hold = None
         self._replace_run(pending)
 
@@ -1568,6 +1573,12 @@ class PulseEditorController:
         point = max(0, min(int(index), len(table.rows) - 1))
         if self._held_scan_source is source and self._held_scan_index == point:
             return
+        if (
+            self._pending_hold is not None
+            and self._pending_hold[0] is source
+            and self._pending_hold[1] == point
+        ):
+            return
         frozen = resolve_scan_point(source, point)
         api_values = tuple(
             (
@@ -1576,14 +1587,26 @@ class PulseEditorController:
             )
             for parameter in frozen.api_parameters
         )
-        self._pending_hold = (source, point, frozen.fingerprint)
-        self._replace_run(
-            (
-                frozen,
-                PulseExecutionForm.CONTINUOUS_MONITOR,
-                api_values,
-                1,
-            )
+        pulse = self._pulse
+        if pulse is None:
+            raise RuntimeError("No installation is attached.")
+        request = pulse.request(
+            frozen,
+            PulseExecutionForm.CONTINUOUS_MONITOR,
+            api_values=dict(api_values),
+        )
+        self._hold_generation += 1
+        generation = self._hold_generation
+        self._pending_hold = (source, point, frozen.fingerprint, generation)
+        try:
+            applied = pulse.replace_active(request)
+        except BaseException:
+            self._pending_hold = None
+            raise
+        self._submit(
+            "replace",
+            (generation, source, point, frozen.fingerprint),
+            applied.result,
         )
 
     def hold_scan_point(self) -> None:
@@ -1598,13 +1621,14 @@ class PulseEditorController:
         if self._held_scan_source is not None and self._held_scan_index is not None:
             source, index = self._held_scan_source, self._held_scan_index
         elif self._pending_hold is not None:
-            source, index, _fingerprint = self._pending_hold
+            source, index, _fingerprint, _generation = self._pending_hold
         else:
             source, index = self._active_scan_point()
         self._queue_held_scan_point(source, index + delta)
 
     def cancel(self, reason: str = "PulseGUI Stop Pulse") -> None:
         self._pending_start = None
+        self._hold_generation += 1
         self._pending_hold = None
         self._held_scan_source = None
         self._held_scan_index = None
@@ -1813,6 +1837,33 @@ class PulseEditorController:
                         continue
                     self._scan_progress = progress
                     changes.scan_progress = True
+                continue
+            if kind == "replace":
+                generation, source, point, fingerprint = token
+                try:
+                    applied = future.result()
+                    if not isinstance(applied, AppliedPulseSnapshot):
+                        raise TypeError(
+                            "pulse replacement returned another applied snapshot"
+                        )
+                except BaseException as error:
+                    if generation == self._hold_generation:
+                        self._pending_hold = None
+                        self._diagnostic = (
+                            f"Pulse point apply failed: {type(error).__name__}: {error}"
+                        )
+                        changes.runtime = True
+                    continue
+                if generation != self._hold_generation:
+                    continue
+                self._pending_hold = None
+                self._held_scan_source = source
+                self._held_scan_index = point
+                self._applied_snapshot = applied
+                self._scan_progress = None
+                self._diagnostic = ""
+                changes.runtime = True
+                changes.scan_progress = True
                 continue
             if kind == "scan-generate":
                 operation, schema, source = token
@@ -2421,28 +2472,10 @@ class PulseEditorController:
                 self._scan_progress = None
             self._run_snapshot = observation.run
             self._applied_snapshot = observation.applied
-            if observation.applied is not None:
-                pending_hold = self._pending_hold
-                if (
-                    pending_hold is not None
-                    and observation.applied.source_document.fingerprint
-                    == pending_hold[2]
-                ):
-                    if observation.run.state.terminal:
-                        self._pending_hold = None
-                        self._held_scan_source = None
-                        self._held_scan_index = None
-                    else:
-                        self._held_scan_source = pending_hold[0]
-                        self._held_scan_index = pending_hold[1]
-                        self._pending_hold = None
-                elif (
-                    self._held_scan_source is not None
-                    and observation.run.state.terminal
-                    and not observation.request.document.scan_parameters
-                ):
-                    self._held_scan_source = None
-                    self._held_scan_index = None
+            if observation.run.state.terminal:
+                self._pending_hold = None
+                self._held_scan_source = None
+                self._held_scan_index = None
         else:
             self._scan_progress = None
         if handle is not None and observation is None:

@@ -553,7 +553,9 @@ Identity严格按成本和消费者限定：
 ### C5：PulseGUI narrow hold/step
 
 - 建立replace-applied-pulse命令并复用现有compile/upload/prepare/fire seam；缓存同document revision points，原子更新held front。
-- 删除完整Run cancel/reap/restart路径与其UI重投影；分别profile compile、RPC/upload、safe/reap、UI，保持RTL/Tcl/XDC/bitstream/wire零diff。
+- `PulseApplicationOwner.replace_active()`只把typed`PulseRunRequest`排进当前Run的sequencer owner lane并返回receipt future；owner lane用同一个按document fingerprint/API值键控的短期编译缓存，执行现有SAFE interrupt→prepare→FIRE。`PulseSession`保持同一Run、lease、session id；endpoint只有在SAFE readback确认后才把已关闭段标成可再次prepare，不能凭GUI状态或旧revision直接换写。
+- hold/step只在收到applied receipt后更新held front、applied事实与文本；首尾clamp、不wrap、不清空中间文本，失败只报告本次命令错误。它不创建全局snapshot、不制造第二Run、不把编译或transport I/O放进Qt线程；Offline仍仅保留编辑/预览，不能伪造硬件hold。
+- 删除 hold/step 原有的完整Run cancel/reap/restart路径与其UI重投影；普通 On-Pulse 的新文档替换仍沿既有Run admission语义。分别profile compile、RPC/upload、safe/reap、UI，保持RTL/Tcl/XDC/bitstream/wire零diff。
 - 通过Virtual/Remote/Offline与真实server路径验证Stop/hold/step、dirty state、endpoint clamp和稳定文本。
 
 ### C6：领域E2E、性能与全仓清理

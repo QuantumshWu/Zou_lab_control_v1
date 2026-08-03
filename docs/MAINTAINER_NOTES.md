@@ -72,10 +72,22 @@
 
 - 定向产品流：Camera live→Area→第二 Image→两处 Fit、Occupancy 手动绑定、MOT live→FINAL、DeviceManager graph flow、TaskConsole start gate 全部通过；新增 Camera Area patch contract 与 headless discovery 也通过。
 - 当前全套回归：`824 passed, 1 skipped`，总耗时约 146 秒；headless Logic discovery 未加载 Matplotlib/Qt。`git diff --check`通过，RTL/Tcl/XDC/bitstream/wire protocol无diff。
-- C4 已由 `0adaacd` 提交，包含 16 个生产/测试/设计文件（806 insertions, 28 deletions）；受保护用户文件 `pulses/scan_test.json` 仍未读取、未修改、未 stage、未 commit。
+- C4 已由 `2e83365` 提交，包含 16 个生产/测试/设计文件（806 insertions, 28 deletions）；受保护用户文件 `pulses/scan_test.json` 仍未读取、未修改、未 stage、未 commit。
 
-## 当前下一步：C5 PulseGUI narrow hold/step
+## C5 已闭合的 owner
 
-只按 `docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md` §2、§6、§8 C5、§9 推进：审查并收敛 PulseGUI 的 narrow hold/step 语义、现有 server/API-slot 路径和不可变 pulse 文档；保持 hold/step 只操作当前运行态，不引入全局 snapshot 或新安全门。先列唯一 owner、删除清单和当前 LOC，再做一个 dependency-closed 产品纵切；不得为旧测试/API 留兼容，不复核已经闭合的 C1/C2/C3/C4。
+- Pulse hold/step 已改成当前 Run 内的 typed replacement：`PulseApplicationOwner.replace_active()` 返回 receipt future；Run owner lane 复用同一 compile/upload/prepare/FIRE seam，SAFE readback 后可重用同一 sequencer session/lease，不走 cancel→terminal→reap→new Run。replacement 编译结果按 document fingerprint/API 值在当前 plan 内缓存。
+- PulseGUI 只在 receipt 到达后原子更新 held point/applied front；首尾 clamp、不 wrap、失败不清空旧文本。离线仍只可编辑/预览；普通 On-Pulse 文档替换不被这条 narrow seam 改写。
+- Virtual/Remote/Qt 流已覆盖 hold、step、Stop；产品测试额外断言 hold/step 前后 `RunId` 不变。endpoint interrupt 只有在 SAFE readback 成功后才把旧段标为可再次 prepare；RTL/Tcl/XDC/bitstream/wire protocol 未改。
 
-恢复时严格依次完整读取当前 Goal、`AGENTS.md`、本文件、Git branch/HEAD/status/recent log，再只读台账当前未闭合项和设计对应章节。不得重答、重审或重做 C1/C2/C3/C4；若发现矛盾，先停止该 cut，更新设计与删除清单后再实现。
+## C5 证据与规模
+
+- C5 已提交；以当前 `git log -1` checkpoint 为准。
+- 定向 PulseGUI/应用集合：`32 passed`，16.20 秒；Remote server 流 5.44 秒，Virtual hold/step 流 1.77 秒，编译与 transport I/O 均不在 Qt 线程。
+- 全套回归：`824 passed, 1 skipped`，总耗时 150.31 秒；仅有既存 zmq Proactor selector-thread warning。`git diff --check`通过，C5 未改 RTL/Tcl/XDC/bitstream/wire protocol，受保护用户文件仍未读取、未修改、未 stage、未 commit。
+
+## 当前下一步：C6 领域E2E、性能与全仓清理
+
+只按 `docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md` §8 C6、§9 推进：领域 E2E、性能证据和全仓删除扫描。不得重做已经闭合的 C1–C5；不得为旧测试/API留兼容。若发现设计与实现矛盾，先停止该 cut，更新设计与删除清单后再实现。
+
+恢复时严格依次完整读取当前 Goal、`AGENTS.md`、本文件、Git branch/HEAD/status/recent log，再只读台账当前未闭合项和设计对应章节。不得重答、重审或重做 C1/C2/C3/C4/C5；若发现矛盾，先停止该 cut，更新设计与删除清单后再实现。

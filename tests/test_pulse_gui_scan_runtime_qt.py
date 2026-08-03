@@ -69,6 +69,7 @@ def test_operator_observes_holds_steps_and_stops_virtual_scan(tmp_path) -> None:
             lambda: body.active_snapshot is not None
             and body.active_snapshot.state is RunState.RUNNING,
         )
+        run_id = body.active_snapshot.run_id
 
         _click_tab(body, body.scan_view)
         _until(
@@ -90,6 +91,8 @@ def test_operator_observes_holds_steps_and_stops_virtual_scan(tmp_path) -> None:
                 "held at point "
             ),
         )
+        assert body.active_snapshot is not None
+        assert body.active_snapshot.run_id == run_id
         held = body._controller.runtime_update().held_scan_point
         assert held is not None
         old_index, total, _values = held
@@ -105,6 +108,8 @@ def test_operator_observes_holds_steps_and_stops_virtual_scan(tmp_path) -> None:
             lambda: body._controller.runtime_update().held_scan_point is not None
             and body._controller.runtime_update().held_scan_point[0] == expected,
         )
+        assert body.active_snapshot is not None
+        assert body.active_snapshot.run_id == run_id
         assert body.scan_view.scan_progress_label.text().startswith(
             f"held at point {expected + 1}/{total}:"
         )

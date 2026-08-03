@@ -745,6 +745,34 @@ class PulseSession:
             raise
         self._state = _PulseSessionState.FIRED
 
+    def replace(
+        self,
+        context: RunContext,
+        request: ContinuousPulseExecutionRequest,
+    ) -> None:
+        """Apply a new continuous artifact without replacing the enclosing Run.
+
+        The Run owner thread first uses its existing thread-safe SAFE interrupt,
+        then reuses this session's prepare/FIRE commands.  No second Run, lease,
+        or UI-wide state projection is created; the current session remains the
+        sole hardware owner throughout the hand-off.
+        """
+
+        self._assert_owner_thread()
+        if not isinstance(request, ContinuousPulseExecutionRequest):
+            raise TypeError("pulse replacement requires a continuous request")
+        if not isinstance(self._request, ContinuousPulseExecutionRequest):
+            raise RuntimeError("only a continuous pulse can be replaced in place")
+        if self._state is not _PulseSessionState.FIRED:
+            raise RuntimeError("pulse replacement requires an active fired session")
+        context.checkpoint()
+        context._run_interrupts(self._port.interrupt_operations)
+        self._request = request
+        self._state = _PulseSessionState.NEW
+        self._terminal = None
+        self.prepare(context)
+        self.fire(context)
+
     def complete(self, context: RunContext) -> PulseTerminalAck:
         self._assert_owner_thread()
         if isinstance(self._request, ContinuousPulseExecutionRequest):

@@ -196,6 +196,14 @@ class PulseFacade:
         with _service_guard(self._services) as services:
             return services.pulse_application.observe_scan_progress()
 
+    def replace_active(self, request: PulseRunRequest):
+        """Queue an in-place hold/step replacement on the active pulse Run."""
+
+        if not isinstance(request, PulseRunRequest):
+            raise TypeError("replacement request must be PulseRunRequest")
+        with _service_guard(self._services) as services:
+            return services.pulse_application.replace_active(request)
+
     def cancel_active(
         self,
         reason: str = "user requested pulse stop",
@@ -646,6 +654,7 @@ def _prepare_pulse_for_services(
         ),
         start_run=lambda plan: _application_start_run(services, plan),
         on_applied=services.pulse_application._record_applied,
+        on_replace_ready=services.pulse_application._record_replace,
     )
 
 

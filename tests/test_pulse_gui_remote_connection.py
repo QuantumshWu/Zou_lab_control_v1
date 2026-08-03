@@ -52,6 +52,8 @@ class _Backend:
         self.actions: list[str] = []
         self.state = "IDLE"
         self.scan_points = 0
+        self.cursor = 0
+        self.cursor_sample_count = 0
 
     def prepare(self, artifact) -> None:
         self.prepared = artifact
@@ -59,11 +61,14 @@ class _Backend:
         self.actions.append("prepare")
         self.state = "PREPARED"
         self.scan_points = len(artifact.target_ir.scan_points)
+        self.cursor = 0
+        self.cursor_sample_count = 0
 
     def fire(self, artifact) -> None:
         assert artifact is self.prepared
         self.actions.append("fire")
         self.state = "RUNNING"
+        self.cursor_sample_count = 1 if self.scan_points else 0
 
     def await_completion(self, artifact, _timeout):
         assert artifact is self.prepared
@@ -84,6 +89,7 @@ class _Backend:
         self.safe = True
         self.actions.append("safe")
         self.state = "SAFE"
+        self.cursor_sample_count = 0
 
     def request_interrupt(self) -> None:
         return None
@@ -94,6 +100,8 @@ class _Backend:
             raw_lane_count=len(_server_manifest().target.raw_lanes),
             artifact=self.prepared,
             scan_point_count=self.scan_points,
+            cursor=self.cursor,
+            cursor_sample_count=self.cursor_sample_count,
         )
 
 
@@ -288,6 +296,40 @@ def _run_remote_gui(workspace: Path) -> None:
             lambda: body.active_snapshot is not None
             and body.active_snapshot.state is RunState.RUNNING,
         )
+        remote_run_id = body.active_snapshot.run_id
+        _click_tab(body, body.scan_view)
+        _until(
+            application,
+            lambda: body.scan_view.scan_progress_label.text().startswith(
+                "Scan: point "
+            ),
+        )
+        QtTest.QTest.mouseClick(
+            body.scan_view.scan_hold_button,
+            QtCore.Qt.LeftButton,
+        )
+        _until(
+            application,
+            lambda: body._controller.runtime_update().held_scan_point is not None,
+        )
+        assert body.active_snapshot is not None
+        assert body.active_snapshot.run_id == remote_run_id
+        held = body._controller.runtime_update().held_scan_point
+        assert held is not None
+        held_index, total, _values = held
+        step = (
+            body.scan_view.scan_step_forward_button
+            if held_index < total - 1
+            else body.scan_view.scan_step_back_button
+        )
+        QtTest.QTest.mouseClick(step, QtCore.Qt.LeftButton)
+        _until(
+            application,
+            lambda: body._controller.runtime_update().held_scan_point is not None
+            and body._controller.runtime_update().held_scan_point[0] != held_index,
+        )
+        assert body.active_snapshot is not None
+        assert body.active_snapshot.run_id == remote_run_id
         QtTest.QTest.mouseClick(
             body.schedule_view.safe_button,
             QtCore.Qt.LeftButton,
@@ -308,8 +350,8 @@ def _run_remote_gui(workspace: Path) -> None:
     assert server_thread is not None and not server_thread.is_alive()
     assert service.snapshot().state == "SAFE"
     assert service.snapshot().safe_readback_confirmed
-    assert backend.actions.count("prepare") == 2
-    assert backend.actions.count("fire") == 2
+    assert backend.actions.count("prepare") == 4
+    assert backend.actions.count("fire") == 4
     assert backend.actions.count("complete") == 1
     assert backend.actions[-1] == "safe"
 

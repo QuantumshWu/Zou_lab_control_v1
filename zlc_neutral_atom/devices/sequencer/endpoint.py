@@ -398,11 +398,19 @@ class _SequencerSessionOwner:
     def interrupt(self) -> None:
         with self._condition:
             self._operation_epoch += 1
-            if self._session is not None:
-                self._session.closed = True
+            session = self._session
+            if session is not None:
+                session.closed = True
         snapshot = self._set_safe_state()
         if not self._backend._backend_safe_state_confirmed(snapshot):
             raise RuntimeError("sequencer interrupt did not reach verified SAFE state")
+        with self._condition:
+            # The interrupt path is also the in-place replacement seam.  Once
+            # the backend has proved SAFE, the closed segment is equivalent to
+            # a completed cleanup segment for the same Run and may be prepared
+            # again without a new Run/lease.
+            if session is not None and session.closed:
+                session.close_acknowledged = True
 
     def _validate_binding(self, binding: BoundDevice) -> None:
         _require_binding(binding, "sequencer", self._binding_instance_id)
