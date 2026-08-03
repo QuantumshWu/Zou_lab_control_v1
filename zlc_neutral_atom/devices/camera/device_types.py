@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Mapping
 
-from zlc_neutral_atom.authoring import AuthoringChoice, AuthoringField, AuthoringSchema
+from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema
 from zlc_neutral_atom.device_types import (
     CAPABILITY_CAMERA_CAPTURE,
     CAPABILITY_CAMERA_MONITOR,
@@ -31,6 +31,7 @@ from zlc_neutral_atom.runtime.resources import (
     PhysicalDeviceIdentity,
 )
 from zlc_pulse import RemotePulseExecutionClient
+from zlc_pulse import PORT_DIGITAL
 from zlc_storage import canonical_text
 
 
@@ -64,6 +65,36 @@ def _remote_dependency(dependencies: Mapping[str, object]) -> RemotePulseExecuti
     return client
 
 
+_READOUT_TRIGGER_PORT_LABEL = "emCCD"
+_MOT_TRIGGER_PORT_LABEL = "trig"
+
+
+def _target_trigger_channel(
+    client: RemotePulseExecutionClient,
+    port_label: str,
+) -> str:
+    """Resolve one physical trigger lane from the pulse target, not camera config.
+
+    The pulse target/server is the authority for FPGA endpoint names and raw lanes.
+    Camera Device Manager cards therefore never duplicate a trigger-channel field.
+    """
+
+    target = client.snapshot().manifest.target
+    matches = tuple(
+        port
+        for port in target.ports
+        if port.kind == PORT_DIGITAL
+        and port.label == port_label
+        and len(port.lanes) == 1
+    )
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"pulse target must expose exactly one single-lane digital port "
+            f"labelled {port_label!r}; found {len(matches)}"
+        )
+    return matches[0].lanes[0]
+
+
 def _connect_dcam(
     instance: DeviceInstanceConfig,
     dependencies: Mapping[str, object],
@@ -74,6 +105,7 @@ def _connect_dcam(
         raise TypeError("broker must be DeviceBroker")
     client = _remote_dependency(dependencies)
     values = _DCAM_SCHEMA.freeze(instance.parameters)
+    trigger_channel = _target_trigger_channel(client, _READOUT_TRIGGER_PORT_LABEL)
     roi = _optional_roi(
         (
             values["roi_x"],
@@ -85,10 +117,10 @@ def _connect_dcam(
     )
     camera = DcamCameraAdapter(
         DcamCameraConfig(
-            capture_trigger_channels=(values["trigger_lane"],),
+            capture_trigger_channels=(trigger_channel,),
             exposure_seconds=values["exposure_seconds"],
             readout_speed=values["readout_speed"],
-            binning=values["binning"],
+            binning=1,
             roi_xywh=roi,
             device_index=values["device_index"],
         )
@@ -99,7 +131,7 @@ def _connect_dcam(
         qualify_external_trigger_path(
             client=client,
             camera=camera,
-            trigger_lane=values["trigger_lane"],
+            trigger_lane=trigger_channel,
         )
         endpoint = CameraMonitorEndpoint(
             camera,
@@ -117,7 +149,7 @@ def _connect_dcam(
         readout_binding = ReadoutInstallationBinding(
             camera_instance_id=instance.instance_id,
             sequencer_instance_id=instance.parameters["sequencer_ref"],
-            trigger_channel=values["trigger_lane"],
+            trigger_channel=trigger_channel,
         )
     except BaseException as primary:
         try:
@@ -143,6 +175,7 @@ def _connect_pylon(
         raise TypeError("broker must be DeviceBroker")
     client = _remote_dependency(dependencies)
     values = _PYLON_SCHEMA.freeze(instance.parameters)
+    trigger_channel = _target_trigger_channel(client, _MOT_TRIGGER_PORT_LABEL)
     roi = _optional_roi(
         (
             values["roi_x"],
@@ -155,7 +188,7 @@ def _connect_pylon(
     camera = PylonCameraAdapter(
         PylonCameraConfig(
             serial=values["serial"],
-            capture_trigger_channels=(values["trigger_lane"],),
+            capture_trigger_channels=(trigger_channel,),
             exposure_seconds=values["exposure_seconds"],
             trigger_source=values["trigger_source"],
             roi_xywh=roi,
@@ -167,7 +200,7 @@ def _connect_pylon(
         qualify_external_trigger_path(
             client=client,
             camera=camera,
-            trigger_lane=values["trigger_lane"],
+            trigger_lane=trigger_channel,
         )
         endpoint = CameraMonitorEndpoint(
             camera,
@@ -221,23 +254,7 @@ _DCAM_SCHEMA = AuthoringSchema(
             minimum=_POSITIVE,
         ),
         AuthoringField("readout_speed", "int", "Readout speed", 1, True, minimum=1),
-        AuthoringField(
-            "binning",
-            "choice",
-            "Binning",
-            1,
-            True,
-            choices=tuple(AuthoringChoice(value, str(value)) for value in (1, 2, 4, 8, 16)),
-        ),
         *_ROI_FIELDS,
-        AuthoringField(
-            "trigger_lane",
-            "text",
-            "Sequencer trigger lane",
-            "ch11",
-            True,
-            description="Installation wiring: FPGA lane connected to the qCMOS external trigger.",
-        ),
     )
 )
 _PYLON_SCHEMA = AuthoringSchema(
@@ -255,14 +272,6 @@ _PYLON_SCHEMA = AuthoringSchema(
         ),
         AuthoringField("trigger_source", "text", "Trigger source", "Line1", True),
         *_ROI_FIELDS,
-        AuthoringField(
-            "trigger_lane",
-            "text",
-            "Sequencer trigger lane",
-            "ch06",
-            True,
-            description="Installation wiring: FPGA lane connected to the Basler trigger input.",
-        ),
     )
 )
 

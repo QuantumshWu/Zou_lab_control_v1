@@ -27,12 +27,10 @@ INSTALLATION_TEMPLATES = {
                     "device_index": 0,
                     "exposure_seconds": 0.02,
                     "readout_speed": 1,
-                    "binning": 1,
                     "roi_x": None,
                     "roi_y": None,
                     "roi_width": None,
                     "roi_height": None,
-                    "trigger_lane": "ch11",
                 },
             ),
             DeviceInstanceConfig(
@@ -48,7 +46,6 @@ INSTALLATION_TEMPLATES = {
                     "roi_y": None,
                     "roi_width": None,
                     "roi_height": None,
-                    "trigger_lane": "ch06",
                 },
             ),
         )

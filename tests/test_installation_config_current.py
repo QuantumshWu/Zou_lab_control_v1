@@ -66,7 +66,14 @@ def test_real_hardware_template_keeps_calibration_geometry_out_of_devices():
     mot_camera = by_id["mot-camera"].parameters
     sequencer = by_id["sequencer"].parameters
 
-    assert {"grid_rows", "grid_columns", "site_centers_json"}.isdisjoint(camera)
+    assert {
+        "grid_rows",
+        "grid_columns",
+        "site_centers_json",
+        "binning",
+        "trigger_lane",
+    }.isdisjoint(camera)
+    assert "trigger_lane" not in mot_camera
     assert "timeout_seconds" not in mot_camera
     assert "transport_timeout_seconds" not in sequencer
     with pytest.raises(ValueError, match="has no fields"):
