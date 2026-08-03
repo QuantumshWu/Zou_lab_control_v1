@@ -237,8 +237,8 @@ class AuthoringSchema:
 
     def __post_init__(self) -> None:
         values = tuple(self.fields)
-        if not values or any(not isinstance(field, AuthoringField) for field in values):
-            raise TypeError("authoring schema requires AuthoringField values")
+        if any(not isinstance(field, AuthoringField) for field in values):
+            raise TypeError("authoring schema fields must be AuthoringField values")
         keys = tuple(field.key for field in values)
         if len(keys) != len(set(keys)):
             raise ValueError("authoring schema keys must be unique")

@@ -4,225 +4,198 @@ import json
 
 import pytest
 
+import zlc_neutral_atom.device_types as device_types
+from zlc_neutral_atom.authoring import AuthoringField, AuthoringSchema
+from zlc_neutral_atom.device_types import (
+    DeviceTypeDescriptor,
+    validate_installation_graph,
+)
 from zlc_neutral_atom.installation_config import (
     INSTALLATION_CONFIG_FORMAT,
-    InstallationConfigConflict,
+    DeviceInstanceConfig,
     InstallationConfigDocument,
+    discover_installation_templates,
+    installation_template,
     load_installation_config,
     save_installation_config,
-    default_installation_authoring_schema,
-)
-from zlc_neutral_atom.devices.sequencer.config import RemotePulseInstallationConfig
-from zlc_neutral_atom.devices.simulation.config import VirtualInstallationConfig
-from zlc_frontend.form import project_authoring_form
-from zlc_workbench.device_manager.editor_session import (
-    DeviceConfigEditorSession,
-    form_spec,
 )
 
 
-def _virtual(seed=7):
-    return InstallationConfigDocument.from_parameters("virtual", {"seed": seed})
-
-
-def _remote(
-    host="pulse-host",
-    port=18861,
-    transport_timeout_seconds=120.0,
-):
-    return InstallationConfigDocument.from_parameters(
-        "remote_pulse",
-        {
-            "host": host,
-            "port": port,
-            "transport_timeout_seconds": transport_timeout_seconds,
-        },
-    )
-
-
-def test_current_configs_round_trip_through_canonical_json(tmp_path):
+def test_ordered_graph_round_trips_as_ordinary_human_readable_json(tmp_path):
     documents = (
-        _virtual(seed=19),
-        _remote(
+        installation_template("virtual", seed=19),
+        installation_template(
+            "remote_pulse",
             host="pulse-host",
             port=18862,
             transport_timeout_seconds=45.5,
         ),
+        installation_template("hardware"),
+    )
+
+    assert discover_installation_templates() == (
+        "hardware",
+        "remote_pulse",
+        "virtual",
     )
     for index, document in enumerate(documents):
         path = tmp_path / f"installation-{index}.json"
-        digest = save_installation_config(path, document)
-
-        assert path.read_bytes() == document.to_bytes()
-        assert digest == document.content_digest
+        assert save_installation_config(path, document) is None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload == document.to_dict()
+        assert tuple(row["instance_id"] for row in payload["devices"]) == tuple(
+            item.instance_id for item in document.devices
+        )
         assert load_installation_config(path) == document
-
-    assert isinstance(documents[0].config, VirtualInstallationConfig)
-    assert isinstance(documents[1].config, RemotePulseInstallationConfig)
+        assert not tuple(tmp_path.glob("*.tmp"))
 
 
-def test_decoder_is_current_only_and_rejects_legacy_or_ambiguous_json():
+def test_template_override_is_schema_driven_without_backend_dispatch():
+    document = installation_template("virtual", seed=23)
+    seeded = tuple(
+        item.parameters["seed"]
+        for item in document.devices
+        if "seed" in item.parameters
+    )
+    assert seeded == (23, 23)
+    with pytest.raises(ValueError, match="has no fields"):
+        installation_template("virtual", backend="remote")
+
+
+def test_decoder_is_current_only_and_rejects_legacy_or_ambiguous_json(tmp_path):
     legacy = {
-        "camera": {"type": "QCMOSCamera", "params": {}},
-        "sequencer": {"type": "RemoteSequencer", "params": {}},
-    }
-    with pytest.raises(ValueError, match="exactly"):
-        InstallationConfigDocument.from_bytes(json.dumps(legacy).encode())
-
-    versioned = {
         "format": INSTALLATION_CONFIG_FORMAT,
-        "version": 1,
         "backend": "virtual",
         "parameters": {"seed": 7},
     }
     with pytest.raises(ValueError, match="exactly"):
-        InstallationConfigDocument.from_dict(versioned)
+        InstallationConfigDocument.from_dict(legacy)
 
-    unknown_backend = {
-        "format": INSTALLATION_CONFIG_FORMAT,
-        "backend": "class_registry",
-        "parameters": {},
+    unknown_format = {
+        "format": "legacy.installation",
+        "devices": [],
     }
-    with pytest.raises(ValueError, match="unsupported installation backend"):
-        InstallationConfigDocument.from_dict(unknown_backend)
+    with pytest.raises(ValueError, match="unsupported"):
+        InstallationConfigDocument.from_dict(unknown_format)
 
-    duplicate = (
-        '{"format":"zlc_neutral_atom.InstallationConfig",'
-        '"backend":"virtual","backend":"remote_pulse",'
-        '"parameters":{"seed":7}}'
-    )
-    with pytest.raises(ValueError, match="duplicate JSON key"):
-        InstallationConfigDocument.from_bytes(duplicate.encode())
-
-
-def test_field_contracts_reject_non_current_values():
-    with pytest.raises(TypeError, match="int"):
-        _virtual(seed=True)
-    with pytest.raises(ValueError, match="canonical"):
-        _remote(host=" pulse-host ")
-    with pytest.raises(ValueError, match="maximum"):
-        _remote(host="pulse-host", port=65536)
-    with pytest.raises(ValueError, match="minimum"):
-        _remote(
-            host="pulse-host",
-            transport_timeout_seconds=0.0,
-        )
-
-    extra_parameter = {
-        "format": INSTALLATION_CONFIG_FORMAT,
-        "backend": "remote_pulse",
-        "parameters": {
-            "host": "pulse-host",
-            "port": 18861,
-            "transport_timeout_seconds": 120.0,
-            "adapter_class": "module.RemoteSequencer",
-        },
-    }
-    with pytest.raises(ValueError, match="unknown fields"):
-        InstallationConfigDocument.from_dict(extra_parameter)
-
-
-def test_backend_owner_declares_device_manager_form_semantics():
-    virtual_schema = default_installation_authoring_schema("virtual")
-    assert form_spec("virtual") == project_authoring_form(virtual_schema)
-    assert virtual_schema.keys == ("seed",)
-    seed = virtual_schema.fields[0]
-    assert (
-        seed.kind,
-        seed.label,
-        seed.default,
-        seed.required,
-        seed.unit,
-        seed.minimum,
-        seed.maximum,
-        seed.allow_blank,
-    ) == ("int", "Random seed", 7, False, "", 0, None, True)
-    assert seed.description
-
-    remote_schema = default_installation_authoring_schema("remote_pulse")
-    assert form_spec("remote_pulse") == project_authoring_form(remote_schema)
-    assert remote_schema.keys == (
-        "host",
-        "port",
-        "transport_timeout_seconds",
-    )
-    host, port, timeout = remote_schema.fields
-    assert (host.kind, host.default, host.required) == ("text", "", True)
-    assert (port.kind, port.default, port.minimum, port.maximum) == (
-        "int",
-        18861,
-        1,
-        65535,
-    )
-    assert (
-        timeout.kind,
-        timeout.default,
-        timeout.required,
-        timeout.unit,
-        timeout.maximum,
-    ) == ("float", 120.0, True, "s", None)
-    assert timeout.minimum == float.fromhex("0x0.0000000000001p-1022")
-    assert all(field.description for field in remote_schema.fields)
-
-    current = _remote(
-        host="pulse-host",
-        port=18862,
-        transport_timeout_seconds=45.5,
-    )
-    assert form_spec(current).default_values() == {
-        "host": "pulse-host",
-        "port": 18862,
-        "transport_timeout_seconds": 45.5,
-    }
-    editor = DeviceConfigEditorSession(current)
-    editor.set_field("port", 18863)
-    assert editor.candidate() == _remote(
-        host="pulse-host",
-        port=18863,
-        transport_timeout_seconds=45.5,
-    )
-
-
-def test_expected_digest_is_a_real_compare_and_swap(tmp_path):
-    path = tmp_path / "installation.json"
-    first = _virtual(seed=1)
-    second = _virtual(seed=2)
-    third = _virtual(seed=3)
-
-    first_digest = save_installation_config(path, first)
-    second_digest = save_installation_config(
-        path,
-        second,
-        expected_digest=first_digest,
-    )
-    assert second_digest == second.content_digest
-
-    with pytest.raises(InstallationConfigConflict) as caught:
-        save_installation_config(
-            path,
-            third,
-            expected_digest=first_digest,
-        )
-    assert caught.value.expected_digest == first_digest
-    assert caught.value.actual_digest == second_digest
-    assert load_installation_config(path) == second
-    assert not tuple(tmp_path.glob("*.tmp"))
-
-
-def test_expected_digest_accepts_semantically_identical_reformat(tmp_path):
-    path = tmp_path / "installation.json"
-    document = _remote(host="pulse-host")
+    path = tmp_path / "duplicate.json"
     path.write_text(
-        json.dumps(document.to_dict(), indent=2),
+        '{"format":"zlc.installation","devices":[],"devices":[]}',
         encoding="utf-8",
     )
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        load_installation_config(path)
 
-    digest = document.content_digest
-    saved = save_installation_config(
-        path,
-        document,
-        expected_digest=digest,
+
+def test_graph_rejects_duplicate_unknown_missing_and_wrong_capability():
+    with pytest.raises(ValueError, match="instance_id"):
+        InstallationConfigDocument(
+            (
+                DeviceInstanceConfig("same", "a", "sequencer.virtual", {}),
+                DeviceInstanceConfig("same", "b", "sequencer.virtual", {}),
+            )
+        )
+    with pytest.raises(ValueError, match="roles"):
+        InstallationConfigDocument(
+            (
+                DeviceInstanceConfig("a", "same", "sequencer.virtual", {}),
+                DeviceInstanceConfig("b", "same", "sequencer.virtual", {}),
+            )
+        )
+
+    unknown = InstallationConfigDocument(
+        (DeviceInstanceConfig("mystery", "mystery", "device.unknown", {}),)
+    )
+    with pytest.raises(ValueError, match="unknown device type"):
+        validate_installation_graph(unknown)
+
+    missing = InstallationConfigDocument(
+        (
+            DeviceInstanceConfig(
+                "rf",
+                "rf",
+                "rf.virtual",
+                {"sequencer_ref": "missing"},
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="references missing"):
+        validate_installation_graph(missing)
+
+    wrong = InstallationConfigDocument(
+        (
+            DeviceInstanceConfig("mot", "mot", "camera.virtual_mot", {
+                "sequencer_ref": "mot",
+                "seed": 7,
+            }),
+        )
+    )
+    with pytest.raises(ValueError, match="does not provide"):
+        validate_installation_graph(wrong)
+
+
+def test_preflight_detects_cycles_without_calling_a_factory(monkeypatch):
+    calls = []
+
+    def factory(*_args):
+        calls.append("factory")
+        return {"test.link": object()}, lambda: None
+
+    descriptor = DeviceTypeDescriptor(
+        type_id="test.link",
+        domain="test",
+        label="Test link",
+        authoring_schema=AuthoringSchema(
+            (AuthoringField("peer", "text", "Peer", "", True),)
+        ),
+        capabilities=("test.link",),
+        requirements=(("peer", "test.link"),),
+        factory=factory,
+    )
+    monkeypatch.setattr(
+        device_types,
+        "discover_device_types",
+        lambda: (descriptor,),
+    )
+    document = InstallationConfigDocument(
+        (
+            DeviceInstanceConfig("a", "a", "test.link", {"peer": "b"}),
+            DeviceInstanceConfig("b", "b", "test.link", {"peer": "a"}),
+        )
     )
 
-    assert saved == digest
-    assert path.read_bytes() == document.to_bytes()
+    with pytest.raises(ValueError, match="cycle"):
+        validate_installation_graph(document)
+    assert calls == []
+
+
+def test_leaf_schema_rejects_unknown_or_invalid_parameters():
+    invalid = InstallationConfigDocument(
+        (
+            DeviceInstanceConfig(
+                "sequencer",
+                "sequencer",
+                "sequencer.remote_pulse",
+                {
+                    "host": "pulse-host",
+                    "port": 0,
+                    "transport_timeout_seconds": 120.0,
+                },
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="minimum"):
+        validate_installation_graph(invalid)
+
+    extra = InstallationConfigDocument(
+        (
+            DeviceInstanceConfig(
+                "sequencer",
+                "sequencer",
+                "sequencer.virtual",
+                {"backend": "legacy"},
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="unknown fields"):
+        validate_installation_graph(extra)

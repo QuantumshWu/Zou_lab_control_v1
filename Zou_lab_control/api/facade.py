@@ -14,8 +14,13 @@ from zlc_neutral_atom.installation import (
     DeviceCatalogView,
 )
 from zlc_neutral_atom.installation_config import (
+    DeviceInstanceConfig,
     InstallationConfigDocument,
+    installation_template,
     load_installation_config,
+)
+from zlc_neutral_atom.installation_runtime import (
+    create_installation,
 )
 from zlc_data import OwnedSnapshot
 from zlc_neutral_atom.capture.reference import CaptureArtifactRef
@@ -51,6 +56,7 @@ from ._application_services import (
     ExperimentServices as _ExperimentServices,
     WorkspacePaths,
     application_start_run as _application_start_run,
+    _prune_terminal_runs_locked,
     resolve_role as _resolve_role,
     service_guard as _service_guard,
     wait_for_close_attempt as _wait_for_close_attempt,
@@ -115,9 +121,13 @@ class PulseFacade:
                 None,
                 "sequencer",
                 ("sequencer",),
+                "pulse.execute",
             )
-            reference = services.catalog.require(role).ref
-            port = services.runtime.pulse_port(reference)
+            reference = services.catalog.require_role(role).ref
+            port = services.runtime.require_capability(
+                reference,
+                "pulse.execute",
+            )
             capability = port.capability
             return PulseTargetDescriptor(
                 reference,
@@ -144,8 +154,9 @@ class PulseFacade:
                 sequencer_role,
                 "sequencer",
                 ("sequencer",),
+                "pulse.execute",
             )
-            reference = services.catalog.require(role).ref
+            reference = services.catalog.require_role(role).ref
         if api_values is not None and not isinstance(api_values, Mapping):
             raise TypeError("api_values must be a mapping or None")
         requested_api_values = {} if api_values is None else dict(api_values)
@@ -216,14 +227,8 @@ class Experiment:
     """Public experiment root containing values, requests, and narrow APIs only."""
 
     __slots__ = (
-        "_artifact_operations",
-        "_services",
+        "_binding",
         "name",
-        "device_catalog",
-        "installation_config",
-        "pulse",
-        "readout",
-        "nodes",
     )
 
     def __init__(
@@ -236,7 +241,6 @@ class Experiment:
     ) -> None:
         if not isinstance(services, _ExperimentServices):
             raise TypeError("services must be _ExperimentServices")
-        self._services = services
         self.name = _text(name, "experiment name")
         if not isinstance(device_catalog, DeviceCatalogView):
             raise TypeError("device_catalog must be DeviceCatalogView")
@@ -244,15 +248,48 @@ class Experiment:
             raise TypeError(
                 "installation_config must be InstallationConfigDocument"
             )
-        self.device_catalog = device_catalog
-        self.installation_config = installation_config
-        self.readout = ReadoutFacade(services)
-        self.nodes = compose_logic_node_apis(
-            self.readout,
-            self.readout._artifact_capabilities(),
+        readout = ReadoutFacade(services)
+        nodes = compose_logic_node_apis(
+            readout,
+            readout._artifact_capabilities(),
         )
-        self._artifact_operations = self.nodes._artifact_operations
-        self.pulse = PulseFacade(services)
+        self._binding = (
+            services,
+            device_catalog,
+            installation_config,
+            readout,
+            nodes,
+            PulseFacade(services),
+            nodes._artifact_operations,
+        )
+
+    @property
+    def _services(self) -> _ExperimentServices:
+        return self._binding[0]
+
+    @property
+    def device_catalog(self) -> DeviceCatalogView:
+        return self._binding[1]
+
+    @property
+    def installation_config(self) -> InstallationConfigDocument:
+        return self._binding[2]
+
+    @property
+    def readout(self) -> ReadoutFacade:
+        return self._binding[3]
+
+    @property
+    def nodes(self):
+        return self._binding[4]
+
+    @property
+    def pulse(self) -> PulseFacade:
+        return self._binding[5]
+
+    @property
+    def _artifact_operations(self):
+        return self._binding[6]
 
     def pulse_gui(
         self,
@@ -317,17 +354,89 @@ class Experiment:
             existing_error=existing_error,
         )
 
-    def _close_for_device_restart(self) -> None:
-        """Close this installation while its DeviceManager remains the reporter.
+    def _replace_installation(
+        self,
+        candidate: InstallationConfigDocument,
+    ) -> None:
+        """Replace one idle installation while preserving this public object.
 
-        The bound DeviceManager initiated the explicit restart transition, so
-        it must survive long enough to receive and display the terminal admin
-        state.  Every other registered Workbench is retired by ``close()``.
+        The DeviceManager is the only caller.  This is the sole private
+        replacement seam: it freezes admission, retires every runtime-bound
+        Workbench except the initiating manager, reaches the old runtime's SAFE
+        terminal, composes the candidate, and publishes one complete binding in
+        a single assignment.  A failed candidate is never published.
         """
 
-        with _service_guard(self._services) as services:
-            services.gui_handles.pop("device-manager", None)
+        if not isinstance(candidate, InstallationConfigDocument):
+            raise TypeError("candidate must be InstallationConfigDocument")
+        if candidate == self.installation_config:
+            return
+
+        previous = self.installation_config
+        services = self._services
+        caller_thread_id = threading.get_ident()
+        retained_manager = None
+        with services.admission_lock:
+            _prune_terminal_runs_locked(services)
+            if services.active_runs:
+                raise RuntimeError(
+                    "installation Apply requires every active Run to finish or stop"
+                )
+            with services.operation_lock:
+                if services.state != "OPEN":
+                    raise RuntimeError("Experiment is closing or closed")
+                if services.operation_thread_counts.get(caller_thread_id, 0):
+                    raise RuntimeError(
+                        "installation Apply cannot run inside an Experiment operation"
+                    )
+                retained_manager = services.gui_handles.pop(
+                    "device-manager",
+                    None,
+                )
+                services.closing_gui_handles = tuple(
+                    services.gui_handles.values()
+                )
+                services.gui_handles.clear()
+                services.state = "CLOSING"
+                workspace = services.workspace_paths
+
         self.close()
+
+        def publish(replacement: "Experiment") -> None:
+            replacement_services = replacement._services
+            if retained_manager is not None:
+                with replacement_services.operation_lock:
+                    if replacement_services.state != "OPEN":
+                        raise RuntimeError(
+                            "replacement Experiment closed before publication"
+                        )
+                    replacement_services.gui_handles[
+                        "device-manager"
+                    ] = retained_manager
+            self._binding = replacement._binding
+
+        try:
+            replacement = connect(
+                candidate,
+                workspace=workspace,
+                name=self.name,
+            )
+        except BaseException as apply_error:
+            try:
+                restored = connect(
+                    previous,
+                    workspace=workspace,
+                    name=self.name,
+                )
+                publish(restored)
+            except BaseException as restore_error:
+                raise BaseExceptionGroup(
+                    "installation Apply failed and the previous installation "
+                    "could not be restored",
+                    [apply_error, restore_error],
+                ) from apply_error
+            raise
+        publish(replacement)
 
     def start(self, request: CaptureRequest) -> RunHandle:
         return self.readout.prepare_capture(request).start()
@@ -563,7 +672,10 @@ def _prepare_pulse_for_services(
 ) -> PreparedPulseExecution:
     return prepare_pulse_execution(
         request,
-        pulse_port=services.runtime.pulse_port(request.sequencer_ref),
+        pulse_port=services.runtime.require_capability(
+            request.sequencer_ref,
+            "pulse.execute",
+        ),
         start_run=lambda plan: _application_start_run(services, plan),
         on_applied=services.pulse_application._record_applied,
     )
@@ -611,14 +723,12 @@ def _resolve_installation_document(
             "InstallationConfigDocument"
         )
     if config == "virtual":
-        return InstallationConfigDocument.from_parameters(
-            "virtual",
-            {} if seed is _CONNECT_SEED_UNSET else {"seed": seed},
-        )
+        parameters = {} if seed is _CONNECT_SEED_UNSET else {"seed": seed}
+        return installation_template("virtual", **parameters)
     if config == "remote_pulse":
         raise ValueError(
             "remote_pulse requires a saved installation config or "
-            "InstallationConfigDocument.from_parameters('remote_pulse', ...)"
+            "installation_template('remote_pulse', host=..., port=...)"
         )
     if seed is not _CONNECT_SEED_UNSET:
         raise ValueError("seed cannot override a saved installation config")
@@ -653,8 +763,6 @@ def connect(
         durable_makedirs(captures_root)
         calibrations_root = output_root / "calibrations"
         durable_makedirs(calibrations_root)
-        from zlc_neutral_atom.installation_dispatch import create_installation
-
         installation = create_installation(
             installation_document,
             required_pulse_document=required_pulse_document,
@@ -742,8 +850,10 @@ __all__ = [
     "CaptureRequest",
     "connect",
     "device_manager",
+    "DeviceInstanceConfig",
     "Experiment",
     "InstallationConfigDocument",
+    "installation_template",
     "PlanDescriptor",
     "PreparedPulseExecution",
     "PulseFacade",

@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import Callable
 
-from zlc_neutral_atom.installation_config import InstallationConfigDocument
+from zlc_neutral_atom.installation_config import (
+    InstallationConfigDocument,
+    installation_template,
+)
 from zlc_pulse import PulseDocument
 
 
@@ -154,10 +156,7 @@ def standalone_pulse_connection_factory(workspace):
         if not isinstance(required_document, PulseDocument):
             raise TypeError("required_document must be PulseDocument")
         if mode == "virtual":
-            document = InstallationConfigDocument.from_parameters(
-                "virtual",
-                {},
-            )
+            document = installation_template("virtual")
             connection = connect(
                 document,
                 workspace=workspace,
@@ -166,12 +165,10 @@ def standalone_pulse_connection_factory(workspace):
         elif mode == "remote":
             if host is None or port is None:
                 raise ValueError("remote Pulse connection requires host and port")
-            document = InstallationConfigDocument.from_parameters(
+            document = installation_template(
                 "remote_pulse",
-                {
-                    "host": host,
-                    "port": port,
-                },
+                host=host,
+                port=port,
             )
             connection = connect(
                 document,
@@ -196,40 +193,38 @@ def standalone_pulse_connection_factory(workspace):
 
 
 def bound_pulse_mode(experiment) -> str:
-    """Project the immutable installation backend into PulseGUI's mode choice."""
+    """Project the bound pulse capability into PulseGUI's mode choice."""
 
     experiment = _require_experiment(experiment)
-    from zlc_neutral_atom.installation_package import installation_package
+    from Zou_lab_control.api._application_services import service_guard
 
-    package = installation_package(experiment.installation_config.backend)
-    mode = package.pulse_editor_mode
-    if mode is None:
+    target = experiment.pulse.target
+    with service_guard(experiment._services) as services:
+        port = services.runtime.require_capability(
+            target.sequencer_ref,
+            "pulse.execute",
+        )
+        mode = getattr(port, "editor_connection_mode", None)
+    if mode not in {"virtual", "remote"}:
         raise ValueError(
-            f"installation backend {package.backend!r} has no Pulse editor mode"
+            "the bound pulse capability does not declare a virtual/remote "
+            "editor connection mode"
         )
     return mode
 
 
 class ExperimentDeviceAdmin:
-    """Composition-owned implementation of DeviceManager's narrow admin port.
-
-    A standalone manager owns the Experiment it creates and closes it when its
-    owner window is retired.  A manager opened from an existing Experiment only
-    borrows that authority: disposing the window never closes the Experiment.
-    The explicit ``shutdown_for_restart`` command remains the sole UI operation
-    allowed to request installation shutdown.
-    """
+    """Composition-owned implementation of DeviceManager's narrow admin port."""
 
     __slots__ = (
         "_active",
-        "_connect",
         "_disposed",
-        "_initializing",
+        "_ever_active",
+        "_applying",
         "_lock",
         "_name",
         "_owns_active",
         "_workspace",
-        "_terminated",
     )
 
     def __init__(
@@ -240,8 +235,6 @@ class ExperimentDeviceAdmin:
         active=None,
         owns_active: bool,
     ) -> None:
-        from Zou_lab_control.api.facade import connect
-
         if active is not None:
             active = _require_experiment(active)
         if owns_active:
@@ -256,7 +249,6 @@ class ExperimentDeviceAdmin:
                 raise ValueError("DeviceManager experiment name must be non-empty")
             self._workspace = workspace
             self._name = resolved_name
-            self._connect: Callable | None = connect
         else:
             if active is None:
                 raise ValueError("bound DeviceManager requires an Experiment")
@@ -266,12 +258,11 @@ class ExperimentDeviceAdmin:
                 )
             self._workspace = None
             self._name = active.name
-            self._connect = None
         self._active = active
         self._owns_active = bool(owns_active)
         self._disposed = False
-        self._initializing = False
-        self._terminated = False
+        self._ever_active = active is not None
+        self._applying = False
         self._lock = threading.RLock()
 
     @classmethod
@@ -302,88 +293,88 @@ class ExperimentDeviceAdmin:
         with self._lock:
             active = self._active
             disposed = self._disposed
-            terminated = self._terminated
+            applying = self._applying
+            can_apply = (
+                not disposed
+                and not applying
+                and (active is not None or not self._ever_active)
+            )
         if active is None:
             return DeviceAdminState(
                 None,
                 None,
                 None,
-                can_initialize=not disposed and not terminated,
-                closed=terminated or disposed,
+                can_apply=can_apply,
+                closed=disposed,
             )
         catalog = active.device_catalog
         return DeviceAdminState(
             active.installation_config,
             catalog,
             catalog.runtime_instance_id,
-            can_initialize=False,
+            can_apply=can_apply,
+            closed=disposed,
         )
 
-    def assess(self, candidate: InstallationConfigDocument):
-        from zlc_workbench.device_manager.controller import ConfigChange
-
+    def apply(self, candidate: InstallationConfigDocument):
         if not isinstance(candidate, InstallationConfigDocument):
             raise TypeError("candidate must be InstallationConfigDocument")
+        from zlc_neutral_atom.device_types import validate_installation_graph
+
+        # This preflight is pure: no old owner, device factory, or transport is
+        # touched before the complete candidate graph has been accepted.
+        validate_installation_graph(candidate)
         with self._lock:
             if self._disposed:
                 raise RuntimeError("Device manager authority is closed")
+            if self._applying:
+                raise RuntimeError("an installation Apply is already running")
             active = self._active
-            if active is None:
-                if self._terminated:
-                    raise RuntimeError(
-                        "a shut down installation must be restarted in a new process"
-                    )
-                return ConfigChange(
-                    candidate.content_digest,
-                    None,
-                    initialization_required=True,
-                    restart_required=False,
-                )
-            active_digest = active.installation_config.content_digest
-        return ConfigChange(
-            candidate.content_digest,
-            active_digest,
-            initialization_required=False,
-            restart_required=candidate.content_digest != active_digest,
-        )
-
-    def initialize_once(self, candidate: InstallationConfigDocument):
-        if not isinstance(candidate, InstallationConfigDocument):
-            raise TypeError("candidate must be InstallationConfigDocument")
-        with self._lock:
-            connect = self._connect
-            workspace = self._workspace
-            if not self._owns_active or connect is None or workspace is None:
-                raise RuntimeError("a bound DeviceManager cannot initialize a replacement")
-            if self._disposed:
-                raise RuntimeError("Device manager authority is closed")
-            if self._terminated:
+            if active is None and self._ever_active:
                 raise RuntimeError(
-                    "a shut down installation must be restarted in a new process"
+                    "the previous installation could not be restored; "
+                    "no active session remains"
                 )
-            if self._active is not None or self._initializing:
-                raise RuntimeError("an installation is already active or initializing")
-            self._initializing = True
+            workspace = self._workspace
+            self._applying = True
+
         try:
-            active = connect(
-                candidate,
-                workspace=workspace,
-                name=self._name,
-            )
+            if active is None:
+                if not self._owns_active or workspace is None:
+                    raise RuntimeError("bound DeviceManager has no active Experiment")
+                from Zou_lab_control.api.facade import connect
+
+                applied = connect(
+                    candidate,
+                    workspace=workspace,
+                    name=self._name,
+                )
+            else:
+                active._replace_installation(candidate)
+                applied = active
         except BaseException:
             with self._lock:
-                self._initializing = False
+                self._applying = False
+                if active is not None:
+                    try:
+                        active._workspace_paths()
+                    except RuntimeError:
+                        if self._active is active:
+                            self._active = None
             raise
-        close_unclaimed = False
+
+        close_unclaimed = None
         with self._lock:
-            self._initializing = False
+            self._applying = False
             if self._disposed:
-                close_unclaimed = True
+                if self._owns_active:
+                    close_unclaimed = applied
             else:
-                self._active = active
-        if close_unclaimed:
-            active.close()
-            raise RuntimeError("Device manager closed while installation initialized")
+                self._active = applied
+                self._ever_active = True
+        if close_unclaimed is not None:
+            close_unclaimed.close()
+            raise RuntimeError("Device manager closed while installation Apply completed")
         return self.state()
 
     def experiment_for_runtime(self, runtime_instance_id: str):
@@ -397,37 +388,18 @@ class ExperimentDeviceAdmin:
             raise RuntimeError("DeviceManager state belongs to another installation")
         return active
 
-    def shutdown_for_restart(self, expected_runtime_instance_id: str):
-        from zlc_workbench.device_manager.controller import ShutdownReport
-
-        with self._lock:
-            if self._disposed:
-                raise RuntimeError("Device manager authority is closed")
-            active = self._active
-            if active is None:
-                raise RuntimeError("no installation is active")
-            actual = active.device_catalog.runtime_instance_id
-            if str(expected_runtime_instance_id) != actual:
-                raise RuntimeError("installation generation changed before shutdown")
-        if self._owns_active:
-            active.close()
-        else:
-            active._close_for_device_restart()
-        with self._lock:
-            if self._active is active:
-                self._active = None
-            self._terminated = True
-        return ShutdownReport(actual, True)
-
     def dispose(self) -> None:
         with self._lock:
             if self._disposed:
                 return
+            if self._applying:
+                raise RuntimeError(
+                    "cannot dispose device authority during installation Apply"
+                )
             self._disposed = True
             active = self._active if self._owns_active else None
             if active is not None:
                 self._active = None
-            self._terminated = self._terminated or active is not None
         if active is not None:
             active.close()
 

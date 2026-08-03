@@ -15,11 +15,16 @@ import pytest
 from zlc_data.axis import REPEAT, SCAN_POINT, AxisId, AxisSpec
 from zlc_data.schema import PointColumn, PointTable
 from zlc_data.value import BlockId
-from zlc_neutral_atom.devices.simulation.installation import create_virtual_installation
 from zlc_neutral_atom.capture.binding import (
     TriggeredCameraLayout,
     bind_triggered_camera_acquisition,
 )
+from zlc_neutral_atom.device_types import (
+    CAPABILITY_CAMERA_CAPTURE,
+    CAPABILITY_PULSE_EXECUTE,
+)
+from zlc_neutral_atom.installation_config import installation_template
+from zlc_neutral_atom.installation_runtime import create_installation
 from zlc_neutral_atom.runtime.cleanup import CleanupReport, run_cleanup_steps
 from zlc_neutral_atom.capture.coordination import (
     execute_autonomous_single_fire,
@@ -138,12 +143,20 @@ def test_single_fire_failure_poisons_both_finite_owners():
 
 
 def test_trigger_interval_gate_is_exact_for_single_and_cross_point_edges():
-    installation = create_virtual_installation(seed=7)
+    installation = create_installation(
+        installation_template("virtual", seed=7)
+    )
     runtime = installation.runtime
     try:
         catalog = runtime.device_catalog
-        camera_port = runtime.camera_port(catalog.require("camera").ref)
-        pulse_port = runtime.pulse_port(catalog.require("sequencer").ref)
+        camera_port = runtime.require_capability(
+            catalog.require("camera").ref,
+            CAPABILITY_CAMERA_CAPTURE,
+        )
+        pulse_port = runtime.require_capability(
+            catalog.require("sequencer").ref,
+            CAPABILITY_PULSE_EXECUTE,
+        )
         document = load_pulse_document(
             ROOT / "pulses" / "imaging_template.json"
         )

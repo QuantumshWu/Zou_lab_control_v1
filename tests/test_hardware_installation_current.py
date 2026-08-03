@@ -20,14 +20,19 @@ from zlc_neutral_atom.devices.camera.contract import (
     CameraFrameRecord,
     CameraWorkingPoint,
 )
-from zlc_neutral_atom.devices.hardware.config import HardwareInstallationConfig
-from zlc_neutral_atom.devices.hardware.installation import create_hardware_installation
+from zlc_neutral_atom.device_types import (
+    CAPABILITY_CAMERA_CAPTURE,
+    CAPABILITY_CAMERA_MONITOR,
+    CAPABILITY_PULSE_EXECUTE,
+)
+from zlc_neutral_atom.devices.camera import device_types as camera_device_types
 from zlc_neutral_atom.devices.camera.pylon import PylonCameraAdapter, PylonCameraConfig
 from zlc_neutral_atom.devices.sequencer.port import (
     PulseTerminalAck,
     SimulatedPulseReceipt,
 )
-from zlc_neutral_atom.installation_plan import InstallationDevicePlan
+from zlc_neutral_atom.installation_config import installation_template
+from zlc_neutral_atom.installation_runtime import create_installation
 from zlc_neutral_atom.logic_nodes.camera_measurement.definition import (
     CameraMeasurementRequest,
 )
@@ -305,8 +310,37 @@ class _GapCamera(_FakeCamera):
         ]
 
 
-def _kind(cls) -> str:
-    return f"{cls.__module__}.{cls.__qualname__}"
+def _hardware_document():
+    return installation_template(
+        "hardware",
+        host="test-host",
+        serial="test-basler",
+        grid_rows=1,
+        grid_columns=1,
+        site_centers_json="[[1,1]]",
+    )
+
+
+def _patch_hardware_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    client: _FakeRemoteClient,
+    camera_factory,
+) -> None:
+    monkeypatch.setattr(
+        RemotePulseExecutionClient,
+        "connect",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        camera_device_types,
+        "DcamCameraAdapter",
+        camera_factory,
+    )
+    monkeypatch.setattr(
+        camera_device_types,
+        "PylonCameraAdapter",
+        camera_factory,
+    )
 
 
 class _LiveView:
@@ -331,7 +365,9 @@ class _LiveView:
         return None
 
 
-def test_fake_real_installation_runs_both_active_e0_paths_and_binds_ports() -> None:
+def test_fake_real_installation_runs_both_active_e0_paths_and_binds_ports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     bus = _TriggerBus()
     client = _FakeRemoteClient(bus)
     cameras = []
@@ -341,24 +377,8 @@ def test_fake_real_installation_runs_both_active_e0_paths_and_binds_ports() -> N
         cameras.append(camera)
         return camera
 
-    plan = (
-        InstallationDevicePlan("sequencer", "sequencer", _kind(_FakeRemoteClient), "fake remote"),
-        InstallationDevicePlan("camera", "camera", _kind(_FakeCamera), "fake qCMOS"),
-        InstallationDevicePlan("mot_camera", "camera", _kind(_FakeCamera), "fake Basler"),
-    )
-    config = HardwareInstallationConfig(
-        pulse_host="test-host",
-        pylon_serial="test-basler",
-        readout_site_centers_xy=((1.0, 1.0),),
-        readout_grid_shape_yx=(1, 1),
-    )
-    composition = create_hardware_installation(
-        config,
-        device_plan=plan,
-        remote_client_factory=lambda *_args, **_kwargs: client,
-        dcam_factory=camera_factory,
-        pylon_factory=camera_factory,
-    )
+    _patch_hardware_dependencies(monkeypatch, client, camera_factory)
+    composition = create_installation(_hardware_document())
     try:
         assert bus.fire_count == 2
         assert [camera.lane for camera in cameras] == ["ch11", "ch06"]
@@ -366,14 +386,22 @@ def test_fake_real_installation_runs_both_active_e0_paths_and_binds_ports() -> N
         catalog = composition.runtime.device_catalog
         assert catalog.roles("camera") == ("camera", "mot_camera")
         physical_identities = {}
-        for role in ("camera", "mot_camera"):
-            reference = catalog.require(role).ref
-            port = composition.runtime.camera_port(reference)
-            physical_identities[role] = port.capability.binding_stamp.physical_identity
+        for instance_id in ("camera", "mot-camera"):
+            reference = catalog.require(instance_id).ref
+            port = composition.runtime.require_capability(
+                reference,
+                CAPABILITY_CAMERA_CAPTURE,
+            )
+            physical_identities[instance_id] = (
+                port.capability.binding_stamp.physical_identity
+            )
             evidence = port.capability.camera_capability_evidence
             assert evidence.exact_external_trigger_qualification_digest is not None
             assert port.capability.payload_contract.value_schema.dtype == np.dtype("u1")
-        pulse_port = composition.runtime.pulse_port(catalog.require("sequencer").ref)
+        pulse_port = composition.runtime.require_capability(
+            catalog.require("sequencer").ref,
+            CAPABILITY_PULSE_EXECUTE,
+        )
         physical_identities["sequencer"] = (
             pulse_port.device.binding_stamp.physical_identity
         )
@@ -382,20 +410,21 @@ def test_fake_real_installation_runs_both_active_e0_paths_and_binds_ports() -> N
             for role, identity in physical_identities.items()
         } == {
             "camera": "dcam-device-index:0",
-            "mot_camera": "pylon-serial:test-basler",
-            "sequencer": f"remote-pulse-endpoint:test-host:{config.pulse_port}",
+            "mot-camera": "pylon-serial:test-basler",
+            "sequencer": "remote-pulse-endpoint:test-host:18861",
         }
         assert {
             identity.evidence_kind for identity in physical_identities.values()
         } == {DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT}
-        asset_map_revisions = {
-            identity.asset_map_revision for identity in physical_identities.values()
-        }
-        assert len(asset_map_revisions) == 1
-        asset_map_revision = next(iter(asset_map_revisions))
-        assert len(asset_map_revision) == 64
-        assert catalog.installation_id == f"installation-{asset_map_revision[:20]}"
+        assert tuple(catalog) == ("sequencer", "camera", "mot-camera")
+        assert catalog.require("camera").resource_key == "device/camera"
+        assert catalog.require("mot-camera").resource_key == "device/mot-camera"
         assert composition.readout_apparatus_facts[0].trigger_channel == "ch11"
+        assert composition.readout_apparatus_facts[0].camera_instance_id == "camera"
+        assert (
+            composition.readout_apparatus_facts[0].sequencer_instance_id
+            == "sequencer"
+        )
         assert tuple(
             role for role, _authority in composition.camera_signal_association_authorities
         ) == ("camera",)
@@ -405,7 +434,9 @@ def test_fake_real_installation_runs_both_active_e0_paths_and_binds_ports() -> N
     assert all(camera.closed for camera in cameras)
 
 
-def test_real_installation_rejects_an_e0_hardware_stamp_gap() -> None:
+def test_real_installation_rejects_an_e0_hardware_stamp_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     bus = _TriggerBus()
     client = _FakeRemoteClient(bus)
     cameras = []
@@ -415,29 +446,16 @@ def test_real_installation_rejects_an_e0_hardware_stamp_gap() -> None:
         cameras.append(camera)
         return camera
 
-    plan = (
-        InstallationDevicePlan("sequencer", "sequencer", _kind(_FakeRemoteClient), "fake remote"),
-        InstallationDevicePlan("camera", "camera", _kind(_GapCamera), "fake qCMOS"),
-        InstallationDevicePlan("mot_camera", "camera", _kind(_GapCamera), "fake Basler"),
-    )
+    _patch_hardware_dependencies(monkeypatch, client, gap_factory)
     with pytest.raises(RuntimeError, match="frame_stamp has a gap"):
-        create_hardware_installation(
-            HardwareInstallationConfig(
-                pulse_host="test-host",
-                pylon_serial="test-basler",
-                readout_site_centers_xy=((1.0, 1.0),),
-                readout_grid_shape_yx=(1, 1),
-            ),
-            device_plan=plan,
-            remote_client_factory=lambda *_args, **_kwargs: client,
-            dcam_factory=gap_factory,
-            pylon_factory=gap_factory,
-        )
+        create_installation(_hardware_document())
     assert client._closed
     assert cameras and all(camera.closed for camera in cameras)
 
 
-def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals() -> None:
+def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Exercise the real composition's sole Camera->PulseScan evidence path."""
 
     bus = _TriggerBus()
@@ -449,29 +467,17 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
         cameras.append(camera)
         return camera
 
-    plan = (
-        InstallationDevicePlan("sequencer", "sequencer", _kind(_FakeRemoteClient), "fake remote"),
-        InstallationDevicePlan("camera", "camera", _kind(_FakeCamera), "fake qCMOS"),
-        InstallationDevicePlan("mot_camera", "camera", _kind(_FakeCamera), "fake Basler"),
-    )
-    composition = create_hardware_installation(
-        HardwareInstallationConfig(
-            pulse_host="test-host",
-            pylon_serial="test-basler",
-            readout_site_centers_xy=((1.0, 1.0),),
-            readout_grid_shape_yx=(1, 1),
-        ),
-        device_plan=plan,
-        remote_client_factory=lambda *_args, **_kwargs: client,
-        dcam_factory=camera_factory,
-        pylon_factory=camera_factory,
-    )
+    _patch_hardware_dependencies(monkeypatch, client, camera_factory)
+    composition = create_installation(_hardware_document())
     runtime = composition.runtime
     camera_ref = runtime.device_catalog.require("camera").ref
     authority = dict(composition.camera_signal_association_authorities)["camera"]
     prepared = prepare_live_camera_measurement(
         CameraMeasurementRequest(camera_ref, repeat=0),
-        monitor_port=runtime.camera_monitor_port(camera_ref),
+        monitor_port=runtime.require_capability(
+            camera_ref,
+            CAPABILITY_CAMERA_MONITOR,
+        ),
         start_run=runtime.start,
         association_authority=authority,
     )
@@ -619,7 +625,9 @@ def test_fake_real_camera_signal_association_uses_hardware_terminal_and_ordinals
         assert runtime.shutdown(timeout=2.0)
 
 
-def test_real_camera_association_rejects_an_undrained_pre_fire_frame() -> None:
+def test_real_camera_association_rejects_an_undrained_pre_fire_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A driver-ring frame cannot become ordinal zero of a later FPGA FIRE."""
 
     bus = _TriggerBus()
@@ -631,35 +639,17 @@ def test_real_camera_association_rejects_an_undrained_pre_fire_frame() -> None:
         cameras.append(camera)
         return camera
 
-    plan = (
-        InstallationDevicePlan(
-            "sequencer", "sequencer", _kind(_FakeRemoteClient), "fake remote"
-        ),
-        InstallationDevicePlan(
-            "camera", "camera", _kind(_FakeCamera), "fake qCMOS"
-        ),
-        InstallationDevicePlan(
-            "mot_camera", "camera", _kind(_FakeCamera), "fake Basler"
-        ),
-    )
-    composition = create_hardware_installation(
-        HardwareInstallationConfig(
-            pulse_host="test-host",
-            pylon_serial="test-basler",
-            readout_site_centers_xy=((1.0, 1.0),),
-            readout_grid_shape_yx=(1, 1),
-        ),
-        device_plan=plan,
-        remote_client_factory=lambda *_args, **_kwargs: client,
-        dcam_factory=camera_factory,
-        pylon_factory=camera_factory,
-    )
+    _patch_hardware_dependencies(monkeypatch, client, camera_factory)
+    composition = create_installation(_hardware_document())
     runtime = composition.runtime
     camera_ref = runtime.device_catalog.require("camera").ref
     authority = dict(composition.camera_signal_association_authorities)["camera"]
     prepared = prepare_live_camera_measurement(
         CameraMeasurementRequest(camera_ref, repeat=0),
-        monitor_port=runtime.camera_monitor_port(camera_ref),
+        monitor_port=runtime.require_capability(
+            camera_ref,
+            CAPABILITY_CAMERA_MONITOR,
+        ),
         start_run=runtime.start,
         association_authority=authority,
     )

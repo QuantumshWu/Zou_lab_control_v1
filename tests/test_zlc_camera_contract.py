@@ -123,7 +123,6 @@ def _bound(camera: _ReusingRingCamera, *, qualified: bool = True):
     identity = PhysicalDeviceIdentity(
         stable_device_identity="fake-camera-identity",
         evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-        asset_map_revision="fake-map",
     )
     proof = broker.verify_identity(lambda: identity)
     binding = None

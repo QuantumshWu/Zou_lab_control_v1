@@ -5,7 +5,7 @@ from __future__ import annotations
 from zlc_neutral_atom.devices.camera.capture_port import BoundCapturePort
 from zlc_neutral_atom.devices.camera.contract import ReadoutBindingKey
 from zlc_neutral_atom.devices.sequencer.port import BoundPulsePort
-from zlc_neutral_atom.installation import ReadoutApparatusFacts
+from zlc_neutral_atom.installation import DeviceRef, ReadoutApparatusFacts
 
 from .calibration import GridOrder
 from .sitemap import (
@@ -20,6 +20,8 @@ DEFAULT_MAXIMUM_SITE_RESIDUAL_PX = 2.0
 def build_sitemap_acquisition_profile(
     apparatus: ReadoutApparatusFacts,
     *,
+    camera_ref: DeviceRef,
+    sequencer_ref: DeviceRef,
     camera_port: BoundCapturePort,
     pulse_port: BoundPulsePort,
 ) -> SitemapAcquisitionProfile:
@@ -34,6 +36,14 @@ def build_sitemap_acquisition_profile(
 
     if not isinstance(apparatus, ReadoutApparatusFacts):
         raise TypeError("apparatus must be ReadoutApparatusFacts")
+    if not isinstance(camera_ref, DeviceRef):
+        raise TypeError("camera_ref must be DeviceRef")
+    if not isinstance(sequencer_ref, DeviceRef):
+        raise TypeError("sequencer_ref must be DeviceRef")
+    if camera_ref.instance_id != apparatus.camera_instance_id:
+        raise ValueError("camera_ref differs from the installed readout apparatus")
+    if sequencer_ref.instance_id != apparatus.sequencer_instance_id:
+        raise ValueError("sequencer_ref differs from the installed readout apparatus")
     if not isinstance(camera_port, BoundCapturePort):
         raise TypeError("camera_port must be BoundCapturePort")
     if not isinstance(pulse_port, BoundPulsePort):
@@ -49,8 +59,8 @@ def build_sitemap_acquisition_profile(
         expected_centers_xy=apparatus.site_centers_xy,
     )
     return SitemapAcquisitionProfile(
-        readout_binding=ReadoutBindingKey(apparatus.camera_role),
-        sequencer_role=apparatus.sequencer_role,
+        readout_binding=ReadoutBindingKey(camera_ref.role),
+        sequencer_role=sequencer_ref.role,
         camera_facts=camera_facts,
         geometry=geometry,
         maximum_site_residual_px=DEFAULT_MAXIMUM_SITE_RESIDUAL_PX,

@@ -170,7 +170,6 @@ def _bound(camera: _Camera, *, qualified: bool = True):
     identity = PhysicalDeviceIdentity(
         stable_device_identity="fixture-camera",
         evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-        asset_map_revision="fixture-assets-v1",
     )
     proof = broker.verify_identity(lambda: identity)
     binding = None

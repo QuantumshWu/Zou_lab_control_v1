@@ -67,7 +67,7 @@ def test_mot_field_form_runs_live_and_final_named_axis_grids(tmp_path: Path) -> 
     devices = flow.open()
     console_wrapper = None
     try:
-        QtTest.QTest.mouseClick(devices.lifecycle_button, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseClick(devices.apply_button, QtCore.Qt.LeftButton)
         until(
             application,
             lambda: flow.console is not None or flow.failure is not None,

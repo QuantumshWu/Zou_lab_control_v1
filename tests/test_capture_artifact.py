@@ -147,7 +147,6 @@ def _identity(name: str) -> PhysicalDeviceIdentity:
     return PhysicalDeviceIdentity(
         stable_device_identity=name,
         evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-        asset_map_revision="fixture-assets-v1",
     )
 
 
@@ -222,6 +221,7 @@ class _CaptureCase:
                 endpoint=pulse_endpoint,
                 cleanup_operation=SafetyOperation.SAFE_STATE,
             ),
+            "virtual",
             (),
         )
         repeat_axis = AxisSpec(AxisId("repeat"), "repeat", REPEAT, 1, (0,))
@@ -341,7 +341,6 @@ def test_capture_record_is_the_only_visibility_boundary(
         ] == {
             "stable_device_identity": "fixture-camera",
             "evidence_kind": "INSTALLATION_ASSERTED_ENDPOINT",
-            "asset_map_revision": "fixture-assets-v1",
         }
         assert (record_path.parent / "frames.npy").is_file()
         assert (record_path.parent / "pulse.bin").is_file()

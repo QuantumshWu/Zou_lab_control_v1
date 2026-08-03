@@ -68,9 +68,11 @@ def _bind_hosted_request(api, authored, inputs):
 
 
 def _availability(catalog, _apparatus):
-    sequencer = catalog.find("sequencer")
-    if sequencer is None or sequencer.domain != "sequencer":
-        return "PulseScan requires the installed Sequencer role"
+    if not any(
+        item.domain == "sequencer" and "pulse.execute" in item.capabilities
+        for item in catalog.values()
+    ):
+        return "PulseScan requires a pulse sequencer"
     return None
 
 

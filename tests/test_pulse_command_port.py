@@ -26,7 +26,12 @@ IMAGING_TEMPLATE = ROOT / "pulses" / "imaging_template.json"
 def _descriptor() -> PulseTargetDescriptor:
     document = load_pulse_document(IMAGING_TEMPLATE)
     return PulseTargetDescriptor(
-        DeviceRef("installation-a", "runtime-a", "sequencer"),
+        DeviceRef(
+            runtime_instance_id="runtime-a",
+            instance_id="sequencer",
+            type_id="sequencer.test",
+            role="sequencer",
+        ),
         pulse_target_manifest_from_lanes(document.target),
         50e6,
         0x1234ABCD,

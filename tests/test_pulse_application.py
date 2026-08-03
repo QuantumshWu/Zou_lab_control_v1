@@ -183,7 +183,12 @@ def test_hardware_run_retains_authored_api_intent_and_explicit_values():
         document,
         api_parameters=(ApiParameter("on_duration", duration, "ns"),),
     )
-    reference = DeviceRef("installation", "runtime", "sequencer")
+    reference = DeviceRef(
+        runtime_instance_id="runtime",
+        instance_id="sequencer",
+        type_id="sequencer.test",
+        role="sequencer",
+    )
 
     with pytest.raises(ValueError, match="exactly cover"):
         PulseRunRequest(

@@ -289,19 +289,79 @@ def test_retired_figure_presentation_sidecar_has_no_owner_or_consumer():
     )
 
 
-def test_device_owners_do_not_depend_back_on_installation_dispatch():
-    """Concrete attachments consume low-level installation owners, never dispatch."""
+def test_device_graph_composition_has_no_central_concrete_leaf_table():
+    """Generic graph owners discover leaf descriptors instead of importing them."""
 
-    root = ROOT / "zlc_neutral_atom/devices"
-    assert root.is_dir(), "device owner root moved without updating this ratchet"
+    devices_root = ROOT / "zlc_neutral_atom/devices"
+    assert devices_root.is_dir(), (
+        "device owner root moved without updating this ratchet"
+    )
+
+    leaf_paths = sorted(
+        path
+        for path in devices_root.rglob("*.py")
+        if path.name in {"device_types.py", "templates.py"}
+    )
+    assert leaf_paths, "no concrete device descriptor/template leaves were audited"
+
+    def module_name(path: Path) -> str:
+        return ".".join(path.relative_to(ROOT).with_suffix("").parts)
+
+    leaf_modules = {module_name(path) for path in leaf_paths}
+    generic_paths = [
+        ROOT / "zlc_neutral_atom/device_types.py",
+        ROOT / "zlc_neutral_atom/installation.py",
+        ROOT / "zlc_neutral_atom/installation_config.py",
+        ROOT / "zlc_neutral_atom/installation_runtime.py",
+        ROOT / "Zou_lab_control/workbench/_composition.py",
+        *sorted((ROOT / "Zou_lab_control/api").glob("*.py")),
+        *sorted((ROOT / "zlc_workbench/device_manager").rglob("*.py")),
+    ]
+    missing = [path.relative_to(ROOT) for path in generic_paths if not path.is_file()]
+    assert not missing, (
+        "generic device graph owners moved without updating this ratchet: "
+        f"{missing}"
+    )
+
     violations = []
-    for path in sorted(root.rglob("*.py")):
+    for path in generic_paths:
         for imported in _imports(path):
-            if imported == "zlc_neutral_atom.installation_dispatch":
-                violations.append(f"{path.relative_to(ROOT)} imports {imported}")
+            if imported in leaf_modules:
+                violations.append(f"{path.relative_to(ROOT)} centrally imports {imported}")
+    for path in leaf_paths:
+        own_module = module_name(path)
+        for imported in _imports(path):
+            if imported in leaf_modules and imported != own_module:
+                violations.append(
+                    f"{path.relative_to(ROOT)} imports concrete sibling leaf {imported}"
+                )
     assert not violations, (
-        "device attachments are inputs to config dispatch, not consumers of the "
-        "composition-private installation dispatch:\n" + "\n".join(violations)
+        "generic installation/runtime/manager/public owners must discover frozen "
+        "device leaves, and one concrete leaf must not import another:\n"
+        + "\n".join(violations)
+    )
+
+    retired = {
+        ROOT / "zlc_neutral_atom/installation_dispatch.py",
+        ROOT / "zlc_neutral_atom/installation_package.py",
+        ROOT / "zlc_neutral_atom/installation_plan.py",
+        ROOT / "zlc_neutral_atom/installation_assets.py",
+    }
+    retired.update(
+        path
+        for name in (
+            "assets.py",
+            "config.py",
+            "installation.py",
+            "package.py",
+            "plan.py",
+        )
+        for path in devices_root.rglob(name)
+    )
+    survivors = sorted(path.relative_to(ROOT) for path in retired if path.exists())
+    assert not survivors, (
+        "retired central dispatch/package/plan/assets and per-leaf installation "
+        f"modules must not survive: {survivors}"
     )
 
 

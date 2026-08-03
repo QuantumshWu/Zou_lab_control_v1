@@ -117,7 +117,12 @@ def test_camera_named_cursor_filters_readout_phase_without_owning_camera() -> No
     contract = CameraSampleContract(SCHEMA)
     stream, producer = AcquisitionStream.create(StreamId("camera-cycle"), contract)
     request = CameraMeasurementRequest(
-        DeviceRef("installation", "runtime", "camera"),
+        DeviceRef(
+            runtime_instance_id="runtime",
+            instance_id="camera",
+            type_id="camera.test",
+            role="camera",
+        ),
         repeat=0,
         frames_per_cycle=3,
     )

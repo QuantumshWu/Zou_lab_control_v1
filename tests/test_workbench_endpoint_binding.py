@@ -20,7 +20,6 @@ def binding() -> BoundDevice:
         lambda: PhysicalDeviceIdentity(
             stable_device_identity="test-device",
             evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-            asset_map_revision="test-assets-v1",
         )
     )
     value = broker.bind(

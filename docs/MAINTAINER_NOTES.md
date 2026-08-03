@@ -6,9 +6,9 @@
 
 - Branch：`codex/system-architecture-migration`。
 - 重开基线：`476d125304fc90b6ef4f5009184dd2119206fcc2`；C0规范提交：`ed6dfe21c0d99999444c099d8c644a20b44e561d`。
-- 当前checkpoint：§8 C1 `zlc_plot`单一绘图全栈替换已经dependency-closed；下一唯一工作是C2 `DeviceInstance` graph。不得返回旧M1–M7叙事，也不得重做已经闭合的C1。
+- 当前checkpoint：§8 C2 `DeviceInstance` graph已经dependency-closed；下一唯一工作是C3最小Logic Node host。不得返回旧M1–M7叙事，也不得重做已经闭合的C1/C2。
 - 预期worktree例外：未跟踪用户文件`pulses/scan_test.json`。永远不得读取、修改、移动、删除、stage或commit。
-- RTL、Tcl、XDC、bitstream和wire protocol仍冻结；C1没有硬件改动。
+- RTL、Tcl、XDC、bitstream和wire protocol仍冻结；C1/C2没有硬件改动。
 
 ## C1 已闭合的 owner
 
@@ -30,8 +30,24 @@
 - 固定口径生产包：331 modules / 139,278 physical LOC / 933 classes / 558 dataclasses / 38 enums。相对C0为-50 modules / -22,288 LOC；其中本仓`zlc_plot`为33 modules / 27,983 LOC，扣除它后旧包净删83 modules / 50,271 LOC。tests为112 modules / 36,173 LOC，相对C0净删19 modules / 13,649 LOC。
 - `git diff --check`无内容错误；生产残余扫描没有发现旧plot owner/import、history-in-P、ordinary presentation sidecar、Calibration第二report owner或包外Matplotlib实现。headless API只加载`zlc_plot`纯值模块，不加载session/render/Matplotlib/Qt。source-empty旧目录在Git tree中不存在，本机ignored cache/output不属于提交。
 
-## 当前下一步：C2 DeviceInstance graph
+## C2 已闭合的 owner
 
-只按`docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md` §2、§6.6、§8 C2、§9推进：原位改写installation document为ordered heterogeneous instances；把schema/defaults/factory/capability移到device leaf；迁移DeviceManager、composition和全部消费者；同cut删除flat backend config/package/plan/dispatch、digest/CAS链、中央concrete imports和旧tests。开始修改前先从当前tree列出C2精确owner/consumer/deletion manifest，不复核C1绘图算法。
+- `InstallationConfigDocument`现在只保存ordered heterogeneous `DeviceInstanceConfig(instance_id, role, type_id, parameters)`；role只作人类投影，依赖只保存stable instance id。普通JSON没有digest/CAS/version counter；保存复用`zlc_storage.atomic_write_text`。
+- fixed-namespace discovery得到7个leaf device type和3个graph template。descriptor唯一声明schema/defaults/factory/capabilities/stable-id requirements/optional discovery；纯preflight在任何设备副作用前完成schema、missing/wrong-capability、duplicate与cycle检查。runtime只保留`require_capability(DeviceRef, token)`和反向cleanup，不再按具体Port类型分栏。
+- DeviceManager按domain显示稳定per-instance cards；Add/Remove/Retype只改目标结构，普通字段原位更新，New/Load按stable id reconcile。requirement显示为当前graph内兼容instance的typed下拉；discovered hardware与loaded session分开。Save/Load是普通JSON，Apply是application topology replacement。
+- active Run期间Apply不触碰旧runtime；idle成功或失败恢复均保持同一public `Experiment`身份。候选连接失败恢复previous graph；恢复也失败进入明确no-active-session。除DeviceManager外的旧runtime Workbench在replacement前退役，manager继续绑定同一public对象。
+- Camera/Pulse/RF消费者都经generic capability解析。MOT camera资格由Pylon/virtual-MOT leaf的`camera.mot_field_capture`能力表达，不再靠`mot_camera` role充当身份；virtual camera association由观察sequencer FIRE和frame ordinal的`VirtualCamera`拥有。
+- 已删除installation package/plan/dispatch/assets、hardware/sequencer/simulation backend-wide config/package/installation、asset-map revision、installation digest/CAS与storage file lock；旧tests同cut改写或删除，没有compatibility入口。
 
-恢复时严格依次完整读取当前Goal、`AGENTS.md`、本文件、Git branch/HEAD/status/recent log，再只读台账当前未闭合项和设计§2、§6.6、§8 C2、§9。不得重答、重审或重做C1。
+## C2 证据与规模
+
+- DeviceManager正式offscreen流程通过Add/Remove/Retype/New/Load/Save/Apply、typed requirement、discovered/loaded分离、同一Experiment Apply与owner close；standalone TaskConsole从DeviceManager Apply后打开TaskConsole和PulseGUI。
+- active continuous Run拒绝Apply且runtime generation不变；候选连接失败恢复previous graph；双连接失败明确no-active-session。真实qCMOS/Pylon fake-E0五项保留active qualification、stamp gap、association/ordinal/undrained与Mono8 dtype证据。
+- current modified合同集合195项通过；architecture/import集合41项通过；Camera/Occupancy/MOT正式纵切3项通过。全仓collect得到885项且无旧模块import collection错误。
+- 固定口径生产包：324 modules / 138,722 physical LOC / 929 classes / 555 dataclasses / 38 enums；相对C1净删7 modules / 556 LOC / 4 classes / 3 dataclasses。tests为111 modules / 36,405 LOC。C2没有硬件文件diff。
+
+## 当前下一步：C3 最小 Logic Node host
+
+只按`docs/SYSTEM_ARCHITECTURE_DESIGN_zh.md` §2、§6.1、§6.7、§8 C3、§9推进：先从当前tree列出generic host、Declaration/Package、全部leaf重复binder/API/Prepared/Bound/presenter/repository/lifecycle、TaskConsole第二胶水与ordinary SHA/bytes的精确owner/consumer/deletion manifest；随后用一个dependency-closed cut迁移所有leaf并删除完整旧闭包。不得新增阶段类族、中央node import或为旧tests留兼容，不复核已闭合的C1/C2。
+
+恢复时严格依次完整读取当前Goal、`AGENTS.md`、本文件、Git branch/HEAD/status/recent log，再只读台账当前未闭合项和设计§2、§6.1、§6.7、§8 C3、§9。不得重答、重审或重做C1/C2。

@@ -64,7 +64,6 @@ def _bound_virtual_sequencer(document):
         lambda: PhysicalDeviceIdentity(
             stable_device_identity="virtual-sequencer:main",
             evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-            asset_map_revision="test-assets-v1",
         )
     )
     binding = None

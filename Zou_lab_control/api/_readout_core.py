@@ -93,8 +93,14 @@ class ReadoutFacade:
                 raise TypeError("request must be CaptureRequest")
             return prepare_finite_capture(
                 request,
-                pulse_port=services.runtime.pulse_port(request.sequencer_ref),
-                camera_port=services.runtime.camera_port(request.camera_ref),
+                pulse_port=services.runtime.require_capability(
+                    request.sequencer_ref,
+                    "pulse.execute",
+                ),
+                camera_port=services.runtime.require_capability(
+                    request.camera_ref,
+                    "camera.capture",
+                ),
                 captures_root=services.captures_root,
                 start_run=self._start_run,
             )
@@ -183,9 +189,15 @@ class ReadoutFacade:
     def require_readout_binding(self, actual: ReadoutBindingKey) -> None:
         self._require_binding(actual)
 
-    def _resolve_role(self, requested, domain, preferred):
+    def _resolve_role(self, requested, domain, preferred, capability):
         with service_guard(self._services) as services:
-            return resolve_role(services.catalog, requested, domain, preferred)
+            return resolve_role(
+                services.catalog,
+                requested,
+                domain,
+                preferred,
+                capability,
+            )
 
     def _resolve_camera_role(self, requested):
         if self._binding is not None:
@@ -196,6 +208,7 @@ class ReadoutFacade:
             requested,
             "camera",
             ("camera", "readout"),
+            "camera.capture",
         )
 
     def load_readout_pulse(self, value):
@@ -208,11 +221,16 @@ class ReadoutFacade:
     def resolve_readout_camera_ref(self, requested):
         role = self._resolve_camera_role(requested)
         with service_guard(self._services) as services:
-            return services.catalog.require(role).ref
+            return services.catalog.require_role(role).ref
 
     def resolve_readout_sequencer_ref(self, requested):
-        role = self._resolve_role(requested, "sequencer", ("sequencer",))
+        role = self._resolve_role(
+            requested,
+            "sequencer",
+            ("sequencer",),
+            "pulse.execute",
+        )
         with service_guard(self._services) as services:
-            return services.catalog.require(role).ref
+            return services.catalog.require_role(role).ref
 
 __all__ = ["ReadoutFacade"]

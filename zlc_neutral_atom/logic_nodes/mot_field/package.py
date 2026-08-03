@@ -8,7 +8,6 @@ from zlc_storage.paths import resolve_under
 
 from .api import MotFieldApi
 from .application import prepare_mot_field_acquisition
-from .mot_field import DEFAULT_MOT_FIELD_CAMERA_ROLE
 from .mot_field_task import (
     MOT_FIELD_LOGIC_NODE,
     PreparedMotFieldTask,
@@ -24,21 +23,12 @@ def _bind_api(
     (
         pulses_root,
         captures_root,
-        installed_camera_ref,
+        resolve_camera_ref,
         resolve_sequencer_ref,
-        camera_port,
+        mot_camera_port,
         pulse_port,
         start_run,
     ) = facts
-
-    def resolve_camera_ref(requested):
-        if requested not in (None, DEFAULT_MOT_FIELD_CAMERA_ROLE):
-            raise ValueError(
-                "MOT field optimization requires the installation's "
-                "'mot_camera' role; an arbitrary camera is not a "
-                "coil-sensitive exact-scan sensor"
-            )
-        return installed_camera_ref(DEFAULT_MOT_FIELD_CAMERA_ROLE)
 
     def load_pulse(value):
         if isinstance(value, PulseDocument):
@@ -49,7 +39,7 @@ def _bind_api(
         return prepare_mot_field_acquisition(
             request,
             pulse_port=pulse_port(request.sequencer_ref),
-            camera_port=camera_port(request.camera_ref),
+            camera_port=mot_camera_port(request.camera_ref),
             captures_root=captures_root,
             start_run=start_run,
         )
@@ -76,12 +66,16 @@ def _prepare_hosted(api, request, event_source):
 
 
 def _availability(catalog, _apparatus):
-    camera = catalog.find(DEFAULT_MOT_FIELD_CAMERA_ROLE)
-    sequencer = catalog.find("sequencer")
-    if camera is None or camera.domain != "camera":
-        return "MOT Field requires the installed mot_camera Camera role"
-    if sequencer is None or sequencer.domain != "sequencer":
-        return "MOT Field requires the installed Sequencer role"
+    if not any(
+        item.domain == "camera" and "camera.mot_field_capture" in item.capabilities
+        for item in catalog.values()
+    ):
+        return "MOT Field requires a camera with MOT-field capture capability"
+    if not any(
+        item.domain == "sequencer" and "pulse.execute" in item.capabilities
+        for item in catalog.values()
+    ):
+        return "MOT Field requires a pulse sequencer"
     return None
 
 
@@ -91,16 +85,16 @@ LOGIC_NODE_PACKAGE = LogicNodePackage(
     api_requirements=(
         "pulses_root",
         "captures_root",
-        "resolve_camera_ref",
+        "resolve_mot_camera_ref",
         "resolve_sequencer_ref",
-        "camera_port",
+        "mot_camera_port",
         "pulse_port",
         "start_run",
     ),
     bind_api=_bind_api,
     prepare_hosted=_prepare_hosted,
     availability=_availability,
-    dynamic_choice_fact="camera_roles",
+    dynamic_choice_fact="mot_camera_roles",
     start_prepared=start_mot_field_task_command,
 )
 

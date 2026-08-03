@@ -518,26 +518,35 @@ def resolve_role(
     requested: str | None,
     domain: str,
     preferred: tuple[str, ...],
+    capability: str | None = None,
 ) -> str:
     """Resolve one typed installation role without exposing the runtime graph."""
 
     if requested is not None:
-        info = catalog.require(requested)
+        info = catalog.require_role(requested)
         if info.domain != domain:
             raise ValueError(
                 f"device role {requested!r} is {info.domain!r}, not {domain!r}"
             )
+        if capability is not None and capability not in info.capabilities:
+            raise ValueError(
+                f"device role {requested!r} does not provide {capability!r}"
+            )
         return requested
+    roles = tuple(
+        role
+        for role in catalog.roles(domain)
+        if capability is None
+        or capability in catalog.require_role(role).capabilities
+    )
     for role in preferred:
-        info = catalog.find(role)
-        if info is not None and info.domain == domain:
+        if role in roles:
             return role
-    candidates = catalog.roles(domain)
-    if len(candidates) != 1:
+    if len(roles) != 1:
         raise ValueError(
-            f"installation has {len(candidates)} {domain} roles; choose one explicitly"
+            f"installation has {len(roles)} {domain} roles; choose one explicitly"
         )
-    return candidates[0]
+    return roles[0]
 
 
 __all__ = [

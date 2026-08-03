@@ -60,13 +60,11 @@ class PhysicalDeviceIdentity:
 
     stable_device_identity: str
     evidence_kind: DeviceIdentityEvidenceKind
-    asset_map_revision: str
 
     def __post_init__(self) -> None:
         _canonical_text(self.stable_device_identity, "stable_device_identity")
         if not isinstance(self.evidence_kind, DeviceIdentityEvidenceKind):
             raise TypeError("evidence_kind must be DeviceIdentityEvidenceKind")
-        _canonical_text(self.asset_map_revision, "asset_map_revision")
 
 
 @dataclass(frozen=True, order=True)
@@ -90,7 +88,6 @@ def physical_device_identity_to_tree(
     return {
         "stable_device_identity": value.stable_device_identity,
         "evidence_kind": value.evidence_kind.value,
-        "asset_map_revision": value.asset_map_revision,
     }
 
 
@@ -98,14 +95,12 @@ def physical_device_identity_from_tree(tree: object) -> PhysicalDeviceIdentity:
     fields = {
         "stable_device_identity",
         "evidence_kind",
-        "asset_map_revision",
     }
     if not isinstance(tree, dict) or set(tree) != fields:
         raise ValueError("physical device identity has an unknown field set")
     return PhysicalDeviceIdentity(
         stable_device_identity=tree["stable_device_identity"],
         evidence_kind=DeviceIdentityEvidenceKind(tree["evidence_kind"]),
-        asset_map_revision=tree["asset_map_revision"],
     )
 
 

@@ -7,7 +7,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable
+from typing import Callable, Literal
 from zlc_storage import (
     canonical_text as _text,
     positive_real as _positive_float,
@@ -528,6 +528,7 @@ def pulse_terminal_ack_from_tree(tree: object) -> PulseTerminalAck:
 @dataclass(frozen=True)
 class BoundPulsePort:
     capability_attestation: VerifiedDeviceCapability
+    editor_connection_mode: Literal["virtual", "remote"]
     _scan_progress_reader: (
         Callable[[str, str, str, int], PulseScanProgress] | None
     ) = field(default=None, repr=False, compare=False)
@@ -536,6 +537,10 @@ class BoundPulsePort:
     ) = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.editor_connection_mode not in ("virtual", "remote"):
+            raise ValueError(
+                "editor_connection_mode must be 'virtual' or 'remote'"
+            )
         admit_bound_capability(
             self.capability_attestation,
             SequencerCapabilitySnapshot,

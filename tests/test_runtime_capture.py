@@ -177,7 +177,6 @@ class _RuntimeFixture:
         identity = PhysicalDeviceIdentity(
             stable_device_identity="fixture-camera",
             evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-            asset_map_revision="fixture-assets-v1",
         )
         proof = self.broker.verify_identity(lambda: identity)
         binding = None
@@ -218,7 +217,6 @@ class _RuntimeFixture:
         pulse_identity = PhysicalDeviceIdentity(
             stable_device_identity="fixture-sequencer",
             evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-            asset_map_revision="fixture-assets-v1",
         )
         pulse_proof = self.broker.verify_identity(lambda: pulse_identity)
         pulse_binding = None
@@ -245,6 +243,7 @@ class _RuntimeFixture:
         )
         pulse_port = BoundPulsePort(
             self.broker.verify_capability(pulse_binding),
+            "virtual",
             (),
         )
         repeat_axis = AxisSpec(AxisId("repeat"), "repeat", REPEAT, 1, (0,))

@@ -393,8 +393,6 @@ class FormSpec:
     def __post_init__(self) -> None:
         fields = tuple(self.fields)
         object.__setattr__(self, "fields", fields)
-        if not fields:
-            raise ValueError("form spec must contain at least one field")
         if any(not isinstance(field, FormFieldProps) for field in fields):
             raise TypeError("form spec fields must contain FormFieldProps")
         keys = tuple(field.key for field in fields)
@@ -426,8 +424,6 @@ def project_authoring_form(
     if source_fields is None:
         raise TypeError("schema must expose ordered authoring fields")
     fields = tuple(source_fields)
-    if not fields:
-        raise ValueError("authoring schema must contain at least one field")
     required_attributes = (
         "key",
         "kind",

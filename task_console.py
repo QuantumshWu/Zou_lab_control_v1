@@ -108,7 +108,13 @@ class _StandaloneTaskConsoleFlow:
 
     def _open_console(self, experiment) -> None:
         if self.console is not None:
-            return
+            if not self.console.permanently_closed:
+                return
+            # DeviceManager Apply retires every handle bound to the old runtime.
+            # The callback carries the same public Experiment after its atomic
+            # replacement, so reopen both products from that current authority.
+            self.console = None
+            self.pulse = None
         if self.devices is None:
             return
         console = None

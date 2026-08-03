@@ -57,7 +57,6 @@ def identity(resource: ResourceKey) -> PhysicalDeviceIdentity:
     return PhysicalDeviceIdentity(
         stable_device_identity=str(resource),
         evidence_kind=DeviceIdentityEvidenceKind.HARDWARE_IDENTITY_READBACK,
-        asset_map_revision="test-assets-v1",
     )
 
 

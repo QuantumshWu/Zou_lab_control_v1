@@ -37,7 +37,9 @@ from zlc_neutral_atom.capture.session import (
     CameraCaptureProvenance,
 )
 from zlc_neutral_atom.devices.camera.capture_port import CaptureCapabilitySnapshot
-from zlc_neutral_atom.devices.simulation.installation import create_virtual_installation
+from zlc_neutral_atom.device_types import CAPABILITY_CAMERA_CAPTURE
+from zlc_neutral_atom.installation_config import installation_template
+from zlc_neutral_atom.installation_runtime import create_installation
 from zlc_neutral_atom.devices.camera.contract import (
     CameraCapabilityEvidence,
     CameraPhysicalFacts,
@@ -255,7 +257,6 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
         PhysicalDeviceIdentity(
             stable_device_identity="camera:test",
             evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-            asset_map_revision="test-assets-v1",
         ),
         "camera-binding",
     )
@@ -315,11 +316,16 @@ def test_camera_contract_plugs_into_exact_capture_without_anonymous_data_dim():
 
 
 def test_camera_capture_owner_proof_belongs_to_the_bound_camera_contract():
-    composition = create_virtual_installation(seed=7)
+    composition = create_installation(
+        installation_template("virtual", seed=7)
+    )
     runtime = composition.runtime
     try:
         camera_ref = runtime.device_catalog.require("camera").ref
-        port = runtime.camera_port(camera_ref)
+        port = runtime.require_capability(
+            camera_ref,
+            CAPABILITY_CAMERA_CAPTURE,
+        )
         repeat = _axis("binding.repeat", REPEAT, 1)
         event = _axis("binding.event", READOUT_EVENT, 1)
         schema = DatasetSchema(

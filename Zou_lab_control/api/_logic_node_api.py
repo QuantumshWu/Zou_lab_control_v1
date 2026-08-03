@@ -13,6 +13,13 @@ from zlc_neutral_atom.logic_node_package import (
 )
 
 
+_CAMERA_CAPTURE = "camera.capture"
+_CAMERA_MONITOR = "camera.monitor"
+_MOT_FIELD_CAPTURE = "camera.mot_field_capture"
+_PULSE_EXECUTE = "pulse.execute"
+_RF_TABLE = "rf.table"
+
+
 def _ui_invoker(package: LogicNodePackage, open_workbench):
     """Bind one leaf's inert descriptors without importing optional UI now."""
 
@@ -276,43 +283,32 @@ def _logic_node_composition_facts(readout):
         association_authorities = MappingProxyType(
             dict(current.installation.camera_signal_association_authorities)
         )
-        camera_roles = tuple(catalog.roles("camera"))
-        sequencer_roles = tuple(catalog.roles("sequencer"))
-        rf_roles = tuple(catalog.roles("rf"))
+        def capable_roles(domain: str, capability: str) -> tuple[str, ...]:
+            return tuple(
+                role
+                for role in catalog.roles(domain)
+                if capability in catalog.require_role(role).capabilities
+            )
+
+        camera_roles = capable_roles("camera", _CAMERA_CAPTURE)
+        mot_camera_roles = capable_roles("camera", _MOT_FIELD_CAPTURE)
+        sequencer_roles = capable_roles("sequencer", _PULSE_EXECUTE)
+        rf_roles = capable_roles("rf", _RF_TABLE)
         camera_refs = MappingProxyType(
-            {role: catalog.require(role).ref for role in camera_roles}
+            {role: catalog.require_role(role).ref for role in camera_roles}
+        )
+        mot_camera_refs = MappingProxyType(
+            {role: catalog.require_role(role).ref for role in mot_camera_roles}
         )
         sequencer_refs = MappingProxyType(
-            {role: catalog.require(role).ref for role in sequencer_roles}
+            {role: catalog.require_role(role).ref for role in sequencer_roles}
         )
         rf_refs = MappingProxyType(
-            {role: catalog.require(role).ref for role in rf_roles}
+            {role: catalog.require_role(role).ref for role in rf_roles}
         )
-        camera_ports = MappingProxyType(
-            {
-                role: runtime.camera_port(reference)
-                for role, reference in camera_refs.items()
-            }
+        readout_camera_roles = tuple(
+            catalog.require(value.camera_instance_id).role for value in apparatus
         )
-        camera_monitor_ports = MappingProxyType(
-            {
-                role: runtime.camera_monitor_port(reference)
-                for role, reference in camera_refs.items()
-            }
-        )
-        pulse_ports = MappingProxyType(
-            {
-                role: runtime.pulse_port(reference)
-                for role, reference in sequencer_refs.items()
-            }
-        )
-        rf_ports = MappingProxyType(
-            {
-                role: runtime.rf_port(reference)
-                for role, reference in rf_refs.items()
-            }
-        )
-        readout_camera_roles = tuple(value.camera_role for value in apparatus)
 
     def resolve_reference(requested, references, preferred, domain):
         if requested is not None:
@@ -348,13 +344,27 @@ def _logic_node_composition_facts(readout):
             "Sequencer",
         )
 
-    def bound_port(reference, references, ports, domain):
+    def resolve_mot_camera_ref(requested):
+        return resolve_reference(
+            requested,
+            mot_camera_refs,
+            ("mot_camera",),
+            "MOT Camera",
+        )
+
+    def resolve_device_ref(instance_id, capability):
+        info = catalog.require(str(instance_id))
+        token = str(capability)
+        if token not in info.capabilities:
+            raise ValueError(
+                f"device instance {info.instance_id!r} does not provide {token!r}"
+            )
+        return info.ref
+
+    def require_capability(reference, capability, domain):
         if not isinstance(reference, DeviceRef):
             raise TypeError(f"{domain} reference must be DeviceRef")
-        expected = references.get(reference.role)
-        if expected != reference:
-            raise RuntimeError(f"{domain} reference belongs to another installation")
-        return ports[reference.role]
+        return runtime.require_capability(reference, capability)
 
     def load_pulse(value):
         if isinstance(value, PulseDocument):
@@ -386,31 +396,42 @@ def _logic_node_composition_facts(readout):
             "calibrations_root": calibrations_root,
             "camera_signal_association_authorities": association_authorities,
             "readout_apparatus_facts": apparatus,
+            "resolve_device_ref": resolve_device_ref,
             "camera_roles": camera_roles,
+            "mot_camera_roles": mot_camera_roles,
             "rf_roles": rf_roles,
             "readout_camera_roles": readout_camera_roles,
             "resolve_camera_ref": resolve_camera_ref,
+            "resolve_mot_camera_ref": resolve_mot_camera_ref,
             "resolve_sequencer_ref": resolve_sequencer_ref,
             "load_pulse": load_pulse,
-            "pulse_port": lambda reference: bound_port(
+            "pulse_port": lambda reference: require_capability(
                 reference,
-                sequencer_refs,
-                pulse_ports,
+                _PULSE_EXECUTE,
                 "Sequencer",
             ),
-            "camera_port": lambda reference: bound_port(
+            "camera_port": lambda reference: require_capability(
                 reference,
-                camera_refs,
-                camera_ports,
+                _CAMERA_CAPTURE,
                 "Camera",
             ),
-            "camera_monitor_port": lambda reference: bound_port(
+            "camera_monitor_port": lambda reference: require_capability(
                 reference,
-                camera_refs,
-                camera_monitor_ports,
+                _CAMERA_MONITOR,
                 "Camera monitor",
             ),
-            "rf_ports": tuple(sorted(rf_ports.items())),
+            "mot_camera_port": lambda reference: require_capability(
+                reference,
+                _MOT_FIELD_CAPTURE,
+                "MOT Camera",
+            ),
+            "rf_ports": tuple(
+                (
+                    role,
+                    runtime.require_capability(reference, _RF_TABLE),
+                )
+                for role, reference in rf_refs.items()
+            ),
             "start_run": start_run,
             "wait_run": wait_run,
             "operation_guard": operation_guard,

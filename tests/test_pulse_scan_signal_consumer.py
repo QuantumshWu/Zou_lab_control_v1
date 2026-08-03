@@ -278,7 +278,12 @@ def _associated_camera_cursor(*, operation_deadline_seconds: float = 1.0):
     source = camera_signal_event_source(
         stream,
         CameraMeasurementRequest(
-            DeviceRef("installation", "runtime", "camera"),
+            DeviceRef(
+                runtime_instance_id="runtime",
+                instance_id="camera",
+                type_id="camera.test",
+                role="camera",
+            ),
             repeat=0,
             frames_per_cycle=3,
         ),

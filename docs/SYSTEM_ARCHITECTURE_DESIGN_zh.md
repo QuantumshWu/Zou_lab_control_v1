@@ -439,11 +439,13 @@ Calibration只拥有物理标定算法和领域结果：原始每site样本、la
 
 ### 6.6 Device graph 与 Device Manager
 
-内建device type使用固定namespace、一个leaf descriptor和确定性discovery，不是plugin registry、entry point、service locator或中央concrete import表。每个leaf唯一声明`type_id/domain/authoring_schema/defaults/factory/capabilities`；新增/删除类型只改该leaf。
+内建device type使用固定namespace、一个leaf descriptor和确定性discovery，不是plugin registry、entry point、service locator或中央concrete import表。每个leaf唯一声明`type_id/domain/authoring_schema/defaults/factory/capabilities/typed requirements`，以及确有真实设备枚举能力时的optional discover；新增/删除类型只改该leaf。requirement字段是该type参数schema中的stable-instance-id引用，不以可改role或Python类名作连接；leaf声明每个引用要求的capability，composition据此建立依赖边、检查missing/wrong-capability/ambiguous/cardinality与cycle。它不是另一份graph DTO或mutable registry。
 
-Installation文档是一个ordered heterogeneous DeviceInstance tuple。每个实例只保存stable instance id、role、type id和该type的parameters；role可改但不是identity。Virtual/Remote/Hardware只是创建该graph的预填模板或Port实现，不能再拥有整套设备字段。composition按role/domain/cardinality解析typed binding，missing/ambiguous/duplicate stable id与依赖cycle在Experiment可用前失败。
+Installation文档是一个ordered heterogeneous DeviceInstance tuple。每个实例只保存stable instance id、role、type id和该type的parameters；role可改但不是identity，跨设备参数引用只保存目标stable instance id。Virtual/Remote/Hardware只是创建该graph的预填模板或Port实现，不能再拥有整套设备字段。composition按descriptor requirement与实际capability解析typed binding，missing/ambiguous/wrong-capability/duplicate stable id或role与依赖cycle在Experiment可用前失败。
 
-Device Manager只编辑该graph：按domain分组、Add device、每卡独立role/type/type-specific form、Remove/Retype、New/Load/Save/Apply，并把discovered hardware与loaded session分开显示。Apply是application topology replacement：存在active Run时明确拒绝；idle时先做无副作用的完整graph validation，再由旧Experiment正常close→SAFE→release，随后连接新graph并只在成功后发布为active。新连接失败时用previous frozen graph恢复旧Experiment；若恢复也失败则明确进入no-active-session错误，绝不并存两套owner或把失败graph标成active。正式device参数来自leaf schema，不能反射driver`__init__`，不能把qCMOS/Basler/sequencer/readout参数重新混进一个backend-wide form。它是desktop默认Experiment composition入口；TaskConsole、PulseGUI与其它窗口共享同一Experiment owner。
+factory只向通用runtime发布该实例实际提供的`capability token -> narrow Port/fact`；domain只用于分类与默认选择，绝不暗示“所有camera都有monitor”等能力。runtime只保留一个按stable instance id解析的capability表和一个通用`require_capability(DeviceRef, token)`入口，不得中央导入或维护Camera/Pulse/RF等具体Port字典/accessor。`DeviceRef/DeviceInfo`以stable instance id钉住runtime设备，并投影role、type id与capabilities；role只作人类绑定名。这样新增只有finite capture的camera或新domain时不修改runtime、public facade或Device Manager。
+
+Device Manager只编辑该graph：按domain分组、Add device、每卡独立role/type/type-specific form、Remove/Retype、New/Load/Save/Apply，并把discovered hardware与loaded session分开显示。requirement字段由descriptor声明的capability实时投影为当前graph内兼容stable instance id的下拉选择，不让用户填写role或Python类型；缺失/不兼容的旧引用只作为明确的待修复项显示，不能通过Save/Apply。普通字段/role编辑原位更新；Add只插一张卡，Remove只删目标卡，Retype只替换该卡参数body，New/Load按stable id reconcile，任何操作都不全量重建卡片。Apply是application topology replacement：存在active Run时明确拒绝；idle时先做无副作用的完整graph validation，再由旧Experiment正常close→SAFE→release，随后连接新graph并只在成功后发布为active。新连接失败时用previous frozen graph恢复旧Experiment；若恢复也失败则明确进入no-active-session错误，绝不并存两套owner或把失败graph标成active。public `Experiment`对象身份在成功替换或成功恢复后保持不变；composition root退役除Device Manager外缓存旧runtime选择/Port的Workbench handle，之后由同一Experiment按需重开，不能让旧窗口继续持有上一代capability。正式device参数来自leaf schema，不能反射driver`__init__`，不能把qCMOS/Basler/sequencer/readout参数重新混进一个backend-wide form。它是desktop默认Experiment composition入口；TaskConsole、PulseGUI与其它窗口共享同一Experiment owner。
 
 ### 6.7 Logic Node、Task takeover 与 Edit
 
@@ -523,7 +525,7 @@ Identity严格按成本和消费者限定：
 
 ### C2：DeviceInstance graph
 
-- 原位改写Installation文档为ordered heterogeneous instances，建立leaf type descriptor/factory discovery和typed binding resolver。
+- 原位改写Installation文档为ordered heterogeneous instances，建立leaf type descriptor/factory discovery、stable-id requirement graph和typed capability resolver；删除runtime内按具体Port类分栏的中央能力表。
 - DeviceManager改为per-device cards与New/Load/Save/Apply；迁移public composition及所有device consumers。
 - 同cut删除backend-wide config/package/plan/dispatch、flat editor、installation-config digest/CAS conflict链、中央concrete imports及旧tests；其它领域artifact storage不属于C2。以多device add/retype/save/load/apply和正式Experiment启动证明。
 
@@ -560,7 +562,7 @@ Identity严格按成本和消费者限定：
 2. Dataset保持`(R,P,*data_dim)`与scalar`(R,P,1)`，Camera monitor每次publication为`(1,1,*frame)`且dtype不变；regular/sparse/serpentine/arbitrary/duplicate/P=1 point数据均可画，非grid sequence不Cartesian-expand，只有显式GridTopology可densify。R、P/grid logical dimensions与data axes都有coordinate/group/facet/sample/index/repeat-reducer明确归属；Histogram不隐式flatten，Curve/Image不聚合隐藏data axis，Rolling history不进入R/P/data_shape，生产代码不存在`MONITOR_HISTORY` Dataset role、`history_cycles`或history-in-P producer。adapter共享readonly source memory且不复制full validity/float image。
 3. Cross/Area/Fit/Processor都携全部exact parents；Area→第二Figure、ROI→ROI→Fit与raw panel在同一SignalFront原子推进，siblings不拆、无关producer可独立前进，GUI tick不因plot暂缺fatal。Cross发布值、Area发布dtype/axes/validity保持的Dataset、Rolling多样本selection/Fit不丢source revision，Fit只发布参数；无hover与presentation sidecar。
 4. Curve/Image/Histogram/Rolling/FacetGrid/PulseTimeline、Distribution自动双高斯/threshold、focused/all-facets Fit全部通过同一zlc_plot engine。Calibration、TaskConsole、DataFigure、FigureViewer、Edit与Pulse preview对同spec/size/DPR产生同style/data-box；Live Fit不停base，Edit Fit不冻结Monitor，Fit overlay直接在图中且不显示伪lag状态。
-5. DeviceManager完成多种DeviceInstance的Add/Remove/Retype/New/Load/Save/Apply、domain分组与discovered/loaded分离；installation graph对missing/ambiguous/cardinality/cycle启动即失败。active Run期间Apply不关闭/遗弃旧Run，idle Apply严格按validate→old SAFE/release→new connect→publish执行；连接失败不留下双owner或伪active graph。新增/删除device type只改leaf，无flat backend form、中央concrete import或config digest。
+5. DeviceManager完成多种DeviceInstance的Add/Remove/Retype/New/Load/Save/Apply、domain分组与discovered/loaded分离；installation graph对missing/ambiguous/wrong-capability/cardinality/cycle启动即失败。active Run期间Apply不关闭/遗弃旧Run，idle Apply严格按validate→old SAFE/release→new connect→publish执行；连接失败不留下双owner或伪active graph，成功或恢复后public Experiment identity不变且旧runtime-bound窗口已退役。新增/删除device type只改leaf；DeviceRef按stable id钉住实例，runtime只有通用capability resolver，无flat backend form、具体Port中央表、中央concrete import或config digest。
 6. 所有Logic Node均由一个generic host生成lifecycle/form/API/publish/persistence；新增/删除普通node只改leaf。Task takeover有header/progress/stage/Stop并禁止其它mutation，Measurement/Processor row-local，Occupancy不auto-open。Logic Edit与Plot Edit共享producer draft，Area可预填Camera ROI且Apply后继续采集。
 7. 正式纵切全部通过：Camera N=3 atomic frames、Occupancy手动绑定、Calibration capture/calibrate/save_frames/reload/report、MOT Ready→live→FINAL、PulseScan、duration fidelity、release-recapture、FigureViewer/Edit/Grid batch Fit。Camera/MOT并行与真实冲突retire-then-start遵守§5.1；纯consumer不伪claim设备。
 8. task/run输出位于用户project可见目录，只含可reload record、必要科学arrays与显式附件；普通SHA/fingerprint/tagged bytes/`$zlc-bytes`/size manifest/CAS/repository lease/软件内存预算在生产、测试和文档中为零。artifact写入不持hardware lease，partial目录不能load为成功。

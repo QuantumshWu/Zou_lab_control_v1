@@ -2,8 +2,9 @@
 
 > 核心原则：virtual 与 real 共用 declarative Request、typed Port、RunController 和 artifact
 > 语义；GUI 不接 raw device。当前同时提供 sequencer-only `remote_pulse` 与完整 `hardware`
-> installation package。后者已经闭合 remote FPGA、qCMOS DCAM 和 Pylon MOT camera 的软件
-> composition，可以进入真实设备 E0/bring-up；“软件入口存在”不等于“这台装置已经合格”。
+> graph template。每个 device leaf 独占自己的 schema、factory 与 capability；完整 graph 已闭合
+> remote FPGA、qCMOS DCAM 和 Pylon MOT camera 的软件 composition，可以进入真实设备
+> E0/bring-up；“软件入口存在”不等于“这台装置已经合格”。
 > 每次完整 installation 初始化都必须在当前设备上通过主动 E0，失败时不发布 runtime。
 
 > ⚠️ 运行前确认 import 的是这份代码(`python -c "import Zou_lab_control, sys; print(Zou_lab_control.__file__)"`),
@@ -36,7 +37,7 @@
 - [ ] `remote_pulse` real composition 不读取旧 `remote_template.json`或客户端XDC，显式使用server的`host:port`；
       target manifest（含package-pin endpoints）、clock、geometry与connection generation全从current server snapshot取得并在每次Run重验。
 - [ ] 完整 `hardware` composition 由 DeviceManager 或
-      `InstallationConfigDocument.from_parameters("hardware", values)` 创建；它会在发布 Experiment 前
+      `installation_template("hardware", ...)` 创建 ordered `DeviceInstance` graph；它会在发布 Experiment 前
       主动验证两个相机的工作点、trigger lane、帧顺序/计数与 FPGA terminal evidence。
 - [ ] Pulse server 连通只证明 sequencer transport。只有本次完整 initialization 的主动 E0 成功，
       才能说当前 connection generation 上的相机 trigger path 已取得运行期 qualification；不得恢复
@@ -53,7 +54,8 @@ python pulse_gui.py            # 默认 Offline，可编辑/Preview但执行按�
 ```
 
 - 顶部 **Connection**:下拉选 `Remote server` → 填 `host:port`(默认 `127.0.0.1:18861`)→ 点 **Connect**。
-  成功后该process-lifetime installation不可热换；要换server必须安全关闭窗口后启动新进程。
+  standalone PulseGUI 只通过这条显式连接命令替换自己拥有的 connection；绑定完整 Experiment 时，
+  topology 只能由 DeviceManager 的原子 **Apply** 替换，不能在旧 runtime 内偷换 Port。
 - 也可启动即连(脚本/无人值守):`python pulse_gui.py --remote-host <FPGA_IP>`(显式 host 视为必须连,
   连接失败会在同一窗口明确显示，修正地址后可重试；尚未取得installation authority前绝不调用硬件)。
 - 连上后：**Run Once** 编译整段 `PulseDocument`、上传并执行一次；**On Pulse (HOLD)** 在FPGA侧持续；
@@ -62,15 +64,13 @@ python pulse_gui.py            # 默认 Offline，可编辑/Preview但执行按�
 
   ```python
   from pathlib import Path
-  from Zou_lab_control.api import InstallationConfigDocument, WorkspacePaths, connect
+  from Zou_lab_control.api import WorkspacePaths, connect, installation_template
 
-  installation = InstallationConfigDocument.from_parameters(
+  installation = installation_template(
       "remote_pulse",
-      {
-          "host": "<FPGA_IP>",
-          "port": 18861,
-          "transport_timeout_seconds": 120.0,
-      },
+      host="<FPGA_IP>",
+      port=18861,
+      transport_timeout_seconds=120.0,
   )
   workspace = WorkspacePaths.for_workspace(Path.cwd())
   exp = connect(installation, workspace=workspace)
@@ -79,39 +79,63 @@ python pulse_gui.py            # 默认 Offline，可编辑/Preview但执行按�
 
   该 Experiment 只有 sequencer 能力，没有 camera/readout 能力。窗口复用该 Experiment，
   关闭窗口不关闭调用者持有的 Experiment；standalone 窗口则拥有并在关闭时安全关闭自己的
-  Experiment。所有 backend 都只使用 `from_parameters(backend, values)` 或 DeviceManager，
-  不存在 backend-specific 配置 classmethod。
+  Experiment。`remote_pulse` 只是创建 ordered graph 的模板名，不是 runtime backend dispatch；
+  连接时仍由 graph 中 `sequencer` stable instance 的 leaf factory 发布 `pulse.execute` capability。
 
 ---
 
 ## 2. 完整 hardware installation（首选 DeviceManager）
 
-先运行 `device_manager.bat`，选择 **Real hardware**，填写 pulse server、qCMOS、Pylon、trigger
-lane、readout grid 与 site centers，保存 config 后点 **Initialize**。Initialize 是唯一真实
+先运行 `device_manager.bat`，在 **New** 选择 `hardware`，逐张 device card 填写 pulse server、
+qCMOS、Pylon、trigger lane、readout grid 与 site centers，保存 config 后点 **Apply**。Apply 是唯一真实
 bring-up 边界：它先连接 remote FPGA，再建立两个相机 adapter，读取并冻结 working point，随后
 分别运行一段只切换目标 trigger lane、其余数字/DAC 保持 SAFE 的四触发 E0 program。只有相机帧
 ordinal、hardware stamp、produced count、terminal drain 与 FPGA completed schedule 全部一致，才
 发布可供 TaskConsole/PulseGUI 共用的同一个 Experiment。任一步失败都会清理已打开设备，不发布
 部分 runtime。
 
-也可以显式构造同一个配置；未写字段由 installation leaf 的 authoring schema 填入其当前默认值：
+也可以显式构造同一个 ordered graph。模板只负责当前默认实例与不歧义的便捷覆盖；同名但属于
+不同设备的字段（例如两个 camera 的 `trigger_lane`/`exposure_seconds`）必须按 stable instance id
+分别修改，不能重新合并成 backend-wide 参数袋：
 
 ```python
+from dataclasses import replace
 from pathlib import Path
-from Zou_lab_control.api import InstallationConfigDocument, WorkspacePaths, connect
-
-installation = InstallationConfigDocument.from_parameters(
-    "hardware",
-    {
-        "pulse_host": "<FPGA_IP>",
-        "pylon_serial": "<BASLER_SERIAL>",
-        "readout_grid_rows": 2,
-        "readout_grid_columns": 2,
-        "readout_site_centers_json": "[[120.0,80.0],[160.0,80.0],[120.0,120.0],[160.0,120.0]]",
-        # 按实际布线覆盖 readout_trigger_lane / mot_trigger_lane，
-        # 按实际工作点覆盖 exposure / ROI / binning / trigger source。
-    },
+from Zou_lab_control.api import (
+    InstallationConfigDocument,
+    WorkspacePaths,
+    connect,
+    installation_template,
 )
+
+template = installation_template(
+    "hardware",
+    host="<FPGA_IP>",
+    serial="<BASLER_SERIAL>",
+    grid_rows=2,
+    grid_columns=2,
+    site_centers_json="[[120.0,80.0],[160.0,80.0],[120.0,120.0],[160.0,120.0]]",
+)
+per_instance = {
+    "camera": {
+        "trigger_lane": "<READOUT_TRIGGER_LANE>",
+        # 按真实 qCMOS 工作点设置 exposure/ROI/binning。
+    },
+    "mot-camera": {
+        "trigger_lane": "<MOT_TRIGGER_LANE>",
+        # 按真实 Pylon 工作点设置 exposure/ROI/trigger_source。
+    },
+}
+installation = InstallationConfigDocument(tuple(
+    replace(
+        device,
+        parameters={
+            **device.parameters,
+            **per_instance.get(device.instance_id, {}),
+        },
+    )
+    for device in template.devices
+))
 exp = connect(
     installation,
     workspace=WorkspacePaths.for_workspace(Path.cwd()),
@@ -120,8 +144,10 @@ exp.task_console()
 ```
 
 这里的示例坐标只是合法格式，不是装置标定值；真机必须填写实际 site centers 与 camera 参数。
-旧 `remote_template.json`、`open_devices=True`、raw SDK/session 和已删除的 backend-specific
-constructor 都不是 current 入口。
+`camera`/`mot-camera` 的 `sequencer_ref="sequencer"` 引用的是 stable instance id；role 可以改名，
+requirement 不随 role 漂移。若修改 instance id，必须同时更新所有引用该 id 的 leaf 参数，graph
+preflight 会在连接任何设备前拒绝 missing/wrong-capability/cycle。旧 `remote_template.json`、
+`open_devices=True`、raw SDK/session、backend-wide config 与已删除 constructor 都不是 current 入口。
 
 ---
 
@@ -132,9 +158,9 @@ constructor 都不是 current 入口。
    `ch00`；否则不运行。
 2. 用 **Run Once** 依次跑全 SAFE 短 pulse 与一个单通道短 pulse；示波器确认实际波形、lane 与
    编译 Preview 一致。再用 **On Pulse (HOLD)** / **Stop** 验证 terminal SAFE。
-3. 在 DeviceManager 载入完整 `hardware` config 并点 **Initialize**。此动作会在真实输出上主动
+3. 在 DeviceManager 载入完整 `hardware` graph 并点 **Apply**。此动作会在真实输出上主动
    运行两个四触发 E0；先确保 camera trigger lane 已接好、其它输出的 SAFE 值正确。只有两个
-   qualification 都成功且 DeviceManager 发布 initialized Experiment 才继续。
+   qualification 都成功且 DeviceManager 发布 active Experiment 才继续。
 4. 在 TaskConsole 分别运行 qCMOS 与 MOT camera 的 monitor/finite measurement，确认 shape、dtype、
    frame ordinal、working point 与实际设备一致；这一步不得用 GUI 是否有图替代 terminal evidence。
 5. 运行一个最小 Calibration → Occupancy 链，核对 site centers、validity、artifact identity 与原始
@@ -160,7 +186,7 @@ constructor 都不是 current 入口。
 | 首次 `prepare()` 报 `geometry/layout mismatch` | 运行image的几何指纹与current host `build_fingerprint(params)`不一致 | 停止运行并核对已批准的软件/bitstream资产；不得为迁就架构自动重烧，只有证实现有RTL bug或偏离既定设计才启动bitstream变更流程 |
 | server 起不来 / JTAG 报错 | hw_server 没起 / JTAG 接触 / 板掉电 | 查电源、JTAG 线;Vivado 硬件管理器单独验证 |
 | `qCMOS timed out` 等不到帧 | 相机收不到触发(通道/触发名不匹配) | 核对 XDC 的 `channels` 与相机 config 的 `capture_trigger_channels`;示波器看触发线 |
-| Initialize 在 E0 拒绝 stamp/count/terminal | 工作点不满足 deterministic trigger contract、发生漏帧/乱序，或 trigger lane 配错 | 保留本次 pulse terminal、camera records 与示波器证据；先修实际布线/工作点/adapter，不绕过 qualification、不伪造 digest |
+| Apply 在 E0 拒绝 stamp/count/terminal | 工作点不满足 deterministic trigger contract、发生漏帧/乱序，或 trigger lane 配错 | 保留本次 pulse terminal、camera records 与示波器证据；先修实际布线/工作点/adapter，不绕过 qualification、不伪造 digest |
 
 > 真机出问题记录current server snapshot、Run diagnostics、示波器/相机证据，并按
 > `docs/MAINTAINER_NOTES.md` 的现行排查边界定位；不要依赖仓外memory key或旧session路径。

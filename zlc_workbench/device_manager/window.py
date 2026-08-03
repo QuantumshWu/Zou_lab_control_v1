@@ -1,17 +1,11 @@
-"""Formal current DeviceManager window.
-
-The window is deliberately a thin Qt projection of
-:class:`DeviceManagerController`.  Ordinary editor changes are keyed leaf
-deltas: they never read the whole form, rebuild the form, poll a runtime, or
-manufacture a whole-window snapshot.  Runtime control belongs to
-DeviceViewer; this surface owns installation configuration and the two
-lifecycle boundaries only (initialize and shutdown-for-restart).
-"""
+"""Fluent projection of the ordered DeviceInstance graph editor."""
 
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import threading
+
 from PyQt5 import QtCore, QtWidgets
 
 from zlc_frontend.qt_widgets import (
@@ -26,11 +20,10 @@ from zlc_frontend.qt_widgets import (
     FluentComboBox,
     FluentFrame,
     FluentGroupBox,
-    FluentLabel,
+    FluentLineEdit,
     FluentParameterForm,
     FluentScrollArea,
     FluentSectionLabel,
-    FluentSettingRow,
     FluentStatusDot,
     FluentStatusStrip,
     FluentTabWidget,
@@ -40,106 +33,243 @@ from zlc_frontend.qt_widgets import (
     release_window,
     scaled_px,
     screen_fit_window_size,
-    setting_label_width,
     signals_blocked,
     wait_for_owner_retirement,
     window_pad,
 )
-from zlc_neutral_atom.installation_plan import (
-    InstallationDevicePlan,
-    installation_device_plan,
+from zlc_neutral_atom.device_types import (
+    device_type,
+    discover_device_types,
 )
-from zlc_neutral_atom.installation_package import discover_installation_packages
+from zlc_neutral_atom.installation_config import (
+    DeviceInstanceConfig,
+    discover_installation_templates,
+)
 
 from .controller import DeviceAdminState, DeviceManagerController
-from .editor_session import form_spec
 
 
-_BACKEND_PRESENTATION = tuple(
-    (package.backend, package.label)
-    for package in discover_installation_packages()
-)
+_OBJECT_TOKEN = re.compile(r"[^A-Za-z0-9_]+")
+
+
+def _object_token(value: str) -> str:
+    return _OBJECT_TOKEN.sub("_", value).strip("_") or "item"
 
 
 class _DeviceSummaryCard(FluentFrame):
-    """One compact, stable device row shared by draft and loaded sections."""
+    """Compact read-only row for discovered or currently loaded devices."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent, bordered=True)
         layout = QtWidgets.QHBoxLayout(self)
-        pad = window_pad(0.55)
+        pad = window_pad(0.5)
         layout.setContentsMargins(pad, pad, pad, pad)
-        layout.setSpacing(scaled_px(8, minimum=5))
-        self.role_label = ElidedLabel("")
-        role_font = self.role_label.font()
-        role_font.setBold(True)
-        self.role_label.setFont(role_font)
-        self.role_label.setMinimumWidth(scaled_px(86, minimum=68))
-        self.adapter_label = ElidedLabel("")
+        layout.setSpacing(scaled_px(7, minimum=5))
+        self.title_label = ElidedLabel("")
+        font = self.title_label.font()
+        font.setBold(True)
+        self.title_label.setFont(font)
+        self.title_label.setMinimumWidth(scaled_px(92, minimum=72))
         self.detail_label = muted_note_label("")
         self.detail_label.setSizePolicy(
             QtWidgets.QSizePolicy.Ignored,
             QtWidgets.QSizePolicy.Preferred,
         )
-        self.domain_label = muted_note_label("")
-        self.domain_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        layout.addWidget(self.role_label)
-        layout.addWidget(self.adapter_label, 1)
-        layout.addWidget(self.detail_label, 2)
-        layout.addWidget(self.domain_label)
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.detail_label, 1)
 
-    def update_content(
-        self,
-        *,
-        role: str,
-        domain: str,
-        adapter_kind: str,
-        detail: str,
-    ) -> None:
-        self.role_label.setText(str(role))
-        self.domain_label.setText(str(domain))
-        self.domain_label.setToolTip(str(domain))
-        self.adapter_label.setText(str(adapter_kind))
-        self.detail_label.setText(str(detail))
-        self.detail_label.setToolTip(str(detail))
+    def update_content(self, title: str, detail: str) -> None:
+        self.title_label.setText(title)
+        self.title_label.setToolTip(title)
+        self.detail_label.setText(detail)
+        self.detail_label.setToolTip(detail)
+
+
+class _DiscoveredDeviceCard(_DeviceSummaryCard):
+    add_requested = QtCore.pyqtSignal(object)
+
+    def __init__(self, value: DeviceInstanceConfig, parent=None) -> None:
+        super().__init__(parent)
+        self.value = value
+        self.add_button = FluentButton("Add", color=ACCENT)
+        self.add_button.setObjectName(
+            f"device_discovered_add_{_object_token(value.instance_id)}"
+        )
+        self.layout().addWidget(self.add_button)
+        self.add_button.clicked.connect(
+            lambda _checked=False: self.add_requested.emit(self.value)
+        )
+        self.reconcile(value)
+
+    def reconcile(self, value: DeviceInstanceConfig) -> None:
+        self.value = value
+        descriptor = device_type(value.type_id)
+        self.update_content(
+            value.role,
+            f"{descriptor.label} · {value.instance_id}",
+        )
+
+
+class _DeviceEditorCard(FluentFrame):
+    """One stable editor card; only its type-owned form body may reconcile."""
+
+    def __init__(self, controller: DeviceManagerController, instance_id: str, parent=None):
+        super().__init__(parent, bordered=True)
+        self._controller = controller
+        self._instance_id = instance_id
+        row = controller.editor.row(instance_id)
+        self._domain = device_type(row.type_id).domain
+        self._collapsed = False
+
+        layout = QtWidgets.QVBoxLayout(self)
+        pad = window_pad(0.6)
+        layout.setContentsMargins(pad, pad, pad, pad)
+        layout.setSpacing(window_pad(0.4))
+
+        header = QtWidgets.QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(scaled_px(7, minimum=5))
+        self.collapse_button = FluentButton("−", color=GREY)
+        self.collapse_button.setFixedWidth(scaled_px(32, minimum=26))
+        self.identity_label = muted_note_label(instance_id)
+        self.identity_label.setMinimumWidth(scaled_px(100, minimum=80))
+        self.role_edit = FluentLineEdit()
+        self.role_edit.setPlaceholderText("role")
+        self.role_edit.setObjectName(f"device_role_{_object_token(instance_id)}")
+        self.type_combo = FluentComboBox()
+        self.type_combo.setObjectName(f"device_type_{_object_token(instance_id)}")
+        self.remove_button = FluentButton("Remove", color=ORANGE)
+        self.remove_button.setObjectName(
+            f"device_remove_{_object_token(instance_id)}"
+        )
+        header.addWidget(self.collapse_button)
+        header.addWidget(self.identity_label)
+        header.addWidget(self.role_edit, 1)
+        header.addWidget(self.type_combo, 2)
+        header.addWidget(self.remove_button)
+        layout.addLayout(header)
+
+        self.form = FluentParameterForm(
+            controller.editor.form_spec(instance_id),
+            row.parameters,
+            self,
+        )
+        self.form.setObjectName(
+            f"device_parameters_{_object_token(instance_id)}"
+        )
+        layout.addWidget(self.form)
+
+        self.collapse_button.clicked.connect(self._toggle_collapsed)
+        self.role_edit.textChanged.connect(self._role_changed)
+        self.type_combo.activated.connect(self._type_changed)
+        self.remove_button.clicked.connect(
+            lambda _checked=False: self._controller.remove(self._instance_id)
+        )
+        self.form.changed.connect(self._parameter_changed)
+        self.setObjectName(f"device_card_{_object_token(instance_id)}")
+        self.reconcile(row)
+
+    @property
+    def domain(self) -> str:
+        return self._domain
+
+    def reconcile(self, row) -> None:
+        descriptor = device_type(row.type_id)
+        if descriptor.domain != self._domain:
+            self._domain = descriptor.domain
+            self._fill_type_combo()
+        elif self.type_combo.count() == 0:
+            self._fill_type_combo()
+        with signals_blocked(self.role_edit, self.type_combo):
+            self.role_edit.setText(row.role)
+            index = self.type_combo.findData(row.type_id)
+            if index < 0:
+                raise RuntimeError(
+                    f"device type {row.type_id!r} is absent from domain {self._domain!r}"
+                )
+            self.type_combo.setCurrentIndex(index)
+        self.form.reconcile(
+            self._controller.editor.form_spec(self._instance_id),
+            row.parameters,
+        )
+        self.identity_label.setText(row.instance_id)
+        self.identity_label.setToolTip(
+            f"Stable instance id: {row.instance_id}"
+        )
+
+    def set_busy(self, busy: bool) -> None:
+        enabled = not busy
+        self.collapse_button.setEnabled(True)
+        self.role_edit.setEnabled(enabled)
+        self.type_combo.setEnabled(enabled)
+        self.remove_button.setEnabled(enabled)
+        self.form.setEnabled(enabled)
+
+    def _fill_type_combo(self) -> None:
+        with signals_blocked(self.type_combo):
+            self.type_combo.clear()
+            for descriptor in discover_device_types():
+                if descriptor.domain == self._domain:
+                    self.type_combo.addItem(descriptor.label, descriptor.type_id)
+
+    @QtCore.pyqtSlot()
+    def _toggle_collapsed(self) -> None:
+        self._collapsed = not self._collapsed
+        self.form.setVisible(not self._collapsed)
+        self.collapse_button.setText("+" if self._collapsed else "−")
+
+    @QtCore.pyqtSlot(str)
+    def _role_changed(self, value: str) -> None:
+        self._controller.set_role(self._instance_id, value)
+
+    @QtCore.pyqtSlot(int)
+    def _type_changed(self, index: int) -> None:
+        type_id = self.type_combo.itemData(index)
+        if isinstance(type_id, str):
+            self._controller.retype(self._instance_id, type_id)
+
+    @QtCore.pyqtSlot(str)
+    def _parameter_changed(self, key: str) -> None:
+        try:
+            value = self.form.read_value(key)
+        except (TypeError, ValueError) as error:
+            self._controller.set_field_error(
+                self._instance_id,
+                key,
+                error,
+            )
+            return
+        self._controller.set_parameter(self._instance_id, key, value)
 
 
 class DeviceManagerWindowBody(QtWidgets.QWidget):
-    """Event-driven installation config/admin surface for one controller."""
+    """Event-driven graph authoring surface for one application authority."""
 
     _owner_close_requested = QtCore.pyqtSignal()
 
-    def __init__(
-        self,
-        controller: DeviceManagerController,
-        *,
-        shutdown_on_owner_close: bool,
-        parent=None,
-    ) -> None:
+    def __init__(self, controller: DeviceManagerController, parent=None) -> None:
         if not isinstance(controller, DeviceManagerController):
             raise TypeError("controller must be DeviceManagerController")
         super().__init__(parent)
+        self.setObjectName("device_manager_body")
         self._controller = controller
-        self._shutdown_on_owner_close = bool(shutdown_on_owner_close)
         self._window = None
         self._permanently_closed = False
         self._owner_closed = threading.Event()
         self._owner_close_pending = False
-        self._close_after_shutdown = False
-        self._last_status = ("ready", "info")
-        self._configured_cards: dict[str, _DeviceSummaryCard] = {}
+        self._device_cards: dict[str, _DeviceEditorCard] = {}
+        self._discovered_cards: dict[str, _DiscoveredDeviceCard] = {}
         self._loaded_cards: dict[str, _DeviceSummaryCard] = {}
+        self._domain_layouts: dict[str, QtWidgets.QVBoxLayout] = {}
+        self._domain_add_buttons: dict[str, FluentButton] = {}
 
         self._build_ui()
         self._connect_signals()
-        self._replace_document_projection()
+        self._reconcile_document()
+        self._sync_discovered(self._controller.discovered)
         self._sync_runtime(self._controller.state)
         self._refresh_chrome()
         self.status_strip.show_message("ready", severity="info")
-
-    # ------------------------------------------------------------------
-    # construction
-    # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
@@ -152,13 +282,11 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         self.tabs.add_permanent_tab(self.config_page, "Config")
         outer.addWidget(self.tabs, 1)
 
-        page_layout = QtWidgets.QVBoxLayout(self.config_page)
-        page_layout.setContentsMargins(pad, pad, pad, pad)
-        page_layout.setSpacing(window_pad(0.55))
+        page = QtWidgets.QVBoxLayout(self.config_page)
+        page.setContentsMargins(pad, pad, pad, pad)
+        page.setSpacing(window_pad(0.55))
 
         header = QtWidgets.QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 0)
-        header.setSpacing(scaled_px(8, minimum=5))
         header.addWidget(FluentSectionLabel("Devices"))
         header.addStretch(1)
         self.state_dot = FluentStatusDot(color=GREY, size=12)
@@ -166,112 +294,106 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         self.document_name.setMinimumWidth(scaled_px(150, minimum=100))
         header.addWidget(self.state_dot)
         header.addWidget(self.document_name)
-        page_layout.addLayout(header)
+        page.addLayout(header)
 
         columns = QtWidgets.QHBoxLayout()
-        columns.setContentsMargins(0, 0, 0, 0)
         columns.setSpacing(window_pad(0.65))
-        self.left_scroll, self.left_content, left_layout = self._scroll_column()
-        self.right_scroll, self.right_content, right_layout = self._scroll_column()
+        self.left_scroll, _left_content, left = self._scroll_column()
+        self.right_scroll, _right_content, right = self._scroll_column()
         columns.addWidget(self.left_scroll, 3)
         columns.addWidget(self.right_scroll, 2)
-        page_layout.addLayout(columns, 1)
+        page.addLayout(columns, 1)
 
-        self.installation_group = FluentGroupBox("Installation", self.left_content)
-        installation_layout = QtWidgets.QVBoxLayout(self.installation_group)
+        domains = tuple(dict.fromkeys(
+            descriptor.domain for descriptor in discover_device_types()
+        ))
+        for domain in domains:
+            group = FluentGroupBox(domain.replace("_", " ").title())
+            group.setObjectName(f"device_domain_{_object_token(domain)}")
+            group_layout = QtWidgets.QVBoxLayout(group)
+            group_pad = window_pad(0.7)
+            group_layout.setContentsMargins(
+                group_pad, group_pad, group_pad, group_pad
+            )
+            group_layout.setSpacing(window_pad(0.4))
+            cards = QtWidgets.QVBoxLayout()
+            cards.setContentsMargins(0, 0, 0, 0)
+            cards.setSpacing(window_pad(0.4))
+            group_layout.addLayout(cards)
+            button = FluentButton("Add device", color=ACCENT)
+            button.setObjectName(f"device_add_{_object_token(domain)}")
+            button.clicked.connect(
+                lambda _checked=False, value=domain: self._call(
+                    self._controller.add, value
+                )
+            )
+            group_layout.addWidget(button)
+            self._domain_layouts[domain] = cards
+            self._domain_add_buttons[domain] = button
+            left.addWidget(group)
+        left.addStretch(1)
+
         group_pad = window_pad(0.7)
-        installation_layout.setContentsMargins(group_pad, group_pad, group_pad, group_pad)
-        installation_layout.setSpacing(window_pad(0.45))
-
-        self.backend_combo = FluentComboBox(self.installation_group)
-        for backend, label in _BACKEND_PRESENTATION:
-            self.backend_combo.addItem(label, backend)
-        backend_row = FluentSettingRow(
-            "Backend",
-            self.backend_combo,
-            label_width=setting_label_width(("Backend", "Transport timeout")),
-            parent=self.installation_group,
+        self.discovered_group = FluentGroupBox("Discovered hardware")
+        discovered_layout = QtWidgets.QVBoxLayout(self.discovered_group)
+        discovered_layout.setContentsMargins(
+            group_pad, group_pad, group_pad, group_pad
         )
-        installation_layout.addWidget(backend_row)
+        discovered_layout.setSpacing(window_pad(0.4))
+        self.discover_button = FluentButton("Scan hardware", color=ACCENT)
+        self.discover_button.setObjectName("device_manager_discover")
+        discovered_layout.addWidget(self.discover_button)
+        self.discovered_cards_layout = QtWidgets.QVBoxLayout()
+        self.discovered_cards_layout.setSpacing(window_pad(0.4))
+        discovered_layout.addLayout(self.discovered_cards_layout)
+        self.discovered_empty = muted_note_label("No discovered hardware")
+        self.discovered_empty.setWordWrap(True)
+        discovered_layout.addWidget(self.discovered_empty)
+        right.addWidget(self.discovered_group)
 
-        editor = self._controller.editor
-        self.form = FluentParameterForm(
-            form_spec(editor.backend),
-            editor.values,
-            self.installation_group,
-        )
-        installation_layout.addWidget(self.form)
-        left_layout.addWidget(self.installation_group)
-
-        self.configured_group = FluentGroupBox("Configured devices", self.left_content)
-        self.configured_layout = QtWidgets.QVBoxLayout(self.configured_group)
-        self.configured_layout.setContentsMargins(group_pad, group_pad, group_pad, group_pad)
-        self.configured_layout.setSpacing(window_pad(0.4))
-        left_layout.addWidget(self.configured_group)
-        left_layout.addStretch(1)
-
-        self.available_group = FluentGroupBox("Available", self.right_content)
-        available_layout = QtWidgets.QVBoxLayout(self.available_group)
-        available_layout.setContentsMargins(group_pad, group_pad, group_pad, group_pad)
-        available_layout.setSpacing(window_pad(0.4))
-        self._template_buttons = {}
-        for backend, label in _BACKEND_PRESENTATION:
-            button = FluentButton(label, color=ACCENT)
-            self._template_buttons[backend] = button
-            button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-            available_layout.addWidget(button)
-        right_layout.addWidget(self.available_group)
-
-        self.loaded_group = FluentGroupBox("Loaded (session)", self.right_content)
+        self.loaded_group = FluentGroupBox("Loaded session")
         self.loaded_layout = QtWidgets.QVBoxLayout(self.loaded_group)
-        self.loaded_layout.setContentsMargins(group_pad, group_pad, group_pad, group_pad)
+        self.loaded_layout.setContentsMargins(
+            group_pad, group_pad, group_pad, group_pad
+        )
         self.loaded_layout.setSpacing(window_pad(0.4))
         self.loaded_empty = muted_note_label("No active installation")
         self.loaded_empty.setWordWrap(True)
         self.loaded_layout.addWidget(self.loaded_empty)
-        right_layout.addWidget(self.loaded_group)
-        runtime_note = muted_note_label(
-            "Live device controls belong to DeviceViewer; this window edits "
-            "installation configuration."
+        right.addWidget(self.loaded_group)
+        note = muted_note_label(
+            "Live controls belong to Device Viewer; this window authors the "
+            "installation graph."
         )
-        runtime_note.setWordWrap(True)
-        right_layout.addWidget(runtime_note)
-        right_layout.addStretch(1)
+        note.setWordWrap(True)
+        right.addWidget(note)
+        right.addStretch(1)
 
         actions = QtWidgets.QHBoxLayout()
-        actions.setContentsMargins(0, 0, 0, 0)
         actions.setSpacing(scaled_px(7, minimum=5))
-        self.new_combo = FluentComboBox(self.config_page)
+        self.new_combo = FluentComboBox()
+        self.new_combo.setObjectName("device_manager_new_template")
         self.new_combo.addItem("New…", None)
-        for backend, label in _BACKEND_PRESENTATION:
-            self.new_combo.addItem(label, backend)
+        for name in discover_installation_templates():
+            self.new_combo.addItem(name.replace("_", " ").title(), name)
         self.load_button = FluentButton("Load…", color=ORANGE)
+        self.load_button.setObjectName("device_manager_load")
         self.save_button = FluentButton("Save", color=ACCENT)
+        self.save_button.setObjectName("device_manager_save")
         self.save_as_button = FluentButton("Save as…", color=ACCENT)
-        self.cancel_button = FluentButton("Cancel", color=GREY)
-        self.lifecycle_button = FluentButton("Init devices", color=GREEN)
+        self.save_as_button.setObjectName("device_manager_save_as")
+        self.apply_button = FluentButton("Apply", color=GREEN)
+        self.apply_button.setObjectName("device_manager_apply")
         actions.addWidget(self.new_combo)
         actions.addWidget(self.load_button)
         actions.addWidget(self.save_button)
         actions.addWidget(self.save_as_button)
-        actions.addWidget(self.cancel_button)
         actions.addStretch(1)
-        actions.addWidget(self.lifecycle_button)
-        page_layout.addLayout(actions)
+        actions.addWidget(self.apply_button)
+        page.addLayout(actions)
 
-        self.status_strip = FluentStatusStrip(self.config_page)
-        page_layout.addWidget(self.status_strip)
-
-        self._action_widgets = (
-            self.backend_combo,
-            self.new_combo,
-            *self._template_buttons.values(),
-            self.load_button,
-            self.save_button,
-            self.save_as_button,
-            self.cancel_button,
-            self.lifecycle_button,
-        )
+        self.status_strip = FluentStatusStrip()
+        page.addWidget(self.status_strip)
 
     @staticmethod
     def _scroll_column():
@@ -285,204 +407,206 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         return scroll, content, layout
 
     def _connect_signals(self) -> None:
-        self.form.changed.connect(self._field_changed)
-        self.backend_combo.activated.connect(self._backend_selected)
         self.new_combo.activated.connect(self._new_selected)
-        for backend, button in self._template_buttons.items():
-            button.clicked.connect(
-                lambda _checked=False, name=backend: self._controller.replace_new(name)
-            )
         self.load_button.clicked.connect(self._load)
         self.save_button.clicked.connect(self._save)
         self.save_as_button.clicked.connect(self._save_as)
-        self.cancel_button.clicked.connect(self._controller.cancel)
-        self.lifecycle_button.clicked.connect(self._run_lifecycle_action)
-
+        self.apply_button.clicked.connect(
+            lambda _checked=False: self._call(self._controller.apply)
+        )
+        self.discover_button.clicked.connect(
+            lambda _checked=False: self._call(self._controller.discover)
+        )
         self._controller.draft_changed.connect(self._draft_changed)
-        self._controller.document_replaced.connect(self._replace_document_projection)
+        self._controller.device_added.connect(self._device_added)
+        self._controller.device_removed.connect(self._device_removed)
+        self._controller.device_retyped.connect(self._device_retyped)
+        self._controller.document_replaced.connect(self._reconcile_document)
+        self._controller.discovery_changed.connect(self._sync_discovered)
         self._controller.runtime_changed.connect(self._sync_runtime)
         self._controller.busy_changed.connect(self._busy_changed)
+        self._controller.operation_finished.connect(self._operation_finished)
         self._controller.status_changed.connect(self._show_status)
         self._owner_close_requested.connect(
             self._close_from_owner,
             type=QtCore.Qt.QueuedConnection,
         )
 
-    # ------------------------------------------------------------------
-    # keyed editor projection
-    # ------------------------------------------------------------------
-
-    @QtCore.pyqtSlot(str)
-    def _field_changed(self, key: str) -> None:
-        """Read and commit exactly the leaf that emitted the edit signal."""
-
-        try:
-            value = self.form.read_value(key)
-        except (TypeError, ValueError) as error:
-            self._controller.set_field_error(key, error)
-            return
-        self._controller.set_field(key, value)
-
-    @QtCore.pyqtSlot(int)
-    def _backend_selected(self, index: int) -> None:
-        backend = self.backend_combo.itemData(index)
-        if isinstance(backend, str) and backend != self._controller.editor.backend:
-            self._controller.switch_backend(backend)
-
     @QtCore.pyqtSlot(int)
     def _new_selected(self, index: int) -> None:
-        backend = self.new_combo.itemData(index)
+        template = self.new_combo.itemData(index)
         with signals_blocked(self.new_combo):
             self.new_combo.setCurrentIndex(0)
-        if isinstance(backend, str):
-            self._controller.replace_new(backend)
+        if isinstance(template, str):
+            self._call(self._controller.replace_new, template)
 
-    @QtCore.pyqtSlot(str)
-    def _draft_changed(self, key: str) -> None:
-        # No form.populate/reconcile and no document construction here.  The
-        # current leaf is already in the editor; only dependent text and chrome
-        # are projected onto stable widgets.
-        if key:
-            self._update_configured_details_in_place()
+    @QtCore.pyqtSlot(str, str)
+    def _draft_changed(self, instance_id: str, key: str) -> None:
+        del instance_id, key
         self._refresh_chrome()
         errors = self._controller.field_errors
         if errors:
-            first_key = sorted(errors)[0]
+            (device, field), message = next(iter(sorted(errors.items())))
             self.status_strip.show_message(
-                f"{first_key}: {errors[first_key]}",
+                f"{device}.{field}: {message}",
                 severity="error",
             )
-        elif key:
-            self.status_strip.show_message(
-                "unsaved configuration edit",
-                severity="info",
-            )
 
-    @QtCore.pyqtSlot()
-    def _replace_document_projection(self) -> None:
-        editor = self._controller.editor
-        backend_index = self.backend_combo.findData(editor.backend)
-        if backend_index >= 0:
-            with signals_blocked(self.backend_combo):
-                self.backend_combo.setCurrentIndex(backend_index)
-        self.form.reconcile(form_spec(editor.backend), editor.values)
-        self._sync_configured_rows(self._configured_rows_for_current_draft())
+    @QtCore.pyqtSlot(str)
+    def _device_added(self, instance_id: str) -> None:
+        self._insert_or_reconcile_card(instance_id)
+        self._reconcile_requirement_forms()
+        self._refresh_discovered_buttons()
         self._refresh_chrome()
 
-    def _configured_rows_for_current_draft(
-        self,
-    ) -> tuple[InstallationDevicePlan, ...]:
-        return installation_device_plan(self._controller.editor.backend)
+    @QtCore.pyqtSlot(str)
+    def _device_removed(self, instance_id: str) -> None:
+        card = self._device_cards.pop(instance_id)
+        self._domain_layouts[card.domain].removeWidget(card)
+        card.hide()
+        card.deleteLater()
+        self._reconcile_requirement_forms()
+        self._refresh_discovered_buttons()
+        self._refresh_chrome()
 
-    def _sync_configured_rows(
-        self,
-        rows: tuple[InstallationDevicePlan, ...],
-    ) -> None:
-        desired = {row.role: row for row in rows}
-        for role in tuple(self._configured_cards):
-            if role not in desired:
-                card = self._configured_cards.pop(role)
-                self.configured_layout.removeWidget(card)
+    @QtCore.pyqtSlot(str)
+    def _device_retyped(self, instance_id: str) -> None:
+        self._insert_or_reconcile_card(instance_id)
+        self._reconcile_requirement_forms()
+        self._refresh_chrome()
+
+    @QtCore.pyqtSlot()
+    def _reconcile_document(self) -> None:
+        desired = self._controller.editor.instance_ids
+        desired_set = set(desired)
+        for instance_id in tuple(self._device_cards):
+            if instance_id not in desired_set:
+                card = self._device_cards.pop(instance_id)
+                self._domain_layouts[card.domain].removeWidget(card)
                 card.hide()
                 card.deleteLater()
-        for index, row in enumerate(rows):
-            card = self._configured_cards.get(row.role)
+        for instance_id in desired:
+            self._insert_or_reconcile_card(instance_id)
+        by_domain: dict[str, list[str]] = {domain: [] for domain in self._domain_layouts}
+        for instance_id in desired:
+            by_domain[self._device_cards[instance_id].domain].append(instance_id)
+        for domain, instance_ids in by_domain.items():
+            layout = self._domain_layouts[domain]
+            for index, instance_id in enumerate(instance_ids):
+                layout.insertWidget(index, self._device_cards[instance_id])
+        self._refresh_discovered_buttons()
+        self._refresh_chrome()
+
+    def _insert_or_reconcile_card(self, instance_id: str) -> None:
+        row = self._controller.editor.row(instance_id)
+        domain = device_type(row.type_id).domain
+        card = self._device_cards.get(instance_id)
+        if card is None:
+            card = _DeviceEditorCard(self._controller, instance_id)
+            self._device_cards[instance_id] = card
+            self._domain_layouts[domain].addWidget(card)
+        else:
+            previous_domain = card.domain
+            card.reconcile(row)
+            if card.domain != previous_domain:
+                self._domain_layouts[previous_domain].removeWidget(card)
+                self._domain_layouts[card.domain].addWidget(card)
+        card.set_busy(self._controller.busy)
+
+    def _reconcile_requirement_forms(self) -> None:
+        """Refresh only stable card forms after graph topology changes."""
+
+        for instance_id, card in self._device_cards.items():
+            card.reconcile(self._controller.editor.row(instance_id))
+
+    @QtCore.pyqtSlot(object)
+    def _sync_discovered(self, values) -> None:
+        devices = tuple(values)
+        desired = {value.instance_id: value for value in devices}
+        for instance_id in tuple(self._discovered_cards):
+            if instance_id not in desired:
+                card = self._discovered_cards.pop(instance_id)
+                self.discovered_cards_layout.removeWidget(card)
+                card.hide()
+                card.deleteLater()
+        for index, value in enumerate(devices):
+            if not isinstance(value, DeviceInstanceConfig):
+                raise TypeError("discovery projection requires DeviceInstanceConfig")
+            card = self._discovered_cards.get(value.instance_id)
             if card is None:
-                card = _DeviceSummaryCard(self.configured_group)
-                self._configured_cards[row.role] = card
-            card.update_content(
-                role=row.role,
-                domain=row.domain,
-                adapter_kind=row.adapter_kind.rsplit(".", 1)[-1],
-                detail=self._configured_detail(row),
+                card = _DiscoveredDeviceCard(value)
+                card.add_requested.connect(self._add_discovered)
+                self._discovered_cards[value.instance_id] = card
+            else:
+                card.reconcile(value)
+            self.discovered_cards_layout.insertWidget(index, card)
+        self.discovered_empty.setVisible(not devices)
+        self._refresh_discovered_buttons()
+
+    @QtCore.pyqtSlot(object)
+    def _add_discovered(self, value: DeviceInstanceConfig) -> None:
+        self._call(self._controller.add_discovered, value)
+
+    def _refresh_discovered_buttons(self) -> None:
+        configured = set(self._controller.editor.instance_ids)
+        for instance_id, card in self._discovered_cards.items():
+            card.add_button.setEnabled(
+                not self._controller.busy and instance_id not in configured
             )
-            self.configured_layout.insertWidget(index, card)
-
-    def _update_configured_details_in_place(self) -> None:
-        for row in self._configured_rows_for_current_draft():
-            card = self._configured_cards[row.role]
-            detail = self._configured_detail(row)
-            card.detail_label.setText(detail)
-            card.detail_label.setToolTip(detail)
-
-    def _configured_detail(self, row: InstallationDevicePlan) -> str:
-        editor = self._controller.editor
-        values = editor.values
-        fields = {field.key: field for field in self.form.spec.fields}
-        details = [row.summary]
-        for key in row.configuration_keys:
-            if key not in values or key not in fields:
-                raise RuntimeError(
-                    f"device plan field {key!r} is absent from {editor.backend!r}"
-                )
-            field = fields[key]
-            value = values[key]
-            shown = (
-                "not set"
-                if value is None
-                else "empty"
-                if value == ""
-                else str(value)
-            )
-            suffix = f" {field.unit}" if field.unit else ""
-            details.append(f"{field.label}={shown}{suffix}")
-        return "; ".join(details)
-
-    # ------------------------------------------------------------------
-    # runtime observation (event driven; no timer and no control plane)
-    # ------------------------------------------------------------------
 
     @QtCore.pyqtSlot(object)
     def _sync_runtime(self, state: DeviceAdminState) -> None:
-        if not isinstance(state, DeviceAdminState):
-            return
         catalog = state.catalog
         rows = () if catalog is None else tuple(catalog.items())
-        desired_roles = {role for role, _info in rows}
-        for role in tuple(self._loaded_cards):
-            if role not in desired_roles:
-                card = self._loaded_cards.pop(role)
+        desired = {instance_id for instance_id, _info in rows}
+        for instance_id in tuple(self._loaded_cards):
+            if instance_id not in desired:
+                card = self._loaded_cards.pop(instance_id)
                 self.loaded_layout.removeWidget(card)
                 card.hide()
                 card.deleteLater()
-        for index, (role, info) in enumerate(rows):
-            card = self._loaded_cards.get(role)
+        for index, (instance_id, info) in enumerate(rows):
+            card = self._loaded_cards.get(instance_id)
             if card is None:
-                card = _DeviceSummaryCard(self.loaded_group)
-                self._loaded_cards[role] = card
+                card = _DeviceSummaryCard()
+                card.setObjectName(
+                    f"device_loaded_{_object_token(instance_id)}"
+                )
+                self._loaded_cards[instance_id] = card
+            descriptor = device_type(info.ref.type_id)
+            capabilities = ", ".join(info.capabilities) or "no capabilities"
             card.update_content(
-                role=role,
-                domain=info.domain,
-                adapter_kind=info.adapter_kind,
-                detail=info.resource_key,
+                info.role,
+                f"{descriptor.label} · {instance_id} · {capabilities}",
             )
             self.loaded_layout.insertWidget(index, card)
         self.loaded_empty.setVisible(not rows)
         self._refresh_chrome()
-        if self._close_after_shutdown and state.closed:
-            self._finalize_owner_close()
 
     @QtCore.pyqtSlot(bool, str)
     def _busy_changed(self, busy: bool, label: str) -> None:
         self._refresh_chrome()
         if busy and label:
             self.status_strip.show_message(label, severity="task")
-        elif not busy and self._owner_close_pending:
-            # DeviceManagerController emits busy=False before it installs the
-            # completed lifecycle state.  Resume on the next owner turn so a
-            # just-finished initialize is observed before deciding whether a
-            # shutdown is still required.
-            QtCore.QTimer.singleShot(0, self._resume_owner_close)
+
+    @QtCore.pyqtSlot(str, bool)
+    def _operation_finished(self, kind: str, success: bool) -> None:
+        if not self._owner_close_pending:
+            return
+        if kind == "dispose":
+            if success:
+                self._finalize_owner_close()
+            else:
+                self._owner_close_pending = False
+                if self._window is not None:
+                    self._window.show()
+            return
+        QtCore.QTimer.singleShot(0, self._begin_owner_close)
 
     @QtCore.pyqtSlot(str, str)
     def _show_status(self, text: str, severity: str) -> None:
         mapped = severity if severity in FluentStatusStrip.SEVERITIES else "info"
-        self._last_status = (str(text), mapped)
         self.status_strip.show_message(str(text), severity=mapped)
-        if mapped == "error" and self._close_after_shutdown:
-            self._close_after_shutdown = False
-            if self._window is not None:
-                self._window.show()
 
     def _refresh_chrome(self) -> None:
         editor = self._controller.editor
@@ -491,59 +615,58 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         path = editor.path
         name = (
             "session config"
-            if path is None and state.active_config is not None
+            if (
+                path is None
+                and state.active_config is not None
+                and not editor.differs_from_active
+            )
             else "untitled"
             if path is None
             else path.name
         )
-        shown_name = f"{name}{'*' if editor.dirty else ''}"
-        self.document_name.setText(shown_name)
-        self.document_name.setToolTip(shown_name if path is None else str(path))
+        shown = f"{name}{'*' if editor.dirty else ''}"
+        self.document_name.setText(shown)
+        self.document_name.setToolTip(shown if path is None else str(path))
 
         if state.active_config is None:
             self.state_dot.set_color(GREY)
             self.state_dot.setToolTip("No active installation")
-        elif editor.restart_required:
+        elif editor.differs_from_active:
             self.state_dot.set_color(ORANGE)
-            self.state_dot.setToolTip("Saved/draft configuration differs from the active installation")
+            self.state_dot.setToolTip("Draft differs from the loaded session")
         else:
             self.state_dot.set_color(GREEN)
-            self.state_dot.setToolTip("Configuration matches the active installation")
+            self.state_dot.setToolTip("Draft matches the loaded session")
 
+        errors = bool(self._controller.field_errors)
         self.save_button.set_dirty(editor.dirty, dirty_color=YELLOW)
-        for widget in self._action_widgets:
-            widget.setEnabled(not busy)
-        self.form.setEnabled(not busy)
-        has_errors = bool(self._controller.field_errors)
-        draft_ready = not has_errors and self._draft_has_required_values()
-        self.save_button.setEnabled(not busy and path is not None and draft_ready)
-        self.save_as_button.setEnabled(not busy and draft_ready)
-        self.cancel_button.setEnabled(not busy and editor.dirty)
-
-        if state.active_config is not None:
-            if editor.restart_required:
-                self.lifecycle_button.setText("Shutdown for restart")
-            else:
-                self.lifecycle_button.setText("Shutdown devices")
-            self.lifecycle_button.setEnabled(not busy)
-        elif state.closed or not state.can_initialize:
-            self.lifecycle_button.setText("Restart process")
-            self.lifecycle_button.setEnabled(False)
-        else:
-            self.lifecycle_button.setText("Init devices")
-            self.lifecycle_button.setEnabled(not busy and draft_ready)
-
-    def _draft_has_required_values(self) -> bool:
-        return all(
-            not field.required
-            or field.required_choice_unavailable
-            or not self.form.is_empty(field.key)
-            for field in self.form.spec.fields
+        self.new_combo.setEnabled(not busy)
+        self.load_button.setEnabled(not busy)
+        self.save_button.setEnabled(not busy and not errors and path is not None)
+        self.save_as_button.setEnabled(not busy and not errors)
+        needs_apply = (
+            state.active_config is None or editor.differs_from_active
         )
-
-    # ------------------------------------------------------------------
-    # explicit file/lifecycle boundaries
-    # ------------------------------------------------------------------
+        self.apply_button.setEnabled(
+            not busy
+            and not errors
+            and needs_apply
+            and state.can_apply
+            and not state.closed
+        )
+        has_discovery = any(
+            descriptor.discover is not None
+            for descriptor in discover_device_types()
+        )
+        self.discover_button.setEnabled(not busy and has_discovery)
+        self.discover_button.setToolTip(
+            "" if has_discovery else "No installed device type declares discovery"
+        )
+        for button in self._domain_add_buttons.values():
+            button.setEnabled(not busy)
+        for card in self._device_cards.values():
+            card.set_busy(busy)
+        self._refresh_discovered_buttons()
 
     def _load(self) -> None:
         path, _selected = QtWidgets.QFileDialog.getOpenFileName(
@@ -577,20 +700,13 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         if not path:
             return
         target = Path(path)
-        if target.suffix == "":
+        if not target.suffix:
             target = target.with_suffix(".json")
         self._call(self._controller.save_file, target)
 
     def _dialog_start_directory(self) -> Path:
         path = self._controller.editor.path
         return Path.home() if path is None else path.parent
-
-    def _run_lifecycle_action(self) -> None:
-        state = self._controller.state
-        if state.active_config is not None:
-            self._call(self._controller.shutdown_for_restart)
-        elif state.active_config is None and state.can_initialize:
-            self._call(self._controller.initialize)
 
     def _call(self, operation, *args) -> None:
         try:
@@ -601,19 +717,13 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
                 severity="error",
             )
 
-    # ------------------------------------------------------------------
-    # notebook / launcher lifecycle
-    # ------------------------------------------------------------------
-
     @property
     def permanently_closed(self) -> bool:
         return self._permanently_closed
 
     def restore_window(self) -> None:
-        if self._permanently_closed:
+        if self._permanently_closed or self._window is None:
             raise RuntimeError("Device manager is closed")
-        if self._window is None:
-            raise RuntimeError("Device manager window is unavailable")
         self._window.showNormal()
         self._window.raise_()
         self._window.activateWindow()
@@ -626,8 +736,6 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         )
 
     def request_owner_close(self) -> None:
-        """Retire an application-owned window on the Qt owner thread."""
-
         if self._permanently_closed:
             return
         if QtCore.QThread.currentThread() is self.thread():
@@ -640,52 +748,28 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         if self._permanently_closed:
             return
         self._owner_close_pending = True
-        if self._shutdown_on_owner_close:
-            self._begin_owned_close()
-            return
         if self._controller.busy:
             self.status_strip.show_message(
                 "waiting for the device operation before closing",
                 severity="task",
             )
             return
-        self._finalize_owner_close()
+        self._begin_owner_close()
 
-    @QtCore.pyqtSlot()
-    def _resume_owner_close(self) -> None:
-        if self._permanently_closed or not self._owner_close_pending:
+    def _begin_owner_close(self) -> None:
+        try:
+            self._controller.close()
+        except BaseException as error:
+            self._owner_close_pending = False
+            self.status_strip.show_message(
+                f"{type(error).__name__}: {error}",
+                severity="error",
+            )
             return
-        self._close_from_owner()
-
-    def _begin_owned_close(self) -> bool:
-        """Start the one async shutdown path used by every owned window."""
-
-        if self._permanently_closed:
-            return True
-        if self._controller.busy:
-            self.status_strip.show_message(
-                "wait for the device operation to finish before closing",
-                severity="warning",
-            )
-            return False
-        if self._controller.state.active_config is not None:
-            self._close_after_shutdown = True
-            self.status_strip.show_message(
-                "shutting down devices before closing",
-                severity="task",
-            )
-            self._call(self._controller.shutdown_for_restart)
-            return False
-        self._finalize_owner_close()
-        return True
 
     def _finalize_owner_close(self) -> None:
-        if self._permanently_closed:
-            return
         self._permanently_closed = True
         self._owner_close_pending = False
-        self._close_after_shutdown = False
-        self._controller.close()
         window = self._window
         self._window = None
         if window is not None:
@@ -695,7 +779,17 @@ class DeviceManagerWindowBody(QtWidgets.QWidget):
         self._owner_closed.set()
 
     def _request_standalone_close(self) -> bool:
-        return self._begin_owned_close()
+        if self._permanently_closed:
+            return True
+        self._owner_close_pending = True
+        if self._controller.busy:
+            self.status_strip.show_message(
+                "wait for the device operation to finish before closing",
+                severity="warning",
+            )
+            return False
+        self._begin_owner_close()
+        return False
 
     def _attach_window(self, window) -> None:
         self._window = window
@@ -705,15 +799,11 @@ def launch_device_manager_window(
     controller: DeviceManagerController,
     *,
     hide_on_close: bool = False,
-    shutdown_on_owner_close: bool = False,
 ) -> DeviceManagerWindowBody:
-    """Launch the DeviceManager through the one shared Fluent sequence."""
+    """Launch DeviceManager through the shared Fluent window sequence."""
 
     ensure_qt_app()
-    body = DeviceManagerWindowBody(
-        controller,
-        shutdown_on_owner_close=shutdown_on_owner_close,
-    )
+    body = DeviceManagerWindowBody(controller)
     initial = screen_fit_window_size(WINDOW_SCREEN_FRACTION)
 
     def wire(window) -> None:

@@ -132,13 +132,14 @@ def _case_public_authority_and_validation(root: Path) -> None:
 
         request = exp.readout.capture_request(IMAGING_PULSE)
         stale = DeviceRef(
-            request.camera_ref.installation_id,
-            request.camera_ref.runtime_instance_id + "-stale",
-            request.camera_ref.role,
+            runtime_instance_id=request.camera_ref.runtime_instance_id + "-stale",
+            instance_id=request.camera_ref.instance_id,
+            type_id=request.camera_ref.type_id,
+            role=request.camera_ref.role,
         )
         _expect(
             RuntimeError,
-            "another runtime instance",
+            "another runtime generation",
             lambda: exp.inspect(replace(request, camera_ref=stale)),
         )
 

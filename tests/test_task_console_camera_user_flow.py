@@ -260,7 +260,7 @@ def test_camera_live_image_area_second_image_and_fit_use_one_plot_stack(
     devices = flow.open()
     console_wrapper = None
     try:
-        QtTest.QTest.mouseClick(devices.lifecycle_button, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseClick(devices.apply_button, QtCore.Qt.LeftButton)
         until(
             application,
             lambda: flow.console is not None or flow.failure is not None,
@@ -444,7 +444,7 @@ def test_occupancy_start_does_not_open_panel_and_manual_binding_displays(
     console_wrapper = None
     pulse_body = None
     try:
-        QtTest.QTest.mouseClick(devices.lifecycle_button, QtCore.Qt.LeftButton)
+        QtTest.QTest.mouseClick(devices.apply_button, QtCore.Qt.LeftButton)
         until(
             application,
             lambda: flow.console is not None or flow.failure is not None,

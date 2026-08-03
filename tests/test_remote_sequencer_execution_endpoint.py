@@ -200,7 +200,6 @@ def _bound_remote(client, endpoint, *, suffix="main"):
         lambda: PhysicalDeviceIdentity(
             stable_device_identity=f"installation-endpoint:test-fpga-{suffix}",
             evidence_kind=DeviceIdentityEvidenceKind.INSTALLATION_ASSERTED_ENDPOINT,
-            asset_map_revision="test-assets-v1",
         )
     )
     binding = None

@@ -1,150 +1,149 @@
-"""Backend-neutral canonical storage for installation configuration documents.
-
-Concrete values, field semantics, codecs, topology, and composition live in
-their fixed ``devices/<backend>/package.py`` leaf.  This module only envelopes
-one leaf-owned value and provides atomic persistence.
-"""
+"""Human-readable installation graph configuration and atomic persistence."""
 
 from __future__ import annotations
 
 import json
+import math
 import os
-import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cache
+from importlib import import_module
 from pathlib import Path
-from zlc_neutral_atom.authoring import AuthoringSchema
-from zlc_storage import (
-    flush_directory,
-    sha256_digest,
-    sha256_text,
-)
-from zlc_storage.file_lock import (
-    acquire_file_lock,
-    open_durable_lock_file,
-    release_file_lock,
-)
+from pkgutil import walk_packages
+from types import MappingProxyType
+
+from zlc_storage import atomic_write_text, canonical_text
 
 
-INSTALLATION_CONFIG_FORMAT = "zlc_neutral_atom.InstallationConfig"
+INSTALLATION_CONFIG_FORMAT = "zlc.installation"
+
+
+def _json_value(value: object, field: str) -> object:
+    """Copy one ordinary JSON value while rejecting ambiguous Python values."""
+
+    if value is None or type(value) in (bool, int, str):
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{field} must not contain non-finite numbers")
+        return value
+    if isinstance(value, (list, tuple)):
+        return tuple(
+            _json_value(item, f"{field}[{index}]")
+            for index, item in enumerate(value)
+        )
+    if isinstance(value, Mapping):
+        copied: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key:
+                raise TypeError(f"{field} keys must be non-empty strings")
+            if key in copied:
+                raise ValueError(f"{field} contains duplicate key {key!r}")
+            copied[key] = _json_value(item, f"{field}.{key}")
+        return MappingProxyType(copied)
+    raise TypeError(f"{field} must contain only ordinary JSON values")
+
+
+def _plain(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_plain(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceInstanceConfig:
+    """One stable, human-named device instance in an installation graph."""
+
+    instance_id: str
+    role: str
+    type_id: str
+    parameters: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "instance_id",
+            canonical_text(self.instance_id, "device instance_id"),
+        )
+        if "/" in self.instance_id:
+            raise ValueError("device instance_id cannot contain '/'")
+        object.__setattr__(self, "role", canonical_text(self.role, "device role"))
+        object.__setattr__(
+            self,
+            "type_id",
+            canonical_text(self.type_id, "device type_id"),
+        )
+        if not isinstance(self.parameters, Mapping):
+            raise TypeError("device parameters must be a mapping")
+        copied = _json_value(self.parameters, "device parameters")
+        assert isinstance(copied, Mapping)
+        object.__setattr__(self, "parameters", copied)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "instance_id": self.instance_id,
+            "role": self.role,
+            "type_id": self.type_id,
+            "parameters": _plain(self.parameters),
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "DeviceInstanceConfig":
+        fields = {"instance_id", "role", "type_id", "parameters"}
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError(
+                "device instance must contain exactly "
+                "['instance_id', 'parameters', 'role', 'type_id']"
+            )
+        return cls(
+            instance_id=value["instance_id"],
+            role=value["role"],
+            type_id=value["type_id"],
+            parameters=value["parameters"],
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class InstallationConfigDocument:
-    """One immutable, canonicalizable current installation request."""
+    """An ordered installation graph; order is the user's presentation order."""
 
-    config: object
+    devices: tuple[DeviceInstanceConfig, ...]
 
     def __post_init__(self) -> None:
-        from zlc_neutral_atom.installation_package import (
-            installation_package_for_config,
-        )
-
-        installation_package_for_config(self.config).require_config(self.config)
-
-    @classmethod
-    def from_parameters(
-        cls,
-        backend: str,
-        values: Mapping[str, object],
-    ) -> "InstallationConfigDocument":
-        """Build one leaf-validated document from an ordinary editor draft."""
-
-        from zlc_neutral_atom.installation_package import installation_package
-
-        package = installation_package(backend)
-        frozen = package.authoring_schema(None).freeze(values)
-        return cls(package.config_from_parameters(frozen))
-
-    @property
-    def backend(self) -> str:
-        from zlc_neutral_atom.installation_package import (
-            installation_package_for_config,
-        )
-
-        return installation_package_for_config(self.config).backend
-
-    @property
-    def parameters(self) -> dict[str, object]:
-        from zlc_neutral_atom.installation_package import (
-            installation_package_for_config,
-        )
-
-        return installation_package_for_config(self.config).parameters(self.config)
-
-    @property
-    def content_digest(self) -> str:
-        return sha256_digest(self.to_bytes())
+        devices = tuple(self.devices)
+        if any(not isinstance(item, DeviceInstanceConfig) for item in devices):
+            raise TypeError("devices must contain DeviceInstanceConfig values")
+        ids = tuple(item.instance_id for item in devices)
+        roles = tuple(item.role for item in devices)
+        if len(ids) != len(set(ids)):
+            raise ValueError("device instance_id values must be unique")
+        if len(roles) != len(set(roles)):
+            raise ValueError("device roles must be unique")
+        object.__setattr__(self, "devices", devices)
 
     def to_dict(self) -> dict[str, object]:
         return {
             "format": INSTALLATION_CONFIG_FORMAT,
-            "backend": self.backend,
-            "parameters": self.parameters,
+            "devices": [item.to_dict() for item in self.devices],
         }
-
-    def to_bytes(self) -> bytes:
-        """Return deterministic UTF-8 JSON used for file content and identity."""
-
-        return (
-            json.dumps(
-                self.to_dict(),
-                ensure_ascii=False,
-                allow_nan=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            + "\n"
-        ).encode("utf-8")
 
     @classmethod
     def from_dict(cls, value: object) -> "InstallationConfigDocument":
-        if not isinstance(value, dict) or set(value) != {
-            "format",
-            "backend",
-            "parameters",
-        }:
+        if not isinstance(value, Mapping) or set(value) != {"format", "devices"}:
             raise ValueError(
-                "installation config must contain exactly "
-                "['backend', 'format', 'parameters']"
+                "installation config must contain exactly ['devices', 'format']"
             )
         if value["format"] != INSTALLATION_CONFIG_FORMAT:
             raise ValueError(
                 f"unsupported installation config format {value['format']!r}"
             )
-        parameters = value["parameters"]
-        if not isinstance(parameters, dict):
-            raise TypeError("installation config parameters must be a mapping")
-        backend = value["backend"]
-        return cls.from_parameters(backend, parameters)
-
-    @classmethod
-    def from_bytes(cls, payload: bytes | bytearray | memoryview) -> "InstallationConfigDocument":
-        if not isinstance(payload, (bytes, bytearray, memoryview)):
-            raise TypeError("installation config payload must be bytes-like")
-        try:
-            text = bytes(payload).decode("utf-8")
-            value = json.loads(
-                text,
-                object_pairs_hook=_unique_object,
-                parse_constant=_reject_json_constant,
-            )
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("installation config is not valid UTF-8 JSON") from exc
-        return cls.from_dict(value)
-
-
-class InstallationConfigConflict(RuntimeError):
-    """The file changed since the caller loaded its editing baseline."""
-
-    def __init__(self, expected_digest: str, actual_digest: str | None) -> None:
-        self.expected_digest = expected_digest
-        self.actual_digest = actual_digest
-        actual = "missing" if actual_digest is None else actual_digest
-        super().__init__(
-            "installation config changed since it was loaded: "
-            f"expected {expected_digest}, found {actual}"
-        )
+        devices = value["devices"]
+        if not isinstance(devices, list):
+            raise TypeError("installation devices must be a JSON array")
+        return cls(tuple(DeviceInstanceConfig.from_dict(item) for item in devices))
 
 
 def load_installation_config(
@@ -152,108 +151,120 @@ def load_installation_config(
 ) -> InstallationConfigDocument:
     target = _config_path(path)
     try:
-        payload = target.read_bytes()
+        value = json.loads(
+            target.read_text(encoding="utf-8"),
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_json_constant,
+        )
     except OSError as exc:
         raise RuntimeError(f"cannot read installation config {target}: {exc}") from exc
-    try:
-        return InstallationConfigDocument.from_bytes(payload)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"invalid installation config {target}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"installation config {target} is not valid JSON") from exc
+    document = InstallationConfigDocument.from_dict(value)
+    from zlc_neutral_atom.device_types import validate_installation_graph
+
+    validate_installation_graph(document)
+    return document
 
 
 def save_installation_config(
     path: str | os.PathLike[str],
     document: InstallationConfigDocument,
-    *,
-    expected_digest: str | None = None,
-) -> str:
-    """Atomically save one document, optionally comparing its editing baseline.
-
-    The adjacent permanent lock file linearizes the compare and replace across
-    processes.  ``expected_digest`` names the canonical document previously
-    loaded by the editor; a semantically unchanged reformat therefore does not
-    create a false conflict.
-    """
+) -> None:
+    """Validate and atomically replace one ordinary, readable JSON file."""
 
     if not isinstance(document, InstallationConfigDocument):
         raise TypeError("document must be InstallationConfigDocument")
-    expected = (
-        None
-        if expected_digest is None
-        else sha256_text(expected_digest, "expected_digest")
-    )
+    from zlc_neutral_atom.device_types import validate_installation_graph
+
+    validate_installation_graph(document)
     target = _config_path(path)
     if not target.parent.is_dir():
         raise FileNotFoundError(
             f"installation config parent does not exist: {target.parent}"
         )
-    lock_path = target.with_name(f".{target.name}.lock")
-    lock_stream = open_durable_lock_file(lock_path)
-    temporary: Path | None = None
-    acquired = False
+    payload = json.dumps(
+        document.to_dict(),
+        ensure_ascii=False,
+        allow_nan=False,
+        indent=2,
+    ) + "\n"
+    atomic_write_text(target, payload)
+
+
+@cache
+def _installation_templates() -> Mapping[str, InstallationConfigDocument]:
+    namespace = import_module("zlc_neutral_atom.devices")
+    prefix = namespace.__name__ + "."
+    module_names = sorted(
+        item.name
+        for item in walk_packages(namespace.__path__, prefix=prefix)
+        if item.name.endswith(".templates")
+    )
+    templates: dict[str, InstallationConfigDocument] = {}
+    for module_name in module_names:
+        module = import_module(module_name)
+        values = getattr(module, "INSTALLATION_TEMPLATES", None)
+        if not isinstance(values, Mapping):
+            raise TypeError(
+                f"{module_name} must export INSTALLATION_TEMPLATES mapping"
+            )
+        for name, document in values.items():
+            normalized = canonical_text(name, "installation template name")
+            if normalized in templates:
+                raise ValueError(f"duplicate installation template {normalized!r}")
+            if not isinstance(document, InstallationConfigDocument):
+                raise TypeError("installation templates must be config documents")
+            templates[normalized] = document
+    if not templates:
+        raise RuntimeError("no built-in installation templates were discovered")
+    return MappingProxyType(dict(sorted(templates.items())))
+
+
+def discover_installation_templates() -> tuple[str, ...]:
+    return tuple(_installation_templates())
+
+
+def installation_template(
+    name: str,
+    **overrides: object,
+) -> InstallationConfigDocument:
+    """Return one template with generic schema-owned convenience overrides."""
+
+    normalized = canonical_text(name, "installation template name")
     try:
-        acquire_file_lock(lock_stream, blocking=True)
-        acquired = True
-        if expected is not None:
-            if not target.exists():
-                raise InstallationConfigConflict(expected, None)
-            current = load_installation_config(target)
-            if current.content_digest != expected:
-                raise InstallationConfigConflict(
-                    expected,
-                    current.content_digest,
+        document = _installation_templates()[normalized]
+    except KeyError as exc:
+        raise ValueError(f"unknown installation template {normalized!r}") from exc
+    from zlc_neutral_atom.device_types import device_type, validate_installation_graph
+
+    if overrides:
+        unknown = set(overrides)
+        devices: list[DeviceInstanceConfig] = []
+        for instance in document.devices:
+            descriptor = device_type(instance.type_id)
+            matches = set(overrides).intersection(descriptor.authoring_schema.keys)
+            parameters = dict(instance.parameters)
+            for key in matches:
+                parameters[key] = overrides[key]
+                unknown.discard(key)
+            parameters = descriptor.authoring_schema.freeze(parameters)
+            devices.append(
+                DeviceInstanceConfig(
+                    instance.instance_id,
+                    instance.role,
+                    instance.type_id,
+                    parameters,
                 )
-        payload = document.to_bytes()
-        temporary = target.with_name(
-            f".{target.name}.{uuid.uuid4().hex}.tmp"
-        )
-        with temporary.open("xb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, target)
-        temporary = None
-        flush_directory(target.parent)
-        return sha256_digest(payload)
-    finally:
-        if temporary is not None:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-        if acquired:
-            release_file_lock(lock_stream)
-        lock_stream.close()
+            )
+        if unknown:
+            raise ValueError(
+                f"template {normalized!r} has no fields {tuple(sorted(unknown))}"
+            )
+        document = InstallationConfigDocument(tuple(devices))
 
-
-def default_installation_authoring_schema(backend: str) -> AuthoringSchema:
-    """Return the backend owner's declared defaults and field semantics."""
-
-    from zlc_neutral_atom.installation_package import installation_package
-
-    return installation_package(backend).authoring_schema(None)
-
-
-def installation_authoring_schema(document: InstallationConfigDocument):
-    """Return the leaf schema populated with this document's exact values."""
-
-    if not isinstance(document, InstallationConfigDocument):
-        raise TypeError("document must be InstallationConfigDocument")
-    from zlc_neutral_atom.installation_package import (
-        installation_package_for_config,
-    )
-
-    return installation_package_for_config(document.config).authoring_schema(
-        document.config
-    )
-
-
-def supported_installation_backends() -> tuple[str, ...]:
-    """Project the deterministic backend names declared by built-in leaves."""
-
-    from zlc_neutral_atom.installation_package import discover_installation_packages
-
-    return tuple(package.backend for package in discover_installation_packages())
+    validate_installation_graph(document)
+    return document
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -277,11 +288,10 @@ def _config_path(path: str | os.PathLike[str]) -> Path:
 
 __all__ = [
     "INSTALLATION_CONFIG_FORMAT",
-    "InstallationConfigConflict",
+    "DeviceInstanceConfig",
     "InstallationConfigDocument",
-    "default_installation_authoring_schema",
-    "installation_authoring_schema",
+    "discover_installation_templates",
+    "installation_template",
     "load_installation_config",
     "save_installation_config",
-    "supported_installation_backends",
 ]

@@ -58,7 +58,12 @@ def test_api_slot_edit_dirties_applied_intent_and_on_pulse_clears_it():
         api_parameters=(ApiParameter("duration", field, "ns"),),
     )
     descriptor = PulseTargetDescriptor(
-        DeviceRef("test-installation", "test-api-slot", "sequencer"),
+        DeviceRef(
+            runtime_instance_id="test-api-slot",
+            instance_id="sequencer",
+            type_id="sequencer.test",
+            role="sequencer",
+        ),
         pulse_target_manifest_from_lanes(target),
         50_000_000.0,
         0,
@@ -240,7 +245,12 @@ def test_owner_wake_without_new_fact_is_silent_and_runtime_poll_stays_narrow():
         PulseEditorSession.new(target, time_step_ns=20),
         pulse=Pulse(),
         descriptor=PulseTargetDescriptor(
-            DeviceRef("test-installation", "test-runtime", "sequencer"),
+            DeviceRef(
+                runtime_instance_id="test-runtime",
+                instance_id="sequencer",
+                type_id="sequencer.test",
+                role="sequencer",
+            ),
             pulse_target_manifest_from_lanes(target),
             50_000_000.0,
             0,
@@ -398,7 +408,12 @@ def test_borrowed_experiment_retirement_detaches_before_runtime_timer_poll():
 
     pulse = ClosedExperimentPulse()
     descriptor = PulseTargetDescriptor(
-        DeviceRef("test-installation", "test-runtime", "sequencer"),
+        DeviceRef(
+            runtime_instance_id="test-runtime",
+            instance_id="sequencer",
+            type_id="sequencer.test",
+            role="sequencer",
+        ),
         pulse_target_manifest_from_lanes(target),
         50_000_000.0,
         0,

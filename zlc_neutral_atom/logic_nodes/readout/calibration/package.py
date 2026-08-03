@@ -31,6 +31,7 @@ def _bind_api(
         calibrations_root,
         pulses_root,
         apparatus_facts,
+        resolve_device_ref,
         resolve_camera_ref,
         resolve_sequencer_ref,
         camera_port,
@@ -59,12 +60,20 @@ def _bind_api(
         )
     profiles = {}
     for apparatus in apparatus_facts:
+        camera_ref = resolve_device_ref(
+            apparatus.camera_instance_id,
+            "camera.capture",
+        )
+        sequencer_ref = resolve_device_ref(
+            apparatus.sequencer_instance_id,
+            "pulse.execute",
+        )
         profile = build_sitemap_acquisition_profile(
             apparatus,
-            camera_port=camera_port(resolve_camera_ref(apparatus.camera_role)),
-            pulse_port=pulse_port(
-                resolve_sequencer_ref(apparatus.sequencer_role)
-            ),
+            camera_ref=camera_ref,
+            sequencer_ref=sequencer_ref,
+            camera_port=camera_port(camera_ref),
+            pulse_port=pulse_port(sequencer_ref),
         )
         binding = profile.readout_binding.value
         if binding in profiles:
@@ -145,6 +154,7 @@ LOGIC_NODE_PACKAGE = LogicNodePackage(
         "calibrations_root",
         "pulses_root",
         "readout_apparatus_facts",
+        "resolve_device_ref",
         "resolve_camera_ref",
         "resolve_sequencer_ref",
         "camera_port",
