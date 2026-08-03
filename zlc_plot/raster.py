@@ -310,95 +310,6 @@ class _DispatchMode(str, Enum):
         return self in {_DispatchMode.PUBLISH, _DispatchMode.PRESENTATION}
 
 
-_CoalesceResolver = Callable[[tuple[Any, ...], Mapping[str, Any]], object | None]
-
-
-def _parameter_coalesce(args: tuple[Any, ...], _kwargs: Mapping[str, Any]) -> object:
-    return ("parameter", str(args[0]))
-
-
-def _parameters_coalesce(args: tuple[Any, ...], _kwargs: Mapping[str, Any]) -> object:
-    return ("parameters", tuple(sorted(args[0])))
-
-
-def _axis_unit_coalesce(args: tuple[Any, ...], _kwargs: Mapping[str, Any]) -> object:
-    return ("axis-unit", args[0])
-
-
-def _labels_coalesce(
-    _args: tuple[Any, ...],
-    kwargs: Mapping[str, Any],
-) -> object:
-    return ("labels", tuple(sorted(kwargs)))
-
-
-def _pointer_coalesce(args: tuple[Any, ...], _kwargs: Mapping[str, Any]) -> object | None:
-    return "pointer-motion" if args[0] == "move" else None
-
-
-class _SessionCommand(Enum):
-    """Single dispatch-policy catalogue for the worker-side session surface."""
-
-    UPDATE_DATA = "update_data", _DispatchMode.PUBLISH, "data"
-    UPDATE_IMAGE_FRAME = "update_image_frame", _DispatchMode.PUBLISH, "data"
-    UPDATE_IMAGE_OVERLAY = "update_image_overlay", _DispatchMode.PUBLISH, "image-overlay"
-    SET_PARAMETER = "set_parameter", _DispatchMode.PUBLISH, _parameter_coalesce
-    SET_PARAMETERS = "set_parameters", _DispatchMode.PUBLISH, _parameters_coalesce
-    SET_LABELS = "set_labels", _DispatchMode.PUBLISH, _labels_coalesce
-    DESCRIBE_DISPLAY = "describe_display", _DispatchMode.CONTROL
-    CONFIGURATION = "configuration", _DispatchMode.CONTROL, None, True
-    REPLACE_SPEC = "replace_spec", _DispatchMode.PUBLISH, "plot-spec"
-    RESOLVED_COLOR_LIMITS = "resolved_color_limits", _DispatchMode.CONTROL
-    SET_RELIM_MODE = "set_relim_mode", _DispatchMode.PUBLISH, "relim-mode"
-    SET_Y_LIMITS = "set_y_limits", _DispatchMode.PUBLISH, "y-limits"
-    RESET_Y_LIMITS = "reset_y_limits", _DispatchMode.PUBLISH, "y-limits"
-    SET_COLOR_LIMITS = "set_color_limits", _DispatchMode.PUBLISH, "color-limits"
-    RESET_COLOR_LIMITS = "reset_color_limits", _DispatchMode.PUBLISH, "color-limits"
-    SET_X_LIMITS = "set_x_limits", _DispatchMode.PUBLISH, "viewport"
-    SET_VIEW_LIMITS = "set_view_limits", _DispatchMode.PUBLISH, "viewport"
-    SET_SIZE = "set_size", _DispatchMode.PUBLISH, "size"
-    SET_DEVICE_PIXEL_RATIO = "set_device_pixel_ratio", _DispatchMode.PUBLISH, "device-pixel-ratio"
-    SET_AXIS_UNIT = "set_axis_unit", _DispatchMode.PUBLISH, _axis_unit_coalesce
-    SET_VALUE_UNIT = "set_value_unit", _DispatchMode.PUBLISH, "value-unit"
-    SET_TIME_UNIT = "set_time_unit", _DispatchMode.PUBLISH, "time-unit"
-    SAVE = "save", _DispatchMode.CONTROL
-    CLEAR_FIT = "clear_fit", _DispatchMode.PUBLISH, "fit-control"
-    FIT_MODELS = "fit_models", _DispatchMode.CONTROL, None, True
-    SELECTORS = "selectors", _DispatchMode.CONTROL, None, True
-    SELECTOR_STATE = "selector_state", _DispatchMode.CONTROL
-    SELECTOR_DATA = "selector_data", _DispatchMode.CONTROL
-    REMOVE_SELECTOR = "remove_selector", _DispatchMode.PUBLISH
-    SET_SELECTOR_VALUE = "set_selector_value", _DispatchMode.PUBLISH
-    SET_AREA_SELECTOR = "set_area_selector", _DispatchMode.PUBLISH
-    SET_X_SELECTOR = "set_x_selector", _DispatchMode.PUBLISH
-    SET_THRESHOLD_SELECTOR = "set_threshold_selector", _DispatchMode.PUBLISH
-    SET_FACET_THRESHOLDS = "set_facet_thresholds", _DispatchMode.PUBLISH, "facet-thresholds"
-    SET_CROSSHAIR_SELECTOR = "set_crosshair_selector", _DispatchMode.PUBLISH
-    FIT = "fit_async", _DispatchMode.CONTROL
-    SET_VIEWPORT = "set_viewport", _DispatchMode.PUBLISH, "viewport"
-    SHOW_FACET_OVERVIEW = "show_facet_overview", _DispatchMode.PUBLISH, "facet-presentation"
-    RESET_VIEWPORT = "reset_viewport", _DispatchMode.PUBLISH, "viewport"
-    POINTER = "_raster_pointer_event", _DispatchMode.ADAPTIVE, _pointer_coalesce
-    FOCUS_FACET = "focus_facet", _DispatchMode.PUBLISH, "facet-presentation"
-
-    def __init__(
-        self,
-        operation: str,
-        mode: _DispatchMode,
-        coalesce: object | _CoalesceResolver = None,
-        attribute: bool = False,
-    ) -> None:
-        self.operation = operation
-        self.mode = mode
-        self.coalesce = coalesce
-        self.attribute = attribute
-
-    def coalesce_key(
-        self, args: tuple[Any, ...], kwargs: Mapping[str, Any]
-    ) -> object | None:
-        return self.coalesce(args, kwargs) if callable(self.coalesce) else self.coalesce
-
-
 @dataclass(slots=True)
 class _WorkerTask:
     callback: Callable[[], Any]
@@ -420,18 +331,6 @@ class _WorkerSessionAdapter:
             raise RuntimeError("plot session access must run on the raster worker")
         return self._host._require_session()
 
-    def invoke(self, command: _SessionCommand, *args: Any, **kwargs: Any) -> Any:
-        target = getattr(self._session(), command.operation, _UNSET)
-        if command.attribute:
-            if target is _UNSET:
-                raise TypeError(f"session is missing attribute {command.operation!r}")
-            if args or kwargs:
-                raise TypeError(f"session attribute {command.operation!r} takes no arguments")
-            return target
-        if not callable(target):
-            raise TypeError(f"session is missing callable {command.operation!r}")
-        return target(*args, **kwargs)
-
     @property
     def data_revision(self) -> int | None:
         front = self._host.front
@@ -447,7 +346,185 @@ class _WorkerSessionAdapter:
         *,
         revision: int | None = None,
     ) -> object:
-        return self.invoke(_SessionCommand.UPDATE_DATA, data, revision=revision)
+        return self._session().update_data(data, revision=revision)
+
+    def update_image_overlay(self, overlay: object) -> object:
+        return self._session().update_image_overlay(overlay)
+
+    def update_image_frame(self, frame: object) -> object:
+        return self._session().update_image_frame(frame)
+
+    def set_parameter(self, name: str, value: object) -> object:
+        return self._session().set_parameter(name, value)
+
+    def set_parameters(self, values: Mapping[str, object]) -> object:
+        return self._session().set_parameters(values)
+
+    def describe_display(self) -> object:
+        return self._session().describe_display()
+
+    def configuration(self) -> object:
+        return self._session().configuration
+
+    def replace_spec(
+        self,
+        spec: "PlotSpec",
+        *,
+        parameters: Mapping[str, object] | None = None,
+    ) -> object:
+        return self._session().replace_spec(spec, parameters=parameters)
+
+    def resolved_color_limits(self, *, display: bool = True) -> object:
+        return self._session().resolved_color_limits(display=display)
+
+    def set_labels(self, **updates: object) -> object:
+        return self._session().set_labels(**updates)
+
+    def set_relim_mode(self, mode: str) -> object:
+        return self._session().set_relim_mode(mode)
+
+    def set_y_limits(self, low: float, high: float, *, fixed: bool = True) -> object:
+        return self._session().set_y_limits(low, high, fixed=fixed)
+
+    def reset_y_limits(self, *, mode: str = "normal") -> object:
+        return self._session().reset_y_limits(mode=mode)
+
+    def set_color_limits(self, low: float, high: float, *, fixed: bool = True) -> object:
+        return self._session().set_color_limits(low, high, fixed=fixed)
+
+    def reset_color_limits(self, *, mode: str = "tight") -> object:
+        return self._session().reset_color_limits(mode=mode)
+
+    def set_x_limits(self, low: float, high: float) -> object:
+        return self._session().set_x_limits(low, high)
+
+    def set_view_limits(self, *, x: object = None, y: object = None) -> object:
+        return self._session().set_view_limits(x=x, y=y)
+
+    def set_size(self, preset: str) -> object:
+        return self._session().set_size(preset)
+
+    def set_device_pixel_ratio(self, ratio: float) -> object:
+        return self._session().set_device_pixel_ratio(ratio)
+
+    def set_axis_unit(self, axis: object, unit: str | None) -> object:
+        return self._session().set_axis_unit(axis, unit)
+
+    def set_value_unit(self, unit: str | None) -> object:
+        return self._session().set_value_unit(unit)
+
+    def set_time_unit(self, unit: str | None) -> object:
+        return self._session().set_time_unit(unit)
+
+    def save(self, path: str | Path, **options: object) -> object:
+        return self._session().save(path, **options)
+
+    def clear_fit(self) -> object:
+        return self._session().clear_fit()
+
+    def fit_models(self) -> object:
+        return self._session().fit_models
+
+    def selectors(self) -> object:
+        return self._session().selectors
+
+    def selector_state(self, kind: SelectorKind, *, display: bool = False) -> object:
+        return self._session().selector_state(kind, display=display)
+
+    def selector_data(self, kind: SelectorKind) -> object:
+        return self._session().selector_data(kind)
+
+    def remove_selector(self, kind: SelectorKind) -> object:
+        return self._session().remove_selector(kind)
+
+    def set_selector_value(
+        self,
+        kind: SelectorKind,
+        value: object,
+        *,
+        display: bool = True,
+    ) -> object:
+        return self._session().set_selector_value(kind, value, display=display)
+
+    def set_area_selector(
+        self,
+        x: NumericRange,
+        y: NumericRange,
+        *,
+        display: bool = True,
+    ) -> object:
+        return self._session().set_area_selector(x, y, display=display)
+
+    def set_x_selector(
+        self,
+        low: float,
+        high: float,
+        *,
+        display: bool = True,
+    ) -> object:
+        return self._session().set_x_selector(low, high, display=display)
+
+    def set_threshold_selector(
+        self,
+        value: float,
+        *,
+        display: bool = True,
+    ) -> object:
+        return self._session().set_threshold_selector(value, display=display)
+
+    def set_facet_thresholds(
+        self,
+        thresholds: tuple[float | None, ...],
+        *,
+        display: bool = True,
+    ) -> object:
+        return self._session().set_facet_thresholds(thresholds, display=display)
+
+    def set_crosshair_selector(
+        self,
+        x: float,
+        y: float,
+        *,
+        display: bool = True,
+    ) -> object:
+        return self._session().set_crosshair_selector(x, y, display=display)
+
+    def fit(self, model: object, **options: object) -> object:
+        return self._session().fit_async(model, **options)
+
+    def set_viewport(self, x: NumericRange, y: NumericRange) -> object:
+        return self._session().set_viewport(x, y)
+
+    def show_facet_overview(self) -> object:
+        return self._session().show_facet_overview()
+
+    def reset_viewport(self) -> object:
+        return self._session().reset_viewport()
+
+    def focus_facet(self, index: int) -> object:
+        return self._session().focus_facet(index)
+
+    def prepare_live_frame(
+        self,
+        data: object,
+        *,
+        revision: int | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Future[object]:
+        return self._session().prepare_live_frame(
+            data,
+            revision=revision,
+            cancelled=cancelled,
+        )
+
+    def commit_live_frame(self, prepared: object) -> object | None:
+        return self._session().commit_live_frame(prepared)
+
+    def finalize_live_frame(self, finalization: object) -> None:
+        self._session().finalize_live_frame(finalization)
+
+    def abort_live_frame(self, finalization: object) -> None:
+        self._session().abort_live_frame(finalization)
 
     def capture_rgba(
         self,
@@ -800,24 +877,27 @@ class RasterPlotHost:
 
     def _dispatch_session(
         self,
-        command: _SessionCommand,
+        operation: Callable[..., Any] | None,
         *args: Any,
+        _mode: _DispatchMode,
+        coalesce_key: object | None = None,
         _execute: Callable[[], Any] | None = None,
         _after_publish: Callable[[], None] | None = None,
         _on_abort: Callable[[], None] | None = None,
         **kwargs: Any,
     ) -> Future[RasterOperation[Any]]:
-        callback = (
-            (lambda: self._worker_adapter.invoke(command, *args, **kwargs))
-            if _execute is None
-            else _execute
-        )
+        if _execute is None:
+            if not callable(operation):
+                raise TypeError("raster session operation must be callable")
+            callback = lambda: operation(*args, **kwargs)
+        else:
+            callback = _execute
         if not callable(callback):
-            raise TypeError("session command executor must be callable")
+            raise TypeError("raster session operation must be callable")
         return self._submit(
             callback,
-            mode=command.mode,
-            coalesce_key=command.coalesce_key(args, kwargs),
+            mode=_mode,
+            coalesce_key=coalesce_key,
             after_publish=_after_publish,
             on_abort=_on_abort,
         )
@@ -856,7 +936,13 @@ class RasterPlotHost:
         *,
         revision: int | None = None,
     ) -> Future[RasterOperation[None]]:
-        return self._dispatch_session(_SessionCommand.UPDATE_DATA, data, revision=revision)
+        return self._dispatch_session(
+            self._worker_adapter.update_data,
+            data,
+            revision=revision,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="data",
+        )
 
     def update_image_overlay(
         self,
@@ -864,7 +950,12 @@ class RasterPlotHost:
     ) -> Future[RasterOperation["ImagePointOverlay"]]:
         """Coalesce independent Image point revisions on the render worker."""
 
-        return self._dispatch_session(_SessionCommand.UPDATE_IMAGE_OVERLAY, overlay)
+        return self._dispatch_session(
+            self._worker_adapter.update_image_overlay,
+            overlay,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="image-overlay",
+        )
 
     def update_image_frame(
         self,
@@ -872,31 +963,53 @@ class RasterPlotHost:
     ) -> Future[RasterOperation["ImageFrame"]]:
         """Coalesce complete image frames on the serial render worker."""
 
-        return self._dispatch_session(_SessionCommand.UPDATE_IMAGE_FRAME, frame)
+        return self._dispatch_session(
+            self._worker_adapter.update_image_frame,
+            frame,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="data",
+        )
 
     def set_parameter(
         self,
         name: str,
         value: object,
     ) -> Future[RasterOperation["DisplayState"]]:
-        return self._dispatch_session(_SessionCommand.SET_PARAMETER, name, value)
+        return self._dispatch_session(
+            self._worker_adapter.set_parameter,
+            name,
+            value,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key=("parameter", str(name)),
+        )
 
     def set_parameters(
         self,
         values: Mapping[str, object],
     ) -> Future[RasterOperation["DisplayState"]]:
         prepared = dict(values)
-        return self._dispatch_session(_SessionCommand.SET_PARAMETERS, prepared)
+        return self._dispatch_session(
+            self._worker_adapter.set_parameters,
+            prepared,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key=("parameters", tuple(sorted(prepared))),
+        )
 
     def describe_display(self) -> Future[RasterOperation["DisplayDescription"]]:
         """Return the worker session's immutable control-plane description."""
 
-        return self._dispatch_session(_SessionCommand.DESCRIBE_DISPLAY)
+        return self._dispatch_session(
+            self._worker_adapter.describe_display,
+            _mode=_DispatchMode.CONTROL,
+        )
 
     def configuration(self) -> Future[RasterOperation["PlotSessionConfig"]]:
         """Return immutable spec, size and display parameters for persistence."""
 
-        return self._dispatch_session(_SessionCommand.CONFIGURATION)
+        return self._dispatch_session(
+            self._worker_adapter.configuration,
+            _mode=_DispatchMode.CONTROL,
+        )
 
     def replace_spec(
         self,
@@ -908,9 +1021,11 @@ class RasterPlotHost:
 
         prepared = None if parameters is None else dict(parameters)
         return self._dispatch_session(
-            _SessionCommand.REPLACE_SPEC,
+            self._worker_adapter.replace_spec,
             spec,
             parameters=prepared,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="plot-spec",
         )
 
     def resolved_color_limits(
@@ -921,8 +1036,9 @@ class RasterPlotHost:
         """Return the effective clim painted by the worker session."""
 
         return self._dispatch_session(
-            _SessionCommand.RESOLVED_COLOR_LIMITS,
+            self._worker_adapter.resolved_color_limits,
             display=display,
+            _mode=_DispatchMode.CONTROL,
         )
 
     def set_labels(
@@ -944,10 +1060,20 @@ class RasterPlotHost:
         ):
             if selected is not _UNSET:
                 updates[name] = selected
-        return self._dispatch_session(_SessionCommand.SET_LABELS, **updates)
+        return self._dispatch_session(
+            self._worker_adapter.set_labels,
+            **updates,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key=("labels", tuple(sorted(updates))),
+        )
 
     def set_relim_mode(self, mode: str) -> Future[RasterOperation["DisplayState"]]:
-        return self._dispatch_session(_SessionCommand.SET_RELIM_MODE, mode)
+        return self._dispatch_session(
+            self._worker_adapter.set_relim_mode,
+            mode,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="relim-mode",
+        )
 
     def set_y_limits(
         self,
@@ -956,14 +1082,26 @@ class RasterPlotHost:
         *,
         fixed: bool = True,
     ) -> Future[RasterOperation["DisplayState"]]:
-        return self._dispatch_session(_SessionCommand.SET_Y_LIMITS, low, high, fixed=fixed)
+        return self._dispatch_session(
+            self._worker_adapter.set_y_limits,
+            low,
+            high,
+            fixed=fixed,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="y-limits",
+        )
 
     def reset_y_limits(
         self,
         *,
         mode: str = "normal",
     ) -> Future[RasterOperation["DisplayState"]]:
-        return self._dispatch_session(_SessionCommand.RESET_Y_LIMITS, mode=mode)
+        return self._dispatch_session(
+            self._worker_adapter.reset_y_limits,
+            mode=mode,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="y-limits",
+        )
 
     def set_color_limits(
         self,
@@ -973,7 +1111,12 @@ class RasterPlotHost:
         fixed: bool = True,
     ) -> Future[RasterOperation["DisplayState"]]:
         return self._dispatch_session(
-            _SessionCommand.SET_COLOR_LIMITS, low, high, fixed=fixed
+            self._worker_adapter.set_color_limits,
+            low,
+            high,
+            fixed=fixed,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="color-limits",
         )
 
     def reset_color_limits(
@@ -981,14 +1124,25 @@ class RasterPlotHost:
         *,
         mode: str = "tight",
     ) -> Future[RasterOperation["DisplayState"]]:
-        return self._dispatch_session(_SessionCommand.RESET_COLOR_LIMITS, mode=mode)
+        return self._dispatch_session(
+            self._worker_adapter.reset_color_limits,
+            mode=mode,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="color-limits",
+        )
 
     def set_x_limits(
         self,
         low: float,
         high: float,
     ) -> Future[RasterOperation[RectangleRange]]:
-        return self._dispatch_session(_SessionCommand.SET_X_LIMITS, low, high)
+        return self._dispatch_session(
+            self._worker_adapter.set_x_limits,
+            low,
+            high,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="viewport",
+        )
 
     def set_view_limits(
         self,
@@ -996,29 +1150,61 @@ class RasterPlotHost:
         x: tuple[float, float] | NumericRange | None = None,
         y: tuple[float, float] | NumericRange | None = None,
     ) -> Future[RasterOperation[RectangleRange]]:
-        return self._dispatch_session(_SessionCommand.SET_VIEW_LIMITS, x=x, y=y)
+        return self._dispatch_session(
+            self._worker_adapter.set_view_limits,
+            x=x,
+            y=y,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="viewport",
+        )
 
     def set_size(self, preset: str) -> Future[RasterOperation["SurfacePlan"]]:
-        return self._dispatch_session(_SessionCommand.SET_SIZE, preset)
+        return self._dispatch_session(
+            self._worker_adapter.set_size,
+            preset,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="size",
+        )
 
     def set_device_pixel_ratio(self, ratio: float) -> Future[RasterOperation["SurfacePlan"]]:
         selected = _finite(ratio, "device pixel ratio")
         if selected <= 0.0:
             raise ValueError("device pixel ratio must be positive")
-        return self._dispatch_session(_SessionCommand.SET_DEVICE_PIXEL_RATIO, selected)
+        return self._dispatch_session(
+            self._worker_adapter.set_device_pixel_ratio,
+            selected,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="device-pixel-ratio",
+        )
 
     def set_axis_unit(
         self,
         axis: object,
         unit: str | None,
     ) -> Future[RasterOperation["DisplayState"]]:
-        return self._dispatch_session(_SessionCommand.SET_AXIS_UNIT, axis, unit)
+        return self._dispatch_session(
+            self._worker_adapter.set_axis_unit,
+            axis,
+            unit,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key=("axis-unit", axis),
+        )
 
     def set_value_unit(self, unit: str | None) -> Future[RasterOperation["DisplayState"]]:
-        return self._dispatch_session(_SessionCommand.SET_VALUE_UNIT, unit)
+        return self._dispatch_session(
+            self._worker_adapter.set_value_unit,
+            unit,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="value-unit",
+        )
 
     def set_time_unit(self, unit: str | None) -> Future[RasterOperation["DisplayState"]]:
-        return self._dispatch_session(_SessionCommand.SET_TIME_UNIT, unit)
+        return self._dispatch_session(
+            self._worker_adapter.set_time_unit,
+            unit,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="time-unit",
+        )
 
     def save(
         self,
@@ -1030,25 +1216,36 @@ class RasterPlotHost:
     ) -> Future[RasterOperation[None]]:
         options = dict(kwargs)
         return self._dispatch_session(
-            _SessionCommand.SAVE,
+            self._worker_adapter.save,
             path,
             dpi=dpi,
             export_scale=export_scale,
             **options,
+            _mode=_DispatchMode.CONTROL,
         )
 
     def clear_fit(self) -> Future[RasterOperation[None]]:
-        return self._dispatch_session(_SessionCommand.CLEAR_FIT)
+        return self._dispatch_session(
+            self._worker_adapter.clear_fit,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="fit-control",
+        )
 
     def fit_models(self) -> Future[RasterOperation[tuple["FitModelSpec", ...]]]:
         """Return the fit catalogue owned by this host's session."""
 
-        return self._dispatch_session(_SessionCommand.FIT_MODELS)
+        return self._dispatch_session(
+            self._worker_adapter.fit_models,
+            _mode=_DispatchMode.CONTROL,
+        )
 
     def selectors(self) -> Future[RasterOperation[tuple[SelectorState, ...]]]:
         """Return the current canonical selector geometry without slicing data."""
 
-        return self._dispatch_session(_SessionCommand.SELECTORS)
+        return self._dispatch_session(
+            self._worker_adapter.selectors,
+            _mode=_DispatchMode.CONTROL,
+        )
 
     def selector_state(
         self,
@@ -1061,9 +1258,10 @@ class RasterPlotHost:
         if not isinstance(kind, SelectorKind):
             raise TypeError("kind must be SelectorKind")
         return self._dispatch_session(
-            _SessionCommand.SELECTOR_STATE,
+            self._worker_adapter.selector_state,
             kind,
             display=display,
+            _mode=_DispatchMode.CONTROL,
         )
 
     def selector_data(self, kind: SelectorKind) -> Future[RasterOperation["SelectorData"]]:
@@ -1071,12 +1269,21 @@ class RasterPlotHost:
 
         if not isinstance(kind, SelectorKind):
             raise TypeError("kind must be SelectorKind")
-        return self._dispatch_session(_SessionCommand.SELECTOR_DATA, kind)
+        return self._dispatch_session(
+            self._worker_adapter.selector_data,
+            kind,
+            _mode=_DispatchMode.CONTROL,
+        )
 
     def remove_selector(self, kind: SelectorKind) -> Future[RasterOperation[SelectorState]]:
         if not isinstance(kind, SelectorKind):
             raise TypeError("kind must be SelectorKind")
-        return self._dispatch_session(_SessionCommand.REMOVE_SELECTOR, kind)
+        return self._dispatch_session(
+            self._worker_adapter.remove_selector,
+            kind,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key=("selector", kind),
+        )
 
     def set_selector_value(
         self,
@@ -1088,10 +1295,12 @@ class RasterPlotHost:
         if not isinstance(kind, SelectorKind):
             raise TypeError("kind must be SelectorKind")
         return self._dispatch_session(
-            _SessionCommand.SET_SELECTOR_VALUE,
+            self._worker_adapter.set_selector_value,
             kind,
             value,
             display=display,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key=("selector", kind),
         )
 
     def set_area_selector(
@@ -1102,10 +1311,12 @@ class RasterPlotHost:
         display: bool = True,
     ) -> Future[RasterOperation[SelectorState]]:
         return self._dispatch_session(
-            _SessionCommand.SET_AREA_SELECTOR,
+            self._worker_adapter.set_area_selector,
             x,
             y,
             display=display,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key=("selector", SelectorKind.AREA),
         )
 
     def set_x_selector(
@@ -1116,10 +1327,12 @@ class RasterPlotHost:
         display: bool = True,
     ) -> Future[RasterOperation[SelectorState]]:
         return self._dispatch_session(
-            _SessionCommand.SET_X_SELECTOR,
+            self._worker_adapter.set_x_selector,
             low,
             high,
             display=display,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key=("selector", SelectorKind.X_RANGE),
         )
 
     def set_threshold_selector(
@@ -1129,9 +1342,11 @@ class RasterPlotHost:
         display: bool = True,
     ) -> Future[RasterOperation[SelectorState]]:
         return self._dispatch_session(
-            _SessionCommand.SET_THRESHOLD_SELECTOR,
+            self._worker_adapter.set_threshold_selector,
             value,
             display=display,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key=("selector", SelectorKind.THRESHOLD),
         )
 
     def set_facet_thresholds(
@@ -1141,9 +1356,11 @@ class RasterPlotHost:
         display: bool = True,
     ) -> Future[RasterOperation[tuple[float | None, ...]]]:
         return self._dispatch_session(
-            _SessionCommand.SET_FACET_THRESHOLDS,
+            self._worker_adapter.set_facet_thresholds,
             tuple(thresholds),
             display=display,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="facet-thresholds",
         )
 
     def set_crosshair_selector(
@@ -1154,10 +1371,12 @@ class RasterPlotHost:
         display: bool = True,
     ) -> Future[RasterOperation[SelectorState]]:
         return self._dispatch_session(
-            _SessionCommand.SET_CROSSHAIR_SELECTOR,
+            self._worker_adapter.set_crosshair_selector,
             x,
             y,
             display=display,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key=("selector", SelectorKind.CROSSHAIR),
         )
 
     def fit(
@@ -1177,7 +1396,7 @@ class RasterPlotHost:
             raise TypeError("selector_kind must be SelectorKind or None")
         completion: Future[RasterOperation[FitResult | FacetFitBatchResult]] = Future()
         started = self._dispatch_session(
-            _SessionCommand.FIT,
+            self._worker_adapter.fit,
             model,
             selector_kind=selector_kind,
             initial=initial,
@@ -1185,6 +1404,7 @@ class RasterPlotHost:
             options=options,
             live=live,
             fit_all_facets=fit_all_facets,
+            _mode=_DispatchMode.CONTROL,
         )
 
         def start_finished(
@@ -1342,9 +1562,10 @@ class RasterPlotHost:
             )
 
         return self._dispatch_session(
-            _SessionCommand.POINTER,
-            selected_action,
+            None,
             _execute=apply,
+            _mode=_DispatchMode.ADAPTIVE,
+            coalesce_key="pointer-motion" if selected_action == "move" else None,
         )
 
     def set_viewport(
@@ -1354,7 +1575,13 @@ class RasterPlotHost:
     ) -> Future[RasterOperation[RectangleRange]]:
         """Set visible ranges in the current display units."""
 
-        return self._dispatch_session(_SessionCommand.SET_VIEWPORT, x, y)
+        return self._dispatch_session(
+            self._worker_adapter.set_viewport,
+            x,
+            y,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="viewport",
+        )
 
     def focus_facet(
         self,
@@ -1385,15 +1612,28 @@ class RasterPlotHost:
                 )
             session.focus_facet(axes.cell_index)
 
-        return self._dispatch_session(_SessionCommand.FOCUS_FACET, _execute=apply)
+        return self._dispatch_session(
+            None,
+            _execute=apply,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="facet-presentation",
+        )
 
     def show_facet_overview(self) -> Future[RasterOperation[None]]:
         """Return a focused FacetGrid front to its complete overview."""
 
-        return self._dispatch_session(_SessionCommand.SHOW_FACET_OVERVIEW)
+        return self._dispatch_session(
+            self._worker_adapter.show_facet_overview,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="facet-presentation",
+        )
 
     def reset_viewport(self) -> Future[RasterOperation[None]]:
-        return self._dispatch_session(_SessionCommand.RESET_VIEWPORT)
+        return self._dispatch_session(
+            self._worker_adapter.reset_viewport,
+            _mode=_DispatchMode.PUBLISH,
+            coalesce_key="viewport",
+        )
 
     def _submit(
         self,
