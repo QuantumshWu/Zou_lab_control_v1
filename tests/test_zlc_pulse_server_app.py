@@ -570,6 +570,12 @@ def test_a_silent_port_and_an_unframed_port_are_reported_as_different_faults():
     assert "unframed" in unframed and "5 bytes" in unframed
     assert "00 FE 13" in unframed
 
+    # A reply that framed far enough to parse reports which field was wrong.
+    malformed = server_app._probe_failure_reason(
+        framing.FrameError("bad reply opcode 0x02")
+    )
+    assert malformed == "malformed reply (bad reply opcode 0x02)"
+
 
 def test_an_explicitly_demanded_uart_never_degrades_into_jtag(tmp_path):
     def failing_probe(port, timeout):

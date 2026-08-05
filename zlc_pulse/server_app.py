@@ -318,7 +318,11 @@ def _probe_failure_reason(exc: BaseException) -> str:
         return _PYSERIAL_HINT
     if isinstance(exc, RegisterLayoutMismatch):
         return "geometry fingerprint mismatch"
-    if type(exc).__name__ == "FrameError" or "crc" in lower:
+    if type(exc).__name__ == "FrameError":
+        # Bytes came back and framed far enough to be parsed, so the fault text
+        # (preamble, opcode, length, CRC) is the evidence -- not just "CRC".
+        return f"malformed reply ({message})"
+    if "crc" in lower:
         return "CRC error"
     if isinstance(exc, UartReplyTimeout):
         # Same deadline, opposite faults: report which one this port had.
