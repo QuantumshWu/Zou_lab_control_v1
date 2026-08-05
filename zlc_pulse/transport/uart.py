@@ -14,8 +14,27 @@ from fpga.pulse_streamer.host.image import CtrlWords
 from .session import TransportAborted
 
 
+# Enough leading bytes to tell a framing/rate disagreement from line noise.
+_TIMEOUT_SAMPLE_BYTES = 16
+
+
 class UartError(RuntimeError):
     pass
+
+
+class UartReplyTimeout(TimeoutError):
+    """No complete reply framed before the deadline, plus what did arrive.
+
+    A silent line and a line whose bytes never frame are opposite faults with
+    opposite fixes -- nothing is driving TX versus the link is running at a rate
+    or format the two ends disagree on -- so the deadline carries the evidence
+    that separates them instead of collapsing both into "timeout".
+    """
+
+    def __init__(self, message: str, *, received_bytes: int, sample: bytes) -> None:
+        super().__init__(message)
+        self.received_bytes = int(received_bytes)
+        self.sample = bytes(sample)
 
 
 class UartLink(Protocol):
@@ -114,12 +133,20 @@ class PySerialLink:
         _remaining(deadline, "UART reply")
         buffer = bytearray()
         replies: list[bytes] = []
+        received = 0
+        sample = bytearray()
         while len(replies) < count and time.monotonic() < deadline:
             if stop is not None and stop.is_set():
                 raise TransportAborted("UART transaction cancelled")
             available = serial_port.in_waiting
             if available:
-                buffer.extend(serial_port.read(available))
+                chunk = serial_port.read(available)
+                # Counted before framing: the sync hunt consumes leading bytes,
+                # so the buffer alone cannot say whether the line was silent.
+                received += len(chunk)
+                if len(sample) < _TIMEOUT_SAMPLE_BYTES:
+                    sample.extend(chunk[: _TIMEOUT_SAMPLE_BYTES - len(sample)])
+                buffer.extend(chunk)
                 while len(replies) < count:
                     frame = _extract_reply(buffer)
                     if frame is None:
@@ -128,7 +155,12 @@ class PySerialLink:
             else:
                 time.sleep(min(0.0005, max(0.0, deadline - time.monotonic())))
         if len(replies) != count:
-            raise TimeoutError(f"UART replies timed out: {len(replies)}/{count}")
+            raise UartReplyTimeout(
+                f"UART replies timed out: {len(replies)}/{count}"
+                f" after {received} received bytes",
+                received_bytes=received,
+                sample=bytes(sample),
+            )
         return replies
 
     def _require_open(self):
@@ -366,4 +398,5 @@ __all__ = [
     "UartError",
     "UartLink",
     "UartRegisterTransport",
+    "UartReplyTimeout",
 ]

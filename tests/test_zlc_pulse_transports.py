@@ -38,9 +38,11 @@ from zlc_pulse import (
 from zlc_pulse.transport import (
     DeployedStreamerSession,
     InterprocessDeviceLease,
+    PySerialLink,
     TransportAborted,
     UartError,
     UartRegisterTransport,
+    UartReplyTimeout,
     VivadoAxiRegisterTransport,
 )
 
@@ -960,6 +962,72 @@ def test_uart_transport_rejects_stale_or_reordered_sequence_replies(tmp_path):
         transport.write_words(((1, 2),))
     with pytest.raises(UartError, match="read reply sequence"):
         transport.read_word(1)
+
+
+class ScriptedSerial:
+    """A serial port that returns exactly the bytes a faulty link would."""
+
+    def __init__(self, payload=b""):
+        self._payload = bytearray(payload)
+        self.write_timeout = None
+        self.written = bytearray()
+
+    def reset_input_buffer(self):
+        pass
+
+    def write(self, data):
+        self.written.extend(data)
+
+    def flush(self):
+        pass
+
+    @property
+    def in_waiting(self):
+        return len(self._payload)
+
+    def read(self, count):
+        chunk = bytes(self._payload[:count])
+        del self._payload[:count]
+        return chunk
+
+
+@pytest.mark.parametrize(
+    ("payload", "received", "sample"),
+    (
+        (b"", 0, b""),
+        # A rate the two ends disagree on yields bytes that never frame.
+        (b"\x00\xfe\x13\x7f\xc0", 5, b"\x00\xfe\x13\x7f\xc0"),
+    ),
+)
+def test_uart_timeout_reports_whether_anything_answered(payload, received, sample):
+    link = PySerialLink("COM10", 3_000_000)
+    link._serial = ScriptedSerial(payload)
+
+    with pytest.raises(UartReplyTimeout) as failure:
+        link.exchange(
+            framing.encode_read(CtrlWords.LAYOUT_ID, 1, seq=1),
+            deadline=time.monotonic() + 0.05,
+        )
+
+    assert failure.value.received_bytes == received
+    assert failure.value.sample == sample
+    assert f"after {received} received bytes" in str(failure.value)
+
+
+def test_the_timeout_sample_is_bounded_and_taken_before_the_sync_hunt():
+    link = PySerialLink("COM10", 3_000_000)
+    link._serial = ScriptedSerial(bytes(range(64)))
+
+    with pytest.raises(UartReplyTimeout) as failure:
+        link.exchange(
+            framing.encode_read(CtrlWords.LAYOUT_ID, 1, seq=1),
+            deadline=time.monotonic() + 0.05,
+        )
+
+    # The sync hunt deletes leading bytes, so the sample must be captured at
+    # read time; 0x00 is the first byte on the wire and never frames.
+    assert failure.value.received_bytes == 64
+    assert failure.value.sample == bytes(range(16))
 
 
 def test_uart_absolute_deadline_includes_waiting_for_the_io_owner(tmp_path):

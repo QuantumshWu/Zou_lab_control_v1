@@ -555,6 +555,22 @@ def test_auto_falls_back_to_jtag_when_no_serial_port_exists(tmp_path):
     assert resolution.attempts == ("no UART ports detected",)
 
 
+def test_a_silent_port_and_an_unframed_port_are_reported_as_different_faults():
+    from zlc_pulse.transport import UartReplyTimeout
+
+    silent = server_app._probe_failure_reason(
+        UartReplyTimeout("timed out", received_bytes=0, sample=b"")
+    )
+    unframed = server_app._probe_failure_reason(
+        UartReplyTimeout("timed out", received_bytes=5, sample=b"\x00\xfe\x13")
+    )
+
+    assert "silent" in silent and "0 bytes" in silent
+    # The bytes themselves are the evidence that the link is alive but mismatched.
+    assert "unframed" in unframed and "5 bytes" in unframed
+    assert "00 FE 13" in unframed
+
+
 def test_an_explicitly_demanded_uart_never_degrades_into_jtag(tmp_path):
     def failing_probe(port, timeout):
         raise TimeoutError("UART replies timed out: 0/1")

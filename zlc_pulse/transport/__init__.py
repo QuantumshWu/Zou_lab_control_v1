@@ -9,7 +9,13 @@ from .session import (
     TransportAborted,
     verify_register_layout,
 )
-from .uart import PySerialLink, UartError, UartLink, UartRegisterTransport
+from .uart import (
+    PySerialLink,
+    UartError,
+    UartLink,
+    UartRegisterTransport,
+    UartReplyTimeout,
+)
 
 __all__ = [
     "DeployedStreamerSession",
@@ -22,6 +28,7 @@ __all__ = [
     "UartError",
     "UartLink",
     "UartRegisterTransport",
+    "UartReplyTimeout",
     "VivadoAxiRegisterTransport",
     "verify_register_layout",
 ]

@@ -32,6 +32,7 @@ from .transport import (
     InterprocessDeviceLease,
     RegisterLayoutMismatch,
     UartRegisterTransport,
+    UartReplyTimeout,
     VivadoAxiRegisterTransport,
     verify_register_layout,
 )
@@ -319,6 +320,15 @@ def _probe_failure_reason(exc: BaseException) -> str:
         return "geometry fingerprint mismatch"
     if type(exc).__name__ == "FrameError" or "crc" in lower:
         return "CRC error"
+    if isinstance(exc, UartReplyTimeout):
+        # Same deadline, opposite faults: report which one this port had.
+        if exc.received_bytes == 0:
+            return "silent (0 bytes back; nothing is driving this line)"
+        return (
+            f"unframed ({exc.received_bytes} bytes back, none framed:"
+            f" {exc.sample.hex(' ').upper()};"
+            " the two ends disagree on rate or framing)"
+        )
     if isinstance(exc, TimeoutError) or "timeout" in lower or "timed out" in lower:
         return "no reply before timeout"
     if type(exc).__name__ in {"SerialException", "FileNotFoundError", "PermissionError"}:
