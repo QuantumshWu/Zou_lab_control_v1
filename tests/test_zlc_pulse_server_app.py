@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import sys
 from pathlib import Path
 
 import pytest
 from conftest import private_pulse_backend_snapshot, pulse_backend_completion_for
 
-from fpga.pulse_streamer.host.image import StreamerParams
+from fpga.pulse_streamer.host import uart_frame as framing
+from fpga.pulse_streamer.host.image import CtrlWords, StreamerParams, build_fingerprint
 import zlc_pulse.deployment as pulse_deployment
+import zlc_pulse.server_app as server_app
 from zlc_pulse import (
     PORT_DIGITAL,
     PulseDocument,
@@ -26,9 +29,12 @@ from zlc_pulse import (
     validate_target_ir_for_geometry,
 )
 from zlc_pulse.server_app import (
+    BackendResolutionError,
     bring_up_frozen_session,
+    build_arg_parser,
     build_server_runtime,
     build_service_for_session,
+    resolve_backend,
     validate_deployed_target,
 )
 from zlc_pulse.target import pulse_target_to_tree
@@ -403,3 +409,237 @@ def test_runtime_close_failure_is_not_latched_as_success():
     assert runtime._closed
     assert rpc_server.close_count == 1
     assert session.events == ["safe", "safe", "close", "safe", "close"]
+
+
+class GeometryUartLink:
+    """A serial device that answers only the read-only geometry handshake.
+
+    ``fingerprint is None`` models a port that exists but cannot be opened.
+    """
+
+    def __init__(self, port, baud, *, fingerprint):
+        self.port = port
+        self.baud = baud
+        self.fingerprint = fingerprint
+        self.opened = False
+        self.closed = False
+
+    def open(self):
+        if self.fingerprint is None:
+            raise FileNotFoundError(f"could not open port {self.port}")
+        self.opened = True
+
+    def close(self):
+        self.closed = True
+
+    def exchange(self, request, *, deadline, stop=None):
+        assert self.opened and not self.closed
+        assert int.from_bytes(request[4:8], "little") == CtrlWords.LAYOUT_ID
+        return framing.encode_reply(request[3], framing.ST_OK, (self.fingerprint,))
+
+    def write_batch(self, requests, *, deadline, stop=None):
+        raise AssertionError("the geometry probe must never write to a candidate port")
+
+
+def _install_uart_devices(monkeypatch, devices):
+    """Give each candidate port a fake serial device keyed by its name."""
+
+    links = []
+
+    def factory(port, baud):
+        link = GeometryUartLink(port, baud, fingerprint=devices.get(port))
+        links.append(link)
+        return link
+
+    monkeypatch.setattr("zlc_pulse.transport.uart.PySerialLink", factory)
+    return links
+
+
+def test_the_default_transport_policy_probes_uart_before_jtag():
+    arguments = build_arg_parser().parse_args(
+        ["--target", "t.json", "--xdc", "board.xdc", "--state-dir", "state"]
+    )
+    assert arguments.backend == "auto"
+    assert arguments.uart_port is None
+
+
+def test_auto_selects_the_first_port_whose_geometry_matches_the_deployment(
+    monkeypatch,
+    tmp_path,
+):
+    params = StreamerParams()
+    expected = build_fingerprint(params) & 0xFFFFFFFF
+    links = _install_uart_devices(
+        monkeypatch,
+        {"COM3": expected ^ 0x1, "COM5": expected},
+    )
+
+    resolution = resolve_backend(
+        "auto",
+        params=params,
+        state_dir=tmp_path,
+        port_provider=lambda: ("COM3", "COM4", "COM5"),
+    )
+
+    assert (resolution.backend, resolution.uart_port) == ("uart", "COM5")
+    assert resolution.candidates == ("COM3", "COM4", "COM5")
+    assert resolution.attempts == (
+        "COM3: geometry fingerprint mismatch",
+        "COM4: port open failed",
+        "COM5: geometry fingerprint matched",
+    )
+    # Every candidate is released again, including the one that won and the one
+    # that could not be opened at all.
+    assert [link.port for link in links] == ["COM3", "COM4", "COM5"]
+    assert all(link.closed for link in links)
+
+
+def test_auto_falls_back_to_jtag_only_after_every_uart_candidate_failed(tmp_path):
+    attempted = []
+
+    def failing_probe(port, timeout):
+        attempted.append((port, timeout))
+        raise TimeoutError("UART replies timed out: 0/1")
+
+    resolution = resolve_backend(
+        "auto",
+        params=StreamerParams(),
+        state_dir=tmp_path,
+        port_provider=lambda: ("COM3", "COM4"),
+        probe=failing_probe,
+    )
+
+    assert resolution.backend == "jtag-axi"
+    assert resolution.uart_port is None
+    assert [port for port, _timeout in attempted] == ["COM3", "COM4"]
+    assert {timeout for _port, timeout in attempted} == {server_app.UART_PROBE_TIMEOUT}
+    assert resolution.attempts == (
+        "COM3: no reply before timeout",
+        "COM4: no reply before timeout",
+    )
+    assert "auto fallback to jtag-axi" in resolution.reason
+
+
+def test_auto_falls_back_to_jtag_when_no_serial_port_exists(tmp_path):
+    resolution = resolve_backend(
+        "auto",
+        params=StreamerParams(),
+        state_dir=tmp_path,
+        port_provider=tuple,
+    )
+
+    assert resolution.backend == "jtag-axi"
+    assert resolution.attempts == ("no UART ports detected",)
+
+
+def test_an_explicitly_demanded_uart_never_degrades_into_jtag(tmp_path):
+    def failing_probe(port, timeout):
+        raise TimeoutError("UART replies timed out: 0/1")
+
+    with pytest.raises(BackendResolutionError, match="explicit UART backend failed") as failure:
+        resolve_backend(
+            "uart",
+            params=StreamerParams(),
+            state_dir=tmp_path,
+            uart_port="COM9",
+            probe=failing_probe,
+        )
+
+    assert failure.value.attempts == ("COM9: no reply before timeout",)
+
+
+def test_an_explicit_jtag_backend_skips_the_uart_probe_entirely(tmp_path):
+    def forbidden_probe(port, timeout):
+        raise AssertionError("explicit jtag-axi must not open any serial port")
+
+    resolution = resolve_backend(
+        "jtag-axi",
+        params=StreamerParams(),
+        state_dir=tmp_path,
+        port_provider=lambda: (_ for _ in ()).throw(
+            AssertionError("explicit jtag-axi must not enumerate ports")
+        ),
+        probe=forbidden_probe,
+    )
+
+    assert (resolution.backend, resolution.uart_port, resolution.attempts) == (
+        "jtag-axi",
+        None,
+        (),
+    )
+
+
+def test_a_missing_pyserial_names_the_interpreter_instead_of_silently_using_jtag(tmp_path):
+    def missing_pyserial():
+        raise ModuleNotFoundError("No module named 'serial'", name="serial")
+
+    resolution = resolve_backend(
+        "auto",
+        params=StreamerParams(),
+        state_dir=tmp_path,
+        port_provider=missing_pyserial,
+    )
+
+    assert resolution.backend == "jtag-axi"
+    assert resolution.attempts == (server_app._PYSERIAL_HINT,)
+    assert "pip install pyserial" in resolution.reason
+    assert sys.executable in resolution.reason
+
+
+def test_the_uart_probe_decides_on_the_shared_geometry_handshake(monkeypatch, tmp_path):
+    params = StreamerParams()
+    expected = build_fingerprint(params) & 0xFFFFFFFF
+    links = _install_uart_devices(monkeypatch, {"COM7": expected})
+
+    server_app._probe_uart_port(
+        "COM7",
+        server_app.UART_PROBE_TIMEOUT,
+        params=params,
+        state_dir=tmp_path,
+        baud=server_app.DEFAULT_UART_BAUD,
+    )
+    assert (links[-1].baud, links[-1].closed) == (server_app.DEFAULT_UART_BAUD, True)
+
+    _install_uart_devices(monkeypatch, {"COM7": expected ^ 0x1})
+    with pytest.raises(RuntimeError, match="geometry/layout mismatch"):
+        server_app._probe_uart_port(
+            "COM7",
+            server_app.UART_PROBE_TIMEOUT,
+            params=params,
+            state_dir=tmp_path,
+            baud=server_app.DEFAULT_UART_BAUD,
+        )
+
+
+def test_server_runtime_opens_the_uart_port_the_probe_proved(monkeypatch, tmp_path):
+    params = StreamerParams()
+    session = AppSession(params)
+    opened: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(
+        "zlc_pulse.server_app._list_uart_ports",
+        lambda: ("COM3", "COM5"),
+    )
+    _install_uart_devices(
+        monkeypatch,
+        {"COM3": 0xDEADBEEF, "COM5": build_fingerprint(params) & 0xFFFFFFFF},
+    )
+
+    def record_session(backend, *, uart_port, **kwargs):
+        opened.append((backend, uart_port))
+        return session
+
+    monkeypatch.setattr("zlc_pulse.server_app.open_deployed_session", record_session)
+    monkeypatch.setattr(
+        "zlc_pulse.server_app.serve_pulse_execution_service",
+        lambda service, *, host, port, start: type("RPC", (), {"close": lambda self: None})(),
+    )
+
+    build_server_runtime(
+        _manifest(),
+        state_dir=tmp_path,
+        params=params,
+        clock_hz=50e6,
+    )
+
+    assert opened == [("uart", "COM5")]

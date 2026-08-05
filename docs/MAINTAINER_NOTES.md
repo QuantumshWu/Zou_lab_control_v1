@@ -9,6 +9,10 @@
 - 当前checkpoint：C6-R1–R7 已按现场反证闭合；当前 HEAD 为 `5b4d015`，最终 C6 全量门仍待公开审查清单收口，不返回旧 M1–M7 叙事，也不重做与新证据无关的旧切片。
 - 预期worktree例外：未跟踪用户文件`pulses/scan_test.json`。永远不得读取、修改、移动、删除、stage或commit。
 - RTL、Tcl、XDC、bitstream和wire protocol仍冻结；C1/C2没有硬件改动。
+- transport policy：pulse server默认`--backend auto`——逐个候选串口发一帧只读geometry handshake，
+  指纹匹配即选UART，全部失败才退回`jtag-axi`。`resolve_backend`在`zlc_pulse/server_app.py`是唯一决策点；
+  判据复用`transport.verify_register_layout`（与`DeployedStreamerSession`同一份word63握手）。显式`uart`
+  永不降级为JTAG，显式`jtag-axi`完全不开串口。
 
 ## C1 已闭合的 owner
 

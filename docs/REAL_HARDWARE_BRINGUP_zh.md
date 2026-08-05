@@ -15,16 +15,24 @@
 ## 0. 前置环境(到机器前先备齐)
 
 ### FPGA 端(运行 sequencer server 的那台)
-- [ ] Python 使用安装器记录的 `.zlc_python_path`，或显式设 `ZLC_FPGA_PYTHON`；Vivado 在 PATH
-      （或设 `ZLC_PS_VIVADO_BIN`）；`hw_server` 能起。
-- [ ] JTAG 线连好、板子上电;Vivado 硬件管理器能单独看到目标。
+- [ ] Python 使用安装器记录的 `.zlc_python_path`，或显式设 `ZLC_FPGA_PYTHON`；该解释器已装
+      hardware extra（`install_requirements.bat`，含 `pyserial`/`rpyc`）。
+- [ ] UART 桥接线连好（默认控制通路）。板子上电。
+- [ ] JTAG 线连好、Vivado 在 PATH（或设 `ZLC_PS_VIVADO_BIN`）、`hw_server` 能起；这是 UART
+      不可用时的退路，Vivado 硬件管理器能单独看到目标。
 - [ ] **bitstream 已 program**,且其 `ZLC_LAYOUT_ID` 与主机 `image.REGISTER_LAYOUT_ID` 一致。
       不一致时第一次 `prepare()` 会**在写任何配置寄存器前**明确报 `geometry/layout mismatch`(这是设计的保护,
       不是 bug；current owner 在 `zlc_pulse/transport/session.py` 通过
       `image.build_fingerprint`/geometry handshake 校验)。冻结 RTL/bitstream 不因软件架构偏好重烧；
       只有证实现有 RTL bug 或偏离既定设计才进入独立硬件变更流程。
-- [ ] 启动 `fpga\run_server.bat`(`jtag-axi` 后端);确认启动摘要同时列出当前
-      `ZLC_PS_TARGET`与**server-side** `ZLC_PS_XDC`，并通过target/XDC逐lane校验后监听端口(默认18861)。
+- [ ] 启动 `fpga\run_server.bat`。默认 `ZLC_PS_SERVER_BACKEND=auto`：逐个枚举串口发一帧只读
+      geometry handshake，指纹对上就选 UART，全部不通才退回 `jtag-axi`。启动摘要会打印
+      `backend resolved: ... (reason)` 与每个候选口的失败原因。
+      需要绕开其它串口仪器时设 `ZLC_PS_UART_PORT=COM5` 只探这一个口；
+      要钉死通路用 `ZLC_PS_SERVER_BACKEND=uart`（探不到直接失败，绝不静默退 JTAG）或 `=jtag-axi`（完全不开串口）。
+- [ ] 确认启动摘要同时列出当前 `ZLC_PS_TARGET`与**server-side** `ZLC_PS_XDC`，并通过target/XDC逐lane
+      校验后监听端口(默认18861)。`fpga\run_server.bat --check-config` 可在不碰硬件的前提下先看这些事实
+      和已枚举到的串口。
 
 ### 主机端(跑 notebook / GUI 的那台)
 - [ ] 安装 hardware/workbench extra（包含 current pulse RPC 的 `rpyc` 与 `pypylon`；DCAM SDK
@@ -189,6 +197,7 @@ preflight 会在连接任何设备前拒绝 missing/wrong-capability/cycle。旧
 | `ConnectionRefused` / `socket.timeout` | server 没起 / IP 端口错 / 防火墙 | 先起 `run_server.bat`;核对Pulse GUI的host:port;放行端口 |
 | 首次 `prepare()` 报 `geometry/layout mismatch` | 运行image的几何指纹与current host `build_fingerprint(params)`不一致 | 停止运行并核对已批准的软件/bitstream资产；不得为迁就架构自动重烧，只有证实现有RTL bug或偏离既定设计才启动bitstream变更流程 |
 | server 起不来 / JTAG 报错 | hw_server 没起 / JTAG 接触 / 板掉电 | 查电源、JTAG 线;Vivado 硬件管理器单独验证 |
+| 明明插了 UART 却仍退回 `jtag-axi` | 看启动摘要里该口的失败原因：`pyserial is missing`（这台解释器没装 hardware extra）/ `port open failed`（口被别的程序占用）/ `no reply before timeout`（线或 bitstream 的 UART 桥不通）/ `geometry fingerprint mismatch`（板上跑的是别的几何） | 按摘要给出的那一条修；`pyserial` 缺失时 `run_server.bat` 会自动装，装不上就跑 `install_requirements.bat`。想让失败直接暴露而不是退回，改用 `ZLC_PS_SERVER_BACKEND=uart` |
 | `qCMOS timed out` 等不到帧 | 本次 pulse recipe 没有产生预期的外触发，或相机工作点/布线不符 | 核对 pulse recipe 的 semantic endpoint、server Target/XDC 与示波器实际接线；不要到 camera card 里添加 lane |
 | Apply 在 E0 拒绝 stamp/count/terminal | 工作点不满足 deterministic trigger contract、发生漏帧/乱序，或 Target endpoint 接线错误 | 保留本次 pulse terminal、camera records 与示波器证据；先修实际布线/工作点/adapter，不绕过 qualification、不伪造 digest |
 

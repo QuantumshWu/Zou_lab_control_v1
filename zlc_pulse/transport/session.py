@@ -78,6 +78,32 @@ class RegisterTransport(Protocol):
     def record_diagnostic(self, name: str, text: str) -> None: ...
 
 
+class RegisterLayoutMismatch(RuntimeError):
+    """A reachable transport answered for another geometry than the approved one."""
+
+
+def verify_register_layout(
+    transport: RegisterTransport,
+    params: StreamerParams,
+    *,
+    stop: threading.Event | None = None,
+) -> None:
+    """Prove one open transport reaches the approved geometry's running bitstream.
+
+    This is the only geometry handshake.  The deployed session admits its own
+    transport with it, and startup backend resolution reuses it to decide whether
+    a candidate UART port is this streamer rather than an unrelated serial device.
+    """
+
+    expected = build_fingerprint(params) & 0xFFFFFFFF
+    actual = transport.read_word(CtrlWords.LAYOUT_ID, stop=stop)
+    if actual != expected:
+        raise RegisterLayoutMismatch(
+            "geometry/layout mismatch: running bitstream reports "
+            f"0x{actual:08X}, approved host geometry requires 0x{expected:08X}"
+        )
+
+
 class DeployedStreamerSession:
     """One exact compiled artifact, one FIRE, one terminal proof, one safe owner."""
 
@@ -220,13 +246,7 @@ class DeployedStreamerSession:
         self._check_register_layout(stop=None)
 
     def _check_register_layout(self, *, stop: threading.Event | None) -> None:
-        expected = build_fingerprint(self.params) & 0xFFFFFFFF
-        actual = self.transport.read_word(CtrlWords.LAYOUT_ID, stop=stop)
-        if actual != expected:
-            raise RuntimeError(
-                "geometry/layout mismatch: running bitstream reports "
-                f"0x{actual:08X}, approved host geometry requires 0x{expected:08X}"
-            )
+        verify_register_layout(self.transport, self.params, stop=stop)
         with self._lock:
             self._layout_verified = True
 
