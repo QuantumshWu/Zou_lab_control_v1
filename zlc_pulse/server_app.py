@@ -227,16 +227,27 @@ class BackendResolutionError(RuntimeError):
 
 
 def _list_uart_ports() -> tuple[str, ...]:
-    """Enumerate serial device names lazily so importing this module stays UART-optional."""
+    """Enumerate serial ports lazily, physical USB bridges before virtual ones.
+
+    Ordering only, never exclusion: an ordinary workstation also publishes
+    Bluetooth and serial-over-LAN COM ports, and the streamer's USB-UART is
+    indistinguishable from them by name alone.  Probing the ports that carry a
+    USB VID/PID first means the board normally answers on the first attempt, so
+    the decoys are never opened at all -- but they are still probed if nothing
+    on USB answers, because the operator may not know which port this is.
+    """
 
     from serial.tools import list_ports
 
-    ports: list[str] = []
+    usb: list[str] = []
+    virtual: list[str] = []
     for descriptor in list_ports.comports():
         port = str(getattr(descriptor, "device", descriptor)).strip()
-        if port and port not in ports:
-            ports.append(port)
-    return tuple(ports)
+        if not port or port in usb or port in virtual:
+            continue
+        group = usb if getattr(descriptor, "vid", None) is not None else virtual
+        group.append(port)
+    return tuple(usb + virtual)
 
 
 def _uart_candidates(

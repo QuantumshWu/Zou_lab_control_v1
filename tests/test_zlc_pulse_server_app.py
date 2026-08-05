@@ -463,6 +463,29 @@ def test_the_default_transport_policy_probes_uart_before_jtag():
     assert arguments.uart_port is None
 
 
+def test_port_enumeration_probes_usb_bridges_before_virtual_com_ports(monkeypatch):
+    from serial.tools import list_ports
+
+    class Descriptor:
+        def __init__(self, device, vid):
+            self.device = device
+            self.vid = vid
+
+    monkeypatch.setattr(
+        list_ports,
+        "comports",
+        lambda: [
+            Descriptor("COM3", None),    # serial-over-LAN
+            Descriptor("COM4", None),    # Bluetooth
+            Descriptor("COM6", 0x1A86),  # CH340 USB-UART
+            Descriptor("COM6", 0x1A86),  # a repeated device is one candidate
+        ],
+    )
+
+    # Ordering, not filtering: the virtual ports stay in the candidate list.
+    assert server_app._list_uart_ports() == ("COM6", "COM3", "COM4")
+
+
 def test_auto_selects_the_first_port_whose_geometry_matches_the_deployment(
     monkeypatch,
     tmp_path,

@@ -26,9 +26,11 @@
       `image.build_fingerprint`/geometry handshake 校验)。冻结 RTL/bitstream 不因软件架构偏好重烧；
       只有证实现有 RTL bug 或偏离既定设计才进入独立硬件变更流程。
 - [ ] 启动 `fpga\run_server.bat`。默认 `ZLC_PS_SERVER_BACKEND=auto`：逐个枚举串口发一帧只读
-      geometry handshake，指纹对上就选 UART，全部不通才退回 `jtag-axi`。启动摘要会打印
+      geometry handshake，指纹对上就选 UART，全部不通才退回 `jtag-axi`。**不需要事先知道是哪个 COM 口**——
+      带 USB VID/PID 的物理串口排在前面先探（蓝牙、Serial-over-LAN 这类虚拟口排后面，但仍会探，
+      只是排序不是过滤），所以通常第一发就命中，诱饵口根本不会被打开。启动摘要会打印
       `backend resolved: ... (reason)` 与每个候选口的失败原因。
-      需要绕开其它串口仪器时设 `ZLC_PS_UART_PORT=COM5` 只探这一个口；
+      确定了口号、或要绕开其它串口仪器时，设 `ZLC_PS_UART_PORT=COM6` 只探这一个口；
       要钉死通路用 `ZLC_PS_SERVER_BACKEND=uart`（探不到直接失败，绝不静默退 JTAG）或 `=jtag-axi`（完全不开串口）。
 - [ ] 确认启动摘要同时列出当前 `ZLC_PS_TARGET`与**server-side** `ZLC_PS_XDC`，并通过target/XDC逐lane
       校验后监听端口(默认18861)。`fpga\run_server.bat --check-config` 可在不碰硬件的前提下先看这些事实

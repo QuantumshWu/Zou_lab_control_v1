@@ -131,7 +131,7 @@ echo Deployment environment:
 echo   ZLC_PS_SERVER_BACKEND=auto ^| uart ^| jtag-axi   ^(default auto^)
 echo   ZLC_PS_TARGET=path\to\pulse_target.json
 echo   ZLC_PS_XDC=path\to\board.xdc            ^(server-side authority^)
-echo   ZLC_PS_UART_PORT=COM3                    ^(optional: probe only this port^)
+echo   ZLC_PS_UART_PORT=COM6                    ^(optional: probe only this port; auto-discovered otherwise^)
 echo   ZLC_PS_UART_BAUD=3000000
 echo   ZLC_PS_HOST=0.0.0.0
 echo   ZLC_PS_PORT=18861
