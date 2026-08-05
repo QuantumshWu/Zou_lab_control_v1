@@ -441,16 +441,36 @@ class VivadoAxiRegisterTransport:
         output = self._read_until_marker(marker, deadline=deadline, stop=stop)
         self.record_diagnostic(action, output)
         if f"{marker}_ERROR" in output:
-            detail = next(
-                (
-                    line.strip()
-                    for line in output.splitlines()
-                    if line.strip().startswith("ERROR:")
-                ),
-                "Vivado Tcl action returned an error",
+            raise RuntimeError(
+                f"persistent Vivado {action} failed: "
+                f"{self._error_detail(output, marker, action)}"
             )
-            raise RuntimeError(f"persistent Vivado {action} failed: {detail}")
         return output
+
+    def _error_detail(self, output: str, marker: str, action: str) -> str:
+        """Return the Tcl result the wrapper already printed beside the marker.
+
+        Vivado prefixes its own faults with ``ERROR:``, but a Tcl ``error``
+        raised by this transport's bring-up script does not -- and those are
+        exactly the two operator-facing causes ("No Vivado hardware target",
+        "No JTAG-to-AXI core found").  Reporting only that an error occurred
+        discarded the one fact that says which repair to make.
+        """
+
+        token = f"{marker}_ERROR"
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        for line in lines:
+            if line.startswith(token):
+                detail = line[len(token):].strip()
+                if detail:
+                    return detail
+        for line in lines:
+            if line.startswith("ERROR:"):
+                return line
+        return (
+            "Vivado Tcl action returned an error; full output in "
+            f"{self.state_dir / f'{action}.log'}"
+        )
 
     def _kill_process(self) -> None:
         process = self._process

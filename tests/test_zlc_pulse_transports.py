@@ -880,6 +880,26 @@ def test_device_lease_is_exclusive_across_processes(tmp_path):
     assert admitted.returncode == 0
 
 
+def test_axi_error_reports_the_tcl_result_printed_beside_the_marker(tmp_path):
+    transport = VivadoAxiRegisterTransport(state_dir=tmp_path)
+    marker = "ZLC_AXI_000001"
+
+    # The bring-up script's own `error` carries no "ERROR:" prefix, and it is
+    # the fact that separates an unconfigured FPGA from a JTAG/power fault.
+    for expected in ("No JTAG-to-AXI core found", "No Vivado hardware target"):
+        output = f"{marker}_BEGIN\nchatter\n{marker}_ERROR {expected}\n"
+        assert transport._error_detail(output, marker, "transport_start") == expected
+
+    # A Vivado-owned fault still surfaces when the Tcl result itself is empty.
+    vivado = f"{marker}_BEGIN\nERROR: [Labtools 27-3176] no target\n{marker}_ERROR\n"
+    detail = transport._error_detail(vivado, marker, "transport_start")
+    assert detail == "ERROR: [Labtools 27-3176] no target"
+
+    # Nothing usable: name the recorded transcript instead of a bare phrase.
+    empty = transport._error_detail(f"{marker}_ERROR\n", marker, "transport_start")
+    assert str(tmp_path / "transport_start.log") in empty
+
+
 @pytest.mark.parametrize("token", ("XXXXXXXX", "0x12XZ", "123456789", ""))
 def test_axi_read_rejects_unknown_or_malformed_logic_values(token):
     with pytest.raises(RuntimeError, match="no DATA|non-binary DATA"):
