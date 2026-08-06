@@ -11,7 +11,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 import threading
-from typing import Callable, Protocol
+from types import MappingProxyType
+from typing import Callable, Mapping, Protocol
 
 from zlc_plot import PulseTimelineData, PulseTimelinePlot
 
@@ -24,11 +25,7 @@ from zlc_neutral_atom.devices.sequencer.application import (
 from zlc_neutral_atom.runtime.run import RunHandle, RunSnapshot, RunState
 from zlc_neutral_atom.devices.sequencer.port import PulseScanProgress
 from zlc_pulse import (
-    FIELD_DAC,
-    FIELD_DELAY,
     FIELD_DURATION,
-    PORT_DAC,
-    PORT_DIGITAL,
     AnalogStep,
     ApiParameter,
     OutputDelay,
@@ -182,13 +179,6 @@ class PulsePreviewPlot:
             raise TypeError("preview status must be text")
 
 
-def _cancel_and_wait_detached_run(handle: RunHandle) -> RunSnapshot:
-    """Reap an impossible/stale admission without abandoning its SAFE owner."""
-
-    handle.cancel("stale PulseGUI start result")
-    return handle.wait()
-
-
 def parse_remote_endpoint(value: str) -> tuple[str, int]:
     """Parse ``host[:port]`` and bracketed IPv6 without guessing a blank host."""
 
@@ -252,6 +242,7 @@ class PulseRuntimeUpdate:
     diagnostic: str
     file_busy: bool
     run_busy: bool
+    run_admission_pending: bool
     close_requested: bool
     close_complete: bool
 
@@ -318,6 +309,50 @@ class PulseOwnerUpdate:
     runtime: PulseRuntimeUpdate | None = None
     scan_workspace: ScanWorkspaceSnapshot | None = None
     scan_progress: PulseScanProgressUpdate | None = None
+
+
+#: The Scan-workspace submissions, mapped to the name the operator is shown.
+#: This is the one place a scan work kind and its label are related, so the
+#: published ``busy_operation`` is a projection of the pending collection and
+#: not a second copy of it.
+SCAN_WORK_LABELS: Mapping[str, str] = MappingProxyType(
+    {
+        "scan-generate": "generate",
+        "scan-load-program": "load-program",
+        "scan-load-array": "load-array",
+        "scan-save-array": "save-array",
+    }
+)
+
+
+@dataclass
+class _PendingWork:
+    """One outstanding operation; membership *is* the "in flight" fact.
+
+    A boolean copy of this fact is cleared by exactly one line and therefore
+    latches whenever that line is not reached.  Deriving it from the collection
+    that owns the work makes clearing a removal rather than an event.
+    """
+
+    kind: str
+    token: object
+    future: Future
+    completion: int | None = None
+
+
+@dataclass
+class _PendingHold:
+    """The queued scan-point replacement together with the promise it made.
+
+    ``PulseApplication.replace_active`` hands back a future completed by the
+    Run's own holding-pulse loop.  The promise therefore lives where the fact
+    that gives it meaning lives: dropping the hold drops the promise in the
+    same step, so no answer can arrive for a point nobody is holding.
+    """
+
+    source: PulseDocument
+    index: int
+    future: Future
 
 
 @dataclass
@@ -407,17 +442,15 @@ class PulseEditorController:
             max_workers=2, thread_name_prefix="zlc-pulse-editor"
         )
         self._lock = threading.Lock()
-        self._tracked: set[Future] = set()
-        self._results: list[tuple[str, object, Future]] = []
+        self._pending: list[_PendingWork] = []
+        self._completion_order = 0
         self._editor_generation = 0
         self._operation_generation = 0
-        self._preview_inflight = None
         self._preview_requested = None
         self._preview_plot: PulsePreviewPlot | None = None
         self._preview_error = ""
         self._preview_include_off = False
         self._scan_operation_generation = 0
-        self._scan_busy_operation: str | None = None
         self._scan_diagnostic = ""
         self._scan_selected: ScanCandidateSource = "generated"
         self._scan_generated: ScanWorkspaceCandidate | None = None
@@ -431,15 +464,9 @@ class PulseEditorController:
         self._scan_workspace_cache_generated: object | None = None
         self._scan_workspace_cache_loaded: object | None = None
         self._scan_progress: PulseScanProgress | None = None
-        self._scan_progress_inflight = False
         self._held_scan_source: PulseDocument | None = None
         self._held_scan_index: int | None = None
-        self._pending_hold: tuple[PulseDocument, int, str, int] | None = None
-        self._hold_generation = 0
-        self._save_inflight = False
-        self._load_inflight = False
-        self._connect_inflight = False
-        self._run_starting = False
+        self._pending_hold: _PendingHold | None = None
         self._cancel_when_started = False
         self._pending_start: tuple[
             PulseDocument,
@@ -448,11 +475,9 @@ class PulseEditorController:
             int,
         ] | None = None
         self._handle: RunHandle | None = None
+        self._detached_runs: list[RunHandle] = []
         self._run_snapshot: RunSnapshot | None = None
         self._applied_snapshot: AppliedPulseSnapshot | None = None
-        self._owner_reaped = True
-        self._reap_inflight = False
-        self._owned_close_inflight = False
         self._close_requested = False
         self._close_complete = False
         self._borrowed_authority_retire = threading.Event()
@@ -486,7 +511,34 @@ class PulseEditorController:
     @property
     def worker_idle(self) -> bool:
         with self._lock:
-            return not self._tracked and not self._results
+            return not self._pending
+
+    def _in_flight(self, *kinds: str) -> bool:
+        """Derive whether work of ``kinds`` is still outstanding.
+
+        This is the level behind every busy edge in this controller.  It stays
+        true from submission until the result has been consumed, and it becomes
+        false by the same removal that consumes it, so no caller owns a copy
+        that can survive the fact.
+        """
+
+        with self._lock:
+            return any(entry.kind in kinds for entry in self._pending)
+
+    def _scan_busy_operation(self) -> str | None:
+        """Derive which Scan-workspace submission still occupies a worker.
+
+        Admission keeps at most one of these outstanding, so the first match is
+        the whole answer.  Resetting the workspace cannot make this false while
+        the worker runs, which is exactly what a stored copy got wrong.
+        """
+
+        with self._lock:
+            for entry in self._pending:
+                label = SCAN_WORK_LABELS.get(entry.kind)
+                if label is not None:
+                    return label
+        return None
 
     @property
     def current_document(self) -> PulseDocument:
@@ -598,8 +650,9 @@ class PulseEditorController:
             scan_progress=self._scan_progress,
             held_scan_point=self._held_scan_snapshot(),
             diagnostic=self._diagnostic,
-            file_busy=(self._save_inflight or self._load_inflight),
+            file_busy=self._in_flight("save", "load"),
             run_busy=self._run_busy(),
+            run_admission_pending=self._run_admission_pending(),
             close_requested=self._close_requested,
             close_complete=self._close_complete,
         )
@@ -1058,7 +1111,6 @@ class PulseEditorController:
         self._scan_operation_generation += 1
         operation = self._scan_operation_generation
         token = (operation, scan_slot_schema(document), program)
-        self._scan_busy_operation = "generate"
         self._scan_diagnostic = ""
         self._submit(
             "scan-generate",
@@ -1076,7 +1128,6 @@ class PulseEditorController:
         self._require_scan_operation_available()
         self._scan_operation_generation += 1
         operation = self._scan_operation_generation
-        self._scan_busy_operation = "load-program"
         self._scan_diagnostic = ""
         self._submit(
             "scan-load-program",
@@ -1095,7 +1146,6 @@ class PulseEditorController:
         self._scan_operation_generation += 1
         operation = self._scan_operation_generation
         token = (operation, scan_slot_schema(document), resolved)
-        self._scan_busy_operation = "load-array"
         self._scan_diagnostic = ""
         self._submit(
             "scan-load-array",
@@ -1153,7 +1203,6 @@ class PulseEditorController:
         resolved = Path(path).expanduser().resolve()
         self._scan_operation_generation += 1
         operation = self._scan_operation_generation
-        self._scan_busy_operation = "save-array"
         self._scan_diagnostic = ""
         self._submit(
             "scan-save-array",
@@ -1182,23 +1231,19 @@ class PulseEditorController:
     def open_path(self, path: str | Path) -> None:
         self._require_not_closing()
         if (
-            self._save_inflight
-            or self._load_inflight
-            or self._connect_inflight
+            self._in_flight("save", "load", "connect", "switch-close")
             or self._run_busy()
         ):
             raise RuntimeError("cannot load a pulse while another operation is active")
         resolved = Path(path).expanduser().resolve()
-        self._load_inflight = True
         self._submit("load", resolved, lambda: PulseEditorSession.load(resolved))
 
     def save(self, path: str | Path | None = None, *, overwrite: bool = False) -> None:
         self._require_not_closing()
-        if self._save_inflight or self._load_inflight:
+        if self._in_flight("save", "load"):
             raise RuntimeError("a pulse file operation is already active")
         session = self._editor
         token = (self._editor_generation, session)
-        self._save_inflight = True
         self._submit(
             "save", token, lambda: session.save(path, overwrite=overwrite)
         )
@@ -1233,9 +1278,8 @@ class PulseEditorController:
         ) != (document_generation, revision):
             self._preview_plot = None
             self._preview_error = ""
-        if self._preview_inflight is not None:
+        if self._in_flight("preview"):
             return
-        self._preview_inflight = token
 
         def project_preview() -> PulsePreviewPlot:
             timeline = project_pulse_preview(document)
@@ -1272,9 +1316,9 @@ class PulseEditorController:
 
         if self._connection_factory is None:
             raise RuntimeError("this Pulse editor cannot change its installation")
-        if self._connect_inflight or self._close_requested:
+        if self._in_flight("connect", "switch-close") or self._close_requested:
             return
-        if self._load_inflight or self._save_inflight or self._run_busy():
+        if self._in_flight("save", "load") or self._run_busy():
             raise RuntimeError("connection requires an idle Pulse editor")
         normalized_mode = str(mode).strip().lower()
         if normalized_mode == "remote":
@@ -1306,8 +1350,6 @@ class PulseEditorController:
             ):
                 return False
             self._pending_connection_request = request
-            self._connect_inflight = True
-            self._owned_close_inflight = True
             self._connection_state = "switching"
             self._connection_mode = normalized_mode
             self._connection_endpoint = endpoint_label
@@ -1335,7 +1377,6 @@ class PulseEditorController:
         if connector is None:
             raise RuntimeError("this Pulse editor cannot establish an installation")
         required_document = self._editor.document
-        self._connect_inflight = True
         self._connection_state = "connecting"
         self._connection_mode = normalized_mode
         self._connection_endpoint = endpoint_label
@@ -1395,7 +1436,10 @@ class PulseEditorController:
             raise ValueError("STATIC_REFERENCE_POINT is preview-only")
         if self._pulse is None:
             raise RuntimeError("Pulse editor is offline")
-        if self._load_inflight or self._connect_inflight or self._close_requested:
+        if (
+            self._in_flight("load", "connect", "switch-close")
+            or self._close_requested
+        ):
             raise RuntimeError("Pulse execution is unavailable")
         document = self._editor.document
         if self._descriptor is not None:
@@ -1444,8 +1488,7 @@ class PulseEditorController:
         )
         self._held_scan_source = None
         self._held_scan_index = None
-        self._hold_generation += 1
-        self._pending_hold = None
+        self._revoke_pending_hold()
         self._replace_run(pending)
 
     def _replace_run(
@@ -1461,10 +1504,13 @@ class PulseEditorController:
         if pulse is None:
             raise RuntimeError("Pulse editor is offline")
         active = self._pulse.observe_active()
-        local_not_reaped = self._handle is not None and not self._owner_reaped
+        # Holding a handle *is* holding an unreaped owner: the only line that
+        # releases one nulls it, so there is no second fact to consult.
+        local_owner = self._handle is not None
+        starting = self._in_flight("start")
         if (
-            self._run_starting
-            or local_not_reaped
+            starting
+            or local_owner
             or (active is not None and not active.run.state.terminal)
         ):
             # The formal On Pulse action is a replacement: request SAFE first,
@@ -1472,7 +1518,7 @@ class PulseEditorController:
             # terminal.  No pulse edge is scheduled by this GUI state machine.
             self._pending_start = pending
             self._diagnostic = ""
-            if self._run_starting:
+            if starting:
                 self._cancel_when_started = True
             else:
                 self._pulse.cancel_active("PulseGUI replacing the applied pulse")
@@ -1494,9 +1540,7 @@ class PulseEditorController:
             raise RuntimeError("Pulse editor is offline")
         self._operation_generation += 1
         generation = self._operation_generation
-        self._run_starting = True
         self._cancel_when_started = False
-        self._owner_reaped = False
         self._handle = None
         self._run_snapshot = None
         self._applied_snapshot = None
@@ -1520,14 +1564,13 @@ class PulseEditorController:
         run = self._run_snapshot
         if (
             pulse is None
-            or self._scan_progress_inflight
+            or self._in_flight("scan-progress")
             or self._close_requested
         ):
             return
         if run is None or run.state.terminal:
             self._scan_progress = None
             return
-        self._scan_progress_inflight = True
         self._submit(
             "scan-progress",
             run.run_id.value,
@@ -1573,11 +1616,8 @@ class PulseEditorController:
         point = max(0, min(int(index), len(table.rows) - 1))
         if self._held_scan_source is source and self._held_scan_index == point:
             return
-        if (
-            self._pending_hold is not None
-            and self._pending_hold[0] is source
-            and self._pending_hold[1] == point
-        ):
+        queued = self._pending_hold
+        if queued is not None and queued.source is source and queued.index == point:
             return
         frozen = resolve_scan_point(source, point)
         api_values = tuple(
@@ -1595,19 +1635,15 @@ class PulseEditorController:
             PulseExecutionForm.CONTINUOUS_MONITOR,
             api_values=dict(api_values),
         )
-        self._hold_generation += 1
-        generation = self._hold_generation
-        self._pending_hold = (source, point, frozen.fingerprint, generation)
-        try:
-            applied = pulse.replace_active(request)
-        except BaseException:
-            self._pending_hold = None
-            raise
-        self._submit(
-            "replace",
-            (generation, source, point, frozen.fingerprint),
-            applied.result,
-        )
+        self._revoke_pending_hold()
+        applied = pulse.replace_active(request)
+        if not isinstance(applied, Future):
+            raise TypeError("pulse replacement did not return a future")
+        # The editor's own pool must only ever run work the editor can finish.
+        # Waiting on the Run's promise is therefore not work: it is a level
+        # this owner reads on its next turn, woken by the promise itself.
+        self._pending_hold = _PendingHold(source, point, applied)
+        applied.add_done_callback(lambda _completed: self._notify())
 
     def hold_scan_point(self) -> None:
         source, index = self._active_scan_point()
@@ -1618,22 +1654,22 @@ class PulseEditorController:
             raise TypeError("scan step delta must be an integer")
         if delta == 0:
             return
+        queued = self._pending_hold
         if self._held_scan_source is not None and self._held_scan_index is not None:
             source, index = self._held_scan_source, self._held_scan_index
-        elif self._pending_hold is not None:
-            source, index, _fingerprint, _generation = self._pending_hold
+        elif queued is not None:
+            source, index = queued.source, queued.index
         else:
             source, index = self._active_scan_point()
         self._queue_held_scan_point(source, index + delta)
 
     def cancel(self, reason: str = "PulseGUI Stop Pulse") -> None:
         self._pending_start = None
-        self._hold_generation += 1
-        self._pending_hold = None
+        self._revoke_pending_hold()
         self._held_scan_source = None
         self._held_scan_index = None
         self._scan_progress = None
-        if self._run_starting and self._handle is None:
+        if self._in_flight("start") and self._handle is None:
             self._cancel_when_started = True
         pulse = self._pulse
         if pulse is not None:
@@ -1681,15 +1717,17 @@ class PulseEditorController:
         self._notify()
 
     def pump(self) -> PulseOwnerUpdate | None:
-        """Drain one owner wake into independent surface-local publications.
+        """Advance every outstanding fact once and publish what changed.
 
-        Synchronous Qt commands update their stable widgets directly.  This
-        path owns only worker/lifecycle results produced while the Qt owner was
-        asleep.
+        This is the only advancer.  A wake and the periodic clock both enter
+        here, so no entrance exists that can read a stalled fact without also
+        being able to clear it.
         """
 
         changes = self._apply_borrowed_authority_retirement()
         changes.include(self._drain_results())
+        changes.include(self._collect_pending_hold())
+        changes.include(self._reap_detached_runs())
         if self._runtime_poll_required():
             changes.include(self._poll_run())
         changes.include(self._advance_close())
@@ -1723,34 +1761,14 @@ class PulseEditorController:
             ),
         )
 
-    def poll_runtime_change(self) -> PulseRuntimeUpdate | None:
-        """Poll an active Run without manufacturing unchanged GUI snapshots.
-
-        ``RunHandle`` exposes immutable observations rather than Qt callbacks.
-        Idle editors do no work.  Active
-        editors publish only when a runtime fact changes; the 40 ms Qt timer is
-        therefore no longer an application-wide snapshot clock.
-        """
-
-        # The application owner can retire the borrowed facade from another
-        # thread.  Detach it before even deciding whether the observation
-        # timer has Run work; otherwise a timer already queued in Qt can call
-        # observe_active() after application shutdown.
-        changes = self._apply_borrowed_authority_retirement()
-        if self._runtime_poll_required():
-            changes.include(self._poll_run())
-            changes.include(self._advance_close())
-        if not (changes.runtime or changes.scan_progress):
-            return None
-        return self.runtime_update()
-
     def _runtime_poll_required(self) -> bool:
         snapshot = self._run_snapshot
         return bool(
-            self._run_starting
+            self._in_flight("start")
             or self._pending_start is not None
+            or self._pending_hold is not None
             or self._handle is not None
-            or self._reap_inflight
+            or self._detached_runs
             or (snapshot is not None and not snapshot.state.terminal)
             or (self._close_requested and not self._close_complete)
         )
@@ -1788,7 +1806,7 @@ class PulseEditorController:
         self._borrowed_authority_retired = True
         self._close_requested = True
         self._pending_start = None
-        self._pending_hold = None
+        self._revoke_pending_hold()
         self._held_scan_source = None
         self._held_scan_index = None
         self._scan_progress = None
@@ -1803,25 +1821,32 @@ class PulseEditorController:
     def _submit(self, kind: str, token: object, work) -> None:
         if self._pool_closed:
             raise RuntimeError("Pulse editor worker is closed")
-        future = self._pool.submit(work)
+        entry = _PendingWork(kind, token, self._pool.submit(work))
         with self._lock:
-            self._tracked.add(future)
+            self._pending.append(entry)
 
-        def done(completed: Future) -> None:
+        def done(_completed: Future) -> None:
             with self._lock:
-                self._tracked.discard(completed)
-                self._results.append((kind, token, completed))
+                self._completion_order += 1
+                entry.completion = self._completion_order
             self._notify()
 
-        future.add_done_callback(done)
+        entry.future.add_done_callback(done)
 
     def _drain_results(self) -> _OwnerChanges:
         changes = _OwnerChanges()
         with self._lock:
-            pending, self._results = self._results, []
-        for kind, token, future in pending:
+            completed = sorted(
+                (entry for entry in self._pending if entry.completion is not None),
+                key=lambda entry: entry.completion,
+            )
+            if completed:
+                self._pending = [
+                    entry for entry in self._pending if entry.completion is None
+                ]
+        for entry in completed:
+            kind, token, future = entry.kind, entry.token, entry.future
             if kind == "scan-progress":
-                self._scan_progress_inflight = False
                 try:
                     progress = future.result()
                     if progress is not None and not isinstance(
@@ -1838,38 +1863,11 @@ class PulseEditorController:
                     self._scan_progress = progress
                     changes.scan_progress = True
                 continue
-            if kind == "replace":
-                generation, source, point, fingerprint = token
-                try:
-                    applied = future.result()
-                    if not isinstance(applied, AppliedPulseSnapshot):
-                        raise TypeError(
-                            "pulse replacement returned another applied snapshot"
-                        )
-                except BaseException as error:
-                    if generation == self._hold_generation:
-                        self._pending_hold = None
-                        self._diagnostic = (
-                            f"Pulse point apply failed: {type(error).__name__}: {error}"
-                        )
-                        changes.runtime = True
-                    continue
-                if generation != self._hold_generation:
-                    continue
-                self._pending_hold = None
-                self._held_scan_source = source
-                self._held_scan_index = point
-                self._applied_snapshot = applied
-                self._scan_progress = None
-                self._diagnostic = ""
-                changes.runtime = True
-                changes.scan_progress = True
-                continue
             if kind == "scan-generate":
                 operation, schema, source = token
-                if operation == self._scan_operation_generation:
-                    self._scan_busy_operation = None
-                    changes.scan_workspace = True
+                # The entry left ``_pending`` above, so the derived busy fact
+                # already changed regardless of which generation owns it.
+                changes.scan_workspace = True
                 try:
                     result = future.result()
                     if not isinstance(result, ScanCandidateResult):
@@ -1920,9 +1918,7 @@ class PulseEditorController:
                 continue
             if kind == "scan-load-array":
                 operation, schema, resolved = token
-                if operation == self._scan_operation_generation:
-                    self._scan_busy_operation = None
-                    changes.scan_workspace = True
+                changes.scan_workspace = True
                 try:
                     result = future.result()
                     if not isinstance(result, ScanCandidateResult):
@@ -1963,9 +1959,7 @@ class PulseEditorController:
                 continue
             if kind == "scan-load-program":
                 operation, resolved = token
-                if operation == self._scan_operation_generation:
-                    self._scan_busy_operation = None
-                    changes.scan_workspace = True
+                changes.scan_workspace = True
                 try:
                     loaded_path, source = future.result()
                 except BaseException as error:
@@ -1982,9 +1976,7 @@ class PulseEditorController:
                 continue
             if kind == "scan-save-array":
                 operation, _resolved = token
-                if operation == self._scan_operation_generation:
-                    self._scan_busy_operation = None
-                    changes.scan_workspace = True
+                changes.scan_workspace = True
                 try:
                     saved = future.result()
                 except BaseException as error:
@@ -1997,7 +1989,6 @@ class PulseEditorController:
                         self._scan_diagnostic = f"Saved scan array: {saved.name}"
                 continue
             if kind == "preview":
-                self._preview_inflight = None
                 current = (
                     self._editor_generation,
                     self._editor.revision,
@@ -2024,7 +2015,6 @@ class PulseEditorController:
                     self.request_preview()
                 continue
             if kind == "load":
-                self._load_inflight = False
                 changes.runtime = True
                 try:
                     loaded = future.result()
@@ -2072,7 +2062,6 @@ class PulseEditorController:
                         changes.preview = True
                 continue
             if kind == "save":
-                self._save_inflight = False
                 changes.runtime = True
                 try:
                     saved = future.result()
@@ -2084,7 +2073,6 @@ class PulseEditorController:
                         changes.file = True
                 continue
             if kind == "connect":
-                self._connect_inflight = False
                 changes.runtime = True
                 try:
                     connection = future.result()
@@ -2140,7 +2128,6 @@ class PulseEditorController:
                 changes.preview = True
                 continue
             if kind == "switch-close":
-                self._owned_close_inflight = False
                 changes.runtime = True
                 request = self._pending_connection_request
                 self._pending_connection_request = None
@@ -2151,7 +2138,6 @@ class PulseEditorController:
                     close_error = error
                 self._activate_offline()
                 changes.editor = True
-                self._connect_inflight = False
                 if (
                     request is not None
                     and request[0] != "offline"
@@ -2174,25 +2160,20 @@ class PulseEditorController:
             if kind == "start":
                 changes.runtime = True
                 generation = token
-                self._run_starting = False
                 try:
                     handle = future.result()
                 except BaseException as error:
                     if generation == self._operation_generation:
-                        self._owner_reaped = True
                         self._handle = None
-                        self._pending_hold = None
+                        self._revoke_pending_hold()
                         self._diagnostic = (
                             f"Pulse start failed: {type(error).__name__}: {error}"
                         )
                         self._maybe_start_pending()
                     continue
                 if generation != self._operation_generation:
-                    self._submit(
-                        "discard-run",
-                        handle,
-                        lambda: _cancel_and_wait_detached_run(handle),
-                    )
+                    handle.cancel("stale PulseGUI start result")
+                    self._detached_runs.append(handle)
                     continue
                 self._handle = handle
                 self._run_snapshot = handle.snapshot()
@@ -2202,33 +2183,92 @@ class PulseEditorController:
                 ):
                     handle.cancel("PulseGUI stop requested before admission returned")
                 continue
-            if kind == "discard-run":
-                try:
-                    future.result()
-                except BaseException as error:
-                    self._diagnostic = f"Stale Pulse owner reap failed: {error}"
-                    changes.runtime = True
-                continue
-            if kind == "reap":
-                changes.runtime = True
-                self._reap_inflight = False
-                try:
-                    future.result()
-                except BaseException as error:
-                    self._diagnostic = f"Pulse owner reap failed: {error}"
-                else:
-                    self._owner_reaped = True
-                    self._handle = None
-                    self._maybe_start_pending()
-                continue
             if kind == "close-owned":
-                self._owned_close_inflight = False
                 changes.runtime = True
                 try:
                     future.result()
                 except BaseException as error:
                     self._diagnostic = f"Remote installation close failed: {error}"
                 continue
+        return changes
+
+    def _revoke_pending_hold(self) -> None:
+        """Drop the queued replacement together with the promise it made.
+
+        The promise belongs to the Run's lane, not to an executor, so it is
+        never cancelled from here: the lane may already have taken it, and
+        completing a cancelled future would raise inside the Run that owns the
+        hardware.  Dropping the only reference is the whole revocation - an
+        answer nobody holds cannot revive a hold that is already untrue.
+        """
+
+        self._pending_hold = None
+
+    def _collect_pending_hold(self) -> _OwnerChanges:
+        hold = self._pending_hold
+        if hold is None or not hold.future.done():
+            return _OwnerChanges()
+        self._pending_hold = None
+        try:
+            applied = hold.future.result()
+            if not isinstance(applied, AppliedPulseSnapshot):
+                raise TypeError("pulse replacement returned another applied snapshot")
+        except BaseException as error:
+            self._diagnostic = (
+                f"Pulse point apply failed: {type(error).__name__}: {error}"
+            )
+            return _OwnerChanges(runtime=True)
+        self._held_scan_source = hold.source
+        self._held_scan_index = hold.index
+        self._applied_snapshot = applied
+        self._scan_progress = None
+        self._diagnostic = ""
+        return _OwnerChanges(runtime=True, scan_progress=True)
+
+    def _reap_owned_handle(self) -> bool:
+        """Join this editor's terminal Run owner without ever blocking.
+
+        ``RunHandle.wait`` is another party's completion, so it may not be
+        submitted as editor work.  A zero timeout makes it an observation the
+        owner turn can repeat until the owner thread is really gone.
+
+        Holding the handle is the level: this method releases it in the same
+        step that makes the owner reaped, so there is nothing left to latch.
+        """
+
+        handle = self._handle
+        if handle is None:
+            return True
+        try:
+            handle.wait(0.0)
+        except TimeoutError:
+            return False
+        except BaseException as error:
+            # A reap that cannot succeed must not hold the editor open forever;
+            # the failure is reported and the handle released.
+            self._diagnostic = f"Pulse owner reap failed: {error}"
+        self._handle = None
+        self._maybe_start_pending()
+        return True
+
+    def _reap_detached_runs(self) -> _OwnerChanges:
+        """Retry the stale owners this editor abandoned, never waiting on one."""
+
+        if not self._detached_runs:
+            return _OwnerChanges()
+        changes = _OwnerChanges()
+        remaining: list[RunHandle] = []
+        for handle in self._detached_runs:
+            try:
+                handle.wait(0.0)
+            except TimeoutError:
+                remaining.append(handle)
+            except BaseException as error:
+                self._diagnostic = f"Stale Pulse owner reap failed: {error}"
+                changes.runtime = True
+        if len(remaining) != len(self._detached_runs):
+            changes.runtime = True
+        self._detached_runs = remaining
         return changes
 
     def _reset_scan_workspace(self, document: PulseDocument) -> None:
@@ -2245,7 +2285,6 @@ class PulseEditorController:
             self._scan_source_text = self._scan_auto_template
             self._scan_source_baseline = self._scan_auto_template
         self._scan_source_revision += 1
-        self._scan_busy_operation = None
         self._scan_diagnostic = ""
 
     def _scan_workspace_snapshot(
@@ -2260,6 +2299,7 @@ class PulseEditorController:
             (parameter, document.field_value(parameter.field))
             for parameter in document.api_parameters
         )
+        busy_operation = self._scan_busy_operation()
         cache_key = (
             self._scan_source_revision,
             self._scan_source_baseline == self._scan_source_text,
@@ -2268,7 +2308,7 @@ class PulseEditorController:
             api_field_state,
             tuple(period.period_id for period in document.periods),
             document.time_step_ns,
-            self._scan_busy_operation,
+            busy_operation,
             self._scan_diagnostic,
         )
         if (
@@ -2310,7 +2350,7 @@ class PulseEditorController:
                 stale=table_stale,
             ),
             slots_text=format_scan_slots(document),
-            busy_operation=self._scan_busy_operation,
+            busy_operation=busy_operation,
             diagnostic=self._scan_diagnostic,
         )
         self._scan_workspace_cache_key = cache_key
@@ -2394,12 +2434,11 @@ class PulseEditorController:
 
     def _require_scan_operation_available(self) -> None:
         self._require_authoring_available()
-        if self._save_inflight:
+        if self._in_flight("save"):
             raise RuntimeError("scan file operations require the Pulse file owner to be idle")
-        if self._scan_busy_operation is not None:
-            raise RuntimeError(
-                f"scan workspace operation {self._scan_busy_operation!r} is active"
-            )
+        busy = self._scan_busy_operation()
+        if busy is not None:
+            raise RuntimeError(f"scan workspace operation {busy!r} is active")
 
     def _retire_claimed(
         self,
@@ -2412,24 +2451,29 @@ class PulseEditorController:
         self._detach_pulse_authority()
         self._connection_state = "offline"
         self._diagnostic = diagnostic
-        self._owned_close_inflight = True
         self._submit("close-owned", connection, connection.close)
 
+    def _run_admission_pending(self) -> bool:
+        """Whether an On Pulse press this editor already accepted is outstanding."""
+
+        return self._in_flight("start") or self._pending_start is not None
+
     def _run_busy(self) -> bool:
-        if self._run_starting or self._pending_start is not None:
+        if self._run_admission_pending():
             return True
         if self._run_snapshot is not None and not self._run_snapshot.state.terminal:
             return True
         # ``_poll_run`` owns the sole RunSnapshot read for an observation turn.
         # A retained local handle remains busy until its owner has been reaped,
-        # including the terminal-but-not-yet-joined interval.
-        return self._handle is not None and not self._owner_reaped
+        # including the terminal-but-not-yet-joined interval; reaping is what
+        # releases the handle, so holding one is that whole fact.
+        return self._handle is not None
 
     def _require_authoring_available(self) -> None:
         self._require_not_closing()
-        if self._load_inflight:
+        if self._in_flight("load"):
             raise RuntimeError("Pulse authoring is unavailable while Open is active")
-        if self._connect_inflight:
+        if self._in_flight("connect", "switch-close"):
             raise RuntimeError("Pulse authoring is unavailable while Connect is active")
 
     def _require_not_closing(self) -> None:
@@ -2437,14 +2481,15 @@ class PulseEditorController:
             raise RuntimeError("Pulse editor is closing")
 
     def _poll_run(self) -> _OwnerChanges:
+        # The two levels behind ``run_admission_pending`` are carried
+        # separately: promoting a stashed start moves work from one to the
+        # other, and their disjunction alone would hide that transition.
         runtime_before = (
             self._run_snapshot,
             self._applied_snapshot,
-            self._run_starting,
+            self._in_flight("start"),
             self._pending_start is not None,
             id(self._handle),
-            self._owner_reaped,
-            self._reap_inflight,
             self._diagnostic,
         )
         progress_before = (
@@ -2473,7 +2518,7 @@ class PulseEditorController:
             self._run_snapshot = observation.run
             self._applied_snapshot = observation.applied
             if observation.run.state.terminal:
-                self._pending_hold = None
+                self._revoke_pending_hold()
                 self._held_scan_source = None
                 self._held_scan_index = None
         else:
@@ -2490,11 +2535,8 @@ class PulseEditorController:
             handle is not None
             and local_run is not None
             and local_run.state.terminal
-            and not self._owner_reaped
-            and not self._reap_inflight
         ):
-            self._reap_inflight = True
-            self._submit("reap", self._operation_generation, handle.wait)
+            self._reap_owned_handle()
         self._maybe_start_pending()
         return _OwnerChanges(
             runtime=(
@@ -2502,11 +2544,9 @@ class PulseEditorController:
                 != (
                     self._run_snapshot,
                     self._applied_snapshot,
-                    self._run_starting,
+                    self._in_flight("start"),
                     self._pending_start is not None,
                     id(self._handle),
-                    self._owner_reaped,
-                    self._reap_inflight,
                     self._diagnostic,
                 )
             ),
@@ -2522,9 +2562,9 @@ class PulseEditorController:
 
     def _maybe_start_pending(self) -> None:
         pending = self._pending_start
-        if pending is None or self._close_requested or self._run_starting:
+        if pending is None or self._close_requested or self._in_flight("start"):
             return
-        if self._handle is not None and not self._owner_reaped:
+        if self._handle is not None:
             return
         pulse = self._pulse
         if pulse is None:
@@ -2540,34 +2580,28 @@ class PulseEditorController:
     def _advance_close(self) -> _OwnerChanges:
         if not self._close_requested or self._close_complete:
             return _OwnerChanges()
-        if self._run_starting:
+        if self._in_flight("start"):
             return _OwnerChanges()
         if self._run_snapshot is not None and not self._run_snapshot.state.terminal:
             return _OwnerChanges()
-        handle = self._handle
-        if handle is not None:
+        if self._handle is not None:
             snapshot = self._run_snapshot
-            if snapshot is None:
+            if snapshot is None or not snapshot.state.terminal:
                 return _OwnerChanges()
-            if not snapshot.state.terminal:
+            if not self._reap_owned_handle():
                 return _OwnerChanges()
-            if not self._owner_reaped:
-                if not self._reap_inflight:
-                    self._reap_inflight = True
-                    self._submit("reap", self._operation_generation, handle.wait)
-                    return _OwnerChanges(runtime=True)
-                return _OwnerChanges()
+        if self._detached_runs:
+            return _OwnerChanges()
         with self._lock:
-            if self._tracked or self._results:
+            if self._pending:
                 return _OwnerChanges()
         if self._owned_connection is not None:
-            if not self._owned_close_inflight:
-                self._owned_close_inflight = True
-                connection = self._owned_connection
-                self._detach_pulse_authority()
-                self._submit("close-owned", connection, connection.close)
-                return _OwnerChanges(editor=True, runtime=True)
-            return _OwnerChanges()
+            # Nothing is outstanding at this line, so no close of this
+            # connection can already be running.
+            connection = self._owned_connection
+            self._detach_pulse_authority()
+            self._submit("close-owned", connection, connection.close)
+            return _OwnerChanges(editor=True, runtime=True)
         if not self._pool_closed:
             # There are no tracked futures/results at this boundary, so the
             # executor is idle and joining it cannot wait on product work.

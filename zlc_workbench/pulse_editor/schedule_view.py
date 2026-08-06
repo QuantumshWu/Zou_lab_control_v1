@@ -2697,12 +2697,16 @@ class PulseScheduleView(QtWidgets.QWidget):
         running: bool,
         synchronized: bool,
         file_dirty: bool,
-        file_busy: bool = False,
-        run_busy: bool = False,
+        file_busy: bool,
+        run_admission_pending: bool,
     ) -> None:
-        # Busy rejection belongs to the controller.  The formal Edit page keeps
-        # this control row visually stable instead of greying individual buttons.
-        _ = file_busy, run_busy
+        # A press the controller has already accepted but not yet admitted can
+        # only stash a replacement, and a file worker rejects a second file
+        # command outright.  Showing that as a disabled control is the only way
+        # an operator can tell "busy" from "dead".
+        self.fire_button.setEnabled(not run_admission_pending)
+        self.save_button.setEnabled(not file_busy)
+        self.load_button.setEnabled(not file_busy)
         self.fire_button.setText(
             "On Pulse" if running and synchronized else "On Pulse*"
         )

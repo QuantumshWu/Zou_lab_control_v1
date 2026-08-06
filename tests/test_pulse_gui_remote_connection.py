@@ -568,9 +568,14 @@ def _run_virtual_manifest_gui(workspace: Path) -> None:
             if message.startswith("Connected to"):
                 connected_messages.append(message)
                 if len(connected_messages) == 1:
-                    # A desktop modal dialog runs a nested Qt event loop.  This
-                    # models its timer wake without replacing the formal GUI.
-                    body._owner_cycle()
+                    # A desktop modal dialog runs a nested Qt event loop, so a
+                    # clock tick and a worker wake both arrive while this owner
+                    # turn is still running.  QtOwnerWake is the single
+                    # authority that coalesces them; nothing may re-enter the
+                    # owner from here.
+                    body._timer.timeout.emit()
+                    body._wake.request_owner_wake()
+                    application.processEvents(QtCore.QEventLoop.AllEvents, 20)
             normal_message(message)
 
         body._message = message_with_nested_owner_turn

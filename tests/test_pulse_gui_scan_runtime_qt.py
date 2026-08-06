@@ -21,6 +21,9 @@ from zlc_pulse import (
     load_deployed_pulse_target,
     new_pulse_document,
 )
+from Zou_lab_control.workbench import open_pulse_editor
+from zlc_workbench.pulse_editor.schedule_view import PulseScheduleView
+from gui_user_flow import close_pulse_editor as _close_pulse_editor
 
 
 def _until(application, predicate, *, timeout: float = 10.0) -> None:
@@ -39,6 +42,85 @@ def _click_tab(body, page) -> None:
         QtCore.Qt.LeftButton,
         pos=bar.tabRect(index).center(),
     )
+
+
+def test_control_row_shows_an_accepted_but_unadmitted_press_as_busy() -> None:
+    """A wedged editor must look busy, not dead.
+
+    These controls used to discard their busy inputs entirely, so an On Pulse
+    press that the controller had accepted but could not admit was
+    indistinguishable from a button that does nothing.
+    """
+
+    ensure_qt_app()
+    view = PulseScheduleView(
+        new_pulse_document(load_deployed_pulse_target(), time_step_ns=20)
+    )
+    try:
+        view.set_control_state(
+            running=True,
+            synchronized=True,
+            file_dirty=False,
+            file_busy=False,
+            run_admission_pending=False,
+        )
+        assert view.fire_button.isEnabled()
+        assert view.save_button.isEnabled()
+        assert view.load_button.isEnabled()
+
+        view.set_control_state(
+            running=True,
+            synchronized=True,
+            file_dirty=False,
+            file_busy=False,
+            run_admission_pending=True,
+        )
+        assert not view.fire_button.isEnabled()
+        assert view.save_button.isEnabled()
+
+        view.set_control_state(
+            running=False,
+            synchronized=False,
+            file_dirty=True,
+            file_busy=True,
+            run_admission_pending=False,
+        )
+        assert view.fire_button.isEnabled()
+        assert not view.save_button.isEnabled()
+        assert not view.load_button.isEnabled()
+    finally:
+        view.deleteLater()
+
+
+def test_the_control_row_refreshes_when_only_the_admission_level_moves(
+    tmp_path,
+) -> None:
+    """The presented busy edge must be keyed on the level that gates it.
+
+    ``run_admission_pending`` is the only fact behind the On Pulse control, and
+    it moves while ``run_busy`` is already true and the Run snapshot has not
+    been re-observed.  Leaving it out of the key that decides whether to
+    re-apply the control row made that very transition refresh only when some
+    unrelated runtime fact happened to change too.
+    """
+
+    application = ensure_qt_app()
+    body = open_pulse_editor(
+        workspace=WorkspacePaths.for_workspace((tmp_path / "workspace").resolve())
+    )
+    try:
+        baseline = body._last_runtime
+        assert baseline is not None
+        assert not baseline.run_admission_pending
+        assert body.schedule_view.fire_button.isEnabled()
+
+        body._apply_runtime_update(replace(baseline, run_admission_pending=True))
+        assert not body.schedule_view.fire_button.isEnabled()
+
+        body._apply_runtime_update(replace(baseline, run_admission_pending=False))
+        assert body.schedule_view.fire_button.isEnabled()
+    finally:
+        _close_pulse_editor(application, body)
 
 
 def test_operator_observes_holds_steps_and_stops_virtual_scan(tmp_path) -> None:
@@ -130,3 +212,4 @@ def test_operator_observes_holds_steps_and_stops_virtual_scan(tmp_path) -> None:
             application,
             lambda: body.permanently_closed and body.worker_idle,
         )
+        assert body._wake.fault is None

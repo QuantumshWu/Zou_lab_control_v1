@@ -19,7 +19,6 @@ from typing import Callable
 from PyQt5 import QtCore, QtWidgets
 
 from zlc_frontend.qt_widgets import (
-    ACCENT,
     GREEN,
     GREY,
     ORANGE,
@@ -45,6 +44,7 @@ from zlc_frontend.qt_widgets import (
     window_pad,
 )
 from zlc_plot import PulseTimelinePlot, Qt5PlotWidget, RasterPlotHost
+from zlc_workbench.retiring_hosts import RetiringPlotHosts
 from zlc_neutral_atom.runtime.run import RunState
 from zlc_pulse import (
     DestructivePulseTargetEditError,
@@ -123,8 +123,6 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._last_scan_workspace = None
         self._last_scan_progress_key = None
         self._last_preview_key = None
-        self._owner_cycle_active = False
-        self._owner_cycle_pending = False
         self._shown_preview_key: tuple[int, int, bool] | None = None
         self.preview_host: RasterPlotHost | None = None
         self.preview_widget: Qt5PlotWidget | None = None
@@ -133,8 +131,10 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._preview_plot: PulsePreviewPlot | None = None
         self._preview_size: str | None = None
         self._preview_operations: dict[Future, str | None] = {}
+        self._retiring_hosts = RetiringPlotHosts()
         self._close_decided = False
         self._close_requested = False
+        self._teardown_pending = False
         self._owner_retiring = False
         self._permanently_closed = False
         self._owner_closed = threading.Event()
@@ -154,7 +154,11 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._controller.set_notify(self._wake.request_owner_wake)
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(40)
-        self._timer.timeout.connect(self._runtime_tick)
+        # The clock only asks for an owner turn.  Advancing is ``pump``'s job
+        # alone, and QtOwnerWake is the one authority that decides whether a
+        # turn may start, so a tick raised inside a nested modal loop coalesces
+        # instead of re-entering the owner.
+        self._timer.timeout.connect(self._wake.request_owner_wake)
         self._apply_initial_state(initial_editor, initial_runtime, initial_preview)
 
     # ------------------------------------------------------------------
@@ -679,25 +683,13 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         )
 
     def _sync_applied(self) -> None:
-        action = getattr(self._controller, "sync_applied", None)
-        if action is None:
-            self._message("The sequencer has no applied pulse yet (nothing was prepared).")
-            return
-        self._invoke_editor_boundary(action)
+        self._invoke_editor_boundary(self._controller.sync_applied)
 
     def _hold_scan_point(self) -> None:
-        action = getattr(self._controller, "hold_scan_point", None)
-        if action is None:
-            self._message("No running scan point is available to hold.")
-            return
-        self._invoke_runtime(action)
+        self._invoke_runtime(self._controller.hold_scan_point)
 
     def _step_scan_point(self, delta: int) -> None:
-        action = getattr(self._controller, "step_scan_point", None)
-        if action is None:
-            self._message("No held scan point is available to step.")
-            return
-        self._invoke_runtime(action, int(delta))
+        self._invoke_runtime(self._controller.step_scan_point, int(delta))
 
     def _scan_file_start(self) -> Path:
         path = self._controller.current_path
@@ -943,61 +935,34 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
     # ------------------------------------------------------------------
 
     def _owner_cycle(self) -> None:
-        self._run_owner_cycle()
+        """Drain every owner-visible fact once; the only advancing entrance."""
 
-    def _run_owner_cycle(self) -> None:
-        # ``fluent_message`` runs a nested Qt event loop.  Coalesce a worker
-        # wake raised inside that loop so one connection transition cannot be
-        # presented twice.
-        if self._owner_cycle_active:
-            self._owner_cycle_pending = True
-            return
-        self._owner_cycle_active = True
-        try:
-            publication = self._controller.pump()
-            if publication is not None:
-                if not isinstance(publication, PulseOwnerUpdate):
-                    raise TypeError("Pulse owner published an invalid update")
-                runtime = publication.runtime
-                if runtime is not None:
-                    self._apply_runtime_update(runtime)
-                if publication.editor is not None:
-                    self._apply_editor_projection(publication.editor)
-                elif publication.scan_workspace is not None:
-                    self._apply_scan_workspace_value(
-                        publication.scan_workspace,
-                        self._last_scan_workspace,
-                    )
-                    self._last_scan_workspace = publication.scan_workspace
-                if publication.file is not None:
-                    self._apply_file_update(publication.file)
-                if publication.preview is not None:
-                    self._present_preview_update(publication.preview)
-                if publication.scan_progress is not None:
-                    self._present_scan_progress(publication.scan_progress)
-                if runtime is not None:
-                    self._finish_close_if_ready(runtime)
-            self._drain_preview_operations()
-            self._mount_preview_if_ready()
-        finally:
-            self._owner_cycle_active = False
-            if self._owner_cycle_pending:
-                self._owner_cycle_pending = False
-                QtCore.QTimer.singleShot(0, self._owner_cycle)
-
-    def _runtime_tick(self) -> None:
-        """Present an active Run only when its observable state changed."""
-
-        if self._owner_cycle_active:
-            return
-        self._owner_cycle_active = True
-        try:
-            update = self._controller.poll_runtime_change()
-            if update is not None:
-                self._apply_runtime_update(update)
-                self._finish_close_if_ready(update)
-        finally:
-            self._owner_cycle_active = False
+        publication = self._controller.pump()
+        if publication is not None:
+            if not isinstance(publication, PulseOwnerUpdate):
+                raise TypeError("Pulse owner published an invalid update")
+            runtime = publication.runtime
+            if runtime is not None:
+                self._apply_runtime_update(runtime)
+            if publication.editor is not None:
+                self._apply_editor_projection(publication.editor)
+            elif publication.scan_workspace is not None:
+                self._apply_scan_workspace_value(
+                    publication.scan_workspace,
+                    self._last_scan_workspace,
+                )
+                self._last_scan_workspace = publication.scan_workspace
+            if publication.file is not None:
+                self._apply_file_update(publication.file)
+            if publication.preview is not None:
+                self._present_preview_update(publication.preview)
+            if publication.scan_progress is not None:
+                self._present_scan_progress(publication.scan_progress)
+            if runtime is not None:
+                self._finish_close_if_ready(runtime)
+        self._drain_preview_operations()
+        self._mount_preview_if_ready()
+        self._advance_teardown()
 
     def _reconcile_editor_fields(
         self,
@@ -1208,11 +1173,16 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
                 previous.applied_snapshot.authoring_document_digest,
             )
         )
+        # Every fact ``_apply_file_and_run_state`` presents belongs in this key.
+        # ``run_admission_pending`` drives the On Pulse control on its own, and
+        # it moves while ``run_busy`` is already true, so leaving it out made
+        # that transition visible only when some other fact happened to change.
         file_run_key = (
             update.run_snapshot,
             applied_key,
             update.file_busy,
             update.run_busy,
+            update.run_admission_pending,
             update.connection_state,
         )
         previous_file_run_key = None if previous is None else (
@@ -1220,6 +1190,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             previous_applied_key,
             previous.file_busy,
             previous.run_busy,
+            previous.run_admission_pending,
             previous.connection_state,
         )
         if file_run_key != previous_file_run_key:
@@ -1238,10 +1209,31 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
     ) -> None:
         if not runtime.close_complete or self._window is None:
             return
-        if self._owner_retiring:
+        self._teardown_pending = True
+        self._advance_teardown()
+
+    def _advance_teardown(self) -> bool:
+        """Stop the render surface *before* the window accepts its close.
+
+        Once ``closeEvent`` is accepted there is no event left to defer, so a
+        host that has not stopped yet could only be waited for by joining its
+        thread on the Qt thread.  Retiring first turns that join into a level
+        this owner re-reads on its next turn.
+        """
+
+        self._retiring_hosts.poll()
+        if not self._teardown_pending or self._permanently_closed:
+            return self._permanently_closed
+        self._release_preview_surface()
+        if self._retiring_hosts:
+            self._sync_runtime_watchers()
+            return False
+        self._teardown_pending = False
+        if self._owner_retiring or self._window is None:
             self._commit_permanent_close()
-        else:
-            QtCore.QTimer.singleShot(0, self._window.close)
+            return self._permanently_closed
+        QtCore.QTimer.singleShot(0, self._window.close)
+        return True
 
     @staticmethod
     def _scan_progress_key(snapshot) -> tuple[object, ...]:
@@ -1279,9 +1271,9 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             self._last_preview_key = key
 
     def _sync_runtime_watchers(self) -> None:
-        """Arm periodic Run observations only while they have a consumer."""
+        """Arm the owner clock only while some fact still needs advancing."""
 
-        if self._controller.runtime_poll_required:
+        if self._controller.runtime_poll_required or self._retiring_hosts:
             if not self._timer.isActive():
                 self._timer.start()
         elif self._timer.isActive():
@@ -1465,7 +1457,7 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             synchronized=synchronized,
             file_dirty=dirty,
             file_busy=runtime.file_busy,
-            run_busy=runtime.run_busy,
+            run_admission_pending=runtime.run_admission_pending,
         )
 
     def _apply_connection_state(
@@ -1598,24 +1590,34 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
     # lifecycle / launcher contract
     # ------------------------------------------------------------------
 
-    def _close_preview_surface(self) -> None:
+    def _release_preview_surface(self) -> None:
+        """Hand the preview host to the one owner of plot-host shutdown."""
+
         unsubscribe, self._preview_host_unsubscribe = (
             self._preview_host_unsubscribe,
             None,
         )
         if unsubscribe is not None:
             unsubscribe()
+        # The host joins the retiring set BEFORE the widget cleanup edge, which
+        # re-raises its first failure by contract.  Retiring afterwards would let
+        # that raise strand a live host that nobody ever asked to stop, while an
+        # empty set reports every surface already retired.
+        host, self.preview_host = self.preview_host, None
+        if host is not None:
+            self._retiring_hosts.retire(host)
         widget, self.preview_widget = self.preview_widget, None
         if widget is not None:
             widget.close_adapter()
-        host, self.preview_host = self.preview_host, None
-        if host is not None:
-            host.close()
         self._preview_operations.clear()
 
     @property
     def worker_idle(self) -> bool:
-        return self._controller.worker_idle and not self._preview_operations
+        return (
+            self._controller.worker_idle
+            and not self._preview_operations
+            and not self._retiring_hosts
+        )
 
     @property
     def current_document(self):
@@ -1645,12 +1647,13 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
             self._controller.request_close()
         update = self._controller.runtime_update()
         self._apply_runtime_update(update)
-        if update.close_complete and self._window is not None:
-            # ``request_close`` is also a public notebook/test entry point; a
-            # synchronously completed controller close has no later worker wake
-            # on which ``_owner_cycle`` could hide the wrapper.
-            QtCore.QTimer.singleShot(0, self._window.close)
-        return update.close_complete
+        if not update.close_complete:
+            return False
+        # ``request_close`` is also the wrapper's close guard: refusing while
+        # the render surface is still stopping is what keeps the window alive
+        # long enough to retire it without joining a thread here.
+        self._teardown_pending = True
+        return self._advance_teardown()
 
     @property
     def permanently_closed(self) -> bool:
@@ -1684,12 +1687,23 @@ class PulseEditorWindowBody(QtWidgets.QWidget):
         self._controller.retire_borrowed_authority()
 
     def _commit_permanent_close(self) -> None:
-        """Release the wrapper after either standalone or borrowed close commits."""
+        """Release the wrapper after either standalone or borrowed close commits.
+
+        Committing destroys the wrapper and with it the clock, so this entrance
+        may not leave a host that has not stopped with nobody left to poll it.
+        A still-retiring surface keeps the commit pending instead: the level
+        that says so re-arms the clock, and ``_advance_teardown`` re-enters
+        here from the next owner turn.
+        """
 
         if self._permanently_closed:
             return
+        self._release_preview_surface()
+        if not self._retiring_hosts.poll():
+            self._teardown_pending = True
+            self._sync_runtime_watchers()
+            return
         self._permanently_closed = True
-        self._close_preview_surface()
         window = self._window
         self._window = None
         if window is None:
