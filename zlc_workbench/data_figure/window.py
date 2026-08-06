@@ -39,6 +39,7 @@ from zlc_plot import (
     RasterPlotHost,
 )
 from zlc_plot.primitives import ImageFrame, PlotInput
+from zlc_workbench.retiring_hosts import RetiringPlotHosts
 from zlc_workbench.window_runtime import submit_compute
 
 from .archive_io import FigureArchive, LoadedFigureArchive, save_figure_archive
@@ -87,7 +88,7 @@ class DataFigureWindow(QtWidgets.QWidget):
         self._open_fit_when_ready = open_fit
         self._embedded = embedded
         self._closing = False
-        self._closed = False
+        self._retiring = RetiringPlotHosts()
         self._initial_outcome: str | None = None
         self._pending: dict[Future, tuple[str, object]] = {}
         self._host = RasterPlotHost.from_plot(
@@ -181,7 +182,9 @@ class DataFigureWindow(QtWidgets.QWidget):
 
     @property
     def closed(self) -> bool:
-        return self._closed
+        # Derived from the retirement set, so "the host stopped" is answered by
+        # the only party that can produce the answer instead of a stale copy.
+        return self._closing and not self._retiring
 
     def _resolve_archive_path(self, path: str | Path | None) -> Path | None:
         if path is None:
@@ -469,8 +472,15 @@ class DataFigureWindow(QtWidgets.QWidget):
         self.archiveSaved.emit(loaded)
 
     def teardown(self) -> bool:
-        if self._closed:
+        if self.closed:
             return True
+        # Asking the host to stop — and arming the retry that keeps re-asking —
+        # is what every entrance owes, and both run before anything that may
+        # raise: ``close_adapter`` re-raises its first cleanup failure by
+        # design, and an entrance that dies after that edge would otherwise
+        # leave a live worker with nothing left to drain it.
+        self._retiring.retire(self._host)
+        self._arm_shutdown_poll()
         if not self._closing:
             self._closing = True
             for future in tuple(self._pending):
@@ -479,21 +489,25 @@ class DataFigureWindow(QtWidgets.QWidget):
             for popup in (self._settings_popup, self._fit_popup):
                 if popup is not None:
                     popup.hide()
-            widget = self._plot_widget
-            if widget is not None:
-                widget.close_adapter()
-        self._closed = self._host.close(timeout=0.0)
-        if not self._closed and not self._shutdown_timer.isActive():
+        widget = self._plot_widget
+        if widget is not None:
+            widget.close_adapter()
+        if self._retiring:
+            return False
+        # The timer exists only to re-read the retirement set; it is stopped by
+        # whichever entrance observes the set drained.
+        self._shutdown_timer.stop()
+        return True
+
+    def _arm_shutdown_poll(self) -> None:
+        # The retirement set is the level; this timer is only an edge that
+        # re-reads it, so it is armed off the set and never off a flag.
+        if self._retiring and not self._shutdown_timer.isActive():
             self._shutdown_timer.start()
-        return self._closed
 
     @QtCore.pyqtSlot()
     def _poll_shutdown(self) -> None:
-        if self._closed or not self._closing:
-            self._shutdown_timer.stop()
-            return
-        self._closed = self._host.close(timeout=0.0)
-        if not self._closed:
+        if not self._retiring.poll():
             return
         self._shutdown_timer.stop()
         if not self._embedded:

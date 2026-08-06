@@ -55,6 +55,7 @@ from zlc_plot import (
     default_plot_spec,
 )
 from zlc_plot import Qt5PlotWidget
+from zlc_workbench.retiring_hosts import RetiringPlotHosts
 
 from .console_records import (
     DEFAULT_UPDATE_MS,
@@ -163,7 +164,7 @@ class PanelCard(FluentGroupBox):
         self._selector_materializations: dict[Future, tuple[RasterPlotHost, SelectorKind]] = {}
         self._configuration_futures: set[Future] = set()
         self._subscriptions: dict[str, list[object]] = {}
-        self._retiring_hosts: set[RasterPlotHost] = set()
+        self._retiring_hosts = RetiringPlotHosts()
         self._worker_events: deque[tuple[str, RasterPlotHost, object]] = deque()
         self._event_lock = threading.Lock()
         self._closing = False
@@ -1153,20 +1154,20 @@ class PanelCard(FluentGroupBox):
         self._latest_host_revisions.pop(host.host_id, None)
         self._latest_host_sequence.pop(host.host_id, None)
         self._presented_revisions_by_host.pop(host.host_id, None)
-        if host.close(timeout=0.0):
-            self._retiring_hosts.discard(host)
-        else:
-            self._retiring_hosts.add(host)
-            if not self._closing:
-                QtCore.QTimer.singleShot(25, self._wake.request_owner_wake)
+        self._retiring_hosts.retire(host)
+        self._arm_retirement_wake()
 
     def _poll_retiring_hosts(self) -> bool:
-        for host in tuple(self._retiring_hosts):
-            if host.close(timeout=0.0):
-                self._retiring_hosts.discard(host)
+        drained = self._retiring_hosts.poll()
+        self._arm_retirement_wake()
+        return drained
+
+    def _arm_retirement_wake(self) -> None:
+        # The retirement set is the level; this timer is only an edge that
+        # re-reads it, so it is armed off the set and never off a flag.  While
+        # closing the console drives the polling and no wake owner remains.
         if self._retiring_hosts and not self._closing:
             QtCore.QTimer.singleShot(25, self._wake.request_owner_wake)
-        return not self._retiring_hosts
 
     def _retire_pending_host(self) -> None:
         host = self._pending_host
@@ -1178,6 +1179,14 @@ class PanelCard(FluentGroupBox):
 
     def _retire_all_surfaces(self) -> None:
         self._request_serial += 1
+        # Both hosts go first: ``close_adapter`` below re-raises its first
+        # cleanup failure by design, and a host still held when that happens
+        # would never be asked to stop at all.
+        host = self._host
+        self._host = None
+        if host is not None:
+            self._retire_host(host)
+        self._retire_pending_host()
         widget = self._plot_widget
         self._plot_widget = None
         if widget is not None:
@@ -1185,11 +1194,6 @@ class PanelCard(FluentGroupBox):
             widget.hide()
             widget.close_adapter()
             widget.deleteLater()
-        host = self._host
-        self._host = None
-        if host is not None:
-            self._retire_host(host)
-        self._retire_pending_host()
         self._placeholder.show()
         self._presented_value = None
         self._presented_publication = None
@@ -1206,7 +1210,10 @@ class PanelCard(FluentGroupBox):
             self._closing = True
             self._wake.detach()
             self.settings_popup.hide()
-            self._retire_all_surfaces()
+        # Every entrance retires whatever is still held; an entrance that died
+        # on the widget cleanup edge must not leave an empty set reading as
+        # "drained" while the host is alive and never asked to stop.
+        self._retire_all_surfaces()
         return self._poll_retiring_hosts()
 
 

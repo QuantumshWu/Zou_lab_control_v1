@@ -29,6 +29,7 @@ from zlc_frontend.qt_widgets import (
     setting_label_width,
 )
 from zlc_plot import Qt5PlotWidget, RasterFront, RasterOperation, RasterPlotHost
+from zlc_workbench.retiring_hosts import RetiringPlotHosts
 
 from .logic_node_parameter_panel import LogicNodeParameterPanel
 
@@ -53,7 +54,7 @@ class PanelEditor(QtWidgets.QWidget):
         self._initial_future: Future | None = None
         self._front_futures: set[Future] = set()
         self._save_futures: dict[Future, Path] = {}
-        self._retiring_hosts: set[RasterPlotHost] = set()
+        self._retiring_hosts = RetiringPlotHosts()
         self._closing = False
         self._closed = False
         self._wake = QtOwnerWake(self)
@@ -359,6 +360,14 @@ class PanelEditor(QtWidgets.QWidget):
                     child.setEnabled(enabled)
 
     def _retire_surface(self) -> None:
+        # The host goes first: ``close_adapter`` below re-raises its first
+        # cleanup failure by design, and a host still held when that happens
+        # would never be asked to stop at all.
+        host = self._host
+        self._host = None
+        if host is not None:
+            self._retiring_hosts.retire(host)
+            self._arm_retirement_wake()
         future = self._initial_future
         self._initial_future = None
         if future is not None:
@@ -385,29 +394,27 @@ class PanelEditor(QtWidgets.QWidget):
             if child is not None:
                 child.hide()
                 child.deleteLater()
-        host = self._host
-        self._host = None
-        if host is not None:
-            if host.close(timeout=0.0):
-                self._retiring_hosts.discard(host)
-            else:
-                self._retiring_hosts.add(host)
-                if not self._closing:
-                    QtCore.QTimer.singleShot(25, self._wake.request_owner_wake)
 
     def _poll_retiring_hosts(self) -> bool:
-        for host in tuple(self._retiring_hosts):
-            if host.close(timeout=0.0):
-                self._retiring_hosts.discard(host)
+        drained = self._retiring_hosts.poll()
+        self._arm_retirement_wake()
+        return drained
+
+    def _arm_retirement_wake(self) -> None:
+        # The retirement set is the level; this timer is only an edge that
+        # re-reads it, so it is armed off the set and never off a flag.  While
+        # closing the console drives the polling and no wake owner remains.
         if self._retiring_hosts and not self._closing:
             QtCore.QTimer.singleShot(25, self._wake.request_owner_wake)
-        return not self._retiring_hosts
 
     def teardown(self) -> bool:
         if not self._closing:
             self._closing = True
             self._wake.detach()
-            self._retire_surface()
+        # Every entrance retires whatever is still held; an entrance that died
+        # on the widget cleanup edge must not leave an empty set reading as
+        # "drained" while the host is alive and never asked to stop.
+        self._retire_surface()
         closed = self._poll_retiring_hosts()
         if closed:
             self._finish_shutdown()
