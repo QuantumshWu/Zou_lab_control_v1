@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import uuid
@@ -929,6 +930,34 @@ def decode_continuous_failure_message(payload: bytes) -> str | None:
     return failure
 
 
+@dataclass
+class AdmittedPulseSession:
+    """The one admitted client: a control channel and its paired abort channel.
+
+    Roles are declared, never inferred from arrival order, so the server can
+    distinguish one client's second channel from a second client entirely.
+    """
+
+    control: object
+    peer: str
+    generation: str = ""
+    abort: object | None = None
+    abort_peer: str = ""
+
+
+def describe_rpyc_peer(conn: object) -> str:
+    """Name a connection for operator-facing admission records."""
+
+    channel = getattr(conn, "_channel", None)
+    stream = getattr(channel, "stream", None)
+    socket = getattr(stream, "sock", None)
+    try:
+        host, port = socket.getpeername()[:2]
+    except Exception:
+        return "unknown peer"
+    return f"{host}:{port}"
+
+
 def serve_pulse_execution_service(
     service: PulseExecutionService,
     *,
@@ -946,67 +975,149 @@ def serve_pulse_execution_service(
     except ImportError as exc:  # pragma: no cover - deployment dependency
         raise RuntimeError("pulse server requires rpyc on the FPGA computer") from exc
 
-    connection_lock = threading.Lock()
-    active_connection: list[object] = []
+    session_lock = threading.Lock()
+    admitted: list[AdmittedPulseSession] = []
+
+    def held_session() -> AdmittedPulseSession | None:
+        with session_lock:
+            return admitted[0] if admitted else None
 
     class RPyCCurrentPulseService(rpyc.Service):
+        """Admit one paired session; every other connection is refused by name.
+
+        A connection carries no authority from having arrived: it declares a
+        role, and the server admits at most one control channel plus the single
+        abort channel that presents that control channel's generation.
+        """
+
         def on_connect(self, conn):
-            with connection_lock:
-                owns_connection = not active_connection
-                if owns_connection:
-                    active_connection.append(conn)
-            self._owner_connection = conn if owns_connection else None
-            if not owns_connection:
+            self._conn = conn
+
+        def on_disconnect(self, conn):
+            with session_lock:
+                held = admitted[0] if admitted else None
+                if held is None:
+                    return
+                if held.abort is conn:
+                    held.abort = None
+                    role = "abort"
+                elif held.control is conn:
+                    admitted.clear()
+                    role = "control"
+                else:
+                    return
+            logging.info(
+                "%s channel from %s closed", role, describe_rpyc_peer(conn)
+            )
+            if role != "control":
                 return
+            # The physical state belongs to the session, not to the socket:
+            # losing the control channel ends both together.
+            try:
+                service.safe_state()
+            except Exception:
+                logging.exception("SAFE after control channel loss failed")
+
+        def exposed_open_control_session(self):
+            """Admit this connection as the one control channel and re-arm SAFE."""
+
+            conn = self._conn
+            peer = describe_rpyc_peer(conn)
+            with session_lock:
+                if admitted:
+                    held = admitted[0]
+                    raise RuntimeError(
+                        "pulse control is already held by "
+                        f"{held.peer}; close that client before opening another"
+                    )
+                admitted.append(AdmittedPulseSession(conn, peer))
             try:
                 # Admission is a live recovery attempt.  A prior disconnect SAFE
                 # failure blocks only until this serialized owner obtains a
                 # current receipt; no failure state survives successful readback.
                 service.safe_state()
-                service.renew_connection_generation()
+                generation = service.renew_connection_generation()
             except BaseException:
-                with connection_lock:
-                    if active_connection and active_connection[0] is conn:
-                        active_connection.clear()
+                with session_lock:
+                    if admitted and admitted[0].control is conn:
+                        admitted.clear()
+                logging.exception("control channel admission from %s failed", peer)
                 raise
+            with session_lock:
+                if not admitted or admitted[0].control is not conn:
+                    raise RuntimeError(
+                        "pulse control admission was revoked while it was opening"
+                    )
+                admitted[0].generation = generation
+            logging.info("control channel opened by %s (generation %s)", peer, generation)
+            return generation
 
-        def on_disconnect(self, conn):
-            with connection_lock:
-                owns_connection = bool(active_connection and active_connection[0] is conn)
-            if not owns_connection:
+        def exposed_attach_abort_channel(self, connection_generation):
+            """Pair this connection to the live session as its only abort channel.
+
+            The abort path exists because ``complete`` occupies the control
+            channel for the whole run; pairing it explicitly is what lets the
+            server tell one client's second channel from a second client.
+            """
+
+            conn = self._conn
+            peer = describe_rpyc_peer(conn)
+            generation = str(connection_generation)
+            with session_lock:
+                held = admitted[0] if admitted else None
+                if held is None or not held.generation:
+                    raise RuntimeError("no open pulse control session to attach to")
+                if held.control is conn:
+                    raise RuntimeError(
+                        "the control channel cannot also serve as its abort channel"
+                    )
+                if held.generation != generation:
+                    raise RuntimeError(
+                        "abort channel presented another session's generation"
+                    )
+                if held.abort is not None:
+                    raise RuntimeError(
+                        f"this pulse session already has an abort channel ({held.abort_peer})"
+                    )
+                held.abort = conn
+                held.abort_peer = peer
+            logging.info("abort channel attached by %s (generation %s)", peer, generation)
+            return True
+
+        def _require_control(self) -> None:
+            held = held_session()
+            if held is not None and held.control is getattr(self, "_conn", None):
                 return
-            try:
-                service.safe_state()
-            except Exception:
-                pass
-            finally:
-                with connection_lock:
-                    if active_connection and active_connection[0] is conn:
-                        active_connection.clear()
+            raise RuntimeError(
+                "this connection is not the pulse control channel"
+                + (f"; control is held by {held.peer}" if held is not None else "")
+            )
 
-        def _require_owner(self):
-            connection = getattr(self, "_owner_connection", None)
-            with connection_lock:
-                if connection is None or not active_connection or active_connection[0] is not connection:
-                    raise RuntimeError("RPC connection does not own the pulse execution service")
+        def _require_abort(self) -> str:
+            held = held_session()
+            if held is None or held.abort is not getattr(self, "_conn", None):
+                raise RuntimeError(
+                    "this connection is not the abort channel of the open pulse session"
+                )
+            return held.generation
 
         def exposed_current_snapshot(self):
-            self._require_owner()
+            self._require_control()
             return encode(pulse_server_snapshot_to_tree(service.snapshot()))
 
         def exposed_current_prepare(self, artifact_bytes):
-            self._require_owner()
+            self._require_control()
             return encode_prepared_ref_message(
                 service.prepare(decode_artifact_message(bytes(artifact_bytes)))
             )
 
         def exposed_current_fire(self, reference_bytes):
-            self._require_owner()
+            self._require_control()
             service.fire(decode_prepared_ref_message(bytes(reference_bytes)))
             return True
 
         def exposed_current_complete(self, reference_bytes, timeout=None):
-            self._require_owner()
+            self._require_control()
             return encode_completion_message(
                 service.complete(
                     decode_prepared_ref_message(bytes(reference_bytes)),
@@ -1019,7 +1130,7 @@ def serve_pulse_execution_service(
             reference_bytes,
             timeout,
         ):
-            self._require_owner()
+            self._require_control()
             return encode_continuous_failure_message(
                 service.wait_continuous_failure(
                     decode_prepared_ref_message(bytes(reference_bytes)),
@@ -1027,10 +1138,12 @@ def serve_pulse_execution_service(
                 )
             )
 
-        def exposed_current_interrupt_safe_state(self, connection_generation):
+        def exposed_current_interrupt_safe_state(self):
+            # The attached channel is the authority; a generation argument would
+            # only re-admit the forgeable identity this pairing replaced.
             return encode(
                 pulse_server_snapshot_to_tree(
-                    service.safe_state_for_generation(str(connection_generation))
+                    service.safe_state_for_generation(self._require_abort())
                 )
             )
 

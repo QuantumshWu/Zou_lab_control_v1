@@ -82,20 +82,22 @@ class RemotePulseExecutionClient:
             raise RuntimeError("remote pulse execution requires rpyc") from exc
         timeout = float(transport_timeout_seconds)
         use_ipv6 = ":" in str(host)
-        connection = rpyc.connect(
-            host,
-            int(port),
-            config={"allow_public_attrs": True, "sync_request_timeout": timeout},
-            ipv6=use_ipv6,
-        )
+        config = {"allow_public_attrs": True, "sync_request_timeout": timeout}
+        connection = rpyc.connect(host, int(port), config=config, ipv6=use_ipv6)
         interrupt_connection = None
         try:
+            # Both channels declare their role.  Admission is what makes this
+            # client the control owner, and the generation it returns is what
+            # pairs the abort channel to this session rather than to whoever
+            # happened to connect next.
+            generation = str(connection.root.open_control_session())
             interrupt_connection = rpyc.connect(
                 host,
                 int(port),
-                config={"allow_public_attrs": True, "sync_request_timeout": timeout},
+                config=config,
                 ipv6=use_ipv6,
             )
+            interrupt_connection.root.attach_abort_channel(generation)
             return cls(
                 connection,
                 interrupt_connection,
@@ -226,7 +228,7 @@ class RemotePulseExecutionClient:
             pending = rpyc.timed(
                 self._interrupt_root.current_interrupt_safe_state,
                 logical_timeout,
-            )(self._generation)
+            )()
             payload = pending.value
         except AsyncResultTimeout as exc:
             self._abort_connections()

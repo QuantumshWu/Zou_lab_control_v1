@@ -137,10 +137,14 @@ class Root:
             )
         )
 
-    def current_interrupt_safe_state(self, generation):
+    def current_interrupt_safe_state(self):
+        # The attached abort channel is the authority; its session generation
+        # comes from the server, never from the caller.
         return encode(
             pulse_server_snapshot_to_tree(
-                self.service.safe_state_for_generation(generation)
+                self.service.safe_state_for_generation(
+                    self.service.connection_generation
+                )
             )
         )
 
@@ -227,7 +231,7 @@ def test_remote_client_rejects_non_current_snapshot_schema():
         current_prepare = current_fire = current_complete = lambda *args: True
         current_wait_continuous_failure = lambda *args: True
 
-        def current_interrupt_safe_state(self, generation):
+        def current_interrupt_safe_state(self):
             return encode({"schema": "old-server"})
 
     class BadConnection:
@@ -283,12 +287,12 @@ def test_remote_client_serializes_concurrent_close_to_one_safe_request(monkeypat
     calls = 0
     original = interrupt_connection.root.current_interrupt_safe_state
 
-    def blocking_safe(generation):
+    def blocking_safe():
         nonlocal calls
         calls += 1
         entered.set()
         assert release.wait(1.0)
-        return original(generation)
+        return original()
 
     interrupt_connection.root.current_interrupt_safe_state = blocking_safe
     errors = []
@@ -325,7 +329,7 @@ def test_remote_client_terminal_close_revokes_sockets_after_unconfirmed_safe(
     client = RemotePulseExecutionClient(connection, interrupt_connection)
     calls = 0
 
-    def fail_safe(_generation):
+    def fail_safe():
         nonlocal calls
         calls += 1
         raise RuntimeError("SAFE unconfirmed")
@@ -358,12 +362,12 @@ def test_explicit_safe_state_failure_can_retry_on_the_same_live_connection(
     calls = 0
     original = interrupt_connection.root.current_interrupt_safe_state
 
-    def fail_once(generation):
+    def fail_once():
         nonlocal calls
         calls += 1
         if calls == 1:
             raise RuntimeError("SAFE temporarily unconfirmed")
-        return original(generation)
+        return original()
 
     interrupt_connection.root.current_interrupt_safe_state = fail_once
 
@@ -373,3 +377,87 @@ def test_explicit_safe_state_failure_can_retry_on_the_same_live_connection(
     assert client.safe_state().safe_readback_confirmed
     assert calls == 2
     client.close()
+
+
+def _serve_in_background(service):
+    """Bind one real RPyC server so admission is proven over the wire."""
+
+    from zlc_pulse.server import serve_pulse_execution_service
+
+    server = serve_pulse_execution_service(
+        service,
+        host="127.0.0.1",
+        port=0,
+        start=False,
+    )
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def test_a_connection_holds_no_authority_until_it_declares_a_role():
+    import rpyc
+
+    _artifact, service, _connection = _fixture()
+    server, thread = _serve_in_background(service)
+    config = {"allow_public_attrs": True, "sync_request_timeout": 10.0}
+    try:
+        undeclared = rpyc.connect("127.0.0.1", server.port, config=config)
+        try:
+            # Arriving is not a role: neither lane answers an undeclared caller.
+            with pytest.raises(Exception, match="not the pulse control channel"):
+                undeclared.root.current_snapshot()
+            with pytest.raises(Exception, match="not the abort channel"):
+                undeclared.root.current_interrupt_safe_state()
+            with pytest.raises(Exception, match="no open pulse control session"):
+                undeclared.root.attach_abort_channel("whatever")
+        finally:
+            undeclared.close()
+    finally:
+        server.close()
+        thread.join(5.0)
+
+
+def test_a_second_client_is_refused_by_name_instead_of_admitted_as_a_zombie():
+    import rpyc
+
+    _artifact, service, _connection = _fixture()
+    server, thread = _serve_in_background(service)
+    config = {"allow_public_attrs": True, "sync_request_timeout": 10.0}
+    try:
+        owner = RemotePulseExecutionClient.connect(
+            "127.0.0.1",
+            server.port,
+            transport_timeout_seconds=10.0,
+        )
+        try:
+            with pytest.raises(Exception, match="already held by"):
+                RemotePulseExecutionClient.connect(
+                    "127.0.0.1",
+                    server.port,
+                    transport_timeout_seconds=10.0,
+                )
+            # One session admits exactly one abort channel, and only for its
+            # own generation -- an outsider cannot SAFE the owner's run.
+            intruder = rpyc.connect("127.0.0.1", server.port, config=config)
+            try:
+                with pytest.raises(Exception, match="another session's generation"):
+                    intruder.root.attach_abort_channel("not-this-generation")
+                with pytest.raises(Exception, match="already has an abort channel"):
+                    intruder.root.attach_abort_channel(owner.connection_generation)
+            finally:
+                intruder.close()
+        finally:
+            owner.close()
+
+        # The slot is released with the control channel, not leaked.
+        successor = RemotePulseExecutionClient.connect(
+            "127.0.0.1",
+            server.port,
+            transport_timeout_seconds=10.0,
+        )
+        assert successor.connection_generation != owner.connection_generation
+        successor.close()
+    finally:
+        server.close()
+        thread.join(5.0)

@@ -148,10 +148,12 @@ class Root:
             )
         )
 
-    def current_interrupt_safe_state(self, generation):
+    def current_interrupt_safe_state(self):
         return encode(
             pulse_server_snapshot_to_tree(
-                self.service.safe_state_for_generation(generation)
+                self.service.safe_state_for_generation(
+                    self.service.connection_generation
+                )
             )
         )
 
@@ -173,9 +175,7 @@ class InProcessRemotePulseExecutionClient(RemotePulseExecutionClient):
         snapshot = pulse_server_snapshot_from_tree(
             decode(
                 bytes(
-                    self._interrupt_root.current_interrupt_safe_state(
-                        self.connection_generation
-                    )
+                    self._interrupt_root.current_interrupt_safe_state()
                 )
             )
         )
