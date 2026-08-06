@@ -5,7 +5,6 @@ from __future__ import annotations
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 import math
-import queue
 import threading
 from typing import Callable
 
@@ -330,15 +329,18 @@ class AppliedPulseSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class PulseRunObservation:
-    """Immutable observation of the most recently started pulse Run."""
+    """Immutable observation of the most recently started pulse Run.
 
-    request: PulseRunRequest
+    ``applied`` is the only account of what the Run put on the sequencer: it is
+    republished by every in-place replacement.  The intent the Run was admitted
+    with is deliberately absent, because it stops describing the hardware at the
+    first replacement and nothing can update a copy of it here.
+    """
+
     run: RunSnapshot
     applied: AppliedPulseSnapshot | None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.request, PulseRunRequest):
-            raise TypeError("request must be PulseRunRequest")
         if not isinstance(self.run, RunSnapshot):
             raise TypeError("run must be RunSnapshot")
         if self.applied is not None:
@@ -386,10 +388,6 @@ class PreparedPulseExecution:
     def descriptor(self) -> PulseRunDescriptor:
         return self._descriptor
 
-    @property
-    def request(self) -> PulseRunRequest:
-        return self._request
-
     def start(self) -> RunHandle:
         with self._lock:
             if self._started:
@@ -403,6 +401,53 @@ class PreparedPulseExecution:
         )
 
 
+class PulseReplacementLane:
+    """The one lane through which a live Run accepts in-place replacements.
+
+    Admission and drain are the same fact, so they share one lock: closing is
+    performed by the drain itself.  Without that, a request accepted after the
+    only consumer stopped would return a promise nobody can ever complete, and
+    the caller would wait on it for the rest of the process' life.
+    """
+
+    __slots__ = ("_closed_reason", "_lock", "_pending")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending: list[tuple[PulseRunRequest, Future]] = []
+        self._closed_reason: str | None = None
+
+    def submit(self, request: PulseRunRequest) -> Future:
+        """Accept one replacement, or refuse it because nobody can apply it."""
+
+        if not isinstance(request, PulseRunRequest):
+            raise TypeError("replacement request must be PulseRunRequest")
+        if request.execution_form is not PulseExecutionForm.CONTINUOUS_MONITOR:
+            raise ValueError("pulse replacement requires CONTINUOUS_MONITOR")
+        future: Future = Future()
+        with self._lock:
+            if self._closed_reason is not None:
+                raise RuntimeError(
+                    f"pulse replacement lane is closed: {self._closed_reason}"
+                )
+            self._pending.append((request, future))
+        return future
+
+    def take(self) -> tuple[PulseRunRequest, Future] | None:
+        with self._lock:
+            return self._pending.pop(0) if self._pending else None
+
+    def close(self, error: BaseException) -> None:
+        with self._lock:
+            if self._closed_reason is None:
+                self._closed_reason = f"{type(error).__name__}: {error}"
+            drained = tuple(self._pending)
+            self._pending.clear()
+        for _request, future in drained:
+            if not future.done():
+                future.set_exception(error)
+
+
 class PulseApplicationOwner:
     """Single in-process owner of applied pulse identity and the latest Run."""
 
@@ -411,8 +456,7 @@ class PulseApplicationOwner:
         "_active_descriptor",
         "_active_handle",
         "_active_progress_reader",
-        "_active_replace",
-        "_active_request",
+        "_active_replacement_lane",
         "_last_applied",
         "_lock",
         "_pending_applied",
@@ -427,11 +471,10 @@ class PulseApplicationOwner:
         self._pending_applied = None
         self._last_applied: AppliedPulseSnapshot | None = None
         self._active_handle: RunHandle | None = None
-        self._active_request: PulseRunRequest | None = None
         self._active_applied: AppliedPulseSnapshot | None = None
         self._active_descriptor: PulseRunDescriptor | None = None
         self._active_progress_reader: Callable[[], PulseScanProgress] | None = None
-        self._active_replace: Callable[[PulseRunRequest], Future] | None = None
+        self._active_replacement_lane: tuple[str, PulseReplacementLane] | None = None
 
     def snapshot(self) -> AppliedPulseSnapshot | None:
         with self._lock:
@@ -441,22 +484,12 @@ class PulseApplicationOwner:
         while True:
             with self._lock:
                 handle = self._active_handle
-                request = self._active_request
             if handle is None:
                 return None
-            if request is None:
-                raise RuntimeError("pulse application lost its active request")
             run = handle.snapshot()
             with self._lock:
                 if self._active_handle is handle:
-                    observation = PulseRunObservation(
-                        request,
-                        run,
-                        self._active_applied,
-                    )
-                    if run.state.terminal:
-                        self._active_replace = None
-                    return observation
+                    return PulseRunObservation(run, self._active_applied)
 
     def replace_active(self, request: PulseRunRequest) -> Future:
         """Queue one applied-pulse replacement on the existing Run owner.
@@ -464,18 +497,19 @@ class PulseApplicationOwner:
         The returned future completes only after the Run's sequencer lane has
         performed the existing SAFE -> prepare -> FIRE seam.  It never starts
         a second Run and never performs transport I/O on the caller thread.
+        Whether a replacement is still possible is answered by the lane of the
+        Run that is active right now, not by a cached copy here: only the Run
+        knows when it stopped consuming, and it revokes the lane in the same
+        breath.  A lane published by a Run that never became the active one is
+        therefore refused rather than fed work nobody observes.
         """
 
-        if not isinstance(request, PulseRunRequest):
-            raise TypeError("replacement request must be PulseRunRequest")
-        if request.execution_form is not PulseExecutionForm.CONTINUOUS_MONITOR:
-            raise ValueError("pulse replacement requires CONTINUOUS_MONITOR")
         with self._lock:
-            replace = self._active_replace
             handle = self._active_handle
-        if handle is None or replace is None:
+            bound = self._active_replacement_lane
+        if handle is None or bound is None or bound[0] != handle.run_id.value:
             raise RuntimeError("active pulse has no replacement seam")
-        return replace(request)
+        return bound[1].submit(request)
 
     def cancel_active(
         self,
@@ -486,39 +520,25 @@ class PulseApplicationOwner:
         return None if handle is None else handle.cancel(reason)
 
     def observe_scan_progress(self) -> PulseScanProgress | None:
-        """Observe the active continuous scan without acquiring drive authority."""
+        """Observe the active continuous scan without acquiring drive authority.
+
+        The reader published with each applied fact reads the live session, so
+        it is the only thing asked which artifact and how many points are on
+        the sequencer.  The prepared descriptor answers only until the Run has
+        applied anything, when it is still the whole truth.
+        """
 
         while True:
             with self._lock:
                 handle = self._active_handle
-                request = self._active_request
                 descriptor = self._active_descriptor
                 reader = self._active_progress_reader
             if handle is None:
                 return None
-            if request is None or descriptor is None:
+            if descriptor is None:
                 raise RuntimeError("pulse application lost its active execution identity")
             run = handle.snapshot()
-            if descriptor.scan_point_count == 0:
-                progress = PulseScanProgress.unavailable(
-                    run_id=run.run_id.value,
-                    artifact_digest=descriptor.artifact_digest,
-                    point_count=0,
-                    backend_state=run.state.value,
-                    reason="active pulse has no scan table",
-                )
-            elif (
-                request.execution_form
-                is not PulseExecutionForm.AUTONOMOUS_SCAN_CONTINUOUS
-            ):
-                progress = PulseScanProgress.unavailable(
-                    run_id=run.run_id.value,
-                    artifact_digest=descriptor.artifact_digest,
-                    point_count=descriptor.scan_point_count,
-                    backend_state=run.state.value,
-                    reason="realtime progress is defined only for continuous scans",
-                )
-            elif reader is None:
+            if reader is None:
                 progress = PulseScanProgress.unavailable(
                     run_id=run.run_id.value,
                     artifact_digest=descriptor.artifact_digest,
@@ -530,11 +550,7 @@ class PulseApplicationOwner:
                 progress = reader()
             with self._lock:
                 if self._active_handle is handle:
-                    if (
-                        progress.run_id != run.run_id.value
-                        or progress.artifact_digest != descriptor.artifact_digest
-                        or progress.point_count != descriptor.scan_point_count
-                    ):
+                    if progress.run_id != run.run_id.value:
                         raise RuntimeError(
                             "pulse scan progress belongs to another active Run"
                         )
@@ -547,14 +563,12 @@ class PulseApplicationOwner:
             with self._lock:
                 self._start_in_progress = True
                 self._pending_applied = None
-                self._active_replace = None
             try:
                 handle = prepared.start()
             except BaseException:
                 with self._lock:
                     self._start_in_progress = False
                     self._pending_applied = None
-                    self._active_replace = None
                 raise
             with self._lock:
                 pending = self._pending_applied
@@ -565,10 +579,8 @@ class PulseApplicationOwner:
                 if mismatch:
                     self._pending_applied = None
                     self._start_in_progress = False
-                    self._active_replace = None
                 else:
                     self._active_handle = handle
-                    self._active_request = prepared.request
                     self._active_descriptor = prepared.descriptor
                     self._active_applied = None if pending is None else pending[0]
                     self._active_progress_reader = (
@@ -607,20 +619,20 @@ class PulseApplicationOwner:
             self._active_applied = snapshot
             self._active_progress_reader = progress_reader
 
-    def _record_replace(
-        self,
-        replace_request: Callable[[PulseRunRequest], Future],
-    ) -> None:
-        """Install the one replacement queue owned by the active Run lane."""
+    def _record_replace(self, run_id: str, lane: PulseReplacementLane) -> None:
+        """Install the one replacement lane, bound to the Run that owns it."""
 
-        if not callable(replace_request):
-            raise TypeError("replace_request must be callable")
+        canonical_text(run_id, "run_id")
+        if not isinstance(lane, PulseReplacementLane):
+            raise TypeError("replacement lane must be PulseReplacementLane")
         with self._lock:
-            if self._active_handle is None and not self._start_in_progress:
-                raise RuntimeError(
-                    "replacement seam was published without an owned Pulse Run"
-                )
-            self._active_replace = replace_request
+            handle = self._active_handle
+            if handle is None or handle.run_id.value != run_id:
+                if not self._start_in_progress:
+                    raise RuntimeError(
+                        "replacement seam was published without an owned Pulse Run"
+                    )
+            self._active_replacement_lane = (run_id, lane)
 
 
 def _compile_pulse_request(
@@ -681,8 +693,7 @@ def prepare_pulse_execution(
         Callable[[AppliedPulseSnapshot, Callable[[], PulseScanProgress]], None]
         | None
     ) = None,
-    on_replace_ready: Callable[[Callable[[PulseRunRequest], Future]], None]
-    | None = None,
+    on_replace_ready: Callable[[str, PulseReplacementLane], None] | None = None,
 ) -> PreparedPulseExecution:
     """Bind, compile, and freeze one pulse-only Run without touching hardware."""
 
@@ -725,90 +736,66 @@ def _compile_pulse_run_plan(
         Callable[[AppliedPulseSnapshot, Callable[[], PulseScanProgress]], None]
         | None
     ),
-    on_replace_ready: Callable[[Callable[[PulseRunRequest], Future]], None]
-    | None,
+    on_replace_ready: Callable[[str, PulseReplacementLane], None] | None,
 ) -> RunPlan[PulseSession, PulseRunResult, PulseRunResult]:
-    replacement_queue: queue.Queue[tuple[PulseRunRequest, Future]] = queue.Queue()
+    replacement_lane = PulseReplacementLane()
     replacement_cache: dict[
         tuple[str, PulseExecutionForm, tuple[tuple[str, int | float], ...]],
         tuple[PulseDocument, ContinuousPulseExecutionRequest],
     ] = {}
 
-    def enqueue_replacement(request: PulseRunRequest) -> Future:
-        future: Future = Future()
-        try:
-            if not isinstance(request, PulseRunRequest):
-                raise TypeError("replacement request must be PulseRunRequest")
-            if request.execution_form is not PulseExecutionForm.CONTINUOUS_MONITOR:
-                raise ValueError(
-                    "pulse replacement requires CONTINUOUS_MONITOR"
-                )
-        except BaseException as error:
-            future.set_exception(error)
-            return future
-        replacement_queue.put((request, future))
-        return future
-
-    def reject_queued_replacements(error: BaseException) -> None:
-        while True:
-            try:
-                _request, future = replacement_queue.get_nowait()
-            except queue.Empty:
-                return
-            if not future.done():
-                future.set_exception(error)
-
     def preflight(_context: RunContext) -> PulseSession:
         return pulse_port.open_session(execution)
 
-    def execute(context: RunContext, session: PulseSession) -> PulseRunResult:
+    def drive(context: RunContext, session: PulseSession) -> PulseRunResult:
         context.checkpoint()
         session.prepare(context)
-        artifact_digest = execution.artifact_digest
-        point_count = len(execution.artifact.target_ir.scan_points)
-        if on_applied is not None:
-            session_id = session.session_id
-            run_id = context.run_id.value
 
-            def observe_prepared_scan() -> PulseScanProgress:
-                return pulse_port.observe_scan_progress(
-                    session_id=session_id,
-                    run_id=run_id,
-                    artifact_digest=artifact_digest,
-                    point_count=point_count,
-                )
-
-            on_applied(
-                AppliedPulseSnapshot(
-                    context.run_id.value,
-                    request.document,
-                    request.api_values,
-                    request.scan_sweep_count,
-                    execution.document,
-                    request.execution_form,
-                    execution.artifact_digest,
-                ),
-                observe_prepared_scan,
+        def observe_applied_scan() -> PulseScanProgress:
+            # One read of the session answers both facts about the artifact on
+            # the sequencer.  Capturing them here instead would describe the
+            # artifact this Run began with and stop naming the hardware at the
+            # first in-place replacement.
+            applied_artifact = session.applied_artifact
+            return pulse_port.observe_scan_progress(
+                session_id=session.session_id,
+                run_id=context.run_id.value,
+                artifact_digest=applied_artifact.fingerprint,
+                point_count=len(applied_artifact.target_ir.scan_points),
             )
+
+        def publish_applied(
+            source: PulseRunRequest,
+            execution_document: PulseDocument,
+        ) -> AppliedPulseSnapshot:
+            applied = AppliedPulseSnapshot(
+                context.run_id.value,
+                source.document,
+                source.api_values,
+                source.scan_sweep_count,
+                execution_document,
+                source.execution_form,
+                session.artifact_digest,
+            )
+            if on_applied is not None:
+                on_applied(applied, observe_applied_scan)
+            return applied
+
+        publish_applied(request, execution.document)
         if (
             on_replace_ready is not None
             and isinstance(execution, ContinuousPulseExecutionRequest)
         ):
-            on_replace_ready(enqueue_replacement)
+            on_replace_ready(context.run_id.value, replacement_lane)
         context.checkpoint()
         session.fire(context)
         if isinstance(execution, ContinuousPulseExecutionRequest):
             context.set_phase("holding-pulse")
             while True:
                 context.checkpoint()
-                try:
-                    replacement_request, replacement_future = (
-                        replacement_queue.get_nowait()
-                    )
-                except queue.Empty:
-                    replacement_request = None
-                    replacement_future = None
-                if replacement_request is not None:
+                queued = replacement_lane.take()
+                if queued is not None:
+                    replacement_request, replacement_future = queued
                     try:
                         replacement_key = (
                             replacement_request.document.fingerprint,
@@ -838,37 +825,31 @@ def _compile_pulse_run_plan(
                         else:
                             replacement_document, replacement_execution = cached
                         session.replace(context, replacement_execution)
-                        replacement_applied = AppliedPulseSnapshot(
-                            context.run_id.value,
-                            replacement_request.document,
-                            replacement_request.api_values,
-                            replacement_request.scan_sweep_count,
-                            replacement_document,
-                            replacement_request.execution_form,
-                            replacement_execution.artifact_digest,
-                        )
-
-                        def replacement_progress() -> PulseScanProgress:
-                            return PulseScanProgress.unavailable(
-                                run_id=context.run_id.value,
-                                artifact_digest=artifact_digest,
-                                point_count=point_count,
-                                backend_state="HELD",
-                                reason="scan is held at an applied point",
+                        replacement_future.set_result(
+                            publish_applied(
+                                replacement_request,
+                                replacement_document,
                             )
-
-                        if on_applied is not None:
-                            on_applied(replacement_applied, replacement_progress)
-                        assert replacement_future is not None
-                        replacement_future.set_result(replacement_applied)
+                        )
                     except BaseException as error:
-                        assert replacement_future is not None
                         replacement_future.set_exception(error)
+                        if not session.holds_hardware:
+                            # ``replace`` interrupts the fired artifact before
+                            # it prepares the new one, so a refusal past that
+                            # point leaves the sequencer holding nothing.  Only
+                            # the session can say so, and it is asked here
+                            # rather than inferred from the error: a request
+                            # this lane refused before the session was touched
+                            # is the caller's failure, not the Run's.  Staying
+                            # in the loop would advertise "holding-pulse" over
+                            # idle hardware forever, because the backend
+                            # answers "no failure" about the session it sealed.
+                            raise
                     continue
                 failure = pulse_port.wait_continuous_failure(
                     session_id=session.session_id,
                     run_id=context.run_id.value,
-                    artifact_digest=execution.artifact_digest,
+                    artifact_digest=session.artifact_digest,
                     timeout=_CONTINUOUS_FAILURE_WAIT_SLICE_SECONDS,
                 )
                 # Cancellation wins races with a failure notification because its
@@ -882,20 +863,34 @@ def _compile_pulse_run_plan(
         return PulseRunResult(
             context.run_id.value,
             request.execution_form,
-            execution.artifact_digest,
+            session.artifact_digest,
             terminal.evidence_kind,
         )
+
+    def execute(context: RunContext, session: PulseSession) -> PulseRunResult:
+        ended: BaseException | None = None
+        try:
+            return drive(context, session)
+        except BaseException as error:
+            ended = error
+            raise
+        finally:
+            # This frame is where consumption stops, so this is where the lane
+            # stops admitting work.  Revoking it in a later lifecycle callback
+            # would leave a window in which a caller is handed a promise that
+            # nobody is left to complete, and the terminal state that would
+            # warn them is still several hardware round trips away.
+            replacement_lane.close(
+                ended
+                if ended is not None
+                else RuntimeError("pulse Run stopped consuming replacements")
+            )
 
     def cleanup(
         context: RunContext,
         session: PulseSession | None,
-        primary: BaseException | None,
+        _primary: BaseException | None,
     ) -> CleanupReport:
-        reject_queued_replacements(
-            primary
-            if primary is not None
-            else RuntimeError("pulse Run ended before replacement was applied")
-        )
         return (
             pulse_port.verify_idle(context)
             if session is None
@@ -928,6 +923,7 @@ def _compile_pulse_run_plan(
 __all__ = [
     "AppliedPulseSnapshot",
     "PreparedPulseExecution",
+    "PulseReplacementLane",
     "PulseRunDescriptor",
     "PulseRunObservation",
     "PulseRunRequest",

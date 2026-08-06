@@ -688,6 +688,38 @@ class PulseSession:
         return self._session_id
 
     @property
+    def applied_artifact(self) -> CompiledPulseArtifact:
+        """The artifact this session last asked the hardware to hold.
+
+        ``replace`` swaps the whole request, so the session is the only object
+        that can answer "which artifact is applied".  Reading it through one
+        attribute also makes digest and scan cardinality a single observation
+        for callers on another thread.  It names something the sequencer is
+        actually driving only while ``holds_hardware`` is true: a replacement
+        takes the hardware to SAFE before it prepares, and a refusal after that
+        point leaves this artifact applied to nothing.
+        """
+
+        return self._request.artifact
+
+    @property
+    def holds_hardware(self) -> bool:
+        """Whether the sequencer is still driving ``applied_artifact``.
+
+        This is the level under every "the pulse is still running" edge.  It
+        goes false the instant this session stops being able to answer for what
+        it fired: when a prepare or FIRE fails, and when an in-place ``replace``
+        asks the hardware for SAFE, which is the step that ends the fired
+        artifact whether or not it returns.
+        """
+
+        return self._state is _PulseSessionState.FIRED
+
+    @property
+    def artifact_digest(self) -> str:
+        return self.applied_artifact.fingerprint
+
+    @property
     def terminal(self) -> PulseTerminalAck:
         if self._terminal is None:
             raise RuntimeError("pulse session has no terminal acknowledgement")
@@ -766,6 +798,13 @@ class PulseSession:
         if self._state is not _PulseSessionState.FIRED:
             raise RuntimeError("pulse replacement requires an active fired session")
         context.checkpoint()
+        # The interrupt is the point of no return for the fired artifact: the
+        # endpoint seals this session the moment it is asked to go SAFE, before
+        # it has proved it got there.  The level therefore drops before the
+        # call, not after it returns, so an interrupt that raises leaves
+        # ``holds_hardware`` false instead of claiming a hold that no backend
+        # can ever report the end of.
+        self._state = _PulseSessionState.FAILED
         context._run_interrupts(self._port.interrupt_operations)
         self._request = request
         self._state = _PulseSessionState.NEW
